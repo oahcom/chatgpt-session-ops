@@ -38,6 +38,11 @@ def main():
     out = os.path.join(BASE, "cookies.json")
     with open(out, "w", encoding="utf-8") as f:
         json.dump(cookies, f, ensure_ascii=False, indent=2)
+    if os.name == "posix":  # 凭据落盘收权限，别让同机其他用户直接读走
+        try:
+            os.chmod(out, 0o600)
+        except OSError:
+            pass
     print("saved", out)
 
     # build cookie header for chatgpt.com

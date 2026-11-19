@@ -14,6 +14,7 @@
 """
 import json
 import os
+import re
 import sys
 import time
 
@@ -94,10 +95,24 @@ def conv_id_from_url(url):
 
 
 def main():
+    if len(sys.argv) < 3:
+        print("usage: python continue_full.py <old_conv_id> <prompt_file>", flush=True)
+        return 2
     old_id, prompt_file = sys.argv[1], sys.argv[2]
-    prompt = open(prompt_file, encoding="utf-8").read()
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$", old_id):
+        print("ERROR: old_conv_id 非法：%r（只允许字母数字与 _-）" % (old_id,), flush=True)
+        return 2
+    try:
+        with open(prompt_file, encoding="utf-8") as f:
+            prompt = f.read()
+    except OSError as e:
+        print("ERROR: 读不到提示词文件 %s：%s" % (prompt_file, e), flush=True)
+        return 2
     lines = [l for l in prompt.splitlines() if not l.strip().startswith("#")]
     prompt = "\n".join(lines).strip()
+    if not prompt:
+        print("ERROR: 提示词没有正文（只有注释行）：%s" % prompt_file, flush=True)
+        return 2
 
     c = CDPClient(host="127.0.0.1", port=9222, timeout=30)
     c.ensure_page(url_contains="chatgpt.com")
@@ -136,12 +151,24 @@ def main():
         print("FAIL: 未拿到新会话 id")
         return 2
 
-    # 记录映射
+    # 记录映射（原子写：满员续接的映射丢了就只能靠人工回忆旧 id）
     m = {}
     if os.path.exists(MAP):
-        m = json.load(open(MAP, encoding="utf-8"))
+        try:
+            with open(MAP, encoding="utf-8") as f:
+                m = json.load(f)
+            if not isinstance(m, dict):
+                m = {}
+        except (OSError, json.JSONDecodeError) as e:
+            print("WARN: newchat-map.json 读不出来（%s），按空表重建" % e, flush=True)
+            m = {}
     m[old_id] = new_id
-    json.dump(m, open(MAP, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+    tmp = MAP + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(m, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, MAP)
 
     # 新会话重发
     print(c.evaluate(JS_FILL.replace("text", json.dumps(prompt))).get("value"), flush=True)

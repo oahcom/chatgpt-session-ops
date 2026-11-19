@@ -166,6 +166,8 @@ python scripts/chatgpt_send.py --tail <conv_id>
 | 文件锁重入 | 按**线程**记持有者（`path -> thread ident`） | 旧版按路径记集合，同进程第二个线程会跳过加锁，多线程下照样丢更新（已由单测锁死） |
 | `--tail` 退出码 | 没取到内容返回 1 | 否则脚本编排层无法区分「读到了」和「被限速」 |
 | 匿名等待预算 | `CHATGPT_ANON_IDLE_SEC`（默认 900） | 超长回复不必改代码 |
+| `continue_full.py` | 参数缺失/`old_conv_id` 非法/提示词为空均 exit 2；`newchat-map.json` 原子写 | 早先空参直接 IndexError，映射写半截就丢 |
+| `extract_auth.py` | POSIX 上 `cookies.json` 落盘即 chmod 600 | 提取出来的就是全量凭据 |
 
 新增环境变量：`CHATGPT_REPLY_MAX_CHARS`（默认 0=全文）、`CHATGPT_ANON_IDLE_SEC`（默认 900）。
 
