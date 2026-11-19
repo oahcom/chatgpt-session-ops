@@ -1658,8 +1658,9 @@ class TestProxy(TmpBase):
 
     # ---- F-10：process_start_time 损坏值不得当 pid_reused 证据 ----
     def test_lock_corrupt_start_time_not_reclaimed(self):
-        """存储的 process_start_time 是垃圾串：不得当 pid_reused 证据回收。"""
-        for bad in ("corrupted", True, False, [1], {"x": 1}, float("nan")):
+        """存储的 process_start_time 是垃圾串/±inf/负数：不得当 pid_reused 证据回收。"""
+        for bad in ("corrupted", True, False, [1], {"x": 1}, float("nan"),
+                    float("inf"), float("-inf"), -1, -0.5):
             lock = os.path.join(self.tmp, "f10-%s.lock" % str(bad)[:8])
             self._write_lock(lock, {"pid": os.getpid(),
                                     "process_start_time": bad,
@@ -1684,14 +1685,13 @@ class TestProxy(TmpBase):
         self.assertTrue(ok)
         self.assertIsNone(v)
         # 合法 int / float → 原值返回（不转 float，防 FILETIME 精度丢失）
-        for good in (12345, 12345.678, 0):
+        for good in (12345, 12345.678, 0, 0.0):
             ok, v = m._parse_start_time(good)
             self.assertTrue(ok, "合法值 %r 应通过" % (good,))
             self.assertEqual(v, good, "必须原值返回，不得 float() 归一化")
-        # 损坏 → False
-        for bad in (True, False, "12345", [1], {"a": 1}, float("nan"), None):
-            if bad is None:
-                continue  # None 是合法的旧格式
+        # 损坏 → False（含 F-10 第二十一轮补：±inf / 负数）
+        for bad in (True, False, "12345", [1], {"a": 1}, float("nan"),
+                    float("inf"), float("-inf"), -1, -0.5):
             ok, v = m._parse_start_time(bad)
             self.assertFalse(ok, "损坏值 %r 应判无效" % (bad,))
             self.assertIsNone(v)
@@ -2140,8 +2140,9 @@ class TestSlotsAndLease(TmpBase):
 
     # ---- F-10：_lease_reclaimable 的 process_start_time 损坏值不得当 pid_reused ----
     def test_lease_reclaimable_corrupt_start_time_not_reclaimed(self):
-        """存储的 process_start_time 是垃圾值：返回 identity_unreadable，禁止回收。"""
-        for bad in ("corrupted", True, False, [1], {"x": 1}, float("nan")):
+        """存储的 process_start_time 是垃圾值/±inf/负数：返回 identity_unreadable，禁止回收。"""
+        for bad in ("corrupted", True, False, [1], {"x": 1}, float("nan"),
+                    float("inf"), float("-inf"), -1, -0.5):
             info = {"run_id": "r1", "pid": os.getpid(),
                     "lease_until": 0, "process_start_time": bad}
             with self.subTest(value=bad):

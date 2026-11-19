@@ -744,16 +744,21 @@ def _parse_start_time(value):
 
     返回 (valid, normalized_value)。
     None       → (True, None)   旧格式兼容，视为未记录启动时间。
-    bool/str/非 int|float/NaN → (False, None)  字段损坏——不得当 pid_reused 证据，
-                  调用方应按 identity_unreadable 处理（禁止回收）。
-    int / float → (True, value)  原值返回。**不转 float**——Windows FILETIME 是
-                  17 位大整数，float() 丢精度会把同一个值判成不等（误报 pid_reused）。
+    bool/str/非 int|float/NaN/±inf/负数 → (False, None)  字段损坏——不得当
+                  pid_reused 证据，调用方应按 identity_unreadable 处理（禁止回收）。
+    非负 int / 有限非负 float → (True, value)  原值返回。**不转 float**——
+                  Windows FILETIME 是 17 位大整数，float() 丢精度会把同一个值
+                  判成不等（误报 pid_reused）。
     """
     if value is None:
         return True, None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False, None
-    if isinstance(value, float) and value != value:  # NaN
+    if isinstance(value, float):
+        # 拒 NaN / ±inf / 负数——都不是合法的进程启动时间戳
+        if value != value or value in (float("inf"), float("-inf")) or value < 0:
+            return False, None
+    elif value < 0:
         return False, None
     return True, value
 
@@ -770,11 +775,12 @@ def _write_all(fd, data):
 
 
 def _rename_no_overwrite(src, dst):
-    """原子重命名，目标已存在时抛 FileExistsError（R7 不覆盖，F-11）。
+    """目标不覆盖的归档移动（R7 不覆盖，F-11）——不是原子重命名。
 
-    Windows: os.rename 天然拒绝覆盖已存在目标。
-    POSIX:   os.rename 会覆盖，改用 os.link（硬链接，目标存在则失败）+ os.remove(src)。
-    src/dst 必须同盘（归档名派生自原路径，恒满足）。
+    Windows: os.rename 天然拒绝覆盖已存在目标（单步原子）。
+    POSIX:   os.link + os.remove 两步——硬链接成功后、删除源前崩溃会留下两个
+             路径指向同一 inode（不丢数据、不覆盖归档，但不是单步原子）。
+    目标已存在时抛 FileExistsError。src/dst 必须同盘（归档名派生自原路径，恒满足）。
     """
     if os.name == "nt":
         os.rename(src, dst)

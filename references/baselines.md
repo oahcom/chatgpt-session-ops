@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**二十轮对外对抗审查**逐条改写（每轮裁定见 §F；**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至二十轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08）、锁元数据写入失败进临界区（F-09）、损坏启动时间误判 pid_reused（F-10）、归档覆盖（F-11），F-02～F-08 已核销、F-09～F-11 待复审），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 205 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**二十一轮对外对抗审查**逐条改写（每轮裁定见 §F；**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至二十一轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08）、锁元数据写入失败进临界区（F-09）、损坏启动时间误判 pid_reused（F-10，二十一轮补 ±inf/负数残留）、归档覆盖（F-11），F-02～F-08 已核销、F-09～F-11 待复审），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 205 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -408,6 +408,10 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | 20 | v1.8 修订 | `NEEDS-REVISION`（F-09 / F-10 / F-11 三项 + F-08 补充） | 全文复审 `_try_reclaim_stale`/`_lease_reclaimable`/`lease_force_release` + `_file_lock`。F-02 内核锁守卫、F-03 三态判定核心方案均判成立；但抓出：**F-09** `_file_lock` 锁元数据写入失败/短写被 `except OSError: pass` 静默吞掉后仍进临界区，留下空锁触发 mtime 兼容回收，可能双进程同时进临界区；**F-10** `_lease_reclaimable` 与 `_lock_holder_stale` 把损坏的 `process_start_time`（`"corrupted"`/bool/dict/NaN）当作 pid_reused 证据，把身份不可读错误升级成允许回收；**F-11** `_force_release_locked` 用 `os.replace` 归档会覆盖同名已有归档，违反 R7 不覆盖承诺；**F-08 补** `_lock_holder_stale` 的 `except OSError` 拦不住 `UnicodeDecodeError`（非法 UTF-8 锁文件读取异常会穿透） |
 
 **第二十轮改了什么**：① **F-09**：新增 `_write_all()` 完整写入（循环处理短写）；写入失败时清理半成品锁 + 关 fd + 抛 `LockTimeout`，绝不 yield 进临界区（strict 与非 strict 均阻断——身份缺失 ≠ 锁竞争超时）。② **F-10**：新增 `_parse_start_time()` 严格验证（只认 int/float 且拒 bool/str/dict/NaN；`None` 为旧格式兼容；原值返回不转 float 防 FILETIME 精度丢失），`_lock_holder_stale` 与 `_lease_reclaimable` 均接入，损坏值一律 `(False, "identity_unreadable")` / 不回收。③ **F-11**：新增 `_rename_no_overwrite()`（Windows `os.rename` 天然不覆盖；POSIX `os.link`+`os.remove`），`_force_release_locked` 归档冲突时追加序号找唯一名，绝不覆盖已有归档。④ **F-08 补**：`_lock_holder_stale` 读取段 `except OSError` → `except (OSError, ValueError)`（覆盖 `UnicodeDecodeError`）。⑤ 补 13 条回归（192→205）：F-09 三条（写失败/短写/非 strict 均不进临界区）、F-10 七条（损坏 start_time 不回收×2 侧 + 合法不等→pid_reused + None→alive + `_parse_start_time` 契约）、F-11 三条（归档不覆盖 + 多冲突 + `_rename_no_overwrite` 契约）、F-08 补一条（非法 UTF-8 不回收不抛异常）。
+
+| 21 | v1.8 修订 | `NEEDS-REVISION`（F-10 残留） | F-09/F-11/F-08补 均判「修复到位」；`_write_all`/`_rename_no_overwrite` 核心正确（但 `_rename_no_overwrite` POSIX 路径非原子重命名——硬链接+删源两步，docstring 措辞需修正）。**F-10 残留**：`_parse_start_time` 只拒 NaN 未拒 ±inf 和负数，`float("inf")`/`-1` 等能通过验证后 `!= cur` 触发 pid_reused 回收 |
+
+**第二十一轮改了什么**：① `_parse_start_time` 补拒 ±inf（`float("inf")`/`float("-inf")`）与负数（int/float 均查 `< 0`）；② `_rename_no_overwrite` docstring 改为「目标不覆盖的归档移动」并注明 POSIX 两步非原子；③ 测试集扩充 ±inf/-1/-0.5 至三处（`_parse_start_time` 契约 + `_lock_holder_stale` 侧 + `_lease_reclaimable` 侧），205 条不变（用例集扩参不加新 ID）。
 
 **第十四轮之后补的一条**：审查把「`_record_corruption("lease-recovery-failed")` 自己失败会怎样」列为残余风险 3，虽不构成裁定理由，但这是能离线证明的，于是补 `test_quarantine_failed_row_write_failure_is_survivable`（第一次登记成功、第二次返回 `None`，断言不抛异常、仍返回 `quarantine_failed`、租约原样在）。**属于 PASS 后的加证，不改变任何条款口径**，故不重开一轮审查。
 
