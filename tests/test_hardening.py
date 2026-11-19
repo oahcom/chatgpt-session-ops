@@ -15,6 +15,7 @@ import os
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import struct
 import sys
@@ -181,6 +182,50 @@ class TestStateFiles(TmpBase):
             os.replace = real_replace
         self.assertEqual([f for f in os.listdir(self.tmp) if ".tmp" in f], [], "失败后留了 tmp")
         self.assertEqual(json.load(open(path, encoding="utf-8"))["v"], 1, "旧内容必须完好")
+
+    def test_tmp_is_created_in_target_directory(self):
+        """A20：tmp 必须与目标同目录（同文件系统才谈得上原子 replace）。"""
+        path = os.path.join(self.tmp, "nested", "same-dir.json")
+        seen = {}
+        real = os.replace
+
+        def spy(src, dst):
+            seen["src"] = src
+            return real(src, dst)
+
+        os.replace = spy
+        try:
+            m._atomic_write(path, "{}")
+        finally:
+            os.replace = real
+        self.assertEqual(os.path.dirname(os.path.abspath(seen["src"])),
+                         os.path.dirname(os.path.abspath(path)))
+
+    @unittest.skipUnless(os.name == "posix", "Windows 无法 open 目录，目录 fsync 无对应语义")
+    def test_atomic_write_fsyncs_parent_directory(self):
+        """A20（仅 POSIX）：replace 后必须 fsync 目录，否则断电可能丢目录项。
+
+        Windows 上 os.open(dir) 直接 PermissionError，实现按降级处理——这也是 A20 只能
+        记 PARTIAL 的原因：跨平台持久化语义无法用离线单测证明。
+        """
+        path = os.path.join(self.tmp, "dir-sync.json")
+        seen = []
+        real = os.fsync
+
+        def spy(fd):
+            try:
+                seen.append(stat.S_ISDIR(os.fstat(fd).st_mode))
+            except OSError:
+                seen.append(None)
+            return real(fd)
+
+        os.fsync = spy
+        try:
+            m._atomic_write(path, "{}")
+        finally:
+            os.fsync = real
+        self.assertIn(True, seen, "no directory fsync (seen=%r)" % (seen,))
+        self.assertIn(False, seen, "no file fsync")
 
     def test_atomic_write_uses_unique_tmp_names(self):        # 事故：固定 `.tmp` 时同进程两个线程写同一个临时文件，Windows 上 os.replace
         # 抛 WinError 32，线程被打死、锁留在原地 → 4 线程 ×20 次只落 60 条。
@@ -1319,7 +1364,8 @@ class TestSlotsAndLease(TmpBase):
         with open(approval, "w", encoding="utf-8") as f:
             json.dump({"sha256": m._sha256_file(path),
                        "approved_at": "2026-11-19T16:00:00+08:00",
-                       "approver": "owner", "reason": "holder confirmed dead"}, f)
+                       "approver": "owner", "reason": "holder confirmed dead",
+                       "identity_evidence": "process snapshot + B7 state check #4512"}, f)
         ok, why = m.lease_force_release(path, approval)
         self.assertTrue(ok, why)
         self.assertEqual(why, "quarantined")
@@ -1359,6 +1405,85 @@ class TestSlotsAndLease(TmpBase):
         self.assertEqual(row["why"], "identity_unreadable")
         self.assertEqual(row["sha256"], m._sha256_file(sp))
         self.assertEqual(row["size"], os.path.getsize(sp))
+
+    def test_force_release_refuses_without_lock(self):
+        """R2：恢复必须在严格锁内完成；抢不到锁就拒绝，避免 TOCTOU。"""
+        path = os.path.join(self.tmp, "lease-toctou.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{broken")
+        approval = os.path.join(self.tmp, "approve-toctou.json")
+        with open(approval, "w", encoding="utf-8") as f:
+            json.dump({"sha256": m._sha256_file(path),
+                       "approved_at": "2026-11-19T16:00:00+08:00",
+                       "approver": "owner", "reason": "approved"}, f)
+        self._hold_lock(path)
+        ok, why = m.lease_force_release(path, approval)
+        self.assertFalse(ok)
+        self.assertEqual(why, "lock_timeout")
+        self.assertTrue(os.path.exists(path))
+
+    def test_force_release_needs_identity_evidence_when_unreadable(self):
+        """R3：读不出 pid 不等于进程死了；批准人必须给出独立确认依据。"""
+        path = os.path.join(self.tmp, "lease-id.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{broken")
+        approval = os.path.join(self.tmp, "approve-id.json")
+        with open(approval, "w", encoding="utf-8") as f:
+            json.dump({"sha256": m._sha256_file(path),
+                       "approved_at": "2026-11-19T16:00:00+08:00",
+                       "approver": "owner", "reason": "assume dead"}, f)
+        ok, why = m.lease_force_release(path, approval)
+        self.assertFalse(ok)
+        self.assertEqual(why, "identity_unconfirmed")
+        self.assertTrue(os.path.exists(path))
+
+    def test_force_release_blocks_when_audit_registration_fails(self):
+        """R1：登记失败必须阻断恢复——没有审计记录的「恢复成功」比不恢复更危险。"""
+        path = os.path.join(self.tmp, "lease-audit.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{broken")
+        approval = os.path.join(self.tmp, "approve-audit.json")
+        with open(approval, "w", encoding="utf-8") as f:
+            json.dump({"sha256": m._sha256_file(path),
+                       "approved_at": "2026-11-19T16:00:00+08:00",
+                       "approver": "owner", "reason": "dead",
+                       "identity_evidence": "ps snapshot"}, f)
+        real = m._record_corruption
+        try:
+            m._record_corruption = lambda *a, **k: None
+            ok, why = m.lease_force_release(path, approval)
+        finally:
+            m._record_corruption = real
+        self.assertFalse(ok)
+        self.assertEqual(why, "audit_registration_failed")
+        self.assertTrue(os.path.exists(path))
+
+    def test_heartbeat_and_release_timeout_keep_lease_bytes(self):
+        """B15：抢不到锁时，心跳/释放都必须什么都不做——文件与字节都不许变。"""
+        path = os.path.join(self.tmp, "lease-keep.json")
+        m._atomic_write(path, json.dumps({
+            "task_id": "t", "run_id": "rid", "pid": os.getpid(),
+            "process_start_time": m._proc_start_time(os.getpid()),
+            "started_at": time.time(), "heartbeat_at": time.time(),
+            "lease_until": time.time() + 60}, ensure_ascii=False, indent=2))
+        before = open(path, "rb").read()
+        self._hold_lock(path)
+        self.assertFalse(m.lease_heartbeat(path, "rid", lock_timeout=0.2))
+        self.assertFalse(m.lease_release(path, "rid", lock_timeout=0.2))
+        self.assertTrue(os.path.exists(path), "lease file removed by timeout path")
+        self.assertEqual(open(path, "rb").read(), before, "lease content changed")
+
+    def test_lease_conflict_logs_reason(self):
+        """审计要能分辨「有人在跑」与「抢不到锁」。"""
+        path = os.path.join(self.tmp, "lease-log.json")
+        m._atomic_write(path, json.dumps({
+            "task_id": "t", "run_id": "other", "pid": os.getpid(),
+            "process_start_time": m._proc_start_time(os.getpid()),
+            "lease_until": time.time() + 60}))
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertIsNone(m.lease_acquire(path, "t2"))
+        self.assertIn("租约冲突", buf.getvalue())
 
     def test_lease_valid_blocks_reclaim(self):
         ok, why = m._lease_reclaimable({

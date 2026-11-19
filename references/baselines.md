@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**十轮对外对抗审查**逐条改写（每轮裁定见 §F，第九轮把「可判定」本身当成攻击面），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 150 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**十轮对外对抗审查**逐条改写（每轮裁定见 §F，第九轮把「可判定」本身当成攻击面），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 157 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -34,7 +34,7 @@
 | 2 | 这个会话归谁 | `--owner <conv_id>` | 输出唯一账号 |
 | 3 | 配额有没有冷却 | `--rotation` | `unavailable` 为空或目标账号不在其中 |
 | 4 | 匿名要用先看设备 | `--anon-devices` | 目标设备 `jar=true` |
-| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 150 条） |
+| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 157 条） |
 
 ### A1–A4 内容主权（不可协商）
 
@@ -103,8 +103,13 @@
 | tmp 名唯一 | `test_atomic_write_uses_unique_tmp_names`（4 线程各写一次，断言 `os.replace` 收到的 src 互不相同） |
 | flush + fsync(file) | `test_tmp_is_in_same_dir_and_fsync_failure_cleans_up`（注入 `os.fsync` 抛错，断言确实调用过且失败后清 tmp） |
 | `os.replace` 原子替换 | `test_replace_failure_cleans_up_and_keeps_old_content`（注入 `os.replace` 失败，断言旧内容完好、无 tmp 残留） |
-| fsync(dir) | 同一次 `_atomic_write` 内在 `os.replace` 后对父目录 fsync（POSIX；Windows 打不开目录时跳过） |
+| fsync(dir) | 同一次 `_atomic_write` 内在 `os.replace` 后对父目录 fsync（**仅 POSIX**；Windows 上 `os.open(dir)` 直接 PermissionError，实现显式降级并在注释里写明） |
 | 失败清理且不得记成成功 | 上述两个注入用例都断言「失败抛异常 + 目标文件不被替换」 |
+
+**A20 的阶段与边界（第十一轮审查要求写清）**：
+
+- **Windows 降级语义**：目录 fsync 无对应语义，代码跳过；因此 A20 **跨平台只能记 PARTIAL**，不能宣称「无条件持久化」。
+- **replace 之后失败 ≠ 回滚**：`os.replace` 成功后若目录 fsync 失败，函数抛异常，但目标文件**已经是新内容**。调用方必须理解为「可能已生效但未确认」，而不是「保持旧值」——这与 §0 的业务成功/证据成功分层是同一条道理。
 
 **A20 二次事故（v1.8，被新回归抓出）**：文档写着「文件名唯一（禁止共用固定 `.tmp`）」，代码里却一直是 `path + ".tmp"`。同进程 4 线程并发写同一状态文件时，两个线程写同一个临时文件、`os.replace` 在 Windows 上抛 `WinError 32`，线程被打死、锁文件留在原地，后来者等 8s 超时后「跳过加锁」继续写 → **4 × 20 次只落 60 条**（断言要求 80）。修法：tmp 名改成 `<path>.tmp-<pid>-<thread ident>`。教训写进 §0：**「文档里写了」不等于「代码里是」**，这条是本次把文档当受审对象后才暴露的。
 
@@ -326,7 +331,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | automation 名称 / 排程 | 同上 + `--check-name`、`--check-schedule`、`--check-oneshot` | B1/B4/B5/B10/B11 |
 | 排程口径 | `automation_update list` 全量盘点 | B1–B5 |
 
-**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 150 条。
+**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 157 条。
 
 ---
 
@@ -362,6 +367,10 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 
 | 10 | v1.8 修订 | `NEEDS-REVISION`（返修要求 4 条 + 新发现 N1–N6） | A20/B15 的 FULL 名不副实（缺故障注入与异常路径断言）；损坏槽位/租约没有统一登记；缺 B15-R 完整恢复闭环；等级元测试仍只校验字符串；`lease_acquire` 不区分 `lease_conflict` 与 `lock_timeout` |
 
+| 11 | v1.8 修订 | `NEEDS-REVISION`（A20/B15 仍判 PARTIAL；R2 锁未实现；登记失败未阻断） | 只认贴出来的断言，不认矩阵里的用例名；TOCTOU、审计失败、身份不可读三点均属实现未闭环 |
+
+**第十一轮改了什么**：见下方第十轮表格末尾 7 行（A20/B15 降级、审计阻断、R2 加锁、身份证据、超时保留字节、同目录与目录 fsync 断言）。
+
 **第十轮改了什么（逐条对应）**：
 
 | 审查项 | 处置 |
@@ -372,6 +381,12 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | 缺恢复闭环 | 落 `lease_force_release()` + R1–R8 表；`process_alive` 拒绝、批准四字段缺一不可、隔离改名保留原字节 |
 | 等级元测试只校验字符串 | 保留字符串校验，同时把「六项保证 ↔ 用例」写成表格（人可核）；FULL 的语义真实性仍靠对照表，不再声称测试能自动证明 |
 | `lease_acquire` 失败原因混同 | 日志区分 `lease_conflict`（有效租约）与 `lock_timeout`（抢不到锁）；两者都拒绝启动，但审计可分辨 |
+| 第十一轮：A20/B15 仍不够 FULL | **接受**：两条同时降为 PARTIAL，并在矩阵写明不可离线证明的部分（Windows 目录 fsync、断电持久化、PID 复用/子进程/检测时序）。不再争 FULL |
+| 第十一轮：审计登记失败未阻断 | `_record_corruption()` 返回 `None` 表示写失败；`lease_force_release` 检查到 `None` 即 `audit_registration_failed` 拒绝恢复；用例 `test_force_release_blocks_when_audit_registration_fails` |
+| 第十一轮：R2 未真正加锁 / TOCTOU | 整段恢复进 `_file_lock(strict=True)`；抢不到锁返回 `lock_timeout`；用例 `test_force_release_refuses_without_lock` |
+| 第十一轮：身份不可读被当死亡 | 不可读时必须有批准人给出的 `identity_evidence`，否则 `identity_unconfirmed`；用例 `test_force_release_needs_identity_evidence_when_unreadable` |
+| 第十一轮：心跳/释放超时未断言文件仍在 | `test_heartbeat_and_release_timeout_keep_lease_bytes` 断言「文件仍在 + 字节不变」 |
+| 第十一轮：A20 缺同目录与目录 fsync 断言 | `test_tmp_is_created_in_target_directory`（spy `os.replace` 取 src 目录）；`test_atomic_write_fsyncs_parent_directory`（POSIX 专用，Windows 记 skip） |
 
 **第九轮改了什么（逐条对应）**：
 
@@ -407,7 +422,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 
 **矩阵自身有回归**：`TestEvidenceMatrix` 三条断言——条款集合 = 矩阵行集合（不漏、不多、不重复）；每个 `test:`/`code:` 引用都能解析；每行至少一种证据。它的作用是让「文档漂移」变成红灯，而不是等下一次审查才被发现。
 
-**当前分布（49 条，按等级）**：**FULL 22 条**（核心判定 + 失败分支都有独立断言）；**PARTIAL 10 条**（只覆盖一半，缺的部分写在该条说明里）；**CODE_ONLY 4 条**（A7 A9 A15 A18，有实现无回归）；**HUMAN 13 条**（A0 B0 B2 B3 B6 B7 B9 B13 B14 C1–C4）。**只有 FULL 才算「已机械化」**——按「有没有 test:」计数会系统性高估，这是第九轮审查的结论。
+**当前分布（49 条，按等级）**：**FULL 20 条**（核心判定 + 失败分支都有独立断言）；**PARTIAL 12 条**（含 A20/B15：跨平台持久化与进程身份无法离线穷举，见矩阵）；**CODE_ONLY 4 条**（A7 A9 A15 A18，有实现无回归）；**HUMAN 13 条**（A0 B0 B2 B3 B6 B7 B9 B13 B14 C1–C4）。**只有 FULL 才算「已机械化」**——按「有没有 test:」计数会系统性高估，这是第九轮审查的结论。
 
 **已知缺口（按危害排序，写着就是为了下次被追）**：
 

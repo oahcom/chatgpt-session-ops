@@ -811,14 +811,17 @@ def _record_corruption(kind, path, why):
     row = {"at": datetime.now().astimezone().isoformat(timespec="seconds"),
            "kind": kind, "path": os.path.abspath(path), "why": why,
            "size": _size_of(path), "sha256": digest}
+    ok = True
     try:
         with open(os.path.join(BASE, "corrupt-registry.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    except OSError:
-        pass
+            f.flush()
+    except OSError as e:
+        ok = False
+        print("WARN: 损坏登记写入失败（%s）：%s" % (os.path.basename(path), e), flush=True)
     print("WARN: %s 不可用（%s）：%s size=%d sha256=%s；按占用处理，见 corrupt-registry.jsonl"
           % (kind, why, os.path.basename(path), row["size"], digest[:16]), flush=True)
-    return row
+    return row if ok else None
 
 
 def _log_corrupt_lease(path, why):
@@ -934,6 +937,15 @@ def lease_force_release(path, approval_path):
     """
     if not os.path.exists(path):
         return True, "absent"
+    # R2：整段恢复在同一把 strict 锁内完成，避免「校验时是 A、改名时已被替换成 B」的 TOCTOU
+    try:
+        with _file_lock(path, strict=True):
+            return _force_release_locked(path, approval_path)
+    except LockTimeout:
+        return False, "lock_timeout"
+
+
+def _force_release_locked(path, approval_path):
     try:
         with open(approval_path, encoding="utf-8") as f:
             approval = json.load(f)
@@ -951,14 +963,21 @@ def lease_force_release(path, approval_path):
         return False, "unreadable:%s" % e
     if got != want:
         return False, "sha256_mismatch"
-    # R1：先把证据登记下来（原哈希/大小/发现时间），再谈恢复
-    _record_corruption("lease-recovery", path, "approved_recovery")
+    # R1：先把证据登记下来（原哈希/大小/发现时间），再谈恢复。
+    # 登记失败必须阻断——「恢复成功但没有审计记录」比不恢复更危险。
+    if _record_corruption("lease-recovery", path, "approved_recovery") is None:
+        return False, "audit_registration_failed"
     # R3/R4：能读出 pid 且进程还活着 → 不许恢复（文件坏了不代表进程死了）
     info, readable = _read_ephemeral(path)
     if readable:
         pid = info.get("pid")
         if pid and _proc_alive(pid):
             return False, "process_alive"
+    else:
+        # 身份读不出来 ≠ 原实例已死。必须由批准人给出独立确认依据（例如进程表快照、
+        # 子进程检查、B7 状态核对结果），否则拒绝——不能让「批准」替「证据」。
+        if not str(approval.get("identity_evidence") or "").strip():
+            return False, "identity_unconfirmed"
     bad = "%s.corrupt-%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
     try:
         os.replace(path, bad)      # R7：隔离归档，不覆盖

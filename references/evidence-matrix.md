@@ -13,7 +13,7 @@
 
 **矩阵自身受回归保护**：`tests/test_hardening.py::TestEvidenceMatrix` 会校验「条款集合 = 矩阵行集合」「每个 `test:`/`code:` 引用都能解析」「每条至少一种证据」。也就是说，新增条款而不补证据行、或引用了不存在的用例，测试会直接红。
 
-> 最后更新：2026-11-19（v1.8）。当前回归 150 条，全绿。
+> 最后更新：2026-11-19（v1.8）。当前回归 151 条，全绿。
 
 ---
 
@@ -41,7 +41,7 @@
 | A17 | **PARTIAL** | 测试+代码 | `test:test_retry_after_is_clamped` `test:test_retry_after_prefers_body_rate_limit` `code:_retry_after` | Retry-After 当下限；body 里的 resets_in 优先 ；`human:服务端不给时限时只能退默认值，等价性靠实测` |
 | A18 | **CODE_ONLY** | 代码+人判 | `code:classify_failure` `code:warm_cookies` `human:401/403/429 各自冷却时长由调用方按定性结果落地，无集中断言` | 403 补 cookie + PoW 单次重试有实现，冷却值是调用点约定 |
 | A19 | **FULL** | 测试+代码 | `test:test_rejects_traversal_and_junk` `test:test_malicious_conv_id_cannot_escape` `code:safe_id` | id 白名单 + 归档路径不逃逸 |
-| A20 | **FULL** | 测试+代码 | `test:test_atomic_write_uses_unique_tmp_names` `test:test_tmp_is_in_same_dir_and_fsync_failure_cleans_up` `test:test_replace_failure_cleans_up_and_keeps_old_content` `test:test_concurrent_updates_do_not_lose_writes` `code:_atomic_write` | 六项保证逐项有断言：同目录、tmp 名唯一、fsync 真实调用、replace 失败保旧值、dir fsync、失败必清 tmp |
+| A20 | **PARTIAL** | 测试+代码 | `test:test_tmp_is_created_in_target_directory` `test:test_atomic_write_uses_unique_tmp_names` `test:test_tmp_is_in_same_dir_and_fsync_failure_cleans_up` `test:test_replace_failure_cleans_up_and_keeps_old_content` `test:test_atomic_write_fsyncs_parent_directory` `test:test_concurrent_updates_do_not_lose_writes` `code:_atomic_write` | 六项保证逐项有断言：同目录(spy src)、tmp 名唯一、文件 fsync、replace 失败保旧值、目录 fsync(POSIX)、失败必清 tmp `human:Windows 无法 open 目录，目录 fsync 无对应语义；断电/文件系统持久化无法用离线单测证明` |
 | A21 | **FULL** | 测试+代码 | `test:test_corrupt_json_is_quarantined_not_silently_lost` `test:test_empty_file_is_not_quarantined` `code:_load_json` | 损坏即隔离为 `.corrupt-<ts>`，空文件不误伤 |
 | A22 | **FULL** | 测试+代码 | `test:test_lock_is_reentrant` `test:test_stale_lock_is_reclaimed` `test:test_lock_live_holder_not_reclaimed` `test:test_lock_pid_reused_reclaimed` `test:test_lock_unknown_identity_kept` `test:test_lock_legacy_format_uses_mtime` `test:test_lock_records_holder_identity` `code:_lock_holder_stale` | 线程重入 + pid/启动时间/租约三态回收 |
 | A23 | **FULL** | 测试+代码+实测 | `test:test_webrtc_leak_detected` `test:test_webrtc_via_proxy` `test:test_webrtc_no_candidates_is_clean` `code:webrtc_probe` `code:_classify_webrtc` `live:2026-11-19` | 一次性标签页跑真实 ICE，`leaked` 退 3 |
@@ -70,7 +70,7 @@
 | B12 | **PARTIAL** | 测试+代码+人判 | `test:test_cli_exit_codes` `test:test_proxy_check_requires_site_ok` `code:main` `human:exit 0/1/2/3 的语义分散在各分支，只能逐分支看；无事静默靠 stdout 行数人眼确认` | 0/1/2/3 各有用例，但不是集中式断言 |
 | B13 | **HUMAN** | 人判 | `human:attempt_count 与 MANUAL_REVIEW 在各任务状态文件里，无共享库` | 已知缺口 |
 | B14 | **HUMAN** | 人判 | `human:红线本身不含新判定，约束由 B8/A15/A17/A5/A23 各自实现` | 交叉引用型条款 |
-| B15 | **FULL** | 测试+代码 | `test:test_lease_valid_blocks_reclaim` `test:test_lease_expired_process_gone` `test:test_lease_pid_reused` `test:test_heartbeat_keeps_lease_alive` `test:test_lease_run_timeout_cancels_body` `test:test_lease_run_timeout_orphan_keeps_lease` `test:test_lease_ops_never_run_unlocked` `test:test_corrupt_lease_needs_approval_to_release` `test:test_process_alive_blocks_force_release` `test:test_heartbeat_keeps_lease_alive` `test:test_lease_run_timeout_orphan_keeps_lease` `code:lease_run` `code:lease_force_release` | 心跳续期 + 超时两档（TIMEOUT / TIMEOUT_ORPHAN） |
+| B15 | **PARTIAL** | 测试+代码 | `test:test_lease_valid_blocks_reclaim` `test:test_lease_expired_process_gone` `test:test_lease_pid_reused` `test:test_heartbeat_keeps_lease_alive` `test:test_lease_run_timeout_cancels_body` `test:test_lease_run_timeout_orphan_keeps_lease` `test:test_lease_ops_never_run_unlocked` `test:test_corrupt_lease_needs_approval_to_release` `test:test_process_alive_blocks_force_release` `test:test_force_release_refuses_without_lock` `test:test_heartbeat_and_release_timeout_keep_lease_bytes` `test:test_force_release_needs_identity_evidence_when_unreadable` `test:test_force_release_blocks_when_audit_registration_fails` `test:test_corrupt_slot_is_registered` `code:lease_run` `code:lease_force_release` | 心跳续期 + 超时两档（TIMEOUT / TIMEOUT_ORPHAN） `human:PID 复用/派生子进程/检测时序无法穷举；跨进程竞态只能抽样` |
 
 ## C. 配方
 
@@ -98,13 +98,13 @@
 
 | 等级 | 条数 | 条款 |
 |---|---|---|
-| FULL | 22 | A1 A3 A4 A5 A6 A11 A19 A20 A21 A22 A23 A24 A25 A26 A27 A28 B4 B8 B10 B11 B15 |
-| PARTIAL | 10 | A2 A8 A10 A12 A13 A14 A17 B1 B5 B12 |
+| FULL | 20 | A1 A3 A4 A5 A6 A11 A19 A21 A22 A23 A24 A25 A26 A27 A28 B4 B8 B10 B11 |
+| PARTIAL | 12 | A2 A8 A10 A12 A13 A14 A17 A20 B1 B5 B12 B15 |
 | CODE_ONLY | 4 | A7 A9 A15 A18 |
 | HUMAN | 13 | A0 B0 B2 B3 B6 B7 B9 B13 B14 C1 C2 C3 C4 |
 | 合计 | 49 | — |
 
-**结论**：49 条里 **22 条（45%）真正机械化**，10 条半机械化，4 条只有代码，13 条人判。任何「全都可以机器判定」的说法都是夸大。
+**结论**：49 条里 **20 条（41%）真正机械化**，12 条半机械化，4 条只有代码，13 条人判。任何「全都可以机器判定」的说法都是夸大。
 
 **已知缺口（按危害排序，不许糊过去）**：
 
