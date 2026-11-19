@@ -30,6 +30,8 @@ replies/
 prompts/
 conv-api/
 *.lock
+# 出口代理配置可能带账号密码（socks5h://user:pass@host），绝不入库
+proxy.json
 
 # ==========================================================
 # 语言 / 系统

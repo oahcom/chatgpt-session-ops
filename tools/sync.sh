@@ -9,6 +9,18 @@ SRC="${1:-$HOME/.workbuddy/skills/chatgpt-session-ops}"
 
 [ -d "$SRC" ] || { echo "技能目录不存在：$SRC" >&2; exit 1; }
 
+# git 也走同一个出口：直连 github.com:443 在国内是超时，而写死的端口可能已经死了
+# （实测 7890 端口还听着但隧道断流，7897 才活）。所以问 skill 要探活后的结果。
+PROXY="$(cd "$SRC/scripts" && python chatgpt_send.py --proxy-url 2>/dev/null | tail -1)" || PROXY=""
+if [ -n "${PROXY:-}" ]; then
+  git -C "$ROOT" config http.proxy "$PROXY"
+  git -C "$ROOT" config https.proxy "$PROXY"
+  echo "==> git 出口：$PROXY"
+else
+  echo "==> 警告：未解析到可用代理，git 将直连（github 多半超时）" >&2
+  echo "    配法：python scripts/chatgpt_send.py --proxy-set http://host:port" >&2
+fi
+
 echo "==> 同步：$SRC  ->  $ROOT"
 cp "$SRC/SKILL.md" "$ROOT/SKILL.md"
 mkdir -p "$ROOT/references" "$ROOT/scripts"

@@ -169,6 +169,8 @@ python scripts/chatgpt_send.py --anon-restore <device>     # 把留存身份回�
 | 429 退避 | 优先服从 `Retry-After`，夹在 [5,180] 秒 |
 | 文件锁 | 跨进程 `O_EXCL` + stale 60s，重入按**线程**判定（按路径记会让同进程第二个线程跳过加锁，实测丢 21/80 次更新） |
 | 设备身份 | CDP 抓完整 jar 落 `.txt` + `.json`，读旧会话时多设备回退并自愈归属；jar 落盘前剔除 session token |
+| 出口代理 | API / 匿名浏览器 / 自启动 Chrome / git push 共用一次解析结果；取不到出口就拒绝联网（`CHATGPT_ALLOW_DIRECT=1` 才放行直连） |
+| 代理探活 | 自动探测先做 CONNECT/SOCKS 隧道 + TLS 握手，失败即跳过（端口在听 ≠ 能用：实测 7890 通 200 后断流、7897 才活） |
 | 413 续接 | 填词改走 CDP `Input.insertText`；`navigate` 用正确的 `timeout` 参数；CDP 不可用给人话 |
 | 凭据提取 | 只落 ChatGPT 域 cookie，并真正抓 `accessToken` 写 `access_token.txt` |
 | PoW | 解不出时返回空 proof 并告警，不再返回写死的假 token |
@@ -179,7 +181,8 @@ python scripts/chatgpt_send.py --anon-restore <device>     # 把留存身份回�
 |---|---|---|
 | `CHATGPT_AUTH_DIR` | 脚本目录 | acct1 凭据根 |
 | `CHATGPT_BASE` | `https://chatgpt.com` | API 根（可指向本地闸口） |
-| `CHATGPT_PROXY` | 空 | `http://` 或 `socks5h://` 代理 |
+| `CHATGPT_PROXY` | 空 | 出口代理，最高优先级；`http/https/socks5/socks5h` |
+| `CHATGPT_ALLOW_DIRECT` | 空 | 设 `1` 才允许直连（默认 fail-closed，拒绝联网） |
 | `CHATGPT_ANON_CDP_PORT` | 9333 | 匿名通道 CDP 端口 |
 | `CHATGPT_ANON_FALLBACK` | 1 | 设 0 彻底禁用匿名兜底 |
 | `CHATGPT_ANON_AUTOSTART` | 1 | 匿名通道是否自动拉起浏览器 |
@@ -189,10 +192,27 @@ python scripts/chatgpt_send.py --anon-restore <device>     # 把留存身份回�
 | `CHATGPT_ANON_IDLE_SEC` | 900 | 匿名等待生成结束的预算 |
 
 ```bash
-python -m unittest discover -s tests -v      # 49 条，零依赖
+python -m unittest discover -s tests -v      # 61 条，零依赖
 ```
 
 ---
+
+## 统一出口代理
+
+所有出网动作共用一个出口，不允许「API 走代理、浏览器裸连」。解析顺序：
+`CHATGPT_PROXY` → `scripts/proxy.json` → 系统 `https_proxy/http_proxy/all_proxy` → 本机端口探测（**必须真握手通过**）。
+
+```bash
+python scripts/chatgpt_send.py --proxy-show              # 出口来自哪里
+python scripts/chatgpt_send.py --proxy-check             # 量出口 IP（代理侧 vs 直连侧）
+python scripts/chatgpt_send.py --proxy-check --browser   # 再验浏览器侧是否同一出口
+python scripts/chatgpt_send.py --proxy-set socks5h://user:pass@1.2.3.4:1080
+```
+
+- **fail-closed**：一条都解析不到就报错退出，只有 `CHATGPT_ALLOW_DIRECT=1` 才直连。
+- `127.0.0.1 / localhost` 永不过代理：CDP 与本地闸口必须直连。
+- 换代理要重启浏览器（`--proxy-server` 只在启动时生效）；`--proxy-check --browser` 会比对两侧 IP。
+- `socks5h://` 是真支持（自定义 `http.client` 连接类做 RFC1928 握手）：urllib 原生只认 http 代理。
 
 ## 运行态文件
 
@@ -204,6 +224,7 @@ python -m unittest discover -s tests -v      # 49 条，零依赖
 | `conv-accounts.json` | `conv_id → 归属账号`，驱动自动路由 |
 | `anon-sessions.json` | 匿名会话唯一索引 |
 | `replies/` | 收割的回复全文 |
+| `proxy.json` | 出口代理配置（可能含账号密码，chmod 600、不入库） |
 | `*.lock` | 三个 json 的跨进程写锁（`O_EXCL`，stale 60s 自动回收） |
 
 三个状态文件的读-改-写都走 `_file_lock` + `_update_json`，并发建会话不会互相覆盖计数或游标。

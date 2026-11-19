@@ -11,6 +11,10 @@
     4. 新旧 conv_id 映射追加写入 newchat-map.json
 
 依赖：browser-automation-cdp 技能的 cdp.py（Edge 调试端口 9222）。
+
+出口：本脚本不新建浏览器，网络出口由**你启动的那个浏览器**决定。若要用代理，
+启动时带上 `--proxy <url>`（start_chrome.py 支持），或先让系统代理生效；
+`chatgpt_send.py --proxy-check --browser` 可验证浏览器侧出口是否与 API 一致。
 """
 import json
 import os

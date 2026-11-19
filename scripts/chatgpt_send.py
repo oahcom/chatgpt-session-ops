@@ -19,6 +19,15 @@
     python chatgpt_send.py --anon-devices              # 本地留存了哪些设备身份（oai-did）
     python chatgpt_send.py --anon-relink <conv_id> <device>     # 手工修正会话->设备归属
     python chatgpt_send.py --anon-restore <device>     # 把留存设备身份回灌当前浏览器
+    python chatgpt_send.py --proxy-show                # 当前出口代理来自哪里
+    python chatgpt_send.py --proxy-set <url>           # 写入 proxy.json（http/https/socks5/socks5h）
+    python chatgpt_send.py --proxy-check [--browser]   # 量出口 IP：API 侧 + 浏览器侧是否一致
+
+出口代理（统一）：
+    API、匿名浏览器、自启动浏览器共用同一个出口，解析顺序
+    CHATGPT_PROXY > proxy.json > 系统 https_proxy/http_proxy > 本机端口探测(7890/7897/10809/1080/8888)。
+    解析不到就拒绝联网（fail-closed），只有 CHATGPT_ALLOW_DIRECT=1 才放行直连。
+    127.0.0.1/localhost 永不过代理：CDP 与本地闸口(CHATGPT_BASE) 必须直连。
 
 匿名通道（nologin）可用性（实测 2026-11-19）：
     能建会话、能多轮对话（同一标签页内连续发送，session id 不变）、能按 id 经 API 读全文。
@@ -67,19 +76,24 @@
     - POST 200 即消息已提交；SSE 流只用于收割，需读到 EOF（勿提前关连接）。
     - 413 conversation_too_large → 用 continue_full.py 走「开始新聊天」摘要续接。
 """
+import base64
 import contextlib
 import copy
 import gzip
 import hashlib
+import http.client
 import json
 import os
 import re
+import socket
 import ssl
+import struct
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import zlib
@@ -500,6 +514,374 @@ def parse_cookie_header(cookie):
     return out
 
 
+# ---------- 统一出口代理 ----------
+# 所有出网动作共用同一个出口：API（urllib）、匿名浏览器（Chrome --proxy-server）、
+# 自启动的浏览器进程。只给 API 配代理等于「请求走隧道、浏览器裸连」——
+# 设备身份与 cookie 会从直连那条路露出去，所以这里做成单点解析 + 缺失即拒。
+#
+# 解析优先级：CHATGPT_PROXY > proxy.json > 系统 https_proxy/http_proxy/all_proxy > 本机端口探测
+# 兜底：一条都解析不到时拒绝联网（除非显式 CHATGPT_ALLOW_DIRECT=1）。
+PROXY_FILE = os.path.join(BASE, "proxy.json")
+PROXY_AUTODETECT_PORTS = (7890, 7897, 10809, 1080, 8888)
+# 本机地址永不过代理：CDP / 本地闸口(CHATGPT_BASE) 一旦被塞进代理，代理挂了就全链路瘫痪
+PROXY_BYPASS_HOSTS = ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+PROXY_SCHEMES = ("http", "https", "socks5", "socks5h")
+_PROXY_CACHE = {}
+
+
+def normalize_proxy(url):
+    """补 scheme 并校验形态；空串表示「不配代理」。"""
+    u = (url or "").strip()
+    if not u:
+        return ""
+    if "://" not in u:
+        u = "http://" + u           # 只给 host:port 时按 http 代理处理
+    scheme = u.split("://", 1)[0].lower()
+    if scheme not in PROXY_SCHEMES:
+        raise ValueError("不支持的代理类型 %r（只支持 http/https/socks5/socks5h）" % scheme)
+    if not urllib.parse.urlsplit(u).hostname:
+        raise ValueError("代理地址缺少主机名：%r" % url)
+    return u
+
+
+def load_proxy_config():
+    """proxy.json 只放出口配置；损坏时按默认处理，不让它挡住发送。"""
+    cfg = _load_json(PROXY_FILE, {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+    return cfg
+
+
+def _tcp_alive(host, port, timeout=0.4):
+    try:
+        with socket.create_connection((host, int(port)), timeout):
+            return True
+    except (OSError, ValueError):
+        return False
+
+
+def _proxy_alive(url, host="chatgpt.com", port=443, timeout=6):
+    """真连一次：CONNECT / SOCKS 隧道 + TLS 握手。
+
+    只测端口通不通会踩坑：本机常见「端口还在听、上游节点已死」的代理，
+    CONNECT 返回 200 后立刻断流，选错就等于整条链路全废（实测 7890 死 / 7897 活）。
+    """
+    try:
+        u = normalize_proxy(url)
+        scheme = u.split("://", 1)[0].lower()
+        if scheme.startswith("socks"):
+            raw = _socks5_open(_parse_socks_proxy(u), host, port, timeout)
+        else:
+            hp = urllib.parse.urlsplit(u)
+            raw = socket.create_connection((hp.hostname, hp.port or 8080), timeout)
+            raw.settimeout(timeout)
+            lines = ["CONNECT %s:%d HTTP/1.1" % (host, port), "Host: %s:%d" % (host, port)]
+            if hp.username:
+                cred = "%s:%s" % (urllib.parse.unquote(hp.username),
+                                  urllib.parse.unquote(hp.password or ""))
+                lines.append("Proxy-Authorization: Basic "
+                             + base64.b64encode(cred.encode("utf-8")).decode("ascii"))
+            raw.sendall(("\r\n".join(lines) + "\r\n\r\n").encode("latin1"))
+            head = b""
+            while b"\r\n\r\n" not in head:
+                chunk = raw.recv(4096)
+                if not chunk:
+                    raise OSError("代理在 CONNECT 阶段直接断开")
+                head += chunk
+            status = head.split(b"\r\n", 1)[0].decode("latin1", "replace")
+            if " 200" not in status:
+                raise OSError("代理拒绝 CONNECT：%s" % status)
+        t = CTX.wrap_socket(raw, server_hostname=host)
+        t.close()
+        return True, ""
+    except Exception as e:
+        return False, "%s: %s" % (type(e).__name__, e)
+
+
+def resolve_proxy_info(refresh=False):
+    """返回 {url, source}；url 为空表示没有可用出口。结果进程内缓存。"""
+    if _PROXY_CACHE and not refresh:
+        return _PROXY_CACHE
+    cfg = load_proxy_config()
+    url, source = "", ""
+    for key in ("CHATGPT_PROXY", "CHATGPT_PROXY_URL"):
+        if os.environ.get(key):
+            try:
+                url, source = normalize_proxy(os.environ[key]), "env:" + key
+            except ValueError as e:
+                print("%s 配置非法：%s" % (key, e), file=sys.stderr, flush=True)
+                raise SystemExit(3)
+            break
+    if not url and cfg.get("url"):
+        url, source = normalize_proxy(cfg["url"]), "proxy.json"
+    if not url:
+        for key in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY",
+                    "all_proxy", "ALL_PROXY"):
+            v = os.environ.get(key)
+            if v and "://" in v:
+                try:
+                    url, source = normalize_proxy(v), "env:" + key
+                except ValueError:
+                    continue
+                break
+    if not url and cfg.get("autodetect", True):
+        ports = cfg.get("autodetect_ports") or PROXY_AUTODETECT_PORTS
+        probe = cfg.get("autodetect_probe", True)
+        for p in ports:
+            try:
+                p = int(p)
+            except (TypeError, ValueError):
+                continue
+            if not _tcp_alive("127.0.0.1", p):
+                continue
+            cand = "http://127.0.0.1:%d" % p
+            if probe:
+                # 端口开着不代表能用：必须真握手一次（死节点会 CONNECT 200 后断流）
+                ok, why = _proxy_alive(cand, timeout=cfg.get("autodetect_timeout", 5))
+                if not ok:
+                    print("跳过本机代理 %d（探测失败：%s）" % (p, why), flush=True)
+                    continue
+            url, source = cand, "autodetect:%d" % p
+            break
+    _PROXY_CACHE.update({"url": url, "source": source, "config": cfg})
+    return _PROXY_CACHE
+
+
+def resolve_proxy(refresh=False):
+    return resolve_proxy_info(refresh)["url"]
+
+
+def allow_direct():
+    """显式放行直连的口子：只用于本机调试，默认关闭。"""
+    if os.environ.get("CHATGPT_ALLOW_DIRECT") == "1":
+        return True
+    return bool(load_proxy_config().get("allow_direct"))
+
+
+def require_proxy(refresh=False):
+    """取出口；取不到就拒绝联网（fail-closed），并给出三条可用配法。"""
+    info = resolve_proxy_info(refresh)
+    if info["url"]:
+        return info["url"]
+    if allow_direct():
+        print("WARN: 没有可用代理，CHATGPT_ALLOW_DIRECT=1 放行直连（出口 IP 会暴露，仅限调试）",
+              flush=True)
+        return ""
+    print("未配置出口代理，拒绝直连（fail-closed）。任选一种配法：\n"
+          "  1) 环境变量：CHATGPT_PROXY=http://127.0.0.1:7890\n"
+          "  2) 写入配置：python chatgpt_send.py --proxy-set socks5h://user:pass@1.2.3.4:1080\n"
+          "  3) 临时放行：CHATGPT_ALLOW_DIRECT=1（真实 IP 会暴露，仅调试用）\n"
+          "配完用 python chatgpt_send.py --proxy-check 验证出口。",
+          file=sys.stderr, flush=True)
+    # 固定 3：编排层要能区分「参数错(2)」「未满足联网条件(3)」「业务失败(1)」
+    raise SystemExit(3)
+
+
+def save_proxy_config(url):
+    """把出口写进 proxy.json（含凭据，落盘即 600）。"""
+    cfg = load_proxy_config()
+    if url:
+        cfg["url"] = normalize_proxy(url)
+    else:
+        cfg.pop("url", None)
+    _atomic_write(PROXY_FILE, json.dumps(cfg, ensure_ascii=False, indent=2))
+    try:
+        if os.name == "posix":
+            os.chmod(PROXY_FILE, 0o600)
+    except OSError:
+        pass
+    _PROXY_CACHE.clear()
+    return cfg
+
+
+def _parse_socks_proxy(url):
+    u = urllib.parse.urlsplit(normalize_proxy(url))
+    return {
+        "host": u.hostname or "127.0.0.1",
+        "port": u.port or 1080,
+        "user": urllib.parse.unquote(u.username or ""),
+        "password": urllib.parse.unquote(u.password or ""),
+        # socks5h = 由代理解析域名（远端 DNS），跨境场景必需；socks5 = 本地解析
+        "rdns": u.scheme.lower() == "socks5h",
+    }
+
+
+def _recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise OSError("SOCKS5 连接被对端关闭")
+        buf += chunk
+    return buf
+
+
+def _socks5_open(cfg, host, port, timeout=None):
+    """建立到 host:port 的 SOCKS5 隧道（RFC1928 + 用户名密码认证）。
+
+    urllib 的 ProxyHandler 只认 http 代理：`socks5h://` 塞进去会直接
+    「unknown url type」。所以 socks 走自定义连接类，而不是靠 ProxyHandler。
+    """
+    if host in PROXY_BYPASS_HOSTS:
+        return socket.create_connection((host, int(port)), timeout)   # 本机直连
+    s = socket.create_connection((cfg["host"], int(cfg["port"])), timeout)
+    try:
+        if timeout:
+            s.settimeout(timeout)
+        if cfg["user"]:
+            s.sendall(b"\x05\x02\x00\x02")
+        else:
+            s.sendall(b"\x05\x01\x00")
+        ver, method = _recv_exact(s, 2)
+        if ver != 5:
+            raise OSError("SOCKS5 握手失败：版本字节 %d" % ver)
+        if method == 2:
+            if not cfg["user"]:
+                raise OSError("SOCKS5 代理要求用户名密码，但地址里没带")
+            u = cfg["user"].encode("utf-8")
+            p = cfg["password"].encode("utf-8")
+            s.sendall(b"\x01" + bytes([len(u)]) + u + bytes([len(p)]) + p)
+            _v, status = _recv_exact(s, 2)
+            if status != 0:
+                raise OSError("SOCKS5 认证失败（status=%d）" % status)
+        elif method != 0:
+            raise OSError("SOCKS5 没有可用的认证方式（method=%d）" % method)
+        if cfg["rdns"]:
+            addr, atyp = host.encode("utf-8"), 3
+        else:
+            try:
+                addr, atyp = socket.inet_aton(host), 1
+            except OSError:
+                addr, atyp = host.encode("utf-8"), 3
+        head = bytes([atyp]) if atyp == 1 else bytes([atyp, len(addr)]) if atyp == 3 else b""
+        s.sendall(b"\x05\x01\x00" + head + addr + struct.pack(">H", int(port)))
+        rep = _recv_exact(s, 4)
+        if rep[1] != 0:
+            raise OSError("SOCKS5 CONNECT 被拒（code=%d，4=主机不可达 5=连接被拒）" % rep[1])
+        if rep[3] == 1:
+            _recv_exact(s, 4)
+        elif rep[3] == 3:
+            _recv_exact(s, _recv_exact(s, 1)[0])
+        elif rep[3] == 4:
+            _recv_exact(s, 16)
+        _recv_exact(s, 2)
+        return s
+    except Exception:
+        try:
+            s.close()
+        except OSError:
+            pass
+        raise
+
+
+def _socks_conn_classes(cfg):
+    """按目标主机生成 http/https 连接类：connect() 先打 SOCKS 隧道再交回上层。"""
+    class _HTTP(http.client.HTTPConnection):
+        def connect(self):
+            self.sock = _socks5_open(cfg, self.host, self.port, self.timeout)
+
+    class _HTTPS(http.client.HTTPSConnection):
+        def connect(self):
+            raw = _socks5_open(cfg, self.host, self.port, self.timeout)
+            self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+
+    return _HTTP, _HTTPS
+
+
+class _BypassProxyHandler(urllib.request.ProxyHandler):
+    """http 代理：本机地址（CDP / 本地闸口）不代理，其余全走代理。"""
+
+    def proxy_open(self, req, proxy, type):
+        host = urllib.parse.urlsplit(req.full_url).hostname or ""
+        if host in PROXY_BYPASS_HOSTS:
+            return None
+        return super().proxy_open(req, proxy, type)
+
+
+class _SocksHandler(urllib.request.HTTPSHandler):
+    """socks 代理：http 与 https 都走自定义连接类。"""
+
+    def __init__(self, proxy_url, context=None):
+        super().__init__(context=context)
+        self._cfg = _parse_socks_proxy(proxy_url)
+
+    def http_open(self, req):
+        cls = _socks_conn_classes(self._cfg)[0]
+        return self.do_open(cls, req)
+
+    def https_open(self, req):
+        cls = _socks_conn_classes(self._cfg)[1]
+        return self.do_open(cls, req, context=self._context)
+
+
+def build_opener_for(proxy, context=None, extra=()):
+    """按出口构造 opener；proxy 为空时显式禁用环境代理，保证行为可预期。
+
+    extra 用于附加 CookieProcessor 之类的 handler —— 别处再 build 一个
+    裸 opener 就等于绕开出口（warm_cookies 曾这么干过）。
+    """
+    ctx = context or CTX
+    handlers = [urllib.request.HTTPSHandler(context=ctx)]
+    handlers.extend(extra)
+    url = normalize_proxy(proxy)
+    if not url:
+        handlers.insert(0, urllib.request.ProxyHandler({}))
+        return urllib.request.build_opener(*handlers)
+    if url.split("://", 1)[0].lower().startswith("socks"):
+        handlers.insert(0, _SocksHandler(url, context=ctx))
+    else:
+        handlers.insert(0, _BypassProxyHandler({"http": url, "https": url}))
+    return urllib.request.build_opener(*handlers)
+
+
+IP_ECHO_ENDPOINTS = ("https://api.ipify.org", "https://ifconfig.me/ip", "https://ipinfo.io/ip")
+_IP_RE = re.compile(r"^(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F]*:[0-9a-fA-F:.]*)$")
+
+
+def _http_get_text(url, proxy, timeout=10):
+    opener = build_opener_for(proxy)
+    rq = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "text/plain"})
+    with opener.open(rq, timeout=timeout) as resp:
+        return resp.status, resp.read(4096).decode("utf-8", "replace").strip()
+
+
+def check_egress(proxy=None, timeout=10):
+    """量出口：代理侧 IP vs 直连侧 IP。两者相同即说明代理没生效。"""
+    url = resolve_proxy() if proxy is None else normalize_proxy(proxy)
+    out = {"proxy": url, "proxy_ip": None, "direct_ip": None, "same": None,
+           "verdict": "", "errors": []}
+    if url:
+        for ep in IP_ECHO_ENDPOINTS:
+            try:
+                st, txt = _http_get_text(ep, url, timeout)
+                if st == 200 and _IP_RE.match(txt):
+                    out["proxy_ip"] = txt
+                    break
+                out["errors"].append("proxy %s -> HTTP %s" % (ep, st))
+            except Exception as e:
+                out["errors"].append("proxy %s: %s" % (ep, e))
+    # 直连对照：超时要短，避免国内环境白等
+    for ep in IP_ECHO_ENDPOINTS[:2]:
+        try:
+            st, txt = _http_get_text(ep, "", min(timeout, 6))
+            if st == 200 and _IP_RE.match(txt):
+                out["direct_ip"] = txt
+                break
+        except Exception as e:
+            out["errors"].append("direct %s: %s" % (ep, e))
+    if not url:
+        out["verdict"] = "未配置代理：当前所有动作直连"
+    elif not out["proxy_ip"]:
+        out["verdict"] = "代理不可用：请求发不出去（检查地址/认证/服务是否在跑）"
+    elif out["direct_ip"] and out["direct_ip"] == out["proxy_ip"]:
+        out["same"] = True
+        out["verdict"] = "代理未生效：代理出口与直连出口是同一个 IP"
+    else:
+        out["same"] = False
+        out["verdict"] = "代理生效"
+    return out
+
+
 def cookie_header(jar):
     """[{'name','value',...}] → "k=v; k2=v2"（保持顺序，同名只留第一个）。"""
     pairs, seen = [], set()
@@ -683,12 +1065,12 @@ class ChatGPTAPI:
                 if isinstance(ck, dict) and ("chatgpt.com" in (ck.get("domain") or "")
                                              or "openai.com" in (ck.get("domain") or ""))
             )
-        # 代理支持：CHATGPT_PROXY=http://host:port 或 socks5h://host:port
-        proxy_url = os.environ.get("CHATGPT_PROXY", "")
-        handlers = [urllib.request.HTTPSHandler(context=CTX)]
-        if proxy_url:
-            handlers.insert(0, urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
-        self._opener = urllib.request.build_opener(*handlers)
+        # 出口：全部网络动作统一从 CHATGPT_PROXY / proxy.json 取，取不到就拒绝联网。
+        # 支持 http/https/socks5/socks5h；本机地址（CDP、本地闸口）自动绕过。
+        info = resolve_proxy_info()
+        self.proxy = require_proxy()
+        self.proxy_source = info.get("source", "")
+        self._opener = build_opener_for(self.proxy, CTX)
         self.last_headers = {}
         self.quota = {}  # 观测用：最近一次响应的限速相关头
 
@@ -735,9 +1117,9 @@ class ChatGPTAPI:
         try:
             import http.cookiejar
             jar = http.cookiejar.CookieJar()
-            opener = urllib.request.build_opener(
-                urllib.request.HTTPCookieProcessor(jar),
-                urllib.request.HTTPSHandler(context=CTX))
+            # 必须复用统一出口：这里自己 build 一个裸 opener 就会直连 chatgpt.com
+            opener = build_opener_for(self.proxy, CTX,
+                                      extra=[urllib.request.HTTPCookieProcessor(jar)])
             for ck in self.cookies:
                 jar.set_cookie(http.cookiejar.Cookie(
                     0, ck["name"], ck["value"], None, False,
@@ -1079,6 +1461,8 @@ class AnonBrowser:
         self._client = None
         self.last_cid = None   # 最近一次成功发送落到的会话 id（供异常时登记，避免孤儿会话）
         self.last_tab = None
+        # 浏览器也必须走同一个出口：API 走代理、页面裸连等于把设备身份从直连暴露出去
+        self.proxy = require_proxy()
 
     # ---------- 连接 ----------
     def _autostart(self):
@@ -1088,9 +1472,11 @@ class AnonBrowser:
         script = os.path.join(self.cdp_dir, "start_chrome.py")
         if not os.path.exists(script):
             return False
+        cmd = [sys.executable, script, "--temp", "--port", str(self.port)]
+        if self.proxy:
+            cmd += ["--proxy", self.proxy]   # 与 API 同一出口，宁可起不来也不要裸连
         try:
-            subprocess.Popen([sys.executable, script, "--temp", "--port", str(self.port)],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
             print("autostart 浏览器失败：%s" % e, flush=True)
             return False
@@ -1213,6 +1599,56 @@ class AnonBrowser:
             pass
         cl.send("Network.setCookies", {"cookies": cookies})
         return len(cookies)
+
+    # ---------- 出口校验 ----------
+    def egress_ip(self, timeout=25):
+        """开一次性标签页问出口 IP：验证浏览器这一侧真的走了代理。
+
+        不导航当前页：当前页可能是正在续聊的 /uc/<id>，导航它等于毁掉可写通道。
+        """
+        from cdp import CDPClient
+        tid, res = "", None
+        try:
+            b = CDPClient(port=self.port, timeout=timeout)
+            try:
+                b.connect_browser()
+                res = b.send("Target.createTarget",
+                             {"url": "https://api.ipify.org/?format=text"})
+            finally:
+                try:
+                    b.close()
+                except Exception:
+                    pass
+            tid = (res or {}).get("targetId") or ""
+        except Exception as e:
+            raise RuntimeError("无法新建校验标签页：%s" % e)
+        if not tid:
+            raise RuntimeError("无法新建校验标签页：%r" % (res,))
+        ip = ""
+        try:
+            cl = CDPClient(port=self.port, timeout=timeout)
+            cl.connect_page(tid)
+            end = time.time() + timeout
+            while time.time() < end:
+                time.sleep(1.5)
+                got = cl.evaluate("document.body ? document.body.innerText.trim() : ''")
+                txt = (got or {}).get("value") if isinstance(got, dict) else got
+                if txt and _IP_RE.match(txt):
+                    ip = txt
+                    break
+            try:
+                cl.close()
+            except Exception:
+                pass
+        finally:
+            try:
+                b2 = CDPClient(port=self.port, timeout=15)
+                b2.connect_browser()
+                b2.send("Target.closeTarget", {"targetId": tid})
+                b2.close()
+            except Exception:
+                pass
+        return ip
 
     # ---------- 页面动作 ----------
     def _wait(self, expr, timeout=30, interval=0.6):
@@ -1873,6 +2309,57 @@ def main():
         if not args:
             print(__doc__)
             return 1
+    # ---- 出口代理（API / 浏览器 / 自启动共用同一个出口）----
+    if args and args[0] == "--proxy-url":
+        # 给 shell 用：只输出 URL（解析不到就空行 + exit 1），便于 git 等外部动作对齐出口
+        url = resolve_proxy()
+        print(url)
+        return 0 if url else 1
+    if args and args[0] in ("--proxy", "--proxy-show"):
+        info = resolve_proxy_info(refresh=True)
+        print(json.dumps({"proxy": info["url"] or None,
+                          "source": info["source"] or None,
+                          "allow_direct": allow_direct(),
+                          "bypass": list(PROXY_BYPASS_HOSTS),
+                          "config_file": PROXY_FILE,
+                          "candidates": list(PROXY_AUTODETECT_PORTS)},
+                         ensure_ascii=False, indent=2))
+        return 0 if info["url"] else 1
+    if len(args) == 2 and args[0] == "--proxy-set":
+        try:
+            url = normalize_proxy(args[1])
+        except ValueError as e:
+            print(json.dumps({"result": "error", "detail": str(e)}, ensure_ascii=False))
+            return 2
+        save_proxy_config(url)
+        print(json.dumps({"result": "ok", "proxy": url, "config_file": PROXY_FILE,
+                          "next": "用 --proxy-check 验证出口；浏览器需重启才会换代理"},
+                         ensure_ascii=False))
+        return 0
+    if args and args[0] == "--proxy-clear":
+        save_proxy_config("")
+        print(json.dumps({"result": "ok", "proxy": None, "config_file": PROXY_FILE},
+                         ensure_ascii=False))
+        return 0
+    if args and args[0] == "--proxy-check":
+        info = resolve_proxy_info(refresh=True)
+        res = check_egress(info["url"])
+        res["source"] = info["source"] or None
+        if "--browser" in args[1:] and info["url"]:
+            # 浏览器侧出口：单独开一次性标签页量，避免污染正在续聊的 /uc/<id>
+            try:
+                res["browser_ip"] = AnonBrowser().egress_ip()
+            except Exception as e:
+                res["browser_ip"] = None
+                res["browser_error"] = str(e)
+            if res.get("browser_ip") and res.get("proxy_ip"):
+                res["browser_match"] = res["browser_ip"] == res["proxy_ip"]
+        ok = bool(res.get("proxy_ip")) and not res.get("same")
+        if res.get("browser_match") is False:
+            ok = False
+            res["verdict"] = "浏览器出口与 API 不一致：浏览器没走代理，重启浏览器并带 --proxy"
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        return 0 if ok else 1
     # ---- 轮转管理（纯本地状态，不触网）----
     if args and args[0] in ("--rotation", "--rotation-status"):
         print(json.dumps(rotation_summary(), ensure_ascii=False, indent=2))

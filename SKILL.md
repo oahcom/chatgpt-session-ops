@@ -182,8 +182,13 @@ python scripts/chatgpt_send.py --tail <conv_id>
 | PoW 失败 | 返回空 proof 并 WARN | 旧版返回写死的假 token，服务端必然 403，还看不出是解算失败 |
 | 设备身份留存 | 每次投递先抓 CDP `Storage.getCookies`（含 HttpOnly）按 `oai-did` 落 `.txt` + `.json`；jar 落盘前剔除登录态 token | 只存 `document.cookie` 会丢 HttpOnly，换 profile 后旧匿名会话再也读不回；存整包 jar 又可能把 session token 写进 nologin |
 | 设备归属自愈 | `--anon-read` 依次试登记设备与其余快照（≤8），429/0/5xx 立刻停 | 设备记录缺失或换机时不必人工比对；遍历到底会把限速配额烧光 |
+| 出口代理覆盖 | API、匿名浏览器、自启动浏览器共用同一次解析结果；浏览器启动带 `--proxy` | 只给 API 配代理等于「请求走隧道、浏览器裸连」，设备身份与 cookie 从直连泄出去 |
+| 代理探活 | 自动探测先做 CONNECT/SOCKS 隧道 + TLS 握手，失败即跳过该端口 | 端口在听 ≠ 能用：实测 7890 回 `200 Connection established` 后立刻断流，7897 才通 |
+| fail-closed | 解析不到出口直接 `SystemExit`，只有 `CHATGPT_ALLOW_DIRECT=1` 放行直连 | 静默直连是最坏的失败方式：任务「成功」了，但真实 IP 已暴露 |
+| 本机绕过 | `127.0.0.1 / localhost / ::1 / 0.0.0.0` 永不过代理 | CDP 与本地闸口（`CHATGPT_BASE`）被塞进代理后，代理一挂全链路瘫痪 |
 
-环境变量：`CHATGPT_REPLY_MAX_CHARS`（默认 0=全文）、`CHATGPT_ANON_IDLE_SEC`（默认 900）、
+环境变量：`CHATGPT_PROXY`（出口代理，最高优先级）、`CHATGPT_ALLOW_DIRECT=1`（显式放行直连，仅调试）、
+`CHATGPT_REPLY_MAX_CHARS`（默认 0=全文）、`CHATGPT_ANON_IDLE_SEC`（默认 900）、
 `CHATGPT_CDP_PORT`（`continue_full.py` / `extract_auth.py` 用，默认 9222）、`CHATGPT_ANON_CDP_PORT`（匿名通道，默认 9333）。
 
 回归测试（离线，不触网、不需要凭据）：
@@ -192,7 +197,38 @@ python scripts/chatgpt_send.py --tail <conv_id>
 python -m unittest discover -s tests -v
 ```
 
-49 条，覆盖 id 校验与路径穿越、状态文件损坏隔离、原子写与 tmp 清理、锁重入/stale 回收/并发 80 次不丢更新、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性、设备身份留存与多设备回退（含凭据剔除、429 停手、归属自愈），以及用离线桩跑通的投递主流程（含 413、空提示词、非法 id、发送异常时的孤儿会话登记）。**改锁、改落盘、改 id、改设备身份前先跑一遍。**
+61 条，覆盖 id 校验与路径穿越、状态文件损坏隔离、原子写与 tmp 清理、锁重入/stale 回收/并发 80 次不丢更新、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性、设备身份留存与多设备回退（含凭据剔除、429 停手、归属自愈），以及用离线桩跑通的投递主流程（含 413、空提示词、非法 id、发送异常时的孤儿会话登记）；出口代理（优先级、fail-closed、http/socks 真分流、死节点探测、出口判定）。**改锁、改落盘、改 id、改设备身份、改代理前先跑一遍。**
+
+## 统一出口代理（强制）
+
+**一切出网动作共用一个出口**，不允许「API 走代理、浏览器裸连」这种半吊子状态。解析顺序：
+
+1. `CHATGPT_PROXY`（环境变量，最高优先）
+2. `scripts/proxy.json` 的 `url`（`--proxy-set` 写入，落盘 chmod 600，已 gitignore）
+3. 系统 `https_proxy / http_proxy / all_proxy`
+4. 本机常见端口探测 `7890 / 7897 / 10809 / 1080 / 8888` —— **必须真握手通过才采用**
+
+| 动作 | 出口来源 |
+|---|---|
+| API 请求（`ChatGPTAPI.req`：建会话、发送、收割、list、probe） | `build_opener_for(resolve_proxy())`，支持 http/https/socks5/socks5h |
+| 匿名浏览器（`AnonBrowser`） | 启动时带 `--proxy <url>`；已运行的浏览器不会被改造 |
+| 自启动的 Chrome（`_autostart`） | 同上，与 API 同一出口，宁可起不来也不裸连 |
+| git push（`tools/sync.sh`） | 调 `--proxy-url` 拿探活后的结果写进本仓库 `http.proxy` |
+
+```bash
+python scripts/chatgpt_send.py --proxy-show                 # 出口来自哪里、绕过了什么
+python scripts/chatgpt_send.py --proxy-check                # 量出口 IP（代理侧 + 直连侧对照）
+python scripts/chatgpt_send.py --proxy-check --browser      # 再验浏览器侧出口是否一致
+python scripts/chatgpt_send.py --proxy-set socks5h://u:p@1.2.3.4:1080
+python scripts/chatgpt_send.py --proxy-clear                # 清掉 proxy.json 的 url
+```
+
+- **取不到出口就拒绝联网**（`SystemExit`，exit 3）。要直连必须显式 `CHATGPT_ALLOW_DIRECT=1` —— 直连是「明示的例外」，不是默认行为。
+- **本机地址永不过代理**：`127.0.0.1 / localhost / ::1` 直连，保证 CDP（9333/9222）与本地闸口不受代理死活影响。
+- **换了代理要重启浏览器**：Chrome 的 `--proxy-server` 只在启动时生效；`--proxy-check --browser` 会对比 API 侧与浏览器侧出口，不一致直接判失败。
+- **socks 不是装饰**：urllib 的 `ProxyHandler` 只认 http 代理，`socks5h://` 塞进去会 `unknown url type`；这里用自定义 `http.client` 连接类做 RFC1928 握手（含用户名密码认证，`socks5h` = 远端 DNS）。
+
+> 实测坑（2026-11-19）：本机 **7890 端口还在监听、CONNECT 也回 200，但隧道立刻断流**，TLS 一律 `UNEXPECTED_EOF`；同期 **7897 正常**。所以自动探测只「看端口通不通」会稳定选到死节点 —— 现在必须先握手成功才采用，`--proxy-check` 也会把两侧 IP 摆出来给你看。
 
 ## 故障速查
 
@@ -213,6 +249,9 @@ python -m unittest discover -s tests -v
 | 匿名页点击发送无反应 | 窗口未显示 → `visibilityState=hidden` | 脚本已启用 `Emulation.setFocusEmulationEnabled`；仍无效则确认窗口可见 |
 | 消息落入全新会话 | POST 缺 conversation_id | 补字段重发；核对 SSE 返回的 conversation_id |
 | GET 429 | 配额紧张 | 退避 + `conv-api/` 缓存 tail 兜底 parent_message_id |
+| 收割 DONE chars 远小于会话实际产出 | 收割器只截到部分（流式截断/轮询取短） | **大交付必用 raw mapping**（GET `/backend-api/conversation/<id>` 取全部 assistant parts 拼合）核对总长，勿凭 DONE chars 判截断要求重发 |
+| `FAIL: no requirements token` | 并发 POST 撞 sentinel 限速/瞬态 | 错峰 60s 重投；先单独探测 `chat-requirements` 返回 200 再发 |
+| 私有仓库事实包 raw URL 404 | 未认证 raw.githubusercontent 对私有仓恒 404；分支名含 `/` 的 ref 也可能解析不到 | 事实包**内联字节原文**（Git Blob SHA + sha256 供自校验）或走已认证 GitHub 通道；规范类文件注意所在分支（如 AI-EXEC 只在 main） |
 | 413 conversation_too_large | 会话满员 | continue_full.py 摘要续接 |
 | 流读取为空 | `with` 提前关连接 | 读到 EOF（chatgpt_send.py 已正确处理） |
 | 输入框填入失败 | 用了 innerHTML 或裸赋值 | 文本域用原生 setter + InputEvent，或 CDP `Input.insertText` |
@@ -223,7 +262,7 @@ python -m unittest discover -s tests -v
 
 ### scripts/
 
-- `chatgpt_send.py` — 统一发送/收割器（P0）。`<conv_id> <prompt_file>` 投递既有会话；`--new <prompt_file>` 开 Owner 新会话（登录态均分，匿名兜底）；`--tail <conv_id>` 只收割；`--list/--list-all` 会话清单；`--rotation*` 轮转管理；`--owner <conv_id>` 查归属；`--anon-list/--anon-read/--anon-send/--anon-devices/--anon-relink/--anon-restore` 匿名会话对照表、按 id 续聊、设备身份留存与修复。内含 `AnonBrowser`（匿名浏览器通道：同标签页多轮 + CDP 抓 jar + API 收割）。
+- `chatgpt_send.py` — 统一发送/收割器（P0）。`<conv_id> <prompt_file>` 投递既有会话；`--new <prompt_file>` 开 Owner 新会话（登录态均分，匿名兜底）；`--tail <conv_id>` 只收割；`--list/--list-all` 会话清单；`--rotation*` 轮转管理；`--owner <conv_id>` 查归属；`--anon-list/--anon-read/--anon-send/--anon-devices/--anon-relink/--anon-restore` 匿名会话对照表、按 id 续聊、设备身份留存与修复；`--proxy-show/--proxy-set/--proxy-check/--proxy-url` 统一出口的查看、写入、校验与给 shell 用的纯值输出。内含 `AnonBrowser`（匿名浏览器通道：同标签页多轮 + CDP 抓 jar + API 收割）。
 - `continue_full.py` — 413 满员续接器（P1，依赖 browser-automation-cdp 的 cdp.py）。
 - `pow_solver.py` — PoW 解算器（FNV-1a + gAAAAAB 前缀，毫秒级），被 chatgpt_send.py 引用。
 - `extract_auth.py` — 从 Edge CDP 提取 cookies/accessToken。
@@ -235,6 +274,7 @@ python -m unittest discover -s tests -v
 - `anon-sessions.json` — 匿名会话 id 对照表（标签页、prompt、回复摘要、设备号、状态），是匿名会话的唯一留存索引。
 - `anon-sessions/<conv_id8>.md` — 匿名会话全文归档（`--anon-read` 生成）；8 位前缀撞车时自动加 `-<后4位>` 后缀，不会互相覆盖。
 - `*.lock` — 上面三个 json 的跨进程写锁（O_EXCL），正常用完即删；进程被强杀留下的锁 60 秒后自动失效。
+- `proxy.json` — 出口代理配置（`{"url": "socks5h://..."}`，可带账号密码 → chmod 600 且不入库）。没有它时走上表第 3/4 档。
 - `accounts/nologin/device-cookie.txt` — 匿名态最新 device cookie（`oai-did` 等），使 API 侧 `GET /backend-anon/conversation/<id>` 可持续收割。
 - `accounts/nologin/devices/<oai-did>.txt` — 按设备分档的 Cookie 头快照；`--anon-read` 优先用它，保证浏览器换 profile 后旧会话仍可读。
 - `accounts/nologin/devices/<oai-did>.json` — 同设备的完整 cookie jar（含 HttpOnly），`--anon-restore` 用它把身份回灌浏览器；已剔除 session token 一类凭据。
@@ -245,7 +285,7 @@ python -m unittest discover -s tests -v
 
 ### tests/
 
-- `test_hardening.py` — 离线回归（49 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW、设备身份留存与多设备回退。
+- `test_hardening.py` — 离线回归（61 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW、设备身份留存与多设备回退、出口代理（含本地假 http/socks 代理真分流）。
 
 ## 协议细节
 

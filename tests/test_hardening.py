@@ -11,6 +11,8 @@ import importlib.util
 import json
 import os
 import shutil
+import socket
+import struct
 import sys
 import tempfile
 import threading
@@ -588,6 +590,247 @@ class TestSendFlow(TmpBase):
         with self.assertRaises(ValueError):
             m.send_prompt(api, "../../evil", self._prompt("x"))
         self.assertEqual(api.sent, [])
+
+
+class _StubServer(object):
+    """起一个只接一次连接的本地 TCP 服务，用 handler(conn) 定义协议。"""
+
+    def __init__(self, handler):
+        self.seen = {}
+        self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind(("127.0.0.1", 0))
+        self.srv.listen(1)
+        self.port = self.srv.getsockname()[1]
+        self._handler = handler
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+
+    def _run(self):
+        conn = None
+        try:
+            conn, _ = self.srv.accept()
+            self._handler(conn, self.seen)
+        except Exception:
+            pass
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+            self.srv.close()
+
+    def close(self):
+        try:
+            self.srv.close()
+        except OSError:
+            pass
+
+
+class TestProxy(TmpBase):
+    """统一出口：解析优先级、fail-closed、http/socks 真实分流、出口判定。"""
+
+    ENV_KEYS = ("CHATGPT_PROXY", "CHATGPT_PROXY_URL", "CHATGPT_ALLOW_DIRECT",
+                "https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY",
+                "all_proxy", "ALL_PROXY")
+
+    def setUp(self):
+        super().setUp()
+        self._pf = m.PROXY_FILE
+        m.PROXY_FILE = os.path.join(self.tmp, "proxy.json")
+        m._PROXY_CACHE.clear()
+        self._env = {}
+        for k in self.ENV_KEYS:
+            self._env[k] = os.environ.pop(k, None)
+
+    def tearDown(self):
+        m.PROXY_FILE = self._pf
+        m._PROXY_CACHE.clear()
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        super().tearDown()
+
+    def _cfg(self, **kw):
+        base = {"autodetect": False}
+        base.update(kw)
+        with open(m.PROXY_FILE, "w", encoding="utf-8") as f:
+            json.dump(base, f)
+
+    # ---- 形态与优先级 ----
+    def test_normalize_proxy_variants(self):
+        self.assertEqual(m.normalize_proxy("127.0.0.1:7890"), "http://127.0.0.1:7890")
+        self.assertEqual(m.normalize_proxy(" socks5h://u:p@1.2.3.4:1080 "),
+                         "socks5h://u:p@1.2.3.4:1080")
+        self.assertEqual(m.normalize_proxy(""), "")
+        for bad in ("ftp://x:1", "http://", "socks4://x:1"):
+            with self.assertRaises(ValueError):
+                m.normalize_proxy(bad)
+
+    def test_env_beats_file(self):
+        self._cfg(url="socks5h://file:1080")
+        os.environ["CHATGPT_PROXY"] = "http://env:8080"
+        self.assertEqual(m.resolve_proxy(refresh=True), "http://env:8080")
+        del os.environ["CHATGPT_PROXY"]
+        self.assertEqual(m.resolve_proxy(refresh=True), "socks5h://file:1080")
+
+    def test_fail_closed_when_nothing_configured(self):
+        self._cfg()
+        with self.assertRaises(SystemExit) as cm:
+            m.require_proxy(refresh=True)
+        # 3 = 「未满足联网条件」，与参数错(2)、业务失败(1) 区分开
+        self.assertEqual(cm.exception.code, 3)
+
+    def test_invalid_env_proxy_exits_cleanly(self):
+        self._cfg()
+        os.environ["CHATGPT_PROXY"] = "ftp://x:1"
+        with self.assertRaises(SystemExit) as cm:
+            m.resolve_proxy_info(refresh=True)
+        self.assertEqual(cm.exception.code, 3)
+
+    def test_allow_direct_is_explicit_only(self):
+        self._cfg()
+        os.environ["CHATGPT_ALLOW_DIRECT"] = "1"
+        self.assertEqual(m.require_proxy(refresh=True), "")
+        self.assertTrue(m.allow_direct())
+
+    def test_proxy_set_then_clear(self):
+        m.save_proxy_config("socks5h://u:p@1.2.3.4:1080")
+        self.assertEqual(m.load_proxy_config()["url"], "socks5h://u:p@1.2.3.4:1080")
+        m.save_proxy_config("")
+        self.assertNotIn("url", m.load_proxy_config())
+
+    # ---- 真分流 ----
+    def test_http_request_goes_through_proxy(self):
+        def handler(conn, seen):
+            data = b""
+            while b"\r\n\r\n" not in data:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                data += chunk
+            seen["line"] = data.split(b"\r\n")[0].decode("latin1")
+            body = b"via-proxy"
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                         b"Content-Length: %d\r\n\r\n" % len(body) + body)
+
+        stub = _StubServer(handler)
+        try:
+            st, txt = m._http_get_text("http://example.invalid/x",
+                                       "http://127.0.0.1:%d" % stub.port, timeout=10)
+        finally:
+            stub.close()
+        self.assertEqual(st, 200)
+        self.assertEqual(txt, "via-proxy")
+        # 走代理时请求行是 absolute-form，证明没在本地直连
+        self.assertIn("http://example.invalid/x", stub.seen.get("line", ""))
+
+    def test_socks5_handshake_reaches_target(self):
+        def handler(conn, seen):
+            head = conn.recv(2)
+            conn.recv(head[1])                      # 客户端支持的方法列表
+            conn.sendall(b"\x05\x00")
+            req = conn.recv(4)                      # VER CMD RSV ATYP
+            if req[3] == 3:
+                n = conn.recv(1)[0]
+                seen["host"] = conn.recv(n).decode()
+            elif req[3] == 1:
+                seen["host"] = socket.inet_ntoa(conn.recv(4))
+            seen["port"] = struct.unpack(">H", conn.recv(2))[0]
+            conn.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0")
+                         + struct.pack(">H", 0))
+            data = conn.recv(4096)                  # 隧道通了之后回显
+            conn.sendall(b"ECHO:" + data)
+
+        stub = _StubServer(handler)
+        try:
+            cfg = {"host": "127.0.0.1", "port": stub.port, "user": "",
+                   "password": "", "rdns": True}
+            sock = m._socks5_open(cfg, "example.com", 443, 5)
+            try:
+                sock.sendall(b"hi")
+                got = sock.recv(64)
+            finally:
+                sock.close()
+        finally:
+            stub.close()
+        self.assertEqual(got, b"ECHO:hi")
+        self.assertEqual(stub.seen.get("host"), "example.com")   # socks5h：远端解析
+        self.assertEqual(stub.seen.get("port"), 443)
+
+    def test_socks5_username_password_auth(self):
+        def handler(conn, seen):
+            head = conn.recv(2)
+            conn.recv(head[1])
+            conn.sendall(b"\x05\x02")               # 要求用户名密码
+            ver = conn.recv(1)
+            ulen = conn.recv(1)[0]
+            seen["user"] = conn.recv(ulen).decode()
+            plen = conn.recv(1)[0]
+            seen["pwd"] = conn.recv(plen).decode()
+            conn.sendall(b"\x01\x00")
+            conn.recv(4)
+            conn.recv(1)                            # 域名长度
+            conn.recv(64)
+            conn.sendall(b"\x05\x00\x00\x01" + socket.inet_aton("0.0.0.0")
+                         + struct.pack(">H", 0))
+
+        stub = _StubServer(handler)
+        try:
+            cfg = {"host": "127.0.0.1", "port": stub.port, "user": "u1",
+                   "password": "p1", "rdns": True}
+            sock = m._socks5_open(cfg, "a.example", 443, 5)
+            sock.close()
+        finally:
+            stub.close()
+        self.assertEqual((stub.seen.get("user"), stub.seen.get("pwd")), ("u1", "p1"))
+
+    def test_local_hosts_bypass_proxy(self):
+        h = m._BypassProxyHandler({"https": "http://127.0.0.1:1"})
+        h.proxy_open(m.urllib.request.Request("http://127.0.0.1:9333/json"), "http://p:1", "http")
+        # 只有本机被放过：远端请求会被改写 host 指到代理
+        rq = m.urllib.request.Request("https://chatgpt.com/x")
+        m._BypassProxyHandler({"https": "http://127.0.0.1:1"}).proxy_open(rq, "http://127.0.0.1:1", "https")
+        self.assertEqual(rq.host, "127.0.0.1:1")
+
+    # ---- 探活与出口判定 ----
+    def test_dead_proxy_detected_even_if_port_accepts(self):
+        """端口开着、CONNECT 也回 200，但隧道立刻断——这种代理必须判死。"""
+        def handler(conn, seen):
+            conn.recv(4096)
+            conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+
+        stub = _StubServer(handler)
+        try:
+            ok, why = m._proxy_alive("http://127.0.0.1:%d" % stub.port, timeout=5)
+        finally:
+            stub.close()
+        self.assertFalse(ok)
+        self.assertTrue(why)
+
+    def test_check_egress_verdicts(self):
+        real = m._http_get_text
+        try:
+            m._http_get_text = lambda url, proxy, timeout=10: (200, "1.2.3.4")
+            self.assertEqual(m.check_egress("http://p:1")["verdict"],
+                             "代理未生效：代理出口与直连出口是同一个 IP")
+
+            m._http_get_text = lambda url, proxy, timeout=10: (200, "1.2.3.4" if proxy else "5.6.7.8")
+            res = m.check_egress("http://p:1")
+            self.assertFalse(res["same"])
+            self.assertEqual(res["verdict"], "代理生效")
+
+            def boom(url, proxy, timeout=10):
+                if proxy:
+                    raise OSError("connection refused")
+                return 200, "5.6.7.8"
+            m._http_get_text = boom
+            self.assertEqual(m.check_egress("http://p:1")["verdict"][:5], "代理不可用")
+        finally:
+            m._http_get_text = real
 
 
 if __name__ == "__main__":
