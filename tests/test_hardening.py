@@ -2170,6 +2170,16 @@ class TestParserEdges(TmpBase):
             m._atomic_create_exclusive(p, "第二份证据——不得覆盖")
         self.assertEqual(_read(p), "第一份证据", "已存在的隔离证据必须原样保留")
 
+    def test_as_ctime_rejects_large_integer_valued_float(self):
+        """F-12c（第30轮）：整数值型 float 超 ±2^53−1 必须拒——
+        9007199254740992.0 / 1e20 不能被当可靠时间戳参与排序。"""
+        for bad in (9007199254740992.0, 1e20, -1e20):
+            with self.subTest(v=bad):
+                self.assertEqual(m._as_ctime(bad), (False, 0.0))
+        # 安全范围内与非整数型 float 仍接受
+        self.assertEqual(m._as_ctime(9007199254740991.0)[0], True)
+        self.assertEqual(m._as_ctime(1.5), (True, 1.5))
+
 
 class TestLandingMismatch(TmpBase):
     """A10/F-13：投递目标与服务器实际落点不一致时的处置。
@@ -2381,6 +2391,23 @@ class TestLandingMismatch(TmpBase):
         self.assertIsNone(path)
         self.assertEqual(saved, [])
         self.assertEqual(getattr(conv, "candidate_ids", []), [])
+
+    def test_quarantine_body_reflects_resp_save_failure(self):
+        """N-01/F-18：响应保全失败时，隔离档案不得仍声称『完整原始响应已保全』。"""
+        orig = m._atomic_create_exclusive
+        def fail_resp(path, text):
+            if path.endswith(".resp.txt"):
+                raise OSError("simulated disk full")
+            return orig(path, text)
+        try:
+            m._atomic_create_exclusive = fail_resp
+            _status, path, conv, _saved, _gets = self._run(self._sse(self.ACTUAL))
+            body = _read(path)
+            self.assertIn("保全失败", body, "必须如实记录响应保全失败")
+            self.assertNotIn("完整原始响应已保全", body, "失败的保全不得声称成功")
+            self.assertIs(conv.evidence_complete, False)
+        finally:
+            m._atomic_create_exclusive = orig
 
     def test_evidence_complete_false_when_claim_fails(self):
         """F-25：待认领登记失败必须进入机器可识别的失败状态，不能报告完整隔离保全。"""
@@ -3468,6 +3495,14 @@ class TestScheduleContract(unittest.TestCase):
         曾被当成单个合法 VALUE 放行——换行必须是畸形 rule part。"""
         for bad in ("FREQ=HOURLY;INTERVAL=1\nX=2", "FREQ=HO\r\nHOURLY",
                     "FREQ=HOURLY\n;INTERVAL=1"):
+            with self.subTest(rrule=bad):
+                with self.assertRaises(m.ScheduleError):
+                    m.check_schedule(bad)
+
+    def test_rrule_rejects_leading_trailing_newline(self):
+        """F-22（第30轮）：`.strip()` 会吃掉首尾换行——必须在清理前拒绝 CR/LF。"""
+        for bad in ("FREQ=HOURLY\n", "\nFREQ=HOURLY", "FREQ=HOURLY\r\n",
+                    "\r\nFREQ=HOURLY\r\n"):
             with self.subTest(rrule=bad):
                 with self.assertRaises(m.ScheduleError):
                     m.check_schedule(bad)

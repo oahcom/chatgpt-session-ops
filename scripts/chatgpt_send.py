@@ -487,6 +487,11 @@ def check_schedule(rrule):
     悄悄修补成合法输入，等于替用户改输入）；拒绝 FREQ/INTERVAL 之外的 rule part
     （`BYxxx`/`UNTIL`/`COUNT` 会改变触发语义，不得静默忽略后照样下发）。
     """
+    # F-22（第三十轮审查）：必须在 .strip() **之前**检查 CR/LF——
+    # 旧版先 strip() 再查 \s，`FREQ=HOURLY\n` / `\nFREQ=HOURLY` 的换行被
+    # strip 吃掉，绕过「换行一律畸形」的契约。预处理不能替输入消除违规字符。
+    if "\r" in str(rrule or "") or "\n" in str(rrule or ""):
+        raise ScheduleError("rrule 含换行（CR/LF 一律畸形，不参与首尾 strip 清理）")
     raw = str(rrule or "").strip()
     if not raw:
         raise ScheduleError("rrule 为空")
@@ -640,7 +645,15 @@ def _as_ctime(value):
         return False, 0.0            # NaN：非有限数参与排序没有意义
     if value == float("inf") or value == float("-inf"):
         return False, 0.0            # ±inf
-    return True, float(value)
+    # F-12c（第三十轮审查）：float 分支此前只查有限性，整数值型 float
+    # 超 ±2^53−1（如 9007199254740992.0、1e20）照样放行——与文档声明的
+    # 「不得在精度范围外转 float」矛盾：这个 float 本身就不能精确表示整数，
+    # 排序结果不可信。非整数型 float（如 1.5）保留，有限数足以排序。
+    if abs(value) <= 9007199254740991 and value == int(value):
+        return True, float(value)     # 安全范围内的整数值型 float：精确
+    if abs(value) > 9007199254740991 and value == int(value):
+        return False, 0.0            # 大整数值型 float：精度不可信，拒
+    return True, float(value)        # 非整数型 float（如 1.5）：有限数足以排序
 
 
 def _part_is_structured(part):
@@ -4080,15 +4093,23 @@ def _record_pending_claim(base, record):
     服务器实际落点 ≠ 系统已确认该会话归属：自动 `record_conv(actual)` 会把
     一次异常投递变成正式会话关系。所以另记一份异常登记——含 target、actual、
     时间、隔离档案路径与原因——**人工确认后**再正式登记归属。
+
+    第三十轮审查 N-02：JSONL 追加必须**跨进程互斥**，否则两个进程同时 append
+    会让记录交错/截断（`write` 不是原子的，尤其 >PIPE_BUF 或跨进程缓冲）。
+    复用锁子系统的 `_file_lock`（与状态文件同一把锁语义，fail-closed）。
     """
     path = os.path.join(base, PENDING_CLAIMS_FILE)
     try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+        with _file_lock(path, strict=True):
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
     except OSError as e:
         print("FAIL: 待认领登记写入失败（%s）——actual 会话可能无人认领" % e, flush=True)
+        return False
+    except LockTimeout as e:
+        print("FAIL: 待认领登记加锁超时（%s）——actual 会话可能无人认领" % e, flush=True)
         return False
     return True
 
@@ -4138,6 +4159,17 @@ def _quarantine_reply(api, target_conv, actual_conv, reply, resp, status, pfile)
     rel = os.path.join(QUARANTINE_DIR, name + ".md")
     resp_rel = os.path.join(QUARANTINE_DIR, name + ".resp.txt")
     resp_path = os.path.join(base, resp_rel)
+    # 先落**完整**原始响应（F-18：800 字符的头部不足以保全证据，关键 id 与
+    # 后续事件可能正好落在截断部分）。保全结果决定档案正文的真实性声明——
+    # N-01：失败的保全操作绝不能在正式证据里继续声称成功。
+    resp_ok = True
+    resp_err = ""
+    try:
+        _atomic_create_exclusive(resp_path, resp_text)
+    except OSError as e:
+        resp_ok = False
+        resp_err = "%s: %s" % (type(e).__name__, e)
+        print("FAIL: 原始响应保全失败（%s）——隔离证据不完整" % e, flush=True)
     header = {
         "type": "landing_mismatch_quarantine",
         "target_conv_id": target_conv,
@@ -4148,49 +4180,53 @@ def _quarantine_reply(api, target_conv, actual_conv, reply, resp, status, pfile)
         "quarantined_at": datetime.now().isoformat(timespec="seconds"),
         "reply_chars": len(reply_text),
         "reply_sha256": hashlib.sha256(reply_text.encode("utf-8")).hexdigest(),
-        "resp_path": resp_rel.replace("\\", "/"),
-        "resp_chars": len(resp_text),
-        "resp_sha256": resp_sha,
+        "resp_preserved": resp_ok,
+        "resp_path": resp_rel.replace("\\", "/") if resp_ok else "",
+        "resp_chars": len(resp_text) if resp_ok else 0,
+        "resp_sha256": resp_sha if resp_ok else "",
+        "resp_error": resp_err,
         "resp_head": resp_text[:800],
     }
+    # N-01：声明随保全结果变化，三种状态明确区分（已保全 / 保全失败 / 未验证）
+    if resp_ok:
+        resp_line = "> **完整原始响应已保全**于 `%s`（%d 字符，sha256=%s）。\n" % (
+            resp_rel.replace("\\", "/"), len(resp_text), resp_sha)
+    else:
+        resp_line = ("> ⚠️ **完整原始响应保全失败**（%s）——下方仅有前 800 字符速览，"
+                     "不得当作完整证据；需人工重取。\n" % resp_err)
     body = (
         "# ⚠️ 隔离归档：落点不一致（landing_mismatch）\n\n"
         "> 这条回复**不是** `%s` 的正常会话回复——服务器实际把它落在 `%s`。\n"
         "> 本文件只用于保全与人工判定；下游不得把它当成 `%s` 的会话回复，"
         "也不得据此认为 `%s` 已经回完。\n"
-        "> **完整原始响应**另存于 `%s`（%d 字符，sha256=%s）。\n\n"
+        "%s\n"
         "```json\n%s\n```\n\n"
         "## 原始响应摘要（前 800 字符）\n\n```\n%s\n```\n\n"
         "## 回复全文（保全）\n\n%s\n"
     ) % (target_conv, actual_conv, target_conv, target_conv,
-         resp_rel.replace("\\", "/"), len(resp_text), resp_sha,
-         json.dumps(header, ensure_ascii=False, indent=2),
+         resp_line, json.dumps(header, ensure_ascii=False, indent=2),
          resp_text[:800], reply_text)
-    # 先落**完整**原始响应（F-18：800 字符的头部不足以保全证据，关键 id 与
-    # 后续事件可能正好落在截断部分），再写隔离档案正文，最后登记待认领。
-    # 三件事任一失败 → evidence_complete=False，绝不能报告为完整隔离保全。
-    resp_ok = True
+    # N-02：占名后先用临时文件完整写入 + fsync，再 os.replace 发布到已占名路径
+    # ——避免「占名成功但写到一半磁盘满」留下空壳/部分档案；失败则清除占名。
     try:
-        _atomic_create_exclusive(resp_path, resp_text)
-    except OSError as e:
-        resp_ok = False
-        print("FAIL: 原始响应保全失败（%s）——隔离证据不完整" % e, flush=True)
-    try:
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            f.write(body)
-            f.flush()
-            os.fsync(f.fileno())
+        _atomic_write(path, body)
     except OSError as e:
         print("FAIL: 隔离档案写入失败（%s）——回复可能丢失！" % e, flush=True)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
         return None, False
     claimed = _record_pending_claim(base, {
         "target_conv_id": target_conv,
         "actual_conv_id": actual_conv,
         "quarantined_at": header["quarantined_at"],
         "quarantine_path": rel.replace("\\", "/"),
-        "resp_path": resp_rel.replace("\\", "/"),
-        "resp_chars": len(resp_text),
-        "resp_sha256": resp_sha,
+        "resp_path": resp_rel.replace("\\", "/") if resp_ok else "",
+        "resp_preserved": resp_ok,
+        "resp_error": resp_err,
+        "resp_chars": len(resp_text) if resp_ok else 0,
+        "resp_sha256": resp_sha if resp_ok else "",
         "reply_chars": len(reply_text),
         "reason": header["reason"],
         "claim_status": "pending_human_review",

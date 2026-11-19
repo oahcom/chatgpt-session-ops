@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**二十九轮对外对抗审查**逐条改写（每轮裁定见 §F；**第二十五轮 `PASS`——锁子系统全文最终确认·收敛**，第二十二轮 `PASS`（F-10 残留定向复审），**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至二十三轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08）、锁元数据写入失败进临界区（F-09）、损坏启动时间误判 pid_reused（F-10）、归档覆盖（F-11）、超长 pid 串 int() 异常逃逸（F-07 残留）、**收割/对账解析器畸形 JSON 崩溃（F-12，41 处）**、**落点不一致只 WARN 导致会话身份与回复归属分裂（F-13）**、**RRULE 校验语义 ≠ 下发语义（F-14）**、**解析边界与证据保全缺口（F-15～F-19）**、**落点正则绕过与回复完整性 fail-open（F-13/F-16 残留 + F-23～F-25）**——前 11 组已在第二十五轮核销，F-12～F-25 已修待复审），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 265 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**三十轮对外对抗审查**逐条改写（每轮裁定见 §F；**第二十五轮 `PASS`——锁子系统全文最终确认·收敛**，第二十二轮 `PASS`（F-10 残留定向复审），**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至二十三轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08）、锁元数据写入失败进临界区（F-09）、损坏启动时间误判 pid_reused（F-10）、归档覆盖（F-11）、超长 pid 串 int() 异常逃逸（F-07 残留）、**收割/对账解析器畸形 JSON 崩溃（F-12，41 处）**、**落点不一致只 WARN 导致会话身份与回复归属分裂（F-13）**、**RRULE 校验语义 ≠ 下发语义（F-14）**、**解析边界与证据保全缺口（F-15～F-19）**、**落点正则绕过与回复完整性 fail-open（F-13/F-16 残留 + F-23～F-25）**、**浮点精度与首尾换行边界（F-12c/F-22 残留 + N-01/N-02）**——前 11 组已在第二十五轮核销，F-12～F-25 已修待复审），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 268 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -34,7 +34,7 @@
 | 2 | 这个会话归谁 | `--owner <conv_id>` | 输出唯一账号 |
 | 3 | 配额有没有冷却 | `--rotation` | `unavailable` 为空或目标账号不在其中 |
 | 4 | 匿名要用先看设备 | `--anon-devices` | 目标设备 `jar=true` |
-| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 265 条） |
+| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 268 条） |
 
 ### A1–A4 内容主权（不可协商）
 
@@ -335,7 +335,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | automation 名称 / 排程 | 同上 + `--check-name`、`--check-schedule`、`--check-oneshot` | B1/B4/B5/B10/B11 |
 | 排程口径 | `automation_update list` 全量盘点 | B1–B5 |
 
-**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 265 条。
+**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 268 条。
 
 ---
 
@@ -443,8 +443,12 @@ X=2` 会被当成单个合法 VALUE 放行；改为 `([^;
 **第二十九轮改了什么（自审，待复审确认）**：① **F-21**——`_quarantine_reply` 的文件名加序号避唯一名：秒级时间戳不足以区分同秒同对会话的两次异常投递，旧实现会覆盖前一次的隔离档案与完整响应（证据永久丢失）；新实现从 `seq=0` 起找 `name`/`name-1`/`name-2`… 直到 `.md` 与 `.resp.txt` 都不存在。② **F-22**——`_RRULE_PART_RE` 由 `^([A-Za-z][A-Za-z0-9-]*)=(.+)$` 配 `re.S` 改为 `^([A-Za-z][A-Za-z0-9-]*)=([^;
 
 ]+)$`（无 re.S），杜绝把换行后内容当合法 VALUE 放行。③ 补 2 条回归（`test_quarantine_same_second_never_overwrites` / `test_rrule_part_regex_rejects_newline_in_value`），257→259。
+| 30 | v1.8 修订 | `NEEDS-REVISION`（新会话 6aff2c63 增量复审：F-12c/F-18/F-22 + N-01/N-02） | 本轮 F-13/F-16/F-21/F-23/F-24/F-25 主要设计方向成立；仍判五处：**F-12c** 只对 int 查 ±2^53−1，整数值型 float（`9007199254740992.0`/`1e20`）仍放行；**F-22** `.strip()` 先吃掉首尾换行再查 `\s`，`FREQ=HOURLY
+` 可用绕过；**F-18/N-01** 响应保全失败时隔离档案仍无条件写『完整原始响应另存于…』——失败的保全操作不得在正式证据里声称成功；**N-02** O_EXCL 占名后普通 `open(path,"w")` 写内容，磁盘满会留空壳/部分档案，非原子事务；另要求补 JSONL 并发登记测试。裁定明确：完成后**增量复审**即可，不需重审前 25 轮已 PASS 的锁/进程身份问题。|
 
 **第二十九轮改了什么（依新会话裁定）**：① **F-13/F-16**——**删除整包 JSON 与正文正则 id 兜底**：落点证明只信 SSE 首个带 id 的结构化事件，解不出即失败关闭；反例「先 `[DONE]` 后写 B」实测返回 status=1、不落盘。② **F-21**——新增 `_atomic_create_exclusive()`（`O_WRONLY|O_CREAT|O_EXCL` 内核级占名），`_quarantine_reply` 改用它原子占名，冲突就换序号，**绝不覆盖**已存在的隔离证据。③ **F-18/F-25**——隔离三件事（完整响应、隔离档案、待认领登记）任一失败即 `evidence_complete=False`，随 `ConvRef` 返回给机器调用方，不再只打 WARN。④ **F-23/F-24**——完整性证明真正参与放行：GET 补全触发条件由「仅 last_truncated」扩到「SSE/mapping 任一不完整」；`digest_ok` 要求 `gcomplete` + parts 合计==拼接长度 + **摘要 sha256 == 按 parts 拼出的全文 sha256**（不再同源自证）；仍无法证明完整时**内容照收但归档文本自带「完整性未证明」声明**、`ConvRef.reply_complete=False`——既不违反第二十六轮「解析失败不能阻断归档」口径，也不让部分流冒充定稿。⑤ 自审另修 **F-22**：`_RRULE_PART_RE` 去掉 `re.S`、拒换行。⑥ 补 6 条回归（259→265）。
+
+**第三十轮改了什么（依新会话裁定）**：① **F-12c**——`_as_ctime` 的 float 分支补安全整数边界：`abs(value)>2^53−1 且 value==int(value)` 判不可用，非整数型 float（1.5）仍接受；实测 `9007199254740992.0`/`1e20`→`(False,0.0)`。② **F-22**——`check_schedule` 在 `.strip()` **之前**检查原始串 CR/LF，含换行一律拒绝（首尾换行也不许预处理替用户消除）。③ **F-18/N-01**——响应保全移到 body 构造**之前**，`header.resp_preserved`/`resp_error` 随结果变化；档案正文按 `resp_ok` 动态生成「已保全 / 保全失败 + 需人工重取」两种声明，失败时不再声称成功。④ **N-02**——占名后改 `_atomic_write(path, body)`（临时文件完整写 + fsync + os.replace 发布），失败则删除占名空壳，不留部分档案。⑤ **`_record_pending_claim` 并发**——JSONL append 纳入 `_file_lock(path, strict=True)` 跨进程互斥，LockTimeout 与 OSError 都返回 False（fail-closed）。⑥ 补 3 条回归（265→268）。
 
 **第十四轮之后补的一条**：审查把「`_record_corruption("lease-recovery-failed")` 自己失败会怎样」列为残余风险 3，虽不构成裁定理由，但这是能离线证明的，于是补 `test_quarantine_failed_row_write_failure_is_survivable`（第一次登记成功、第二次返回 `None`，断言不抛异常、仍返回 `quarantine_failed`、租约原样在）。**属于 PASS 后的加证，不改变任何条款口径**，故不重开一轮审查。
 
