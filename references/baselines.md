@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**九轮对外对抗审查**逐条改写（每轮裁定见 §F，第九轮把「可判定」本身当成攻击面），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 138 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**九轮对外对抗审查**逐条改写（每轮裁定见 §F，第九轮把「可判定」本身当成攻击面），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 139 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -34,7 +34,7 @@
 | 2 | 这个会话归谁 | `--owner <conv_id>` | 输出唯一账号 |
 | 3 | 配额有没有冷却 | `--rotation` | `unavailable` 为空或目标账号不在其中 |
 | 4 | 匿名要用先看设备 | `--anon-devices` | 目标设备 `jar=true` |
-| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 138 条） |
+| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 139 条） |
 
 ### A1–A4 内容主权（不可协商）
 
@@ -200,7 +200,7 @@
 
 **不要用 `^.+ .+ .+$` 这类贪婪正则代替分词**——它连四段、五段一起放行，正是本轮审查抓到的口径漏洞。
 
-**B10/B11 实现（v1.8）**：`--check-name "<名称>" [--argv "<命令串>"]` 把上面两张表落成代码——分词判段数、动作词与词表**整段相等**比对、只读名的 argv 必须全部命中 `READONLY_ARGV`；任一条不成立 `exit 2`。别再自己写正则：`startswith("--rotation")` 会放行 `--rotation-reset`，`查看并删除` 会被包含匹配当成只读。回归 `TestScheduleContract`（15 条）覆盖四段名、全角空格、`（只读）+ 写动词`、白名单四个越权命令。
+**B10/B11 实现（v1.8）**：`--check-name "<名称>" [--argv "<命令串>"]` 把上面两张表落成代码——分词判段数、动作词与词表**整段相等**比对、只读名的 argv 必须全部命中 `READONLY_ARGV`；任一条不成立 `exit 2`。别再自己写正则：`startswith("--rotation")` 会放行 `--rotation-reset`，`查看并删除` 会被包含匹配当成只读。回归 `TestScheduleContract`（19 条）覆盖四段名、全角空格、`（只读）+ 写动词`、白名单四个越权命令。
 
 **B1/B4/B5 实现（v1.8）**：`--check-schedule "FREQ=HOURLY;INTERVAL=1"` 只认 HOURLY + INTERVAL=1（天维度、`INTERVAL=0` 表示高频、`INTERVAL=2` 一律 `exit 2`）；`--check-oneshot <ISO8601>` 要求带时区、距今 `0 < Δ ≤ 3600s`——已过点（本该按 B5 归档）和超过 1 小时（本该走 B2 条件巡检）两头都在建之前堵住。
 
@@ -298,7 +298,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | automation 名称 / 排程 | 同上 + `--check-name`、`--check-schedule`、`--check-oneshot` | B1/B4/B5/B10/B11 |
 | 排程口径 | `automation_update list` 全量盘点 | B1–B5 |
 
-**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 138 条。
+**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 139 条。
 
 ---
 

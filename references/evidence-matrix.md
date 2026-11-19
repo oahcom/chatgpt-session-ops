@@ -13,7 +13,7 @@
 
 **矩阵自身受回归保护**：`tests/test_hardening.py::TestEvidenceMatrix` 会校验「条款集合 = 矩阵行集合」「每个 `test:`/`code:` 引用都能解析」「每条至少一种证据」。也就是说，新增条款而不补证据行、或引用了不存在的用例，测试会直接红。
 
-> 最后更新：2026-11-19（v1.8）。当前回归 138 条，全绿。
+> 最后更新：2026-11-19（v1.8）。当前回归 139 条，全绿。
 
 ---
 
@@ -24,7 +24,7 @@
 | A0 | 人判 | `human:清单是操作序列，各项证据分别挂在 A26/A7/A5/A8/E` | 30 秒清单本身不产生新判定，只是把已有条款串成开工顺序 |
 | A1 | 测试+代码 | `test:test_between_extracts_exact_bytes_and_offsets` `test:test_only_blank_lines_are_trimmed` `code:extract_deliverable` `code:_sha256_file` | CRLF/尾随空格逐字节比对；提取只允许裁首尾空行 |
 | A2 | 测试+代码 | `test:test_fence_picks_nth_not_longest` `test:test_duplicate_marker_rejected` `test:test_locator_is_mandatory` `code:extract_deliverable` | 最长块是干扰项，第 2 块才是交付；定位器不给就退 2 |
-| A3 | 测试+代码 | `test:test_new_chat_has_no_parent` `test:test_happy_path_keeps_conversation_id` `code:send_prompt` | 新会话请求体不含 `conversation_id`，既有会话必须含 |
+| A3 | 测试+代码 | `test:test_post_payload_carries_conversation_id_only_when_given` `test:test_new_chat_has_no_parent` `code:send_prompt` | 请求体级别断言：`--new` 时 body 里没有该字段，既有会话必须带 |
 | A4 | 测试+代码 | `test:test_verify_copy_detects_single_byte_change` `test:test_cli_exit_codes` `code:verify_copy` | 大小写差一个字节即判不一致并退 2 |
 | A5 | 测试+代码 | `test:test_fallback_requires_all_login_429` `test:test_rotation_plan_puts_unavailable_last` `code:rotation_plan` `code:anon_fallback_block_reason` | 两账号都 429 才允许匿名；匿名计数不推主游标 |
 | A6 | 测试+代码 | `test:test_fallback_requires_all_login_429` `test:test_fallback_blocked_when_disabled_by_env` `code:anon_fallback_block_reason` | 兜底判定只读 429 / nologin 冷却两个输入 |
@@ -36,7 +36,7 @@
 | A12 | 测试+代码 | `test:test_reply_digest_reports_parts_and_sha` `test:test_tail_from_mapping_picks_newest` `code:reply_digest` `code:tail_from_mapping` | 截断补全文时按 part 数 + 拼接 SHA-256 对账，不只看「变长了」 |
 | A13 | 测试+代码 | `test:test_full_text_is_kept` `test:test_optional_truncation_is_labelled` `code:save_reply` | 默认全文；截断必须写进文件头 |
 | A14 | 测试+代码 | `test:test_jar_is_persisted_and_header_is_readable` `test:test_auth_cookies_are_never_written_to_disk` `code:save_device_cookie` | 发前落身份，auth cookie 永不落盘 |
-| A15 | 测试+代码 | `test:test_lock_is_reentrant` `test:test_concurrent_updates_do_not_lose_writes` `code:_file_lock` | 账号级串行靠同一把状态锁 |
+| A15 | 代码+人判 | `code:_file_lock` `human:账号级串行是调用点约定（同一账号不并发起两个 GET），离线只能验锁本身，验不了「谁在调用」` | 已知缺口：缺一个「同账号并发调用被拒」的用例 |
 | A16 | 代码+人判 | `code:_idle` `human:超时预算由调用方按思考/非思考传入，没有统一常量可断言` | 分档超时是参数约定，不是硬编码 |
 | A17 | 测试+代码 | `test:test_retry_after_is_clamped` `test:test_retry_after_prefers_body_rate_limit` `code:_retry_after` | Retry-After 当下限；body 里的 resets_in 优先 |
 | A18 | 代码+人判 | `code:classify_failure` `code:warm_cookies` `human:401/403/429 各自冷却时长由调用方按定性结果落地，无集中断言` | 403 补 cookie + PoW 单次重试有实现，冷却值是调用点约定 |
@@ -67,7 +67,7 @@
 | B9 | 人判 | `human:PAUSED→等实例结束→删除的顺序只在操作时执行，无脚本` | 已知缺口 |
 | B10 | 测试+代码 | `test:test_readonly_name_ok` `test:test_write_name_ok` `test:test_four_segments_rejected` `test:test_verb_must_match_whole_segment` `test:test_readonly_suffix_with_write_verb_rejected` `code:check_automation_name` | 分词判段，动作词整段相等 |
 | B11 | 测试+代码 | `test:test_readonly_argv_whitelist_is_exact` `code:READONLY_ARGV` | `--rotation-reset` 不再被前缀匹配放行 |
-| B12 | 测试+代码+人判 | `test:test_cli_exit_codes` `code:main` `human:exit 0/1/2/3 的语义分散在各分支，只能逐分支看` | 无事静默靠 stdout 行数人眼确认 |
+| B12 | 测试+代码+人判 | `test:test_cli_exit_codes` `test:test_proxy_check_requires_site_ok` `code:main` `human:exit 0/1/2/3 的语义分散在各分支，只能逐分支看；无事静默靠 stdout 行数人眼确认` | 0/1/2/3 各有用例，但不是集中式断言 |
 | B13 | 人判 | `human:attempt_count 与 MANUAL_REVIEW 在各任务状态文件里，无共享库` | 已知缺口 |
 | B14 | 人判 | `human:红线本身不含新判定，约束由 B8/A15/A17/A5/A23 各自实现` | 交叉引用型条款 |
 | B15 | 测试+代码 | `test:test_lease_valid_blocks_reclaim` `test:test_lease_expired_process_gone` `test:test_lease_pid_reused` `test:test_heartbeat_keeps_lease_alive` `test:test_lease_run_timeout_cancels_body` `test:test_lease_run_timeout_orphan_keeps_lease` `code:lease_run` | 心跳续期 + 超时两档（TIMEOUT / TIMEOUT_ORPHAN） |

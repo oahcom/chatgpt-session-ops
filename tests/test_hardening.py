@@ -705,6 +705,23 @@ class TestSendFlow(TmpBase):
         self.assertEqual(status, 200)
         self.assertEqual(conv, cid, "新会话必须从 SSE 里认出 id")
         self.assertIsNone(api.sent[0]["parent"], "新会话不该带 parent_message_id")
+        self.assertIsNone(api.sent[0]["conv_id"], "新会话请求体不许带 conversation_id（A3）")
+
+    def test_post_payload_carries_conversation_id_only_when_given(self):
+        """A3/A10 的请求体级别证据：--new 时 body 里根本没有 conversation_id 字段。"""
+        api = m.ChatGPTAPI.__new__(m.ChatGPTAPI)
+        seen = {}
+
+        def fake_req(method, url, body=None, extra_headers=None, timeout=120):
+            seen.clear()
+            seen.update(body or {})
+            return 200, ""
+
+        api.req = fake_req
+        api.send(None, "hi", None, "tok", "proof", model=None)
+        self.assertNotIn("conversation_id", seen, "新会话不许带该字段")
+        api.send("11111111-2222-4333-8444-555555555555", "hi", "p1", "tok", "proof")
+        self.assertEqual(seen.get("conversation_id"), "11111111-2222-4333-8444-555555555555")
 
     def test_413_is_reported_not_swallowed(self):
         api = FakeAPI(os.path.join(self.tmp, "auth"), send_status=413,
