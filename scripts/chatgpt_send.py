@@ -162,16 +162,23 @@ _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
 
 
 def safe_id(value, what="id"):
-    """校验外部传入的会话 id / 设备号；不合法直接抛错，不留给下游拼接。"""
-    v = (value or "").strip()
+    """校验外部传入的会话 id / 设备号；不合法直接抛错，不留给下游拼接。
+
+    F-37：契约是「不合法 → ValueError」，不是 AttributeError——非 str
+    （int/float/bool/list/…）一律走同一条拒绝路径，不得借 `.strip` 炸出别样异常。
+    """
+    v = value.strip() if isinstance(value, str) else ""
     if not _ID_RE.match(v):
         raise ValueError("%s 非法：%r（只允许字母数字与 _-，长度 1-80）" % (what, value))
     return v
 
 
 def id8(conv_id, fallback="new"):
-    """取 8 位短前缀做文件名；非法 id 退化为哈希，绝不拼出路径分隔符。"""
-    v = (conv_id or "").strip()
+    """取 8 位短前缀做文件名；非法 id 退化为哈希，绝不拼出路径分隔符。
+
+    F-37：永不抛异常——非 str/bytes 先经 _as_text 收敛（没有可解析内容 → fallback）。
+    """
+    v = _as_text(conv_id).strip()
     if not v:
         return fallback
     if _ID_RE.match(v):
@@ -346,6 +353,11 @@ def extract_deliverable(src, begin=None, end=None, fence=None, out=None):
       - ``fence``：第 n 个围栏块（``` 或 ~~~，1 起）。
     这也正是 A2 的要求——按约定定位，不按「最长」定位。
     """
+    # F-37：路径参数先过类型守卫——os.path.isfile(None/3.5) 抛 TypeError，
+    # os.path.isfile(True) 更是把 True 当文件描述符 1（F-31b 同款陷阱）。
+    # 契约是 CustodyError，不是 TypeError。
+    if not isinstance(src, (str, bytes, os.PathLike)):
+        raise CustodyError("源文件路径非法：%r" % (src,))
     if not os.path.isfile(src):
         raise CustodyError("源文件不存在：%s" % src)
     raw = open(src, "rb").read()
@@ -2020,7 +2032,9 @@ def acquire_slot(task_id, run_id=None, cap=SLOT_CAP, base=None, lease_sec=LEASE_
 
 
 def release_slot(slot_path, run_id=None):
-    """释放槽位（只有持有者能释放）。"""
+    """释放槽位（只有持有者能释放）。F-37：非路径一律 False，不让 os.path 炸 TypeError。"""
+    if not isinstance(slot_path, (str, bytes, os.PathLike)):
+        return False
     if not slot_path or not os.path.exists(slot_path):
         return False
     if run_id is not None:
@@ -2335,9 +2349,9 @@ def _read_text(path, default=""):
 
 
 def parse_cookie_header(cookie):
-    """Cookie 头 → {name: value}；坏片段直接丢弃，不抛错。"""
+    """Cookie 头 → {name: value}；坏片段直接丢弃，不抛错（F-37：非 str 经 _as_text 收敛）。"""
     out = {}
-    for part in (cookie or "").split(";"):
+    for part in _as_text(cookie).split(";"):
         part = part.strip()
         if not part or "=" not in part:
             continue
@@ -2850,9 +2864,10 @@ def check_egress(proxy=None, timeout=10):
 
 
 def cookie_header(jar):
-    """[{'name','value',...}] → "k=v; k2=v2"（保持顺序，同名只留第一个）。"""
+    """[{'name','value',...}] → "k=v; k2=v2"（保持顺序，同名只留第一个）。
+    F-37：jar 不可迭代/不是 list 时按空处理（_as_seq），不抛 TypeError。"""
     pairs, seen = [], set()
-    for ck in jar or []:
+    for ck in _as_seq(jar):
         if not isinstance(ck, dict):
             continue
         k = (ck.get("name") or "").strip()

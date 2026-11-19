@@ -89,6 +89,16 @@ class TestIds(TmpBase):
     def test_id8_empty_falls_back(self):
         self.assertEqual(m.id8("", "new"), "new")
 
+    def test_non_str_ids_use_contract_error_not_attributeerror(self):
+        """F-37：safe_id 契约是「不合法 → ValueError」——非 str 不得借 .strip 炸
+        AttributeError；id8/cli_id 同步不得抛异常（id8 退 fallback，cli_id 返回 None）。"""
+        for bad in (-1, 3.5, True, float("inf"), [1], {"a": 1}, object(), b"bytes"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    m.safe_id(bad)
+                self.assertIsInstance(m.id8(bad), str)
+                self.assertIsNone(m.cli_id(bad))
+
     def test_archive_path_stays_inside(self):
         path = os.path.abspath(m.anon_archive_path("../../evil"))
         inside = os.path.abspath(os.path.join(self.tmp, "anon-sessions"))
@@ -981,6 +991,16 @@ class TestDeviceIdentity(TmpBase):
     def test_parse_header_tolerates_junk_and_equals_in_value(self):
         got = m.parse_cookie_header(" a=1; b=2=3 ;; =empty; c ;d=4 ")
         self.assertEqual(got, {"a": "1", "b": "2=3", "d": "4"})
+
+    def test_cookie_helpers_never_raise_on_non_str(self):
+        """F-37：parse_cookie_header 文档承诺「不抛错」——非 str 经 _as_text 收敛；
+        cookie_header 对不可迭代 jar 按空处理；device_id_from_cookie 随之收敛。"""
+        for bad in (-1, 3.5, True, float("inf"), [1], {"a": 1}, object()):
+            with self.subTest(bad=bad):
+                self.assertEqual(m.parse_cookie_header(bad), {})
+                self.assertEqual(m.device_id_from_cookie(bad), "")
+                self.assertEqual(m.cookie_header(bad), "")
+        self.assertEqual(m.cookie_header("not-a-jar"), "")
 
     def test_jar_is_persisted_and_header_is_readable(self):
         did = m.save_device_cookie(self._jar(DEV_A))
@@ -2886,6 +2906,12 @@ class TestLandingMismatch(TmpBase):
 class TestSlotsAndLease(TmpBase):
     """B8 原子领槽 + B15 租约回收的回归（审查要求的实现证据）。"""
 
+    def test_release_slot_non_path_returns_false(self):
+        """F-37：slot_path 不是路径时返回 False（契约值），不得让 os.path 炸 TypeError。"""
+        for bad in ([1], True, float("inf"), {"p": 1}, object()):
+            with self.subTest(bad=bad):
+                self.assertIs(m.release_slot(bad, run_id="r1"), False)
+
     def _now(self):
         return time.time()
 
@@ -3703,6 +3729,14 @@ class TestCustody(TmpBase):
     误取别的段落；以及提取时顺手 strip/Unicode 规范化，把 CRLF 与全角空格改掉。
     两者都不会报错，只会让投递出去的正文与 ChatGPT 自产的正文不是同一份字节。
     """
+
+    def test_extract_deliverable_non_path_is_custodyerror(self):
+        """F-37：路径参数非法 → CustodyError（契约），不得让 os.path.isfile 炸 TypeError
+        （isfile(True) 更是把 True 当 fd 1，F-31b 同款陷阱）。"""
+        for bad in (None, 3.5, True, float("inf"), [1], object()):
+            with self.subTest(bad=bad):
+                with self.assertRaises(m.CustodyError):
+                    m.extract_deliverable(bad, begin="B", end="E")
 
     def _src(self, body, name="src.md"):
         path = os.path.join(self.tmp, name)
