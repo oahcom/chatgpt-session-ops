@@ -1960,6 +1960,42 @@ class TestMalformedResponse(TmpBase):
                "\"content\": {\"parts\": [\"真正的回复\"]}}}\n")
         self.assertEqual(m.ChatGPTAPI.extract_reply_sse(raw), "真正的回复")
 
+    def test_sse_parsers_accept_non_str_without_raising(self):
+        """F-31：`_scan_sse`/`_sse_conv_ids` 收到 bytes/int/None 只能降级，不得抛异常。
+
+        旧版直接 `(raw or "").splitlines()`：bytes 抛
+        `TypeError: startswith first arg must be bytes`、int 抛 AttributeError。
+        而 `reply_digest`/`harvest_mapping_checked` 对同一类输入都降级成 None——
+        同一份不可信输入不能两种待遇（F-12 口径）。
+        """
+        for bad in (None, 123, 1.5, True, [], {}, object()):
+            with self.subTest(kind=type(bad).__name__):
+                self.assertEqual(m._scan_sse(bad)[:2], ("", False))
+                self.assertEqual(m._sse_conv_ids(bad), (None, []))
+
+    def test_lock_judgement_rejects_non_path(self):
+        """F-31b：`_lock_holder_stale`/`_try_reclaim_stale` 收到非路径只能返回 False。
+
+        `open(True)` 在 Python 中等价于 `open(1)`——**把 stdout 当文件读**，
+        fuzz 时实测会挂住；`open(10**400)` 抛 `OverflowError`（既非 OSError
+        也非 ValueError，旧 except 抓不到）。
+        """
+        for bad in (True, False, 0, 1, 10 ** 400, 1.5, None, [], {}, object()):
+            with self.subTest(kind=type(bad).__name__):
+                self.assertFalse(m._lock_holder_stale(bad))
+                self.assertFalse(m._try_reclaim_stale(bad))
+
+    def test_sse_parsers_decode_bytes(self):
+        """bytes 是 HTTP 体的天然形态：解码后照常解析，不因类型差异丢掉证据。"""
+        sse = ('data: {"conversation_id": "11111111-2222-4333-8444-555555555555"}\n'
+               'data: {"message": {"author": {"role": "assistant"}, '
+               '"content": {"parts": ["hi"]}, "create_time": 1}}\n'
+               "data: [DONE]\n")
+        self.assertEqual(m._sse_conv_ids(sse.encode("utf-8")),
+                         ("11111111-2222-4333-8444-555555555555",
+                          ["11111111-2222-4333-8444-555555555555"]))
+        self.assertEqual(m._scan_sse(sse.encode("utf-8"))[:2], ("hi", True))
+
     def test_reply_digest_malformed_returns_none(self):
         """对账器遇到畸形体：一律返回 None（核不了），不得抛异常。
 

@@ -663,6 +663,29 @@ def _as_float(value, default=0.0):
     return out
 
 
+def _as_text(value):
+    """把不可信响应体裁成 str；不是可文本化类型就返回空串（F-31）。
+
+    为什么需要：同一份不可信输入不能两种待遇——`reply_digest`/
+    `harvest_mapping_checked` 走 `json.loads` 的 `except Exception`，任意类型
+    都降级成 None；而 `_scan_sse`/`_sse_conv_ids` 直接 `(raw or "").splitlines()`，
+    收到 bytes 抛 `TypeError: startswith first arg must be bytes`、收到 int 抛
+    `AttributeError`。当前 HTTP 层统一 `.decode("utf-8","replace")` 后再传入，
+    所以不可达；但只要哪天上层改流式/二进制读取，异常就会从解析器穿出去。
+
+    bytes/bytearray 解码（HTTP 体本就是字节）；其余非 str 一律空串——
+    「没有可解析内容」是保守结论（不完整），不是猜测。
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return bytes(value).decode("utf-8", "replace")
+        except Exception:
+            return ""
+    return ""
+
+
 def _as_ctime(value):
     """规范化 create_time，返回 (ok, number)。
 
@@ -764,7 +787,7 @@ def _scan_sse(raw_text):
     last = ""
     bad = 0
     saw_done = False
-    for line in (raw_text or "").splitlines():
+    for line in _as_text(raw_text).splitlines():
         if not line.startswith("data:"):
             continue
         payload = line[5:].strip()
@@ -838,7 +861,7 @@ def _sse_conv_ids(raw_text):
     """
     first = None
     uniq = []
-    for line in (raw_text or "").splitlines():
+    for line in _as_text(raw_text).splitlines():
         if not line.startswith("data:"):
             continue
         payload = line[5:].strip()
@@ -1277,11 +1300,18 @@ def _lock_holder_stale(lock):
       5. 存活但启动时间读不到 → **不可回收**（宁可等超时，也不误删活锁）；
       6. 存活但启动时间与记录不一致 → PID 被复用，可回收；
       7. 否则不可回收。
+
+    F-31b：`lock` 必须是路径字符串。`open(True)` 在 Python 里等价于 `open(1)`
+    ——**把 stdout 当文件读**（fuzz 时实测会挂住读终端）；`open(10**400)` 抛
+    `OverflowError`（既不是 OSError 也不是 ValueError）。本函数的契约是路径，
+    入口先验类型，不合契约一律「不可回收」（保守，绝不动锁）。
     """
+    if not isinstance(lock, (str, bytes, os.PathLike)):
+        return False
     try:
         with open(lock, "r", encoding="utf-8") as f:
             raw = f.read()
-    except (OSError, ValueError):
+    except (OSError, ValueError, OverflowError):
         # F-08：读不出内容（权限/瞬时错误/非法 UTF-8 均属读取失败），保守不回收。
         # UnicodeDecodeError 是 ValueError 子类，必须在这里拦住，否则异常会穿过
         # _try_reclaim_stale 炸掉 _file_lock，而不是走「不可回收」路径。
@@ -1377,6 +1407,8 @@ def _try_reclaim_stale(lock):
     让两个进程各锁一个 inode，互斥悄悄失效。空文件常驻无害。
     拿不到守卫（或平台不支持内核锁）→ 不回收，宁可等超时也不冒险删活锁。
     """
+    if not isinstance(lock, (str, bytes, os.PathLike)):
+        return False            # F-31b：契约是路径，非路径一律不回收
     guard = lock + ".reclaim"
     try:
         fd = os.open(guard, os.O_CREAT | os.O_RDWR)
