@@ -488,20 +488,30 @@ def check_schedule(rrule):
     if iv is None:
         interval = 1                      # RFC 5545：INTERVAL 缺省即 1
     else:
+        if len(iv) > 32:
+            raise ScheduleError("INTERVAL 过长（%d 位）：%r" % (len(iv), iv[:32]))
         if not _RRULE_INT_RE.match(iv):
             raise ScheduleError("INTERVAL 不是 RFC 十进制整数：%r" % iv)
-        n = int(iv)
-        if n != 1:
-            raise ScheduleError("INTERVAL 必须为 1：%d 会变成 %s 小时一次，"
-                                "高频也不能用 INTERVAL<1 表示" % (n, n))
-        interval = n
+        # **不调用 int()**：Python 3.11+ 对超长十进制串会抛 ValueError
+        # （位数上限 4300），从 check_schedule 里逃逸出去就是异常逃逸
+        # （与 F-07 同型）。这里直接比数字串，零转换、零溢出。
+        body = iv[1:] if iv[:1] in ("+", "-") else iv
+        norm_digits = body.lstrip("0") or "0"
+        if iv.startswith("-") or norm_digits != "1":
+            raise ScheduleError("INTERVAL 必须为 1：%r（高频也不能用 INTERVAL<1 表示）"
+                                % iv)
+        interval = 1
     if unsupported:
         raise ScheduleError("rrule 含未支持的 rule part %s：B1 只允许 FREQ 与 INTERVAL"
                             "（BYxxx/UNTIL/COUNT 会改变触发语义，不得静默忽略）"
                             % ",".join(sorted(unsupported)))
     # 下发用规范化串：由**已验证字段**重新构造，不含用户原始串里的任何杂质。
+    # 契约：**唯一可执行字段是 `rrule`**；`original_input_for_audit_only`
+    # 只留档审计，任何下游都不得拿它去排程。
     canonical = "FREQ=HOURLY;INTERVAL=%d" % interval
-    return {"result": "ok", "rrule": canonical, "rrule_input_echo": raw,
+    return {"result": "ok", "rrule": canonical,
+            "original_input_for_audit_only": raw,
+            "executable_field": "rrule",
             "freq": "HOURLY", "interval": interval}
 
 
@@ -606,14 +616,36 @@ def _as_ctime(value):
     return True, float(value)
 
 
-def _parts_are_strings(parts):
-    """parts 是否全为字符串（F-12a）。
+def _part_is_structured(part):
+    """part 是不是「合法但不可文本化」的结构化 part（如多模态图片对象）。
 
-    为什么单独判：`"".join(p for p in parts if isinstance(p, str))` 会把
-    非字符串元素**静默丢掉**——内容凭空消失，而「完整性」却报告为 True。
-    跳过坏 node ≠ 证明 mapping 完整；静默丢 part 更糟。
+    ChatGPT 的 `content.parts` 不保证每项都是字符串：图片/音频/视频会以
+    `{"content_type": ..., ...}` 的对象形式出现。这类 part **不是畸形**——
+    把它当畸形会把正常的多模态用户消息误报成「assistant 回复残缺」（F-19）；
+    但它也确实**不是文本**，直接 join 会让内容凭空消失（F-12a）。
+    所以必须把「合法但非文本」和「非法」分开认，不能一刀切。
     """
-    return all(isinstance(p, str) for p in parts)
+    return isinstance(part, dict) and isinstance(part.get("content_type"), str)
+
+
+def _split_parts(parts):
+    """把 parts 拆成 (texts, structured, malformed)。
+
+    - `texts`：字符串 part 的列表（唯一能拼成文本的部分）
+    - `structured`：结构化 part 的个数（合法但不可文本化）
+    - `malformed`：True = 含**非法** part（既不是字符串，也不是可识别的结构化 part）
+    """
+    texts = []
+    structured = 0
+    malformed = False
+    for p in parts:
+        if isinstance(p, str):
+            texts.append(p)
+        elif _part_is_structured(p):
+            structured += 1
+        else:
+            malformed = True
+    return texts, structured, malformed
 
 
 def _scan_sse(raw_text):
@@ -624,6 +656,14 @@ def _scan_sse(raw_text):
 
     complete = 没出现畸形事件 且 流以 [DONE] 正常收尾。
     detail 说明差在哪（坏事件数 / 是否见到 [DONE]）。
+
+    F-15：显式 `message: null` 与「根本没有 message 字段」必须分开——前者是
+    畸形事件（计入坏事件），后者是合法的非消息事件。旧版 `msg is None` 两者
+    一视同仁，畸形事件能混进「complete=True」里。
+    F-16：`[DONE]` 是**解析终点**，其后的数据一律不采信。
+    F-19：结构化（非文本）part 合法但不可文本化——按角色区分：非 assistant
+    角色属正常多模态内容，不算坏事件；assistant 角色的结构化 part 意味着
+    「抽出来的文本只是投影」，按不完整处理。
     """
     last = ""
     bad = 0
@@ -634,6 +674,8 @@ def _scan_sse(raw_text):
         payload = line[5:].strip()
         if payload == "[DONE]":
             saw_done = True
+            break                      # F-16：[DONE] 是终点，之后的事件不采信
+        if not payload:
             continue
         try:
             obj = json.loads(payload)
@@ -643,11 +685,11 @@ def _scan_sse(raw_text):
         if not isinstance(obj, dict):
             bad += 1
             continue
-        msg = obj.get("message")
-        if msg is None:
-            continue                     # 事件里没有 message（如 conversation_id）——正常
+        if "message" not in obj:
+            continue                   # 事件里没有 message（如 conversation_id）——正常
+        msg = obj["message"]
         if not isinstance(msg, dict):
-            bad += 1
+            bad += 1                   # F-15：显式 message: null / 非 dict → 畸形
             continue
         # F-12b：带 message 却没有合法 author 的事件是**畸形**——必须计入坏事件。
         # 旧版把 role 取成 None 就静默跳过，坏事件不进计数，complete 照样报 True，
@@ -656,6 +698,7 @@ def _scan_sse(raw_text):
         if not isinstance(author, dict):
             bad += 1
             continue
+        role = author.get("role")
         content = msg.get("content")
         if content is None:
             parts = []
@@ -669,13 +712,14 @@ def _scan_sse(raw_text):
         else:
             bad += 1
             continue
-        # F-12a：parts 里混进非字符串元素 → 该段内容会凭空消失。
-        # 宁可判它畸形（坏事件 + 跳过），也不静默过滤后还报告 complete。
-        if not _parts_are_strings(parts):
-            bad += 1
+        texts, structured, malformed = _split_parts(parts)
+        if malformed:
+            bad += 1                   # F-12a：非法 part → 该段内容会凭空消失
             continue
-        role = author.get("role")
-        txt = "".join(parts)
+        if structured and role == "assistant":
+            bad += 1                   # F-19：assistant 回复含非文本内容 → 文本是投影
+            continue
+        txt = "".join(texts)
         if role == "assistant" and txt.strip():
             last = txt
     detail = "坏事件 %d 个、%s" % (bad, "见到 [DONE]" if saw_done else "未见 [DONE]")
@@ -692,6 +736,9 @@ def _sse_conv_ids(raw_text):
     JSON、正文正则里继续捞——等于「响应里出现过什么 id 就用哪个」。一旦后面
     出现另一个 id，落点判定就建立在一个无法确认归属的 id 上。
     现在只认**首个**事件的 id；一旦发现多个不同 id 就失败关闭。
+
+    F-16：`[DONE]` 是**解析终点**——其后的数据一律不采信。否则一个
+    「先 [DONE]、后补一个别的 id」的响应会把结束标记之后的 id 拿来做落点证明。
     """
     first = None
     uniq = []
@@ -699,7 +746,9 @@ def _sse_conv_ids(raw_text):
         if not line.startswith("data:"):
             continue
         payload = line[5:].strip()
-        if not payload or payload == "[DONE]":
+        if payload == "[DONE]":
+            break                       # F-16：结束标记之后的事件不参与身份判断
+        if not payload:
             continue
         try:
             obj = json.loads(payload)
@@ -763,16 +812,18 @@ def _scan_mapping(raw_body):
         else:
             complete = False
             continue
-        # F-12a：parts 里混进非字符串元素 → 这个节点的内容会凭空消失，
-        # 必须跳过该节点并把整体标成不完整（静默过滤 = 内容丢失却报完整）。
-        if not _parts_are_strings(parts):
-            complete = False
+        texts, structured, malformed = _split_parts(parts)
+        if malformed:
+            complete = False       # F-12a：非法 part → 内容会凭空消失，跳过该节点
+            continue
+        role = author.get("role")
+        if structured and role == "assistant":
+            complete = False       # F-19：assistant 回复含非文本内容 → 文本是投影，不是全文
             continue
         ok, ct = _as_ctime(m.get("create_time"))
         if not ok:
             complete = False             # 时间戳不可用 → 顺序不可信
-        role = author.get("role")
-        text = "".join(parts).strip()
+        text = "".join(texts).strip()
         if role in ("user", "assistant") and text:
             rows.append((ct, role, text))
     rows.sort(key=lambda x: x[0])
@@ -827,24 +878,24 @@ def reply_digest(raw_body):
         if not ok:
             return None        # 时间戳不可用 → 顺序不可信，核不了
         if author.get("role") != "assistant":
-            continue
-        # F-12a：parts 里有非字符串元素 → 摘要算出来的 sha256/chars 不再对应
-        # 真实内容。作为完整性证明器，这里必须**整体判不可用**，不能拿过滤后的
-        # 剩余 part 算一个「看起来正常」的摘要。
-        if not _parts_are_strings(parts):
-            return None
-        if not parts or not "".join(parts).strip():
+            continue        # 非 assistant 节点不参与对账（含用户多模态消息，F-19）
+        texts, structured, malformed = _split_parts(parts)
+        if malformed:
+            return None    # 非法 part → 摘要算出来的 sha256/chars 不再对应真实内容
+        if structured:
+            return None    # F-19：assistant 消息含非文本内容 → 核不了全文
+        if not texts or not "".join(texts).strip():
             continue
         key = (ct, str(msg.get("id") or node_id))
         if best is None or key > best[0]:
-            best = (key, msg, parts)
+            best = (key, msg, texts)
     if best is None:
         return None
-    _key, msg, parts = best
-    joined = "".join(parts).encode("utf-8")
+    _key, msg, texts = best
+    joined = "".join(texts).encode("utf-8")
     return {"message_id": msg.get("id") or "",
-            "parts": [len(p) for p in parts],
-            "chars": sum(len(p) for p in parts),
+            "parts": [len(p) for p in texts],
+            "chars": sum(len(p) for p in texts),
             "sha256": hashlib.sha256(joined).hexdigest()}
 
 
@@ -3971,18 +4022,44 @@ class ConvRef(str):
     只回一个就把「回复实际落在哪个会话」这条关键信息丢了——而这正是下游
     继续操作时最需要的东西；把回复悄悄归档到 A 名下则更糟：会话身份与
     回复归属分裂，下游会拿着错误的 conversation id 继续往下走。
+
+    F-17：id **歧义**分支（响应里出现多个不同 id）同样不能把诊断信息丢掉——
+    候选 id 列表放在 `candidate_ids` 里，失败结果要能让机器调用方定位问题。
     """
 
-    def __new__(cls, conv_id, actual_conv_id=None, mismatch=False, reason=""):
+    def __new__(cls, conv_id, actual_conv_id=None, mismatch=False, reason="",
+                candidate_ids=None):
         obj = super().__new__(cls, conv_id or "")
         obj.target_conv_id = conv_id or ""
         obj.actual_conv_id = actual_conv_id or ""
         obj.mismatch = bool(mismatch)
         obj.reason = reason
+        obj.candidate_ids = list(candidate_ids or [])
         return obj
 
 
 LANDING_MISMATCH_STATUS = 409
+QUARANTINE_DIR = "quarantine"
+PENDING_CLAIMS_FILE = "pending-claims.jsonl"
+
+
+def _record_pending_claim(base, record):
+    """落点不一致的**待认领登记**（F-13）。
+
+    服务器实际落点 ≠ 系统已确认该会话归属：自动 `record_conv(actual)` 会把
+    一次异常投递变成正式会话关系。所以另记一份异常登记——含 target、actual、
+    时间、隔离档案路径与原因——**人工确认后**再正式登记归属。
+    """
+    path = os.path.join(base, PENDING_CLAIMS_FILE)
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError as e:
+        print("FAIL: 待认领登记写入失败（%s）——actual 会话可能无人认领" % e, flush=True)
+        return False
+    return True
 
 
 def _quarantine_reply(api, target_conv, actual_conv, reply, resp, status, pfile):
@@ -3991,17 +4068,21 @@ def _quarantine_reply(api, target_conv, actual_conv, reply, resp, status, pfile)
     为什么必须隔离而不是直接归档到目标会话：回复实际落在 actual_conv，
     归档到 target_conv 会让下游把别的会话的回复当成本会话的回复继续操作
     （A10/F-13：会话身份与回复归属分裂）。隔离档案带完整证据——两个 id、
-    HTTP 状态、原始响应摘要、回复全文与 sha256——供人工判定归属。
+    HTTP 状态、原始响应全文与 sha256、回复全文与 sha256——供人工判定归属。
 
-    隔离档案刻意放在 `replies/quarantine/` 子目录：下游按 `replies/reply-*.md`
-    扫正常归档时扫不到它，不会把隔离件当正常会话回复。
+    隔离目录刻意放在 **`replies/` 之外**（与 `replies/` 同级）：下游按
+    `replies/**` 递归扫描也够不到它——不靠文件名 glob 兜底（F-13 第 3 问）。
     """
     base = getattr(api, "base_dir", BASE)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    rel = os.path.join("replies", "quarantine",
-                       "quarantine-reply-%s-%s-%s.md"
-                       % (id8(target_conv), id8(actual_conv), stamp))
+    name = "quarantine-reply-%s-%s-%s" % (id8(target_conv), id8(actual_conv), stamp)
+    rel = os.path.join(QUARANTINE_DIR, name + ".md")
     path = os.path.join(base, rel)
+    resp_rel = os.path.join(QUARANTINE_DIR, name + ".resp.txt")
+    resp_path = os.path.join(base, resp_rel)
+    resp_text = resp or ""
+    resp_sha = hashlib.sha256(resp_text.encode("utf-8")).hexdigest()
+    reply_text = reply or ""
     header = {
         "type": "landing_mismatch_quarantine",
         "target_conv_id": target_conv,
@@ -4010,26 +4091,53 @@ def _quarantine_reply(api, target_conv, actual_conv, reply, resp, status, pfile)
         "http_status": status,
         "prompt_file": pfile,
         "quarantined_at": datetime.now().isoformat(timespec="seconds"),
-        "reply_chars": len(reply or ""),
-        "reply_sha256": hashlib.sha256((reply or "").encode("utf-8")).hexdigest(),
-        "resp_head": (resp or "")[:800],
+        "reply_chars": len(reply_text),
+        "reply_sha256": hashlib.sha256(reply_text.encode("utf-8")).hexdigest(),
+        "resp_path": resp_rel.replace("\\", "/"),
+        "resp_chars": len(resp_text),
+        "resp_sha256": resp_sha,
+        "resp_head": resp_text[:800],
     }
     body = (
         "# ⚠️ 隔离归档：落点不一致（landing_mismatch）\n\n"
         "> 这条回复**不是** `%s` 的正常会话回复——服务器实际把它落在 `%s`。\n"
         "> 本文件只用于保全与人工判定；下游不得把它当成 `%s` 的会话回复，"
-        "也不得据此认为 `%s` 已经回完。\n\n"
+        "也不得据此认为 `%s` 已经回完。\n"
+        "> **完整原始响应**另存于 `%s`（%d 字符，sha256=%s）。\n\n"
         "```json\n%s\n```\n\n"
-        "## 原始响应摘要\n\n```\n%s\n```\n\n"
+        "## 原始响应摘要（前 800 字符）\n\n```\n%s\n```\n\n"
         "## 回复全文（保全）\n\n%s\n"
     ) % (target_conv, actual_conv, target_conv, target_conv,
+         resp_rel.replace("\\", "/"), len(resp_text), resp_sha,
          json.dumps(header, ensure_ascii=False, indent=2),
-         (resp or "")[:2000], reply or "")
+         resp_text[:800], reply_text)
+    # 先落**完整**原始响应（F-18：800 字符的头部不足以保全证据，关键 id 与
+    # 后续事件可能正好落在截断部分），再落隔离档案，最后登记待认领。
+    resp_ok = True
+    try:
+        _atomic_write(resp_path, resp_text)
+    except OSError as e:
+        resp_ok = False
+        print("FAIL: 原始响应保全失败（%s）——隔离证据不完整" % e, flush=True)
     try:
         _atomic_write(path, body)
     except OSError as e:
         print("FAIL: 隔离归档写入失败（%s）——回复可能丢失！" % e, flush=True)
         return None
+    _record_pending_claim(base, {
+        "target_conv_id": target_conv,
+        "actual_conv_id": actual_conv,
+        "quarantined_at": header["quarantined_at"],
+        "quarantine_path": rel.replace("\\", "/"),
+        "resp_path": resp_rel.replace("\\", "/"),
+        "resp_chars": len(resp_text),
+        "resp_sha256": resp_sha,
+        "reply_chars": len(reply_text),
+        "reason": header["reason"],
+        "claim_status": "pending_human_review",
+    })
+    if not resp_ok:
+        print("WARN: 隔离档案已落盘，但完整原始响应缺失——证据不完整", flush=True)
     return path
 
 
@@ -4156,7 +4264,10 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
         if len(uniq) > 1:
             print("FAIL: 响应里出现多个不同的 conversation_id（%s）——无法确认落点，"
                   "按 A11 判失败，不落盘" % ", ".join(uniq), flush=True)
-            return 1, None, None
+            return (1, None,
+                    ConvRef(conv_id, mismatch=True,
+                            reason="ambiguous_conversation_id: 响应里出现多个不同的 id",
+                            candidate_ids=uniq))
         if uniq:
             parsed = uniq[0]
             print("conversation_id 由正则兜底解析得到：%s" % parsed, flush=True)
@@ -4164,17 +4275,23 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
     if len(all_cids) > 1:
         print("FAIL: 同一响应里出现多个 conversation_id（%s）——无法确认落点，"
               "按 A11 判失败，不落盘" % ", ".join(all_cids), flush=True)
-        return 1, None, None
+        # F-17：失败结果要带 target 与候选 id，不能把诊断信息丢掉
+        return (1, None,
+                ConvRef(conv_id, mismatch=True,
+                        reason="ambiguous_conversation_id: 同一响应里出现多个 id",
+                        candidate_ids=all_cids))
     # A11 硬要求：解析不出唯一且合规的 id 就判失败，禁止「WARN 一下接着走」或换身份重投。
     # 旧版在 id 不合规时回落到传入的 conv_id 继续落盘，等于把「没认回会话」粉饰成成功。
     if not parsed:
         print("FAIL: 200 但解析不出 conversation_id（无法证明落点会话）；按 A11 判失败，不重投",
               flush=True)
-        return 1, None, None
+        return (1, None, ConvRef(conv_id, mismatch=True,
+                                 reason="conversation_id_unresolved: 响应里没有可用的 id"))
     if not _ID_RE.match(parsed):
         print("FAIL: 解析出的 conversation_id 不合规（%r）；按 A11 判失败，不重投、不落盘"
               % (parsed,), flush=True)
-        return 1, None, None
+        return (1, None, ConvRef(conv_id, mismatch=True,
+                                 reason="conversation_id_invalid: %r" % (parsed,)))
     real_conv = parsed
     mismatch = bool(conv_id) and real_conv != conv_id
 
@@ -4744,6 +4861,9 @@ def main():
             out["actual_conv_id"] = getattr(conv, "actual_conv_id", "")
             out["reason"] = getattr(conv, "reason", "")
             out["quarantine_path"] = _p
+            # F-17：id 歧义时把候选 id 列表也报出来
+            if getattr(conv, "candidate_ids", None):
+                out["candidate_conv_ids"] = list(conv.candidate_ids)
         print(json.dumps(out, ensure_ascii=False))
         return 0 if status == 200 else 1
     # ---- 会话清单 ----
@@ -4870,6 +4990,8 @@ def main():
             "actual_conv_id": getattr(conv, "actual_conv_id", ""),
             "reason": getattr(conv, "reason", ""),
             "quarantine_path": _path,
+            # F-17：id 歧义时把候选 id 列表也报出来
+            "candidate_conv_ids": list(getattr(conv, "candidate_ids", []) or []),
         }, ensure_ascii=False), flush=True)
     return 0 if status == 200 else 1
 

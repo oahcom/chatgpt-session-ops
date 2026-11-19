@@ -2046,6 +2046,122 @@ class TestMalformedParts(TmpBase):
         self.assertEqual(m._as_ctime(1.5), (True, 1.5))
 
 
+class TestParserEdges(TmpBase):
+    """F-15/F-16/F-19：解析边界——显式 null、DONE 终点、多模态 part。
+
+    F-15：`obj.get("message")` 分不清「没有 message 字段」与「显式
+    `message: null`」。后者是畸形事件，却按正常非消息事件放过去了——
+    于是 `complete=True` 里混进了畸形事件。
+    F-16：`[DONE]` 是解析终点；其后的数据不能参与落点证明。
+    F-19：多模态 part（`{"content_type": ...}` 对象）**合法但不可文本化**——
+    把它当畸形会把正常的用户多模态消息误报成「assistant 回复残缺」；
+    当成普通字符串拼进去又会让内容凭空消失。必须分开认。
+    """
+
+    CONV = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+    IMG = {"content_type": "image_asset_pointer", "asset_pointer": "file-service://x"}
+
+    def test_explicit_null_message_is_bad_event(self):
+        raw = 'data: {"message": null}\ndata: [DONE]'
+        _t, complete, detail = m._scan_sse(raw)
+        self.assertFalse(complete, "显式 message: null 是畸形事件，不能放行")
+        self.assertIn("坏事件 1 个", detail)
+
+    def test_explicit_non_dict_message_is_bad_event(self):
+        raw = 'data: {"message": "hi"}\ndata: [DONE]'
+        _t, complete, detail = m._scan_sse(raw)
+        self.assertFalse(complete)
+        self.assertIn("坏事件 1 个", detail)
+
+    def test_absent_message_key_is_not_bad_event(self):
+        """合法非消息事件（只有 conversation_id）不算畸形。"""
+        raw = 'data: {"conversation_id": "x"}\ndata: [DONE]'
+        _t, complete, _d = m._scan_sse(raw)
+        self.assertTrue(complete)
+
+    def test_events_after_done_are_ignored(self):
+        """F-16：[DONE] 之后的事件不参与身份判断——结束标记之后没有发言权。"""
+        raw = ('data: {"conversation_id": "%s"}\n' % self.CONV +
+               "data: [DONE]\n" +
+               'data: {"conversation_id": "ffffffff-9999-4aaa-8bbb-cccccccccccc"}\n')
+        first, uniq = m._sse_conv_ids(raw)
+        self.assertEqual(first, self.CONV)
+        self.assertEqual(uniq, [self.CONV], "[DONE] 之后的 id 不得进入候选集")
+
+    def test_id_after_done_alone_is_not_accepted(self):
+        """只有 [DONE] 之后才有 id → 解析不出 id，必须失败关闭。"""
+        raw = ('data: [DONE]\n'
+               'data: {"conversation_id": "ffffffff-9999-4aaa-8bbb-cccccccccccc"}\n')
+        first, uniq = m._sse_conv_ids(raw)
+        self.assertIsNone(first)
+        self.assertEqual(uniq, [])
+
+    def test_sse_content_after_done_is_not_harvested(self):
+        raw = ('data: {"message": {"author": {"role": "assistant"}, '
+               '"content": {"parts": ["DONE 之前的话"]}}}\n'
+               "data: [DONE]\n"
+               'data: {"message": {"author": {"role": "assistant"}, '
+               '"content": {"parts": ["DONE 之后的话"]}}}\n')
+        text, complete, _d = m._scan_sse(raw)
+        self.assertEqual(text, "DONE 之前的话", "[DONE] 之后的内容不得被采信")
+        self.assertNotIn("DONE 之后的话", text)
+        self.assertTrue(complete, "见到 [DONE] 且无坏事件")
+
+    def test_structured_user_part_does_not_break_mapping(self):
+        """F-19：用户消息含合法多模态 part，不得把 assistant 回复误报成残缺。"""
+        body = json.dumps({"mapping": {
+            "u": {"message": {"author": {"role": "user"},
+                              "content": {"parts": ["看图", self.IMG]},
+                              "create_time": 1}},
+            "a": {"message": {"id": "msg-1", "author": {"role": "assistant"},
+                              "content": {"parts": ["这是回答"]}, "create_time": 5}},
+        }})
+        rows, complete = m._scan_mapping(body)
+        self.assertTrue(complete, "用户多模态消息不是畸形")
+        self.assertEqual([r for r in rows if r[1] == "assistant"], [(5.0, "assistant", "这是回答")])
+
+    def test_structured_user_part_does_not_break_digest(self):
+        """F-19：用户多模态消息不得让对账器整体判不可用（它核的是 assistant 消息）。"""
+        body = json.dumps({"mapping": {
+            "u": {"message": {"author": {"role": "user"},
+                              "content": {"parts": ["看图", self.IMG]},
+                              "create_time": 1}},
+            "a": {"message": {"id": "msg-1", "author": {"role": "assistant"},
+                              "content": {"parts": ["这是回答"]}, "create_time": 5}},
+        }})
+        dg = m.reply_digest(body)
+        self.assertIsNotNone(dg, "用户多模态消息不影响 assistant 消息的对账")
+        self.assertEqual(dg["chars"], 4)
+
+    def test_structured_assistant_part_makes_digest_none(self):
+        """F-19：assistant 消息含非文本内容 → 核不了全文，整体判不可用。"""
+        body = json.dumps({"mapping": {
+            "a": {"message": {"id": "msg-1", "author": {"role": "assistant"},
+                              "content": {"parts": ["文字", self.IMG]},
+                              "create_time": 5}},
+        }})
+        self.assertIsNone(m.reply_digest(body))
+        _rows, complete = m._scan_mapping(body)
+        self.assertFalse(complete, "assistant 的文本只是投影，不能报完整")
+
+    def test_structured_user_part_in_sse_is_not_bad_event(self):
+        raw = ('data: {"message": {"author": {"role": "user"}, '
+               '"content": {"parts": ["看图", %s]}}}\n'
+               'data: {"message": {"author": {"role": "assistant"}, '
+               '"content": {"parts": ["回答"]}}}\ndata: [DONE]' % json.dumps(self.IMG))
+        text, complete, detail = m._scan_sse(raw)
+        self.assertTrue(complete, "用户多模态事件不是坏事件")
+        self.assertEqual(text, "回答")
+
+    def test_illegal_part_still_counts_as_bad_event(self):
+        """F-12a 仍然成立：既不是字符串也不是结构化对象的 part 是非法 part。"""
+        raw = ('data: {"message": {"author": {"role": "assistant"}, '
+               '"content": {"parts": ["ok", 42]}}}\ndata: [DONE]')
+        _t, complete, detail = m._scan_sse(raw)
+        self.assertFalse(complete)
+        self.assertIn("坏事件 1 个", detail)
+
+
 class TestLandingMismatch(TmpBase):
     """A10/F-13：投递目标与服务器实际落点不一致时的处置。
 
@@ -2133,6 +2249,66 @@ class TestLandingMismatch(TmpBase):
         self.assertIn(self.ACTUAL, content)
         self.assertIn("落在 B 的回复", content, "回复正文必须被保全，不得丢")
         self.assertIn("landing_mismatch", content)
+
+    def test_quarantine_dir_is_outside_replies_tree(self):
+        """隔离目录必须在 `replies/` 之外——下游按 `replies/**` 递归扫描也够不到它，
+        不靠文件名 glob 兜底。"""
+        _status, path, _conv, _saved, _gets = self._run(self._sse(self.ACTUAL))
+        rel = os.path.relpath(path, os.path.join(self.tmp, "auth")).replace("\\", "/")
+        self.assertFalse(rel.startswith("replies/"),
+                         "隔离件不得落在 replies/ 树里（会被递归扫描扫到）：%s" % rel)
+
+    def test_quarantine_preserves_full_raw_response(self):
+        """F-18：800 字符的头部不足以保全证据——关键 id 可能正好落在截断部分。
+
+        必须把**完整**原始响应另存，并在隔离头部记下它的路径/长度/sha256。
+        """
+        filler = "x" * 1200
+        tail_marker = "TAIL-MARKER-AFTER-800"
+        sse = (self._sse(self.ACTUAL, "回复") + "\n" +
+               "data: {\"note\": \"%s\", \"marker\": \"%s\"}\n" % (filler, tail_marker))
+        _status, path, _conv, _saved, _gets = self._run(sse)
+        content = _read(path)
+        self.assertIn("resp_path", content)
+        self.assertIn("resp_sha256", content)
+        self.assertIn("resp_chars", content)
+        # 头部记录的 sha256/长度必须对得上**完整**响应
+        head = json.loads(content.split("```json")[1].split("```")[0])
+        self.assertEqual(head["resp_chars"], len(sse))
+        self.assertEqual(head["resp_sha256"],
+                         __import__("hashlib").sha256(sse.encode("utf-8")).hexdigest())
+        # 完整响应单独存一份，尾部标记必须在里面
+        resp_file = os.path.join(os.path.join(self.tmp, "auth"),
+                                 head["resp_path"].replace("/", os.sep))
+        self.assertTrue(os.path.exists(resp_file), "完整原始响应必须单独落盘")
+        raw = _read(resp_file)
+        self.assertIn(tail_marker, raw, "截断部分之后的证据必须保全")
+        self.assertEqual(len(raw), len(sse))
+
+    def test_pending_claim_registry_records_actual_conversation(self):
+        """F-13：服务器实际落点 ≠ 已确认归属——记**待认领登记**，不自动登记归属。"""
+        _status, path, _conv, _saved, _gets = self._run(self._sse(self.ACTUAL))
+        reg = os.path.join(os.path.join(self.tmp, "auth"), m.PENDING_CLAIMS_FILE)
+        self.assertTrue(os.path.exists(reg), "必须留一份待认领登记")
+        rows = [json.loads(l) for l in _read(reg).splitlines() if l.strip()]
+        self.assertTrue(rows)
+        last = rows[-1]
+        self.assertEqual(last["target_conv_id"], self.TARGET)
+        self.assertEqual(last["actual_conv_id"], self.ACTUAL)
+        self.assertEqual(last["quarantine_path"],
+                         os.path.relpath(path, os.path.join(self.tmp, "auth")).replace("\\", "/"))
+        self.assertEqual(last["claim_status"], "pending_human_review")
+
+    def test_ambiguous_ids_failure_carries_candidates(self):
+        """F-17：id 歧义时失败结果必须带 target 与候选 id，不能把诊断信息丢掉。"""
+        sse = ('data: {"conversation_id": "%s"}\n' % self.TARGET +
+               'data: {"conversation_id": "%s"}\n' % self.ACTUAL + "data: [DONE]")
+        status, path, conv, saved, _gets = self._run(sse)
+        self.assertEqual(status, 1)
+        self.assertIsNone(path)
+        self.assertEqual(saved, [])
+        self.assertEqual(conv.target_conv_id, self.TARGET)
+        self.assertEqual(sorted(conv.candidate_ids), sorted([self.TARGET, self.ACTUAL]))
 
     def test_landing_mismatch_return_carries_both_ids(self):
         _status, _path, conv, _saved, _gets = self._run(self._sse(self.ACTUAL))
@@ -3194,6 +3370,27 @@ class TestScheduleContract(unittest.TestCase):
             with self.subTest(rrule=bad):
                 with self.assertRaises(m.ScheduleError):
                     m.check_schedule(bad)
+
+    def test_huge_interval_does_not_escape_as_exception(self):
+        """Python 3.11+ 对超长十进制串 int() 会抛 ValueError（位数上限 4300）——
+        从 check_schedule 里逃逸出去就是异常逃逸（与 F-07 同型）。"""
+        for bad in ("FREQ=HOURLY;INTERVAL=" + "9" * 5000,
+                    "FREQ=HOURLY;INTERVAL=" + "9" * 4301,
+                    "FREQ=HOURLY;INTERVAL=" + "0" * 5000):
+            with self.subTest(length=len(bad)):
+                with self.assertRaises(m.ScheduleError):
+                    m.check_schedule(bad)
+
+    def test_only_rrule_field_is_executable(self):
+        """契约：唯一可执行字段是 `rrule`；原始串只能作为审计留档，不得被误当下发值。"""
+        res = m.check_schedule("freq=hourly")
+        self.assertEqual(res["rrule"], "FREQ=HOURLY;INTERVAL=1")
+        self.assertEqual(res["executable_field"], "rrule")
+        self.assertEqual(res["original_input_for_audit_only"], "freq=hourly")
+        for k in res:
+            if k != "executable_field":
+                self.assertNotIn(k, ("rrule_input_echo", "rrule_canonical"),
+                                 "不得再留容易被误当下发值的字段名：%s" % k)
 
     def test_oneshot_within_hour_ok(self):
         from datetime import datetime, timedelta

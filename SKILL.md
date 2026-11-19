@@ -84,7 +84,7 @@ ChatGPT 会话操控与生命周期管理。把"手和眼"（I/O、投递、收�
 4. CDP 端口没起时**不把会话标 archived**（浏览器没起 ≠ 会话丢了），改为明确提示先启浏览器；会话仍可 `--anon-read`。
 5. 匿名发送中途异常若已拿到 conv_id，仍登记进对照表，避免查不到的孤儿会话。
 6. 三个 json 的读-改-写走**跨进程文件锁**（`*.lock` + stale 60s + 进程内重入），并发建会话不再互相覆盖计数/游标。
-7. POST 200 但 SSE 未解析出 id 时，依次用整包 JSON、`"conversation_id":"…"` 正则兜底，减少「200 无 id」。**只认首个带 id 的事件**；同一响应出现两个不同 id → 无法确认落点，判失败关闭，不取最后一个也不回落到传入 id。
+7. POST 200 但 SSE 未解析出 id 时，依次用整包 JSON、`"conversation_id":"…"` 正则兜底，减少「200 无 id」。**只认首个带 id 的事件**，`[DONE]` 之后的事件不采信；同一响应出现两个不同 id → 无法确认落点，判失败关闭（失败结果带 target 与候选 id），不取最后一个也不回落到传入 id。
 8. 兜底前检查 `nologin` 冷却，避免浏览器坏掉时每次兜底都白等自动拉起。
 
 **按 id 启用匿名通道**：
@@ -138,7 +138,7 @@ python scripts/chatgpt_send.py --account acct2 <conv_id> <prompt_file>
 
 查询会话清单：`python scripts/chatgpt_send.py --account acct1 --list` 查询单一账号；`python scripts/chatgpt_send.py --list-all` 顺序查询本机已配置的 acct1、acct2 与匿名态，并为每条结果标注身份。`--list-all` 输出 `by_account`（按账号分组，便于归档）、`summary`（各账号计数）、`quota`（各账号最近响应的限速观测头，只读）与 `errors`。不可用的账号和接口错误会进入 errors；遇到 429 即停止剩余扫描。聚合结果只覆盖各身份自身有权看到的会话，不代表匿名态能读取私有会话。
 
-自动走完整链路：live tail（GET 429 时缓存 tail 兜底）→ requirements + PoW → POST（**必带 conversation_id**）→ **校验落点会话一致**（取 SSE **首个带 id 的** `data:` 事件；落点不一致 → **判失败**，回复写入 `replies/quarantine/` 隔离档案并返回 target/actual 两个 id，不静默改归属）→ SSE 收割 → 落盘 `replies/reply-*.md`。
+自动走完整链路：live tail（GET 429 时缓存 tail 兜底）→ requirements + PoW → POST（**必带 conversation_id**）→ **校验落点会话一致**（取 SSE **首个带 id 的** `data:` 事件；落点不一致 → **判失败**，回复写入 `quarantine/` 隔离档案（**完整原始响应**另存并记 sha256）并返回 target/actual 两个 id，实际落点会话另记待认领登记，不静默改归属）→ SSE 收割 → 落盘 `replies/reply-*.md`。
 
 ### 2. 开全新会话（Owner 裁决模式，登录态优先）
 
@@ -229,7 +229,7 @@ python scripts/chatgpt_send.py --tail <conv_id>
 python -m unittest discover -s tests -v
 ```
 
-240 条，覆盖 id 校验与路径穿越、状态文件损坏隔离、原子写（tmp 名唯一，防同进程多线程互踩）与并发 80 次不丢更新、锁重入/stale 回收/持有者身份、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性、设备身份留存与多设备回退（含凭据剔除、429 停手、归属自愈），以及用离线桩跑通的投递主流程（含 413、空提示词、非法 id、发送异常时的孤儿会话登记）；出口代理（优先级、fail-closed、http/socks 真分流、死节点探测、出口判定、目标站探活、WebRTC 泄漏分类）；B8 六进程并发抢槽（抢不到锁即 QUEUED、半截槽位不回收）、B15 租约心跳与超时两档；交付正文托管（`--extract` 字节级、CRLF 不改、标记不唯一退 2、`--verify-copy` 单字节差异即拒）；调度口径（`--check-name` 12 条命名契约、`--check-schedule` 1 小时维度、`--check-oneshot` 一次性窗口）；证据矩阵自校验（条款与证据一一对应，引用不存在的用例即红）。**改锁、改落盘、改 id、改设备身份、改代理、改基线条款前先跑一遍。**
+257 条，覆盖 id 校验与路径穿越、状态文件损坏隔离、原子写（tmp 名唯一，防同进程多线程互踩）与并发 80 次不丢更新、锁重入/stale 回收/持有者身份、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性、设备身份留存与多设备回退（含凭据剔除、429 停手、归属自愈），以及用离线桩跑通的投递主流程（含 413、空提示词、非法 id、发送异常时的孤儿会话登记）；出口代理（优先级、fail-closed、http/socks 真分流、死节点探测、出口判定、目标站探活、WebRTC 泄漏分类）；B8 六进程并发抢槽（抢不到锁即 QUEUED、半截槽位不回收）、B15 租约心跳与超时两档；交付正文托管（`--extract` 字节级、CRLF 不改、标记不唯一退 2、`--verify-copy` 单字节差异即拒）；调度口径（`--check-name` 12 条命名契约、`--check-schedule` 1 小时维度、`--check-oneshot` 一次性窗口）；证据矩阵自校验（条款与证据一一对应，引用不存在的用例即红）。**改锁、改落盘、改 id、改设备身份、改代理、改基线条款前先跑一遍。**
 
 ### 交付正文与排程口径的机器闸口（v1.8）
 
@@ -343,7 +343,7 @@ python scripts/chatgpt_send.py --proxy-clear                # 清掉 proxy.json 
 
 ### tests/
 
-- `test_hardening.py` — 离线回归（240 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW、设备身份留存与多设备回退、出口代理（含本地假 http/socks 代理真分流）。
+- `test_hardening.py` — 离线回归（257 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW、设备身份留存与多设备回退、出口代理（含本地假 http/socks 代理真分流）。
 
 ## 协议细节
 
