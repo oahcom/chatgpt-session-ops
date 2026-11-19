@@ -2567,10 +2567,18 @@ def _socks5_open(cfg, host, port, timeout=None):
 
     urllib 的 ProxyHandler 只认 http 代理：`socks5h://` 塞进去会直接
     「unknown url type」。所以 socks 走自定义连接类，而不是靠 ProxyHandler。
+    F-36：端口字段先收敛再用——垃圾端口抛 OSError（本函数的失败契约），
+    绝不让 int()/struct.pack 的 TypeError/OverflowError 穿出。
     """
+    dst_port = _as_int(port, None)
+    if dst_port is None or not (0 < dst_port < 65536):
+        raise OSError("目标端口非法：%r" % (port,))
+    proxy_port = _as_int(_as_dict(cfg).get("port"), None)
+    if proxy_port is None or not (0 < proxy_port < 65536):
+        raise OSError("SOCKS 代理端口非法：%r" % (_as_dict(cfg).get("port"),))
     if host in PROXY_BYPASS_HOSTS:
-        return socket.create_connection((host, int(port)), timeout)   # 本机直连
-    s = socket.create_connection((cfg["host"], int(cfg["port"])), timeout)
+        return socket.create_connection((host, dst_port), timeout)   # 本机直连
+    s = socket.create_connection((_as_dict(cfg).get("host") or "127.0.0.1", proxy_port), timeout)
     try:
         if timeout:
             s.settimeout(timeout)
@@ -2585,8 +2593,8 @@ def _socks5_open(cfg, host, port, timeout=None):
             if not cfg["user"]:
                 raise OSError("SOCKS5 代理要求用户名密码，但地址里没带")
             u = cfg["user"].encode("utf-8")
-            p = cfg["password"].encode("utf-8")
-            s.sendall(b"\x01" + bytes([len(u)]) + u + bytes([len(p)]) + p)
+            pw = cfg["password"].encode("utf-8")
+            s.sendall(b"\x01" + bytes([len(u)]) + u + bytes([len(pw)]) + pw)
             _v, status = _recv_exact(s, 2)
             if status != 0:
                 raise OSError("SOCKS5 认证失败（status=%d）" % status)
@@ -2600,7 +2608,7 @@ def _socks5_open(cfg, host, port, timeout=None):
             except OSError:
                 addr, atyp = host.encode("utf-8"), 3
         head = bytes([atyp]) if atyp == 1 else bytes([atyp, len(addr)]) if atyp == 3 else b""
-        s.sendall(b"\x05\x01\x00" + head + addr + struct.pack(">H", int(port)))
+        s.sendall(b"\x05\x01\x00" + head + addr + struct.pack(">H", dst_port))
         rep = _recv_exact(s, 4)
         if rep[1] != 0:
             raise OSError("SOCKS5 CONNECT 被拒（code=%d，4=主机不可达 5=连接被拒）" % rep[1])
@@ -3590,7 +3598,15 @@ class AnonBrowser:
     COMPOSER = "#mobile-composer-prompt, #prompt-textarea"
 
     def __init__(self, port=None, cdp_dir=None):
-        self.port = int(port or os.environ.get("CHATGPT_ANON_CDP_PORT") or 9333)
+        # F-36：端口是不可信配置（参数/环境变量）——int() 的 TypeError/ValueError/
+        # OverflowError 不得穿出构造器。变量写错不该让匿名通道起不来（与
+        # CHATGPT_REPLY_MAX_CHARS「变量写错不该让整次收割白跑」同口径：降级 + WARN）。
+        raw = port or os.environ.get("CHATGPT_ANON_CDP_PORT") or 9333
+        p = _as_int(raw, None)
+        if p is None or not (0 < p < 65536):
+            print("WARN: CDP 端口非法：%r（回退默认 9333）" % (raw,), flush=True)
+            p = 9333
+        self.port = p
         self.cdp_dir = cdp_dir or os.environ.get("CHATGPT_CDP_DIR") or os.path.join(
             os.path.expanduser("~"), ".workbuddy", "skills", "browser-automation-cdp", "scripts")
         self._client = None

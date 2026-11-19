@@ -1139,6 +1139,24 @@ class TestAnonSendFailure(TmpBase):
         self.assertIsNotNone(s, "异常路径也必须登记会话，否则就是查不到的孤儿")
         self.assertEqual(s.get("device"), DEV_A, "设备号必须取浏览器侧的，不能取空的 api.cookie")
 
+    def test_anon_browser_port_pollution_degrades_to_default(self):
+        """F-36：CDP 端口是不可信配置——int() 的三类异常不得穿出构造器；
+        变量写错不该让匿名通道起不来（降级 9333 + WARN，与 CHATGPT_REPLY_MAX_CHARS 同口径）。"""
+        old = os.environ.pop("CHATGPT_ANON_CDP_PORT", None)
+        try:
+            for raw in ("notaport", "99999", "inf", "", "0"):
+                with self.subTest(env=raw):
+                    os.environ["CHATGPT_ANON_CDP_PORT"] = raw
+                    self.assertEqual(m.AnonBrowser().port, 9333)
+            for port in ([1], float("inf"), {"p": 1}, True, 70000):
+                with self.subTest(port=port):
+                    self.assertEqual(m.AnonBrowser(port=port).port, 9333)
+            self.assertEqual(m.AnonBrowser(port=9444).port, 9444, "合法端口不得被改")
+        finally:
+            os.environ.pop("CHATGPT_ANON_CDP_PORT", None)
+            if old is not None:
+                os.environ["CHATGPT_ANON_CDP_PORT"] = old
+
 
 # ---------------------------------------------------------------- 投递流程（离线桩）
 class FakeAPI:
@@ -1548,6 +1566,19 @@ class TestProxy(TmpBase):
                 self._cfg(autodetect=True, autodetect_ports=ports)
                 info = m.resolve_proxy_info(refresh=True)
                 self.assertEqual(info["url"], "", "畸形端口不得被探测成出口")
+
+    def test_socks5_open_junk_port_raises_oserror_not_typeerror(self):
+        """F-36：_socks5_open 的失败契约是 OSError——端口/配置垃圾不得让
+        int()/struct.pack 的 TypeError/OverflowError 穿出（那不是调用方预期的异常族）。"""
+        for cfg, port in (({"host": "127.0.0.1", "port": 1080}, [1]),
+                          ({"host": "127.0.0.1", "port": 1080}, float("inf")),
+                          ({"host": "127.0.0.1", "port": 1080}, 99999),
+                          ({"host": "127.0.0.1", "port": "abc"}, 443),
+                          ({"host": "127.0.0.1"}, 443),
+                          ("junk", 443)):
+            with self.subTest(cfg=cfg, port=port):
+                with self.assertRaises(OSError):
+                    m._socks5_open(cfg, "example.com", port, 0.2)
 
     def test_env_beats_file(self):
         self._cfg(url="socks5h://file:1080")
