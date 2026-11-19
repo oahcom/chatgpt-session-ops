@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**十五轮对外对抗审查**逐条改写（每轮裁定见 §F；**第十四轮 `PASS`**，第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五轮抓出 stale 锁回收 TOCTOU（F-02），已修复待复审），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 176 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**十六轮对外对抗审查**逐条改写（每轮裁定见 §F；**第十四轮 `PASS`**，第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五轮抓出 stale 锁回收 TOCTOU（F-02）、第十六轮抓出进程存活二态误判（F-03），均已修复待复审），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 180 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -34,7 +34,7 @@
 | 2 | 这个会话归谁 | `--owner <conv_id>` | 输出唯一账号 |
 | 3 | 配额有没有冷却 | `--rotation` | `unavailable` 为空或目标账号不在其中 |
 | 4 | 匿名要用先看设备 | `--anon-devices` | 目标设备 `jar=true` |
-| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 176 条） |
+| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 180 条） |
 
 ### A1–A4 内容主权（不可协商）
 
@@ -335,7 +335,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | automation 名称 / 排程 | 同上 + `--check-name`、`--check-schedule`、`--check-oneshot` | B1/B4/B5/B10/B11 |
 | 排程口径 | `automation_update list` 全量盘点 | B1–B5 |
 
-**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 176 条。
+**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 180 条。
 
 ---
 
@@ -388,6 +388,10 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | 15 | v1.8 修订 | `NEEDS-REVISION`（F-02 唯一实现级：stale 锁回收 TOCTOU） | 第十四轮 PASS 后按「继续挖 flaky」动作抓到并发丢更新真 bug（4 线程×20 次只落 45/10，伴随「跳过加锁」WARN）；修复过程分两层（两层锁 + fail-closed）提交审查，审查认可两层锁设计方向，但抓到 stale 回收竞态：「判定 stale → `os.remove()`」两步间另一进程可能已删旧建新，迟到者把**新锁**删掉 = 跨进程互斥失效；另要求补真多进程竞争测试、约束非 strict 误用 |
 
 **第十五轮改了什么**：① stale 回收改为「内核文件锁守卫内**重新判定** + 删除」（`_try_reclaim_stale` + `_kernel_lock`：msvcrt.locking/fcntl.flock，进程死亡自动释放，无递归 stale 问题）；迟到的回收者守卫内看到活锁即拒绝删除；守卫文件永不删除。② `_file_lock` 默认翻 `strict=True`（误用边界）。③ 补五条回归：`test_reclaim_removes_only_stale_lock` / `test_reclaim_does_not_delete_fresh_lock` / `test_reclaim_race_two_threads_never_double_enter` / `test_reclaim_race_multi_process_mutual_exclusion`（**真两进程**竞争，断言临界区绝不重叠、事件数不丢）/ `test_file_lock_defaults_to_strict`。
+
+| 16 | v1.8 修订 | `NEEDS-REVISION`（F-03 唯一实现级：进程存活二态误判） | F-02 核销，回收守卫设计成立，守卫文件永久保留被判「接受」；但抓出 `_proc_alive()` 把「进程不存在」与「无权限查询/系统调用失败」折叠成同一个 False，`_lock_holder_stale` 一看 False 就判死回收——「查不到」被当成「死了」，活锁会被误删（内核守卫只保证回收者互斥，纠正不了错误的死亡判定） |
+
+**第十六轮改了什么**：① `_proc_alive` 二态 → `_proc_state` 三态（`PROC_DEAD` / `PROC_ALIVE` / `PROC_UNKNOWN`），只有确认 DEAD 才可回收；UNKNOWN（EPERM / ERROR_ACCESS_DENIED / 查询失败 / pid 不可解析）一律按「可能还活着」保守处理。Windows 按 `OpenProcess` 错误码分桶（`_win_open_error_to_state`：87/1168 → DEAD，5 等 → UNKNOWN），POSIX 按 errno 分桶（ESRCH → DEAD，EPERM 等 → UNKNOWN）。② 三条回收路径同步阻断：`_lock_holder_stale`（UNKNOWN 不判 stale）、`_lease_reclaimable`（UNKNOWN → `identity_unreadable` 禁回收）、`lease_force_release`（UNKNOWN 无 `identity_evidence` → `identity_unconfirmed` 拒绝）。③ 补四条回归：`test_proc_state_three_way_semantics` / `test_proc_state_unknown_blocks_lock_reclaim` / `test_proc_state_unknown_blocks_lease_reclaim` / `test_proc_state_unknown_blocks_force_release`；多进程竞争测试加启动屏障（两进程同起跑才构成真实竞争）。
 
 **第十四轮之后补的一条**：审查把「`_record_corruption("lease-recovery-failed")` 自己失败会怎样」列为残余风险 3，虽不构成裁定理由，但这是能离线证明的，于是补 `test_quarantine_failed_row_write_failure_is_survivable`（第一次登记成功、第二次返回 `None`，断言不抛异常、仍返回 `quarantine_failed`、租约原样在）。**属于 PASS 后的加证，不改变任何条款口径**，故不重开一轮审查。
 

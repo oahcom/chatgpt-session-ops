@@ -333,6 +333,70 @@ class TestStateFiles(TmpBase):
         self.assertIs(sig.parameters["strict"].default, True,
                       "_file_lock 默认应为 strict=True")
 
+    def test_proc_state_three_way_semantics(self):
+        """F-03：进程判定必须三态。查不到（UNKNOWN）≠ 死了（DEAD）。"""
+        self.assertEqual(m._proc_state(os.getpid()), m.PROC_ALIVE, "自己应判 ALIVE")
+        self.assertEqual(m._proc_state(999999), m.PROC_DEAD, "不存在的 pid 应判 DEAD")
+        self.assertEqual(m._proc_state("garbage"), m.PROC_UNKNOWN, "不可解析 pid 应判 UNKNOWN")
+        self.assertEqual(m._proc_state(None), m.PROC_UNKNOWN)
+        self.assertEqual(m._proc_state(-5), m.PROC_UNKNOWN, "非法 pid 应判 UNKNOWN")
+        # Windows 错误码映射：明确不存在 → DEAD，无权限等 → UNKNOWN
+        self.assertEqual(m._win_open_error_to_state(87), m.PROC_DEAD)    # ERROR_INVALID_PARAMETER
+        self.assertEqual(m._win_open_error_to_state(1168), m.PROC_DEAD)  # ERROR_NOT_FOUND
+        self.assertEqual(m._win_open_error_to_state(5), m.PROC_UNKNOWN)  # ERROR_ACCESS_DENIED
+        self.assertEqual(m._win_open_error_to_state(0), m.PROC_UNKNOWN)  # 意外值保守处理
+
+    def test_proc_state_unknown_blocks_lock_reclaim(self):
+        """F-03 事故路径：查询失败被当成死亡 → 活锁被误删。UNKNOWN 绝不能触发回收。"""
+        p = os.path.join(self.tmp, "f03.json")
+        lock = p + ".lock"
+        with open(lock, "w", encoding="utf-8") as f:
+            json.dump({"pid": 4242, "process_start_time": 7,
+                       "created_at": time.time() - 999}, f)
+        real_state = m._proc_state
+        m._proc_state = lambda pid: m.PROC_UNKNOWN   # 模拟无权限/查询失败
+        try:
+            self.assertFalse(m._lock_holder_stale(lock),
+                             "UNKNOWN 不是死亡证据，不得判 stale")
+            self.assertFalse(m._try_reclaim_stale(lock),
+                             "UNKNOWN 状态下回收必须失败")
+            self.assertTrue(os.path.exists(lock), "活锁被误删 = 跨进程互斥失效")
+        finally:
+            m._proc_state = real_state
+
+    def test_proc_state_unknown_blocks_lease_reclaim(self):
+        """F-03 租约同款：UNKNOWN 不得按 process_gone 回收。"""
+        real_state = m._proc_state
+        m._proc_state = lambda pid: m.PROC_UNKNOWN
+        try:
+            ok, why = m._lease_reclaimable({
+                "run_id": "r1", "lease_until": time.time() - 1,
+                "pid": 4242, "process_start_time": 7})
+        finally:
+            m._proc_state = real_state
+        self.assertFalse(ok, "UNKNOWN 状态的租约禁止回收")
+        self.assertEqual(why, "identity_unreadable")
+
+    def test_proc_state_unknown_blocks_force_release(self):
+        """F-03 强制恢复同款：UNKNOWN 无独立确认依据时必须拒绝。"""
+        path = os.path.join(self.tmp, "lease-f03.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"pid": 4242, "process_start_time": 7, "run_id": "rid"}, f)
+        approval = os.path.join(self.tmp, "approve-f03.json")
+        with open(approval, "w", encoding="utf-8") as f:
+            json.dump({"sha256": m._sha256_file(path),
+                       "approved_at": "2026-11-19T16:00:00+08:00",
+                       "approver": "owner", "reason": "looks dead"}, f)
+        real_state = m._proc_state
+        m._proc_state = lambda pid: m.PROC_UNKNOWN
+        try:
+            ok, why = m.lease_force_release(path, approval)
+        finally:
+            m._proc_state = real_state
+        self.assertFalse(ok, "UNKNOWN 状态不得凭批准放行")
+        self.assertEqual(why, "identity_unconfirmed")
+        self.assertTrue(os.path.exists(path))
+
     def test_reclaim_removes_only_stale_lock(self):
         """确认已死的残留锁：回收成功，且只删这一份。"""
         p = os.path.join(self.tmp, "rc1.json")
@@ -394,13 +458,16 @@ class TestStateFiles(TmpBase):
             json.dump({"pid": 999999, "process_start_time": 1,
                        "created_at": time.time() - 999}, f)
         worker = os.path.join(self.tmp, "rc4_worker.py")
+        gate = os.path.join(self.tmp, "rc4.gate")
         with open(worker, "w", encoding="utf-8") as f:
             f.write(
                 "import os, sys, time, importlib.util\n"
                 "spec = importlib.util.spec_from_file_location('cgs', sys.argv[1])\n"
                 "m = importlib.util.module_from_spec(spec)\n"
                 "spec.loader.exec_module(m)\n"
-                "path, log, n = sys.argv[2], sys.argv[3], int(sys.argv[4])\n"
+                "path, log, n, gate = sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]\n"
+                "while not os.path.exists(gate):\n"   # 启动屏障：两进程同时起跑才构成真实竞争
+                "    time.sleep(0.005)\n"
                 "for i in range(n):\n"
                 "    with m._file_lock(path, timeout=15, strict=True):\n"
                 "        open(log, 'a', encoding='utf-8').write('ENTER %s %f\\n' % (os.getpid(), time.time()))\n"
@@ -413,8 +480,9 @@ class TestStateFiles(TmpBase):
             ef = open(os.path.join(self.tmp, "rc4_err%d.log" % i), "wb")
             err_logs.append(ef)
             procs.append(subprocess.Popen(
-                [sys.executable, worker, os.path.abspath(SCRIPT), p, log, "2"],
+                [sys.executable, worker, os.path.abspath(SCRIPT), p, log, "2", gate],
                 stdout=subprocess.DEVNULL, stderr=ef))
+        open(gate, "w").close()   # 两进程都起来后放行
         for ef in err_logs:
             ef.close()
         errs = ""
@@ -1335,15 +1403,15 @@ class TestProxy(TmpBase):
     def test_lock_unknown_identity_kept(self):
         """进程身份读不到 → 宁可等超时也不误删活锁。"""
         lock = os.path.join(self.tmp, "d.json.lock")
-        real_alive, real_start = m._proc_alive, m._proc_start_time
+        real_state, real_start = m._proc_state, m._proc_start_time
         try:
-            m._proc_alive = lambda pid: True
+            m._proc_state = lambda pid: m.PROC_ALIVE
             m._proc_start_time = lambda pid: None
             self._write_lock(lock, {"pid": 4242, "process_start_time": 7,
                                     "created_at": time.time() - 999})
             self.assertFalse(m._lock_holder_stale(lock))
         finally:
-            m._proc_alive, m._proc_start_time = real_alive, real_start
+            m._proc_state, m._proc_start_time = real_state, real_start
 
     def test_lock_legacy_format_uses_mtime(self):
         """老格式（无 pid）退化为 mtime 判据，保持兼容。"""
@@ -1893,15 +1961,15 @@ class TestSlotsAndLease(TmpBase):
         self.assertEqual(why, "pid_reused")
 
     def test_lease_identity_unreadable_keeps(self):
-        alive, start = m._proc_alive, m._proc_start_time
+        state, start = m._proc_state, m._proc_start_time
         try:
-            m._proc_alive = lambda pid: True
+            m._proc_state = lambda pid: m.PROC_ALIVE
             m._proc_start_time = lambda pid: None
             ok, why = m._lease_reclaimable({
                 "run_id": "r1", "lease_until": self._now() - 1,
                 "pid": 4242, "process_start_time": 7})
         finally:
-            m._proc_alive, m._proc_start_time = alive, start
+            m._proc_state, m._proc_start_time = state, start
         self.assertFalse(ok)
         self.assertEqual(why, "identity_unreadable")
 

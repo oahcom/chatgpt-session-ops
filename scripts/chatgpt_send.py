@@ -606,32 +606,64 @@ def _thread_lock_for(path):
         return lk
 
 
-def _proc_alive(pid):
-    """进程是否还在（只判存在，不判身份）。读不到一律按「不在」之外的保守侧处理。"""
+PROC_DEAD = "DEAD"        # 确认进程不存在
+PROC_ALIVE = "ALIVE"      # 确认进程存活
+PROC_UNKNOWN = "UNKNOWN"  # 无权限 / 查询失败 / 身份无法确认
+
+
+def _win_open_error_to_state(err):
+    """OpenProcess 失败原因分桶（F-03）：明确不存在 → DEAD，其余 → UNKNOWN。
+
+    ERROR_INVALID_PARAMETER(87) / ERROR_NOT_FOUND(1168) = 进程不存在；
+    ERROR_ACCESS_DENIED(5) 等 = 进程可能存在但查不了——那是 UNKNOWN，不是死亡。
+    """
+    if err in (87, 1168):
+        return PROC_DEAD
+    return PROC_UNKNOWN
+
+
+def _proc_state(pid):
+    """进程存活三态判定（F-03）：DEAD / ALIVE / UNKNOWN。
+
+    为什么三态：旧版 `_proc_alive` 只返回 bool，把「进程不存在」与「无权限查询、
+    系统调用失败」折叠成同一个 False。`_lock_holder_stale` 一看 False 就判死回收，
+    于是「查不到」被当成「死了」——活锁会被误删，跨进程互斥失效（第十六轮审查 F-03）。
+    现在只有确认 DEAD 才允许回收；UNKNOWN 一律按「可能还活着」保守处理。
+
+    返回值语义：
+      DEAD    —— 系统明确说进程不存在（ESRCH / ERROR_INVALID_PARAMETER 等）；
+      ALIVE   —— 系统确认进程存活（后续还要比对启动时间防 PID 复用）；
+      UNKNOWN —— 无权限（EPERM / ERROR_ACCESS_DENIED）、查询失败、pid 不可解析。
+    """
     try:
         pid = int(pid)
     except (TypeError, ValueError):
-        return False
+        return PROC_UNKNOWN   # 身份不可解析 ≠ 死亡
     if pid <= 0:
-        return False
+        return PROC_UNKNOWN
     try:
         if os.name == "nt":
             import ctypes
             k32 = ctypes.WinDLL("kernel32", use_last_error=True)
             h = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
             if not h:
-                return False
+                return _win_open_error_to_state(ctypes.get_last_error())
             try:
                 code = ctypes.c_ulong()
                 if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
-                    return False
-                return code.value == 259              # STILL_ACTIVE
+                    return PROC_UNKNOWN               # 查询失败 ≠ 死亡
+                return PROC_ALIVE if code.value == 259 else PROC_DEAD   # STILL_ACTIVE
             finally:
                 k32.CloseHandle(h)
-        os.kill(pid, 0)
-        return True
+        import errno
+        try:
+            os.kill(pid, 0)
+            return PROC_ALIVE
+        except OSError as e:
+            # ESRCH=明确不存在；EPERM=存在但无权限信号（POSIX 语义），其余同 UNKNOWN
+            return PROC_DEAD if e.errno == errno.ESRCH else PROC_UNKNOWN
     except Exception:
-        return False
+        return PROC_UNKNOWN   # 意外异常同样不能当死亡证据
 
 
 def _proc_start_time(pid):
@@ -694,7 +726,12 @@ def _lock_holder_stale(lock):
         created = 0.0
     if time.time() - created <= LOCK_STALE_SEC:
         return False
-    if not _proc_alive(pid):
+    # F-03：只有确认 DEAD 才可回收。UNKNOWN（无权限查询/系统调用失败）绝不当死亡
+    # ——「查不到」不是「死了」，UNKNOWN 回收活锁 = 跨进程互斥失效。
+    state = _proc_state(pid)
+    if state == PROC_UNKNOWN:
+        return False
+    if state == PROC_DEAD:
         return True
     cur = _proc_start_time(pid)
     if cur is None:
@@ -896,7 +933,11 @@ def _lease_reclaimable(info, now=None, expect_run_id=None):
         until = 0.0
     if now < until:
         return False, "lease_valid"
-    if not _proc_alive(info.get("pid")):
+    # F-03：只有确认 DEAD 才算 process_gone；UNKNOWN（查不到）禁止回收
+    state = _proc_state(info.get("pid"))
+    if state == PROC_UNKNOWN:
+        return False, "identity_unreadable"
+    if state == PROC_DEAD:
         return True, "process_gone"
     cur = _proc_start_time(info.get("pid"))
     if cur is None:
@@ -1095,12 +1136,19 @@ def _force_release_locked(path, approval_path):
         return False, "unreadable"
     if got != want:
         return False, "sha256_mismatch"
-    # R3/R4：能读出 pid 且进程还活着 → 不许恢复（文件坏了不代表进程死了）
+    # R3/R4：能读出 pid 且进程还活着 → 不许恢复（文件坏了不代表进程死了）。
+    # F-03：三态判定——UNKNOWN（无权限查询）不是死亡证据，走 identity_unconfirmed
+    # 同款口径（必须有独立确认依据），绝不因「查不到」放行。
     info, readable = _read_ephemeral(path)
     if readable:
         pid = info.get("pid")
-        if pid and _proc_alive(pid):
-            return False, "process_alive"
+        if pid:
+            state = _proc_state(pid)
+            if state == PROC_ALIVE:
+                return False, "process_alive"
+            if state == PROC_UNKNOWN:
+                if not str(approval.get("identity_evidence") or "").strip():
+                    return False, "identity_unconfirmed"
     else:
         # 身份读不出来 ≠ 原实例已死。必须由批准人给出独立确认依据（例如进程表快照、
         # 子进程检查、B7 状态核对结果），否则拒绝——不能让「批准」替「证据」。
