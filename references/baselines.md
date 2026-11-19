@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**二十八轮对外对抗审查**逐条改写（每轮裁定见 §F；**第二十五轮 `PASS`——锁子系统全文最终确认·收敛**，第二十二轮 `PASS`（F-10 残留定向复审），**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至二十三轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08）、锁元数据写入失败进临界区（F-09）、损坏启动时间误判 pid_reused（F-10）、归档覆盖（F-11）、超长 pid 串 int() 异常逃逸（F-07 残留）、**收割/对账解析器畸形 JSON 崩溃（F-12，41 处）**、**落点不一致只 WARN 导致会话身份与回复归属分裂（F-13）**、**RRULE 校验语义 ≠ 下发语义（F-14）**、**解析边界与证据保全缺口（F-15～F-19）**——前 11 组已在第二十五轮核销，F-12～F-19 已修待复审），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 257 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**二十九轮对外对抗审查**逐条改写（每轮裁定见 §F；**第二十五轮 `PASS`——锁子系统全文最终确认·收敛**，第二十二轮 `PASS`（F-10 残留定向复审），**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至二十三轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08）、锁元数据写入失败进临界区（F-09）、损坏启动时间误判 pid_reused（F-10）、归档覆盖（F-11）、超长 pid 串 int() 异常逃逸（F-07 残留）、**收割/对账解析器畸形 JSON 崩溃（F-12，41 处）**、**落点不一致只 WARN 导致会话身份与回复归属分裂（F-13）**、**RRULE 校验语义 ≠ 下发语义（F-14）**、**解析边界与证据保全缺口（F-15～F-19）**、**落点正则绕过与回复完整性 fail-open（F-13/F-16 残留 + F-23～F-25）**——前 11 组已在第二十五轮核销，F-12～F-25 已修待复审），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 265 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -34,7 +34,7 @@
 | 2 | 这个会话归谁 | `--owner <conv_id>` | 输出唯一账号 |
 | 3 | 配额有没有冷却 | `--rotation` | `unavailable` 为空或目标账号不在其中 |
 | 4 | 匿名要用先看设备 | `--anon-devices` | 目标设备 `jar=true` |
-| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 257 条） |
+| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 265 条） |
 
 ### A1–A4 内容主权（不可协商）
 
@@ -65,10 +65,10 @@
 
 | 编号 | 基线 | 判定口径 | 违例后果 |
 |---|---|---|---|
-| **A10** | 发进既有会话**必带** `conversation_id`，且**落点必须一致** | 请求体含该字段；发送后 SSE **首个带 `conversation_id` 的** `data:` 事件的 id 与目标**相等**；同一响应出现两个不同 id → 无法确认落点，**判失败**；落点不一致 → **判失败**（不返回成功、不归档为目标会话的正常回复）、回复写入**独立隔离归档**（**目录在 `replies/` 之外**，记 `target_conv_id`/`actual_conv_id`/异常原因；**完整原始响应**另存并记路径/长度/sha256）、实际落点会话另记**待认领登记**（**不自动登记归属**，人工确认后再登记）、失败返回**携带两个 id**，**禁止静默改归属**；`[DONE]` 是**解析终点**，其后的数据不参与落点证明；同一响应出现多个 id → 失败关闭且**带候选 id 列表** | 消息静默落入全新会话（已发生事故）；回复落在别的会话却被当成 A 的回复继续操作 |
+| **A10** | 发进既有会话**必带** `conversation_id`，且**落点必须一致** | 请求体含该字段；发送后 SSE **首个带 `conversation_id` 的** `data:` 事件的 id 与目标**相等**；同一响应出现两个不同 id → 无法确认落点，**判失败**；**禁止正文正则兜底**——落点只信 SSE 首个结构化事件里的 id，不得从 `[DONE]` 之后或整包正文捞 id；落点不一致 → **判失败**（不返回成功、不归档为目标会话的正常回复）、回复写入**独立隔离归档**（**目录在 `replies/` 之外**，记 `target_conv_id`/`actual_conv_id`/异常原因；**完整原始响应**另存并记路径/长度/sha256；**隔离文件名必须避唯一名**——同秒同对会话的两次异常投递不得互相覆盖证据）、实际落点会话另记**待认领登记**（**不自动登记归属**，人工确认后再登记）、失败返回**携带两个 id**，**禁止静默改归属**；`[DONE]` 是**解析终点**，其后的数据不参与落点证明；同一响应出现多个 id → 失败关闭且**带候选 id 列表** | 消息静默落入全新会话（已发生事故）；回复落在别的会话却被当成 A 的回复继续操作 |
 | **A11** | 200 即停止轮转 | 200 后立刻停止；id 解析顺序 SSE（**首个带 id 的事件**，坏事件跳过但不得改用后面的 id）→ 整包 JSON → 严格字段匹配；只接受**唯一、非空、符合 A19 白名单**的 id；解析不出、不合规、或同一响应出现多个不同 id → **返回 1、不落盘、不重投**（不许回落到传入 id 粉饰成功）；失败结果**带 target 与候选 id**，不得把诊断信息丢掉 | 同一 prompt 建出多个会话 |
 | **A12** | 大交付用 raw mapping 核对 | GET 全量 → 按原始顺序取目标 assistant 全部 parts → 记录 `message_id / part数 / 各part字符数 / 拼接 SHA-256`；与 `DONE chars` 同口径比对；缺 part、重复消息、口径不一致 → 判**不完整**（结论：补采，不是要模型重发）；保留原始 mapping 备查 | 流截断与真实生成失败无法区分 |
-| **A13** | 回复默认全文落盘 | `CHATGPT_REPLY_MAX_CHARS` 默认 0；非 0 时文件头必须写明截断点与原始长度 | 归档只留尾巴，结论丢失 |
+| **A13** | 回复默认全文落盘（SSE 不完整时内容照收但**归档文本必须标注「完整性未证明」**，不得冒充定稿） | `CHATGPT_REPLY_MAX_CHARS` 默认 0；非 0 时文件头必须写明截断点与原始长度 | 归档只留尾巴，结论丢失 |
 | **A14** | 投递前先落设备身份 | 发送**开始前**经 CDP `Storage.getCookies` 取 jar（含 HttpOnly），从目标浏览器上下文读 `oai-did`（**不得**用可能为空的 `api.cookie`）；写盘后**重新读取并校验 SHA-256 与 oai-did 一致**；任一失败 `exit 1` 禁止发送 | 会话建出来但读不回来（死档） |
 
 ### A15–A18 限速与失败分级
@@ -179,7 +179,7 @@
 
 | 编号 | 基线 | 判定口径 | 违例后果 |
 |---|---|---|---|
-| **B1** | 周期任务固定 1 小时 | `rrule` 必须 `FREQ=HOURLY;INTERVAL=1`；禁止 `DAILY/WEEKLY/MONTHLY`；**禁止用 `INTERVAL<1` 表示高频**；**禁止重复 rule part**（RFC 5545 §3.3.10，如 `FREQ=DAILY;FREQ=HOURLY` 一律拒绝）；`INTERVAL` 按 RFC 十进制整数严格解析、不得含内部空白（**不调用 `int()`**——超长十进制串会让 `int()` 抛 ValueError 逃逸）；**下发必须是校验后重建的规范化 RRULE**，不得下发用户原始串；**唯一可执行字段是 `rrule`**，原始串只作审计留档；枚举值大小写不敏感（`freq=hourly` 合法，规范化为 `HOURLY`）；同一 automation 实际触发间隔 ≥60 分钟；时区统一 `Asia/Shanghai`，缺失即禁止启用 | 天维度过久 / 语义漂移；校验按「最后一个同名 key」而下发按「第一个」——周期被确定性绕过 |
+| **B1** | 周期任务固定 1 小时 | `rrule` 必须 `FREQ=HOURLY;INTERVAL=1`；禁止 `DAILY/WEEKLY/MONTHLY`；**禁止用 `INTERVAL<1` 表示高频**；**禁止重复 rule part**（RFC 5545 §3.3.10，如 `FREQ=DAILY;FREQ=HOURLY` 一律拒绝）；`INTERVAL` 按 RFC 十进制整数严格解析、不得含内部空白（**不调用 `int()`**——超长十进制串会让 `int()` 抛 ValueError 逃逸；rule part 正则**不得配 `re.S`**，换行不得当 VALUE 放行）；**下发必须是校验后重建的规范化 RRULE**，不得下发用户原始串；**唯一可执行字段是 `rrule`**，原始串只作审计留档；枚举值大小写不敏感（`freq=hourly` 合法，规范化为 `HOURLY`）；同一 automation 实际触发间隔 ≥60 分钟；时区统一 `Asia/Shanghai`，缺失即禁止启用 | 天维度过久 / 语义漂移；校验按「最后一个同名 key」而下发按「第一个」——周期被确定性绕过 |
 | **B2** | 到期项走每小时条件巡检 | 状态文件持久化三态 `PENDING/RUNNING/DONE`：未到点→`exit 0` 静默；到点且 `PENDING`→**原子领取**后才可执行；`RUNNING` 且租约有效→退出；`DONE`→`exit 0`；`FAILED`→按 B13；**先持久化 `DONE` 再结束**；状态文件读写失败→`exit 1` 禁止处置 | 重复处置、漏处置 |
 | **B3** | 长周期用 `validFrom/validUntil` 收窗 | 带时区 ISO 8601，窗口**左闭右开** `[from, until)`；窗口外 `exit 0` 不做业务；`until` 到点标 `EXPIRED`，不得再执行（除非新实例） | 窗外执行或永久残留 |
 | **B4** | 一次性看门狗寿命 ≤1h | `scheduledAt` 带时区；创建时 `0 < scheduledAt - now ≤ 3600s`；已过去的不得建成 ACTIVE；更远的需求改 B2；单次运行上限 3600s，超时先取消执行体、**确认执行体已停**才记 `TIMEOUT` 并释放租约（执行体不响应取消 → `TIMEOUT_ORPHAN` 保留租约，见 B15，不得在此处擅自释放） | 远期单点触发 / 长期占并发槽 |
@@ -335,7 +335,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | automation 名称 / 排程 | 同上 + `--check-name`、`--check-schedule`、`--check-oneshot` | B1/B4/B5/B10/B11 |
 | 排程口径 | `automation_update list` 全量盘点 | B1–B5 |
 
-**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 257 条。
+**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 265 条。
 
 ---
 
@@ -433,8 +433,18 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | 28 | v1.8 修订 | `NEEDS-REVISION`（F-15/F-16/F-17/F-18/F-19） | **F-12a/b/c 的核心修正基本闭环**（F-12a 承认「非字符串 part 必然畸形」不是对所有 ChatGPT 消息都成立——多模态 part 是合法对象）；**F-14 的重复项、规范化下发与大小写处理已闭环**，但要求明确契约边界。新判五处：**F-15** 显式 `message: null` 与「没有 message 字段」被混为一谈——前者是畸形事件却按正常事件放过；**F-16** `[DONE]` 之后的事件仍参与落点证明——「先 [DONE]、后补另一个 id」会被接受；**F-17** id 歧义分支返回 `(1, None, None)`，丢掉了 target 与候选 id，机器调用方拿不到诊断信息；**F-18** 隔离档案只留 `resp_head` 前 800 字符，不满足「原始响应证据完整保全」——关键 id 可能正好落在截断部分；**F-19** `_scan_mapping` 把**用户消息**里的合法多模态 part 判成畸形，误报「assistant 回复残缺」。并对 F-13 四问定调：①「首个带 id 事件」符合 A10 条文，但须 `[DONE]` 即停；②409 在所贴调用点均按失败处理，但歧义分支要带诊断；③隔离目录必须**移出正常回复树**，不能只靠文件名 glob；④**不应自动 `record_conv(B)`**——服务器实际落点 ≠ 已确认归属，应另记**待认领登记**。对 F-14 四问定调：严格白名单（只允许 FREQ+INTERVAL）合理，但表达的是「只接受最简单的每小时重复规则」；`INTERVAL=+1` 合法（RFC integer ABNF 允许前导 `+`）；`rrule_input_echo` 有误用风险，应改成明确的审计字段名；**下游只读 `rrule`**，不要另加 `rrule_canonical` 制造第二个可执行字段 |
 
 **第二十七轮改了什么**：① **F-13 落点不一致改 fail-closed**：新增 `_sse_conv_ids()`（只取**首个**带 id 的 `data:` 事件，并汇总全部出现过的 id 供唯一性检查）、`ConvRef`（str 子类，失败返回同时携带 `target_conv_id`/`actual_conv_id`/`mismatch`）、`_quarantine_reply()`（写入 `replies/quarantine/` 独立隔离档案，头部记两个 id、HTTP 状态、原始响应摘要、回复 sha256 与全文）；`send_prompt` 里落点不一致时**判失败（状态 409）**、**不归档为目标会话的正常回复**、**不静默改归属**，截断补全文的 GET 目标改为**服务器实际写入的会话**（旧版按目标会话拉回来的是别的会话内容）；CLI 两个入口在失败时输出 `landing_mismatch` + 两个 id + 隔离档案路径。② **F-14 重写 `check_schedule`**：解析阶段**拒绝重复 rule part**、拒绝空/畸形 rule part、拒绝内部空白、`INTERVAL` 按 RFC 十进制整数正则严格解析（缺省按 1）、枚举值大小写不敏感但规范化为大写、拒绝 FREQ/INTERVAL 之外的 rule part；**下发改为由已验证字段重建的规范化 RRULE**（`FREQ=HOURLY;INTERVAL=1`），原始串只作为 `rrule_input_echo` 留档不下发。③ **F-12a/b/c**：`parts` 里混进非字符串元素时，`_scan_mapping` 跳过该节点并置 `complete=False`、`reply_digest` 整体返回 `None`、`_scan_sse` 跳过该事件并 `bad += 1`；SSE 里带 `message` 却缺 `author`/`author` 非 dict 的事件计入坏事件；`_as_ctime` 捕获大整数溢出、拒 NaN/±inf、拒超出 float64 精确整数范围的值；新增 `_parts_are_strings()` 统一判定。④ 补 22 条回归（218→240），新增 `TestMalformedParts`（8 条）、`TestLandingMismatch`（7 条）与 7 条 RRULE 契约用例。
+X=2` 会被当成单个合法 VALUE 放行；改为 `([^;
+
+]+)$` 并去掉 re.S，换行/分号一律畸形。补 2 条回归（257→259）。|
+| 29 | v1.8 修订 | `NEEDS-REVISION`（新会话独立复审：F-13/F-16 残留 + F-18/F-21/F-25 + F-23/F-24） | 原审查会话累积 113 节点/1MB，78k 提示词投递后 45 分钟无响应；改用**精简版提示词（30k）另开新会话** `6aff29ae`，63 秒返回裁定。新判：①**F-13/F-16 未闭环**——删掉 SSE 结构化解析后仍有**正文正则兜底**，能捞到 `[DONE]` 之后的 id（反例：先 start、再 `[DONE]`、后写 B）；②**F-18** 完整响应保全失败仍返回成功路径；③**F-21** 序号避唯一名是 TOCTOU，需 O_EXCL 原子独占；④**F-23（新）** SSE 不完整（无 `[DONE]` 且无 IncompleteRead）仍直接正常归档——**WARN 不是完整性保护**；⑤**F-24（新）** `reply_digest` 算出 chars/sha256 却没接进放行门禁，只拿同一批 full 自证；⑥**F-25（新）** 待认领登记失败被忽略。另要求补交 F-12/F-12c/F-22 的实现供独立核验。对收敛的裁定：锁子系统本轮未贴代码不重新确认；**回复完整性/收割链路未收敛**；RRULE 核心契约通过但 F-22 待核。|
 
 **第二十八轮改了什么**：① **F-15**——`_scan_sse` 改用 `"message" in obj` 区分「没有 message 字段」（合法非消息事件）与「显式 `message: null`/非 dict」（畸形事件，计入坏事件）。② **F-16**——`[DONE]` 改为**解析终点**：`_sse_conv_ids` 与 `_scan_sse` 都在见到 `[DONE]` 时 `break`，其后的 id 与内容一律不采信。③ **F-17**——`ConvRef` 增加 `candidate_ids`；id 歧义分支不再返回 `(1, None, None)`，而是返回带 `target_conv_id` 与 `candidate_ids` 的失败结果；「解析不出 id」「id 不合规」两条失败分支同样改为返回带 target 的 `ConvRef`；CLI 两个失败出口都补 `candidate_conv_ids`。④ **F-18**——`_quarantine_reply` 把**完整原始响应**另存为 `quarantine/*.resp.txt`，隔离头部记 `resp_path`/`resp_chars`/`resp_sha256`（800 字符的头部摘要只作速览）。⑤ **F-19**——新增 `_part_is_structured()` / `_split_parts()`，把 part 分成「文本 / 合法但不可文本化的结构化对象 / 非法」三类：用户消息里的结构化 part **不算畸形**（不再误报 assistant 回复残缺，其文本部分照收）；assistant 消息里的结构化 part 仍判对账整体不可用；非法 part 仍按 F-12a 处理。⑥ **F-20（自审发现，审查方要求确认）**——`check_schedule` 的 `INTERVAL` 改**不调用 `int()`**（Python 3.11+ 对超长十进制串会抛 ValueError，与 F-07 同型的异常逃逸），改为直接比数字串并加长度上限。⑦ **F-13 补强**——隔离目录从 `replies/quarantine/` 移到与 `replies/` **同级**的 `quarantine/`（下游按 `replies/**` 递归扫描也够不到，不靠 glob 兜底）；新增 `pending-claims.jsonl` **待认领登记**（记 target/actual/时间/隔离档案路径/原因/状态），**不自动 `record_conv(B)`**——服务器实际落点 ≠ 已确认归属。⑧ **F-14 补强**——审计字段改名 `original_input_for_audit_only` 并加 `executable_field: "rrule"`，**唯一可执行字段是 `rrule`**；并在 B1 条款里写明「严格白名单表达的是只接受最简单的每小时重复规则」，避免被当成「所有实际间隔一小时的 RRULE 都接受」。⑨ 补 17 条回归（240→257）。
+
+**第二十九轮改了什么（自审，待复审确认）**：① **F-21**——`_quarantine_reply` 的文件名加序号避唯一名：秒级时间戳不足以区分同秒同对会话的两次异常投递，旧实现会覆盖前一次的隔离档案与完整响应（证据永久丢失）；新实现从 `seq=0` 起找 `name`/`name-1`/`name-2`… 直到 `.md` 与 `.resp.txt` 都不存在。② **F-22**——`_RRULE_PART_RE` 由 `^([A-Za-z][A-Za-z0-9-]*)=(.+)$` 配 `re.S` 改为 `^([A-Za-z][A-Za-z0-9-]*)=([^;
+
+]+)$`（无 re.S），杜绝把换行后内容当合法 VALUE 放行。③ 补 2 条回归（`test_quarantine_same_second_never_overwrites` / `test_rrule_part_regex_rejects_newline_in_value`），257→259。
+
+**第二十九轮改了什么（依新会话裁定）**：① **F-13/F-16**——**删除整包 JSON 与正文正则 id 兜底**：落点证明只信 SSE 首个带 id 的结构化事件，解不出即失败关闭；反例「先 `[DONE]` 后写 B」实测返回 status=1、不落盘。② **F-21**——新增 `_atomic_create_exclusive()`（`O_WRONLY|O_CREAT|O_EXCL` 内核级占名），`_quarantine_reply` 改用它原子占名，冲突就换序号，**绝不覆盖**已存在的隔离证据。③ **F-18/F-25**——隔离三件事（完整响应、隔离档案、待认领登记）任一失败即 `evidence_complete=False`，随 `ConvRef` 返回给机器调用方，不再只打 WARN。④ **F-23/F-24**——完整性证明真正参与放行：GET 补全触发条件由「仅 last_truncated」扩到「SSE/mapping 任一不完整」；`digest_ok` 要求 `gcomplete` + parts 合计==拼接长度 + **摘要 sha256 == 按 parts 拼出的全文 sha256**（不再同源自证）；仍无法证明完整时**内容照收但归档文本自带「完整性未证明」声明**、`ConvRef.reply_complete=False`——既不违反第二十六轮「解析失败不能阻断归档」口径，也不让部分流冒充定稿。⑤ 自审另修 **F-22**：`_RRULE_PART_RE` 去掉 `re.S`、拒换行。⑥ 补 6 条回归（259→265）。
 
 **第十四轮之后补的一条**：审查把「`_record_corruption("lease-recovery-failed")` 自己失败会怎样」列为残余风险 3，虽不构成裁定理由，但这是能离线证明的，于是补 `test_quarantine_failed_row_write_failure_is_survivable`（第一次登记成功、第二次返回 `None`，断言不抛异常、仍返回 `quarantine_failed`、租约原样在）。**属于 PASS 后的加证，不改变任何条款口径**，故不重开一轮审查。
 

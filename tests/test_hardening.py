@@ -2161,6 +2161,15 @@ class TestParserEdges(TmpBase):
         self.assertFalse(complete)
         self.assertIn("坏事件 1 个", detail)
 
+    def test_atomic_create_exclusive_never_overwrites(self):
+        """F-21：O_EXCL 原子独占创建——已存在的文件绝不能被覆盖（TOCTOU 封堵）。"""
+        p = os.path.join(self.tmp, "excl.md")
+        m._atomic_create_exclusive(p, "第一份证据")
+        self.assertEqual(_read(p), "第一份证据")
+        with self.assertRaises(FileExistsError):
+            m._atomic_create_exclusive(p, "第二份证据——不得覆盖")
+        self.assertEqual(_read(p), "第一份证据", "已存在的隔离证据必须原样保留")
+
 
 class TestLandingMismatch(TmpBase):
     """A10/F-13：投递目标与服务器实际落点不一致时的处置。
@@ -2285,6 +2294,15 @@ class TestLandingMismatch(TmpBase):
         self.assertIn(tail_marker, raw, "截断部分之后的证据必须保全")
         self.assertEqual(len(raw), len(sse))
 
+    def test_quarantine_same_second_never_overwrites(self):
+        """F-21：秒级时间戳不够唯一——同秒同对会话的两次不一致投递
+        不得互相覆盖隔离证据（R7「归档不覆盖」）。"""
+        _s1, p1, _c1, _saved1, _g1 = self._run(self._sse(self.ACTUAL, "第一次回复"))
+        _s2, p2, _c2, _saved2, _g2 = self._run(self._sse(self.ACTUAL, "第二次回复"))
+        self.assertNotEqual(p1, p2, "隔离档案必须各有唯一名，不得覆盖")
+        self.assertIn("第一次回复", _read(p1))
+        self.assertIn("第二次回复", _read(p2))
+
     def test_pending_claim_registry_records_actual_conversation(self):
         """F-13：服务器实际落点 ≠ 已确认归属——记**待认领登记**，不自动登记归属。"""
         _status, path, _conv, _saved, _gets = self._run(self._sse(self.ACTUAL))
@@ -2349,6 +2367,80 @@ class TestLandingMismatch(TmpBase):
         self.assertTrue(gets, "截断必须走 GET 补全文")
         self.assertIn(self.ACTUAL, gets[0])
         self.assertNotIn(self.TARGET, gets[0])
+
+    def test_id_after_done_is_not_used_by_regex_fallback(self):
+        """F-13/F-16 反例：先 [DONE]、后写 B——旧版正文正则兜底会捞到 B 当落点。
+
+        落点证明只信 SSE 结构化事件里首个带 id 的事件；解不出就失败关闭，
+        绝不扫整包正文（那等于「响应里出现过什么 id 就用哪个」）。
+        """
+        sse = ('data: {"event":"start"}\ndata: [DONE]\n'
+               'data: {"conversation_id": "%s"}\n' % self.ACTUAL)
+        status, path, conv, saved, gets = self._run(sse)
+        self.assertNotEqual(status, 200, "不得接受 [DONE] 之后的 id 当落点")
+        self.assertIsNone(path)
+        self.assertEqual(saved, [])
+        self.assertEqual(getattr(conv, "candidate_ids", []), [])
+
+    def test_evidence_complete_false_when_claim_fails(self):
+        """F-25：待认领登记失败必须进入机器可识别的失败状态，不能报告完整隔离保全。"""
+        orig = m._record_pending_claim
+        try:
+            m._record_pending_claim = lambda base, rec: False
+            _status, path, conv, _saved, _gets = self._run(self._sse(self.ACTUAL))
+            self.assertIsNotNone(path, "隔离档案本身仍要落盘")
+            self.assertIs(getattr(conv, "evidence_complete", None), False,
+                          "登记失败必须让 evidence_complete=False")
+        finally:
+            m._record_pending_claim = orig
+
+    def test_evidence_complete_false_when_resp_save_fails(self):
+        """F-18：完整原始响应保全失败同样必须让 evidence_complete=False。"""
+        orig = m._atomic_create_exclusive
+        def fail_resp(path, text):
+            if path.endswith(".resp.txt"):
+                raise OSError("simulated resp save failure")
+            return orig(path, text)
+        try:
+            m._atomic_create_exclusive = fail_resp
+            _status, path, conv, _saved, _gets = self._run(self._sse(self.ACTUAL))
+            self.assertIsNotNone(path)
+            self.assertIs(getattr(conv, "evidence_complete", None), False)
+        finally:
+            m._atomic_create_exclusive = orig
+
+    def test_incomplete_sse_is_labelled_not_silent(self):
+        """F-23：SSE 无 [DONE] 且没触发 IncompleteRead——旧版直接正常归档。
+
+        修复后：内容照收（保住唯一副本），但归档文本必须自带「完整性未证明」
+        声明，且 ConvRef.reply_complete=False。
+        """
+        sse = ('data: {"conversation_id": "%s"}\n' % self.TARGET +
+               'data: {"message": {"author": {"role": "assistant"}, '
+               '"content": {"parts": ["半截回复"]}}}\n')   # 没有 [DONE]
+        status, _path, conv, saved, gets = self._run(sse)
+        self.assertEqual(status, 200, "归档不被阻断（保住唯一副本）")
+        self.assertTrue(gets, "不完整必须触发 GET 补全尝试")
+        self.assertIs(getattr(conv, "reply_complete", None), False)
+        self.assertTrue(saved and "完整性未证明" in saved[0][1],
+                        "归档文本必须自带不完整声明，不得冒充定稿")
+
+    def test_completeness_requires_get_evidence_not_selfratio(self):
+        """F-24：digest 必须真正参与放行——GET 补全失败时不得标 reply_complete=True。"""
+        class NoGetStub(self._Stub):
+            def req(self, method, url, body=None, timeout=60):
+                return 404, "{}"      # GET 补全失败
+        saved, gets = [], []
+        api = NoGetStub(os.path.join(self.tmp, "auth"), self._plain_incomplete(),
+                        saved, gets, False)
+        status, _path, conv = m.send_prompt(api, self.TARGET, self._prompt(), thinking=False)
+        self.assertIs(getattr(conv, "reply_complete", None), False,
+                      "GET 补全失败时不能证明完整")
+
+    def _plain_incomplete(self):
+        return ('data: {"conversation_id": "%s"}\n' % self.TARGET +
+                'data: {"message": {"author": {"role": "assistant"}, '
+                '"content": {"parts": ["半截"]}}}\n')
 
 
 class TestSlotsAndLease(TmpBase):
@@ -3367,6 +3459,15 @@ class TestScheduleContract(unittest.TestCase):
         """没有 '='、空值、空 rule part 一律拒绝——旧版 `if "=" in chunk` 会整段忽略。"""
         for bad in ("FREQ", "FREQ=", "FREQ=HOURLY;;INTERVAL=1", "FREQ=HOURLY;INTERVAL",
                     ";FREQ=HOURLY"):
+            with self.subTest(rrule=bad):
+                with self.assertRaises(m.ScheduleError):
+                    m.check_schedule(bad)
+
+    def test_rrule_part_regex_rejects_newline_in_value(self):
+        """F-22：`_RRULE_PART_RE` 的 `.` 配 re.S 会跨行，`INTERVAL=1\\nX=2`
+        曾被当成单个合法 VALUE 放行——换行必须是畸形 rule part。"""
+        for bad in ("FREQ=HOURLY;INTERVAL=1\nX=2", "FREQ=HO\r\nHOURLY",
+                    "FREQ=HOURLY\n;INTERVAL=1"):
             with self.subTest(rrule=bad):
                 with self.assertRaises(m.ScheduleError):
                     m.check_schedule(bad)

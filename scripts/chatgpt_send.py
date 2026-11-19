@@ -235,6 +235,33 @@ def _atomic_write(path, text):
     _harden_perms(path)
 
 
+def _atomic_create_exclusive(path, text):
+    """原子独占创建并写入：文件已存在则抛 FileExistsError，**绝不覆盖**。
+
+    F-21：`_atomic_write` 用 `os.replace`，语义是**覆盖**；靠「先检查不存在再写」
+    找唯一名是 TOCTOU——两个线程/进程可以同时通过检查、同时写同一个路径，
+    后写的覆盖先写的证据。隔离档案是异常证据的**唯一副本**，覆盖即永久丢失。
+    这里用内核级 `O_CREAT|O_EXCL` 把「占名 + 判重」合成一个原子操作。
+    写入失败时文件已占名（空壳），调用方应换名重试；已存在则抛 FileExistsError。
+    """
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+    _harden_perms(path)
+
+
 def _atomic_write_bytes(path, data):
     """二进制原子写。用于交付正文字节级落盘——不能经过文本层，否则 CRLF 会被改写。"""
     parent = os.path.dirname(path)
@@ -436,7 +463,7 @@ def check_automation_name(name, argv=None):
             "verb": verb, "argv": cmds}
 
 
-_RRULE_PART_RE = re.compile(r"^([A-Za-z][A-Za-z0-9-]*)=(.+)$", re.S)
+_RRULE_PART_RE = re.compile(r"^([A-Za-z][A-Za-z0-9-]*)=([^;\r\n]+)$")
 _RRULE_INT_RE = re.compile(r"^[+-]?[0-9]+$")
 _RRULE_ALLOWED = ("FREQ", "INTERVAL")
 
@@ -4028,13 +4055,17 @@ class ConvRef(str):
     """
 
     def __new__(cls, conv_id, actual_conv_id=None, mismatch=False, reason="",
-                candidate_ids=None):
+                candidate_ids=None, evidence_complete=None, reply_complete=None):
         obj = super().__new__(cls, conv_id or "")
         obj.target_conv_id = conv_id or ""
         obj.actual_conv_id = actual_conv_id or ""
         obj.mismatch = bool(mismatch)
         obj.reason = reason
         obj.candidate_ids = list(candidate_ids or [])
+        # evidence_complete=None = 不适用（非落点不一致分支）；
+        # False = 隔离三件事有失败，机器调用方必须据此判「证据不完整」。
+        obj.evidence_complete = evidence_complete
+        obj.reply_complete = reply_complete
         return obj
 
 
@@ -4072,17 +4103,41 @@ def _quarantine_reply(api, target_conv, actual_conv, reply, resp, status, pfile)
 
     隔离目录刻意放在 **`replies/` 之外**（与 `replies/` 同级）：下游按
     `replies/**` 递归扫描也够不到它——不靠文件名 glob 兜底（F-13 第 3 问）。
+
+    返回 `(path, evidence_complete)`：
+    - `evidence_complete=False` 表示三件事（完整响应、隔离档案、待认领登记）
+      有任一失败——调用方**必须**把它当成「证据不完整」，不得报告为完整隔离保全
+      （F-18/F-25：WARN 不是状态，机器调用方要能判定）。
     """
     base = getattr(api, "base_dir", BASE)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    name = "quarantine-reply-%s-%s-%s" % (id8(target_conv), id8(actual_conv), stamp)
-    rel = os.path.join(QUARANTINE_DIR, name + ".md")
-    path = os.path.join(base, rel)
-    resp_rel = os.path.join(QUARANTINE_DIR, name + ".resp.txt")
-    resp_path = os.path.join(base, resp_rel)
+    prefix = "quarantine-reply-%s-%s-%s" % (id8(target_conv), id8(actual_conv), stamp)
+    # F-21：用内核级 O_EXCL 独占创建占名，**不再**「先检查不存在再写」——
+    # 那是 TOCTOU，两个进程能通过同一检查后互相覆盖隔离证据。
+    # 独占创建失败（FileExistsError）就换下一个序号；绝不覆盖已存在的证据。
     resp_text = resp or ""
     resp_sha = hashlib.sha256(resp_text.encode("utf-8")).hexdigest()
     reply_text = reply or ""
+    reserved = None
+    for seq in range(1000):
+        name = prefix if seq == 0 else "%s-%d" % (prefix, seq)
+        candidate = os.path.join(base, QUARANTINE_DIR, name + ".md")
+        try:
+            _atomic_create_exclusive(candidate, "")   # 原子占名，内容随后写
+            reserved = (name, candidate)
+            break
+        except FileExistsError:
+            continue
+        except OSError as e:
+            print("FAIL: 隔离档案占名失败（%s）——回复可能丢失！" % e, flush=True)
+            return None, False
+    if reserved is None:
+        print("FAIL: 隔离档案连续 1000 次占名冲突——回复可能丢失！", flush=True)
+        return None, False
+    name, path = reserved
+    rel = os.path.join(QUARANTINE_DIR, name + ".md")
+    resp_rel = os.path.join(QUARANTINE_DIR, name + ".resp.txt")
+    resp_path = os.path.join(base, resp_rel)
     header = {
         "type": "landing_mismatch_quarantine",
         "target_conv_id": target_conv,
@@ -4112,19 +4167,23 @@ def _quarantine_reply(api, target_conv, actual_conv, reply, resp, status, pfile)
          json.dumps(header, ensure_ascii=False, indent=2),
          resp_text[:800], reply_text)
     # 先落**完整**原始响应（F-18：800 字符的头部不足以保全证据，关键 id 与
-    # 后续事件可能正好落在截断部分），再落隔离档案，最后登记待认领。
+    # 后续事件可能正好落在截断部分），再写隔离档案正文，最后登记待认领。
+    # 三件事任一失败 → evidence_complete=False，绝不能报告为完整隔离保全。
     resp_ok = True
     try:
-        _atomic_write(resp_path, resp_text)
+        _atomic_create_exclusive(resp_path, resp_text)
     except OSError as e:
         resp_ok = False
         print("FAIL: 原始响应保全失败（%s）——隔离证据不完整" % e, flush=True)
     try:
-        _atomic_write(path, body)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
     except OSError as e:
-        print("FAIL: 隔离归档写入失败（%s）——回复可能丢失！" % e, flush=True)
-        return None
-    _record_pending_claim(base, {
+        print("FAIL: 隔离档案写入失败（%s）——回复可能丢失！" % e, flush=True)
+        return None, False
+    claimed = _record_pending_claim(base, {
         "target_conv_id": target_conv,
         "actual_conv_id": actual_conv,
         "quarantined_at": header["quarantined_at"],
@@ -4136,9 +4195,11 @@ def _quarantine_reply(api, target_conv, actual_conv, reply, resp, status, pfile)
         "reason": header["reason"],
         "claim_status": "pending_human_review",
     })
-    if not resp_ok:
-        print("WARN: 隔离档案已落盘，但完整原始响应缺失——证据不完整", flush=True)
-    return path
+    evidence_complete = bool(resp_ok and claimed)
+    if not evidence_complete:
+        print("FAIL: 隔离证据不完整（响应保全=%s 待认领登记=%s）——"
+              "不得报告为完整隔离保全" % (resp_ok, claimed), flush=True)
+    return path, evidence_complete
 
 
 def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
@@ -4245,32 +4306,16 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
     first_cid, all_cids = _sse_conv_ids(resp)
     parsed = first_cid
     if not parsed:
-        # 整包 JSON 响应（不是 SSE）——整包只有一个 conversation_id，不存在「取哪个」
-        try:
-            body_obj = json.loads(resp)
-        except Exception:
-            body_obj = None
-        if isinstance(body_obj, dict):
-            cid = body_obj.get("conversation_id")
-            if isinstance(cid, str) and cid.strip():
-                parsed = cid.strip()
-    if not parsed:
-        # 正则兜底（流被截断时仍能捞出 id）——必须**唯一**，多个不同 id 一律判失败
-        found = re.findall(r'"conversation_id"\s*:\s*"([0-9a-fA-F-]{36})"', resp or "")
-        uniq = []
-        for x in found:
-            if x not in uniq:
-                uniq.append(x)
-        if len(uniq) > 1:
-            print("FAIL: 响应里出现多个不同的 conversation_id（%s）——无法确认落点，"
-                  "按 A11 判失败，不落盘" % ", ".join(uniq), flush=True)
-            return (1, None,
-                    ConvRef(conv_id, mismatch=True,
-                            reason="ambiguous_conversation_id: 响应里出现多个不同的 id",
-                            candidate_ids=uniq))
-        if uniq:
-            parsed = uniq[0]
-            print("conversation_id 由正则兜底解析得到：%s" % parsed, flush=True)
+        # F-13/F-16（第二十九轮审查）：**不再做整包 JSON / 正文正则兜底**。
+        # 旧版在 SSE 解不出 id 时扫整包 JSON、再用正则在响应任意位置捞 id——
+        # 这会捞到 `[DONE]` 之后的事件（审查方给出的反例：先 [DONE]，后写 B），
+        # 把「响应里出现过什么 id」当成「服务器实际落在哪个会话」的证据。
+        # 落点证明必须只信受信任的结构化来源；解不出就失败关闭。
+        print("FAIL: 200 但 SSE 首个事件解析不出 conversation_id（无法证明落点会话）；"
+              "按 A11 判失败，不重投、不做正文正则兜底", flush=True)
+        return (1, None,
+                ConvRef(conv_id, mismatch=True,
+                        reason="conversation_id_unresolved: SSE 结构化事件里没有可用的 id"))
     # 唯一性：同一响应里出现两个不同 id → 无法证明落点，失败关闭
     if len(all_cids) > 1:
         print("FAIL: 同一响应里出现多个 conversation_id（%s）——无法确认落点，"
@@ -4296,6 +4341,7 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
     mismatch = bool(conv_id) and real_conv != conv_id
 
     reply, sse_complete, sse_detail = api.extract_reply_sse_checked(resp)
+    map_complete = True
     if not reply:
         reply, map_complete = api.harvest_mapping_checked(resp)
         if reply and not map_complete:
@@ -4303,12 +4349,20 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
     elif not sse_complete:
         # 部分流不得冒充完整回复：明确记下来，内容照收（第二十六轮审查口径）
         print("WARN: SSE 流不完整（%s）——本次回复按「部分流」处理" % sse_detail, flush=True)
-    if getattr(api, "last_truncated", False) and real_conv:
-        # 流被截断：SSE 里的回复可能只到一半。用 GET 拉 mapping 取全文，
-        # 避免把半截内容当定稿落盘（归档是唯一副本）。
-        # F-13：GET 的目标必须是**服务器实际写入的那个会话**（real_conv），
+    # F-23（第二十九轮审查）：完整性证明必须**真正参与放行**。
+    # 旧版只在 `last_truncated`（IncompleteRead）时 GET 补全；SSE 没有 [DONE]
+    # 但也没触发 IncompleteRead 时，部分流被直接正常归档 → fail-open。
+    # 现在：只要 SSE/mapping 任一不完整就强制 GET 补全与完整性核验；
+    # 仍无法证明完整时**不许冒充完整回复**——在归档文件头写明不完整声明。
+    # 注意：不阻断归档（第二十六轮口径「解析失败不能阻断已获得内容的归档」），
+    # 但归档件必须自带可机器识别的不完整标记。
+    reply_complete = bool(sse_complete and map_complete and reply)
+    completeness_note = ""
+    if (not reply_complete or getattr(api, "last_truncated", False)) and real_conv:
+        # GET 的目标必须是**服务器实际写入的那个会话**（real_conv），
         # 不能用 conv_id —— 落点不一致时按目标会话拉回来的，是别的会话的内容。
         full = ""
+        digest_ok = False
         gst, gbody = api.req("GET", API_BASE + "/backend-api/conversation/" + real_conv,
                              timeout=120)
         if gst == 200:
@@ -4318,19 +4372,31 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
             # A12：按 part 统计对账，不只看「长度变长了」。
             # 对账器是**辅助核验**，绝不能成为归档的前置硬依赖——它崩了/核不了，
             # 也必须继续 save_reply（否则唯一副本反而丢了）。
+            digest = None
             try:
                 digest = reply_digest(gbody)
             except Exception as e:
-                digest = None
                 print("WARN: 全文对账器异常（%s: %s）——跳过对账，继续归档"
                       % (type(e).__name__, e), flush=True)
+            digest_ok = False
             if digest:
                 print("GET 全文核对：message=%s parts=%s chars=%d sha256=%s"
                       % ((digest["message_id"] or "?")[:12], digest["parts"],
                          digest["chars"], digest["sha256"][:12]), flush=True)
-                if digest["chars"] != len(full):
-                    print("WARN: parts 合计 %d 字符 ≠ 拼接 %d 字符（可能缺 part），按不完整处理"
-                          % (digest["chars"], len(full)), flush=True)
+                # F-24：digest 必须真正参与完整性判定——旧版只 print 一句
+                # 「parts 合计 ≠ 拼接」，判定结果没接进任何放行条件。
+                # 这里要求三个条件同时成立才算对账通过：
+                #   ① GET mapping 自身完整（gcomplete）
+                #   ② parts 合计 == 拼接长度（无缺 part）
+                #   ③ 摘要的 sha256 与「按 parts 拼接出来的 full」逐字节一致
+                #      （不是拿 digest 自己的 chars 和自己比，那是同源自证）
+                digest_ok = bool(gcomplete and digest["chars"] == len(full) and
+                                 digest["sha256"] == hashlib.sha256(
+                                     full.encode("utf-8")).hexdigest())
+                if not digest_ok:
+                    print("WARN: GET 全文对账未通过（gcomplete=%s parts_chars=%d "
+                          "joined_chars=%d）——本次回复按不完整处理"
+                          % (gcomplete, digest["chars"], len(full)), flush=True)
             else:
                 print("WARN: GET 全文无法对账（mapping 畸形）——按尽力而为处理，继续归档",
                       flush=True)
@@ -4338,8 +4404,20 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
             print("补全文：SSE %d 字符 → GET %d 字符" % (len(reply or ""), len(full)), flush=True)
             reply = full
         else:
-            print("WARN: 流被截断且 GET 未取到更完整内容（GET st=%s，现有 %d 字符）"
+            print("WARN: GET 未取到更完整内容（GET st=%s，现有 %d 字符）"
                   % (gst, len(reply or "")), flush=True)
+        # F-24：完整性判定真正接进放行：只有 GET 对账通过才能把内容标成「完整」。
+        # 对账失败不阻断归档（保住唯一副本），但必须在归档件上留下机器可读的标记。
+        if digest_ok and len(full) >= len(reply or ""):
+            reply_complete = True
+        else:
+            reply_complete = False
+    if not reply_complete and reply:
+        completeness_note = (
+            "⚠️ 回复完整性未证明：SSE 未正常以 [DONE] 收尾或 GET 全文对账未通过；"
+            "以下内容为尽力而为收割，可能不完整，不得当作定稿。\n"
+        )
+        print("FAIL: 回复完整性未证明——归档件将明确标注，不冒充完整回复", flush=True)
 
     if mismatch:
         # A10/F-13：落点不一致 = 会话身份与回复归属分裂。
@@ -4352,19 +4430,29 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
         #   ④ 失败返回携带两个 id（target 与 actual）
         print("FAIL: 落点不一致——投递 target=%s，服务器实际落在 actual=%s。"
               "按 A10/F-13 判失败，不静默改归属" % (conv_id, real_conv), flush=True)
-        qpath = _quarantine_reply(api, conv_id, real_conv, reply, resp, st, pfile)
-        if qpath:
-            print("FAIL: 回复已隔离保全 -> %s（不得当成 %s 的正常会话回复）"
+        qpath, evidence_complete = _quarantine_reply(
+            api, conv_id, real_conv, reply, resp, st, pfile)
+        if qpath and evidence_complete:
+            print("FAIL: 回复已完整隔离保全 -> %s（不得当成 %s 的正常会话回复）"
                   % (qpath, conv_id), flush=True)
+        elif qpath:
+            print("FAIL: 隔离档案已落盘但**证据不完整** -> %s；"
+                  "原始响应/待认领登记可能缺失，需人工重取 actual=%s"
+                  % (qpath, real_conv), flush=True)
         else:
+            evidence_complete = False
             print("FAIL: 隔离归档未能落盘——回复可能已丢失，需人工重取 actual=%s"
                   % real_conv, flush=True)
         return (LANDING_MISMATCH_STATUS, qpath,
                 ConvRef(conv_id, actual_conv_id=real_conv, mismatch=True,
-                        reason="landing_mismatch: 投递目标与服务器实际落点不一致"))
+                        reason="landing_mismatch: 投递目标与服务器实际落点不一致",
+                        evidence_complete=evidence_complete))
 
-    path = api.save_reply(real_conv, pfile, reply)
-    return st, path, ConvRef(real_conv)
+    # F-23：不完整的回复照归档（保住唯一副本），但归档文本自带醒目声明——
+    # 下游看到这个标记就知道「这不是定稿」，不会把它当完整回复继续操作。
+    archived = (completeness_note + reply) if completeness_note else reply
+    path = api.save_reply(real_conv, pfile, archived)
+    return st, path, ConvRef(real_conv, reply_complete=reply_complete)
 
 
 def _attempt_create(st, name, prompt_file, attempts, thinking=None):
