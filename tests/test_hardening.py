@@ -1763,6 +1763,63 @@ class TestProxy(TmpBase):
             m.os.write = real_write
         self.assertEqual(entered, [], "非 strict 也不能带着空锁进临界区")
 
+    # ---- F-30：状态文件里的超大数值不得让 OverflowError 穿出锁判定 ----
+    def test_as_float_never_raises_on_overflow(self):
+        """`float(10**400)` 抛的是 OverflowError，不是 TypeError/ValueError。
+
+        历史上六处 `except (TypeError, ValueError)` 全都漏了它——损坏的
+        `created_at`/`lease_until`/`ttl` 会让异常穿过锁判定路径。
+        """
+        huge = 10 ** 400
+        for bad in (huge, -huge, float("inf"), float("-inf"), float("nan"),
+                    None, True, False, "abc", {"a": 1}, [1]):
+            with self.subTest(value=type(bad).__name__):
+                self.assertEqual(m._as_float(bad, 0.0), 0.0)
+        # 正常值必须原样通过
+        self.assertEqual(m._as_float("1.5", 0.0), 1.5)
+        self.assertEqual(m._as_float(1.5, 0.0), 1.5)
+        self.assertEqual(m._as_float(10 ** 18, 0.0), 1e18)
+        # default 可为 None（调用方用「没有可用值」表达缺失）
+        self.assertIsNone(m._as_float("abc", None))
+
+    def test_overflow_in_server_rate_fields_does_not_raise(self):
+        """服务端响应体的超大限速字段：解析降级为 None，不得抛 OverflowError。"""
+        api = m.ChatGPTAPI.__new__(m.ChatGPTAPI)
+        for body in ({"detail": {"resets_in": 10 ** 400}},
+                     {"detail": {"reset": 10 ** 400}},
+                     {"error": {"retry_after": 10 ** 400}}):
+            with self.subTest(body=str(body)[:30]):
+                self.assertIsNone(api._rate_seconds_from(body))
+        self.assertEqual(api._rate_seconds_from({"detail": {"resets_in": 42}}), 42.0)
+
+    def test_overflow_created_at_does_not_break_lock_judgement(self):
+        """坏 created_at 的残留锁：判定返回 False，`_file_lock` 抛 LockTimeout 而非 OverflowError。"""
+        path = os.path.join(self.tmp, "f30a.json")
+        with open(path + ".lock", "w", encoding="utf-8") as f:
+            f.write('{"pid": %d, "created_at": %s}' % (os.getppid(), "9" * 400))
+        self.assertFalse(m._lock_holder_stale(path + ".lock"),
+                         "损坏的时间戳只能降级为「不可回收」，不得抛异常")
+        entered = []
+        with self.assertRaises(m.LockTimeout):
+            with m._file_lock(path, timeout=0.3, strict=True):
+                entered.append(1)
+        self.assertEqual(entered, [], "锁判定崩溃不得退化成无锁进临界区")
+
+    def test_overflow_lease_and_ttl_do_not_raise(self):
+        """租约与不可用标记的超大 ttl/epoch 同样只降级，不抛异常。"""
+        st = {"unavailable": {"a": {"ttl": 10 ** 400, "epoch": 10 ** 400},
+                              "b": {"ttl": "x", "epoch": None}}}
+        self.assertFalse(m.is_unavailable(st, "a"))
+        self.assertFalse(m.is_unavailable(st, "b"))
+        self.assertIsInstance(m.purge_expired(st), bool)
+        # lease_until 是超大值 → 降级为 0.0 → 租约视为已过期，走进程身份判定；
+        # 关键是不得抛 OverflowError。这里只断言「不抛异常且返回二元组」。
+        ok, reason = m._lease_reclaimable(
+            {"run_id": "r", "lease_until": 10 ** 400, "pid": os.getppid()},
+            now=time.time())
+        self.assertIsInstance(ok, bool)
+        self.assertIsInstance(reason, str)
+
     # ---- F-10：process_start_time 损坏值不得当 pid_reused 证据 ----
     def test_lock_corrupt_start_time_not_reclaimed(self):
         """存储的 process_start_time 是垃圾串/±inf/负数：不得当 pid_reused 证据回收。"""

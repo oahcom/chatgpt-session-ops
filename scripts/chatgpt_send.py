@@ -640,6 +640,29 @@ def _as_seq(obj):
     return list(obj) if isinstance(obj, (list, tuple)) else []
 
 
+def _as_float(value, default=0.0):
+    """把不可信状态文件里的数值字段收敛成 float，**永不抛异常**（F-30）。
+
+    为什么需要：`float()` 对超大整数抛的是 `OverflowError`（ArithmeticError
+    子类），而历史上六处调用点只写了 `except (TypeError, ValueError)`——
+    `{"created_at": 10**400}` 这类损坏字段会让异常直接逃逸出 `_file_lock`，
+    调用方拿到的不是 LockTimeout 而是 OverflowError。更糟的是它出现在**锁判定**
+    路径上：判定器一崩，互斥就没了确定性结局。
+
+    与 `_as_dict`/`_as_seq` 同一原则：状态文件是不可信输入，任何字段损坏都应
+    降级成「没有这个值」，而不是让异常穿过临界区。
+    """
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        out = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if out != out or out in (float("inf"), float("-inf")):
+        return default
+    return out
+
+
 def _as_ctime(value):
     """规范化 create_time，返回 (ok, number)。
 
@@ -1282,10 +1305,9 @@ def _lock_holder_stale(lock):
         except OSError:
             return False
     pid = info.get("pid")
-    try:
-        created = float(info.get("created_at") or 0)
-    except (TypeError, ValueError):
-        created = 0.0
+    # F-30：`float()` 对超大整数抛 OverflowError（ArithmeticError，不是
+    # TypeError/ValueError），旧写法只 catch 后两者会让异常穿出锁判定。
+    created = _as_float(info.get("created_at"), 0.0)
     if time.time() - created <= LOCK_STALE_SEC:
         return False
     # F-03：只有确认 DEAD 才可回收。UNKNOWN（无权限查询/系统调用失败）绝不当死亡
@@ -1507,10 +1529,7 @@ def _lease_reclaimable(info, now=None, expect_run_id=None):
         return True, "empty"
     if expect_run_id is not None and info.get("run_id") != expect_run_id:
         return False, "run_id_mismatch"
-    try:
-        until = float(info.get("lease_until") or 0)
-    except (TypeError, ValueError):
-        until = 0.0
+    until = _as_float(info.get("lease_until"), 0.0)   # F-30：OverflowError 不得穿出
     if now < until:
         return False, "lease_valid"
     # F-03：只有确认 DEAD 才算 process_gone；UNKNOWN（查不到）禁止回收
@@ -2017,8 +2036,8 @@ def is_unavailable(st, account):
     info = (st.get("unavailable") or {}).get(account)
     if not info:
         return False
-    ttl = float(info.get("ttl") or UNAVAILABLE_TTL)
-    return time.time() - float(info.get("epoch") or 0) <= ttl
+    ttl = _as_float(info.get("ttl"), UNAVAILABLE_TTL)          # F-30
+    return time.time() - _as_float(info.get("epoch"), 0.0) <= ttl
 
 
 def purge_expired(st):
@@ -2026,8 +2045,8 @@ def purge_expired(st):
     changed = False
     for a in list(st.get("unavailable") or {}):
         info = st["unavailable"][a] or {}
-        ttl = float(info.get("ttl") or UNAVAILABLE_TTL)
-        if time.time() - float(info.get("epoch") or 0) > ttl:
+        ttl = _as_float(info.get("ttl"), UNAVAILABLE_TTL)      # F-30
+        if time.time() - _as_float(info.get("epoch"), 0.0) > ttl:
             st["unavailable"].pop(a, None)
             changed = True
     return changed
@@ -2057,8 +2076,8 @@ def anon_fallback_block_reason(st, outcomes):
     if "manually disabled" in (info.get("reason") or ""):
         return "nologin 已被手动禁用（--rotation-enable nologin 解封）"
     if is_unavailable(st, "nologin"):
-        ttl = float(info.get("ttl") or UNAVAILABLE_TTL)
-        left = int(ttl - (time.time() - float(info.get("epoch") or 0)))
+        ttl = _as_float(info.get("ttl"), UNAVAILABLE_TTL)      # F-30
+        left = int(ttl - (time.time() - _as_float(info.get("epoch"), 0.0)))
         return "匿名通道冷却中（%s），约 %d 秒后可重试" % (info.get("reason") or "unknown", max(left, 0))
     return None
 
@@ -2988,9 +3007,10 @@ class ChatGPTAPI:
             if val is not None:
                 return int(max(5, min(val, 3600)))
         raw = (self.last_headers or {}).get("retry-after")
-        try:
-            val = float(raw)
-        except (TypeError, ValueError):
+        # F-30：`float("9"*400)` 得 inf，`float(None)` 得 TypeError——统一走
+        # _as_float，非有限值/非数值都退回默认，绝不让 inf 参与退避计算。
+        val = _as_float(raw, None)
+        if val is None:
             print("限速响应未提供时限，按默认 %ss 退避" % default, flush=True)
             return int(max(5, min(float(default), 180)))
         return int(max(5, min(val, 3600)))
@@ -3013,16 +3033,20 @@ class ChatGPTAPI:
         for c in cands:
             for key in ("resets_in", "resets_in_seconds", "retry_after", "retry_after_seconds"):
                 v = c.get(key)
-                if isinstance(v, (int, float)) and v >= 0:
-                    return float(v)
+                # F-30：服务端响应体是不可信输入，超大整数会让 float(v) 抛
+                # OverflowError。走 _as_float 降到 None 就当「没这个字段」。
+                v = _as_float(v, None)
+                if v is not None and v >= 0:
+                    return v
             for key in ("reset", "resets_at", "retry_at"):
                 v = c.get(key)
-                if isinstance(v, (int, float)):
+                v = _as_float(v, None)      # F-30：超大整数参与减法同样会 OverflowError
+                if v is not None:
                     # >1e9 视为 epoch
                     if v > 1e9:
                         return max(0.0, v - time.time())
                     if v >= 0:
-                        return float(v)
+                        return v
         return None
 
     @staticmethod
@@ -4664,7 +4688,7 @@ def create_chat_rotating(prompt_file, thinking=None):
 def rotation_summary():
     st = load_rotation()
     created = st.get("created", {})
-    prim = {a: created.get(a, 0) for a in ROTATION_PRIMARY}
+    prim = {a: _as_float(created.get(a), 0.0) for a in ROTATION_PRIMARY}   # F-30
     prim_total = sum(prim.values()) or 1
     return {
         "policy": "acct1/acct2 均分轮转；nologin 仅在两者都 429 时兜底（其会话不入历史）",
