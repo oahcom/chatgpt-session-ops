@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**二十一轮对外对抗审查**逐条改写（每轮裁定见 §F；**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至二十一轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08）、锁元数据写入失败进临界区（F-09）、损坏启动时间误判 pid_reused（F-10，二十一轮补 ±inf/负数残留）、归档覆盖（F-11），F-02～F-08 已核销、F-09～F-11 待复审），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 205 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**二十二轮对外对抗审查**逐条改写（每轮裁定见 §F；**第二十二轮 `PASS`**（全文最终确认），**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至二十一轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08）、锁元数据写入失败进临界区（F-09）、损坏启动时间误判 pid_reused（F-10）、归档覆盖（F-11），全部已修复并在第二十二轮核销），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 205 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -412,6 +412,8 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | 21 | v1.8 修订 | `NEEDS-REVISION`（F-10 残留） | F-09/F-11/F-08补 均判「修复到位」；`_write_all`/`_rename_no_overwrite` 核心正确（但 `_rename_no_overwrite` POSIX 路径非原子重命名——硬链接+删源两步，docstring 措辞需修正）。**F-10 残留**：`_parse_start_time` 只拒 NaN 未拒 ±inf 和负数，`float("inf")`/`-1` 等能通过验证后 `!= cur` 触发 pid_reused 回收 |
 
 **第二十一轮改了什么**：① `_parse_start_time` 补拒 ±inf（`float("inf")`/`float("-inf")`）与负数（int/float 均查 `< 0`）；② `_rename_no_overwrite` docstring 改为「目标不覆盖的归档移动」并注明 POSIX 两步非原子；③ 测试集扩充 ±inf/-1/-0.5 至三处（`_parse_start_time` 契约 + `_lock_holder_stale` 侧 + `_lease_reclaimable` 侧），205 条不变（用例集扩参不加新 ID）。
+
+| 22 | v1.8 修订 | **`PASS`** | F-10 完全闭环（None/bool/str/NaN/±inf/负数全覆盖，bool 先于 int 排除顺序正确）；`_rename_no_overwrite` docstring 措辞修正可接受（POSIX 两步非原子的描述准确）。无新确定性实现级缺陷。残余风险 2 条：①POSIX 归档硬链接成功后、删源前崩溃可能留下双路径（不丢数据不覆盖归档，需人工/恢复逻辑识别）；②历史空锁/无 pid 锁的 mtime 兼容回收不具备身份级证明（退化恢复机制） |
 
 **第十四轮之后补的一条**：审查把「`_record_corruption("lease-recovery-failed")` 自己失败会怎样」列为残余风险 3，虽不构成裁定理由，但这是能离线证明的，于是补 `test_quarantine_failed_row_write_failure_is_survivable`（第一次登记成功、第二次返回 `None`，断言不抛异常、仍返回 `quarantine_failed`、租约原样在）。**属于 PASS 后的加证，不改变任何条款口径**，故不重开一轮审查。
 
