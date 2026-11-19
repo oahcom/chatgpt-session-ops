@@ -3701,6 +3701,35 @@ class TestScheduleContract(unittest.TestCase):
         with self.assertRaises(m.ScheduleError):
             m.check_oneshot(at)
 
+    def test_oneshot_bad_now_never_escapes_typeerror(self):
+        """F-28：`now` 非 datetime / naive 时只能抛 ScheduleError，不得让 TypeError 逃逸。
+
+        旧版 `base = now or datetime.now(dt.tzinfo)` 直接参与减法：naive datetime
+        抛 "can't subtract offset-naive and offset-aware"，字符串抛 TypeError。
+        调用方按 ScheduleError 处理，异常一逃逸就等于校验器自己崩了（与 F-07 同型）。
+        """
+        from datetime import datetime, timedelta
+        at = (datetime.now().astimezone() + timedelta(minutes=30)).isoformat()
+        for bad in (datetime.now(),              # naive
+                    "2026-11-19T00:00:00+08:00",  # 字符串
+                    12345):                       # 非时间类型
+            with self.assertRaises(m.ScheduleError):
+                m.check_oneshot(at, now=bad)
+
+    def test_oneshot_echoes_canonical_iso(self):
+        """F-29：回显必须是规范化 ISO，原始串只进 audit 字段（校验语义=下发语义）。"""
+        from datetime import datetime, timedelta, timezone
+        base = datetime.now(timezone.utc) + timedelta(minutes=30)
+        for raw in (base.strftime("%Y-%m-%d %H:%M:%S+00:00"),   # 空格分隔
+                    base.strftime("%Y%m%dT%H%M%S+0000"),        # 紧凑
+                    base.strftime("%Y-%m-%dT%H:%M:%SZ"),        # Z 后缀
+                    base.strftime("%Y-%m-%dT%H:%M+00:00")):     # 无秒
+            res = m.check_oneshot(raw)
+            self.assertEqual(res["scheduled_at"], datetime.fromisoformat(raw).isoformat(),
+                             "回显必须是规范化 ISO，不得原样透传用户写法（F-29）")
+            self.assertEqual(res["original_input_for_audit_only"], raw)
+            self.assertEqual(res["executable_field"], "scheduled_at")
+
     def test_cli_check_name_and_schedule(self):
         p = subprocess.run([sys.executable, SCRIPT, "--check-name", "配额 盘点（只读）",
                             "--argv", "--rotation"], stdout=subprocess.PIPE,

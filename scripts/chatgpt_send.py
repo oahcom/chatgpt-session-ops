@@ -552,6 +552,13 @@ def check_oneshot(scheduled_at, now=None):
 
     事故：盘点出 4 个早已过点却仍 ACTIVE 的 one-shot，没人负责归档。
     所以「建之前」就把已过去与过远的两头堵住，而不是等事后巡检。
+
+    F-29（第三十五轮）——与 B1 的 F-14 同一条契约「**校验语义必须等于下发语义**」：
+    `fromisoformat` 接受空格分隔、紧凑 `20261119T181819+0000`、无秒等多种写法，
+    旧版把这些**原始串**回显成 `scheduled_at` 让下游拿去排程——同一个时刻有多种
+    字符串表示，下游按字符串比较/透传就会错。改为：回显**规范化后的 ISO 串**
+    （`dt.isoformat()`），原始输入只留在 `original_input_for_audit_only` 供审计，
+    与 `check_schedule` 的字段命名一致。
     """
     raw = str(scheduled_at or "").strip()
     if not raw:
@@ -562,15 +569,27 @@ def check_oneshot(scheduled_at, now=None):
         raise ScheduleError("scheduledAt 不是 ISO 8601：%r" % raw)
     if dt.tzinfo is None:
         raise ScheduleError("scheduledAt 缺时区偏移（必须形如 2026-11-19T16:00:00+08:00）：%r" % raw)
-    base = now or datetime.now(dt.tzinfo)
+    # F-28（第三十五轮）：`now` 是库 API 参数，naive datetime 或非 datetime 会让
+    # `dt - base` 抛 TypeError 逃逸——与 F-07（超长 int 让 int() 抛 ValueError）
+    # 同型：调用方只 catch ScheduleError，异常一逃逸就等于「校验器自己崩了」。
+    # 校验器对任何输入都只允许两种结局：返回结果，或抛 ScheduleError。
+    base = now if now is not None else datetime.now(dt.tzinfo)
+    if not isinstance(base, datetime):
+        raise ScheduleError("now 必须是 datetime（收到 %s）：不得让 TypeError 逃逸"
+                            % type(base).__name__)
+    if base.tzinfo is None or base.utcoffset() is None:
+        raise ScheduleError("now 必须带时区偏移（naive datetime 无法与 scheduledAt 比较）：%r"
+                            % (base,))
     delta = (dt - base).total_seconds()
     if delta <= 0:
         raise ScheduleError("scheduledAt 已过去（%s）：不得建成 ACTIVE，先按 B5 归档" % raw)
     if delta > 3600:
         raise ScheduleError("scheduledAt 距今 %.0f 分钟 > 60 分钟：改走每小时条件巡检（B2）"
                             % (delta / 60.0))
-    return {"result": "ok", "scheduled_at": raw, "seconds_from_now": int(delta),
-            "lifetime_ok": True}
+    return {"result": "ok", "scheduled_at": dt.isoformat(),
+            "original_input_for_audit_only": raw,
+            "executable_field": "scheduled_at",
+            "seconds_from_now": int(delta), "lifetime_ok": True}
 
 
 def _size_of(path):

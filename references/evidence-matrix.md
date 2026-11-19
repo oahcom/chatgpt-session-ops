@@ -13,7 +13,7 @@
 
 **矩阵自身受回归保护**：`tests/test_hardening.py::TestEvidenceMatrix` 会校验「条款集合 = 矩阵行集合」「每个 `test:`/`code:` 引用都能解析」「每条至少一种证据」。也就是说，新增条款而不补证据行、或引用了不存在的用例，测试会直接红。
 
-> 最后更新：2026-11-19（v1.8）。当前回归 274 条，全绿（1 条 POSIX-only skip）。
+> 最后更新：2026-11-19（v1.8）。当前回归 276 条，全绿（1 条 POSIX-only skip）。
 
 ---
 
@@ -59,7 +59,7 @@
 | B1 | **PARTIAL** | 测试+代码 | `test:test_hourly_rrule_ok` `test:test_non_hourly_rrule_rejected` `test:test_interval_not_one_rejected` `test:test_duplicate_rrule_part_rejected` `test:test_rrule_output_is_canonical` `test:test_lowercase_freq_accepted_and_normalised` `test:test_internal_whitespace_rejected` `test:test_interval_strict_decimal` `test:test_unsupported_rule_part_rejected` `test:test_malformed_rule_part_rejected` `test:test_rrule_rejects_leading_trailing_newline` `test:test_rrule_part_regex_rejects_newline_in_value` `test:test_huge_interval_does_not_escape_as_exception` `test:test_only_rrule_field_is_executable` `code:check_schedule` | 只认 HOURLY + INTERVAL=1；**重复 rule part 一律拒绝**（RFC 5545 §3.3.10），**下发用已验证字段重建的规范化 RRULE**，枚举值大小写不敏感但规范化为大写（F-14）；**唯一可执行字段是 `rrule`**，原始串只作审计留档；`INTERVAL` **不调用 `int()`**——超长十进制串会让 `int()` 抛 ValueError 逃逸（F-20） ；`human:实际触发间隔 ≥60 分钟与时区依赖调度器观测，rrule 层验不了` |
 | B2 | **HUMAN** | 人判 | `human:三态状态机写在 automation prompt 与各任务状态文件里，没有共享库可断言` | 已知缺口：三态靠 prompt 自包含 |
 | B3 | **HUMAN** | 人判 | `human:窗口左闭右开由调度器解释，本地只能校验时间串格式` | 已知缺口 |
-| B4 | **FULL** | 测试+代码 | `test:test_oneshot_within_hour_ok` `test:test_oneshot_in_the_past_rejected` `test:test_oneshot_without_timezone_rejected` `test:test_oneshot_beyond_one_hour_rejected` `code:check_oneshot` | 已过去 / 无时区 / 超 1 小时 三头全堵 |
+| B4 | **FULL** | 测试+代码 | `test:test_oneshot_within_hour_ok` `test:test_oneshot_in_the_past_rejected` `test:test_oneshot_without_timezone_rejected` `test:test_oneshot_beyond_one_hour_rejected` `test:test_oneshot_bad_now_never_escapes_typeerror` `test:test_oneshot_echoes_canonical_iso` `code:check_oneshot` | 已过去 / 无时区 / 超 1 小时 三头全堵；`now` 异常一律 `ScheduleError` 不逃逸 TypeError（F-28）；回显规范化 ISO、原串只进 audit 字段（F-29） |
 | B5 | **PARTIAL** | 测试+代码+实测+人判 | `test:test_oneshot_in_the_past_rejected` `code:check_oneshot` `live:2026-11-19` `human:存量 ACTIVE 的发现与 PAUSED 归档靠接口盘点，本地只实现「创建前预防」` | 两件事必须分开说：预防已机器化，**存量归档仍是人工**（本次盘出 4 个，已归档） |
 | B6 | **HUMAN** | 人判 | `human:路径类型校验写在 prompt 的 preflight 段，没有本地实现` | 已知缺口 |
 | B7 | **HUMAN** | 人判 | `human:step_id/attempt_count 状态机由各任务自己的状态文件落地，无共享实现` | 已知缺口 |
