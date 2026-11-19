@@ -72,7 +72,9 @@
       --new 模式故意不带，用于开 Owner 新会话。
     - 403 "Unusual activity" = PoW 缺失，不是风控；必须带
       OpenAI-Sentinel-Chat-Requirements-Token + OpenAI-Sentinel-Proof-Token。
-    - GET 429 时退避 ≥90s；可用 conv-api/<id8>.json 缓存 tail 兜底 parent_message_id。
+    - 失败先定性（classify_failure）：代理/网络问题修代理（repair_proxy），上游限速按返回体
+      resets_in/retry_after/Retry-After 的真实时限退避（_retry_after，缺省才默认），风控补 cookie+PoW。
+      可用 conv-api/<id8>.json 缓存 tail 兜底 parent_message_id。
     - POST 200 即消息已提交；SSE 流只用于收割，需读到 EOF（勿提前关连接）。
     - 413 conversation_too_large → 用 continue_full.py 走「开始新聊天」摘要续接。
 """
@@ -82,6 +84,7 @@ import copy
 import gzip
 import hashlib
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -90,6 +93,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -233,6 +237,102 @@ LOCK_STALE_SEC = 60        # 锁文件超过这个年龄视为残留（进程被
 LOCK_TIMEOUT_SEC = 8.0     # 抢不到锁就放弃加锁继续业务，绝不阻塞发送
 
 
+def _proc_alive(pid):
+    """进程是否还在（只判存在，不判身份）。读不到一律按「不在」之外的保守侧处理。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        if os.name == "nt":
+            import ctypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            h = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                    return False
+                return code.value == 259              # STILL_ACTIVE
+            finally:
+                k32.CloseHandle(h)
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def _proc_start_time(pid):
+    """进程启动时间（Windows 用 FILETIME 整数，POSIX 用 /proc 的 st_mtime）。
+
+    读不到返回 None —— 调用方必须把 None 当「身份不可确认」，禁止据此回收锁。
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            h = k32.OpenProcess(0x1000, False, pid)
+            if not h:
+                return None
+            try:
+                c, e, k, u = (wintypes.FILETIME() for _ in range(4))
+                if not k32.GetProcessTimes(h, ctypes.byref(c), ctypes.byref(e),
+                                          ctypes.byref(k), ctypes.byref(u)):
+                    return None
+                return (c.dwHighDateTime << 32) | c.dwLowDateTime
+            finally:
+                k32.CloseHandle(h)
+        return os.stat("/proc/%d" % pid).st_mtime
+    except Exception:
+        return None
+
+
+def _lock_holder_stale(lock):
+    """锁能否回收：租约过期 + 原持有者确认不在（或 PID 已被复用）。
+
+    判定顺序（A22）：
+      1. 读不到锁内容（老格式/损坏）→ 退化为 mtime 判据，兼容旧行为；
+      2. 租约未过期 → 不可回收；
+      3. 原 PID 不存活 → 可回收；
+      4. 存活但启动时间读不到 → **不可回收**（宁可等超时，也不误删活锁）；
+      5. 存活但启动时间与记录不一致 → PID 被复用，可回收；
+      6. 否则不可回收。
+    """
+    try:
+        with open(lock, "r", encoding="utf-8") as f:
+            info = json.load(f)
+        if not isinstance(info, dict):
+            info = {}
+    except Exception:
+        info = {}
+    pid = info.get("pid")
+    if not pid:
+        try:
+            return time.time() - os.path.getmtime(lock) > LOCK_STALE_SEC
+        except OSError:
+            return False
+    try:
+        created = float(info.get("created_at") or 0)
+    except (TypeError, ValueError):
+        created = 0.0
+    if time.time() - created <= LOCK_STALE_SEC:
+        return False
+    if not _proc_alive(pid):
+        return True
+    cur = _proc_start_time(pid)
+    if cur is None:
+        return False
+    return info.get("process_start_time") not in (None, cur)
+
+
 @contextlib.contextmanager
 def _file_lock(path, timeout=LOCK_TIMEOUT_SEC):
     me = threading.get_ident()
@@ -245,11 +345,22 @@ def _file_lock(path, timeout=LOCK_TIMEOUT_SEC):
     while True:
         try:
             fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            # 锁里写持有者身份：只靠 mtime 会在 PID 复用/长任务时误判（A22）
+            try:
+                os.write(fd, json.dumps({
+                    "pid": os.getpid(),
+                    "process_start_time": _proc_start_time(os.getpid()),
+                    "created_at": time.time(),
+                    "thread": me,
+                    "path": os.path.basename(path),
+                }).encode("utf-8"))
+            except OSError:
+                pass
             break
         except FileExistsError:
             try:
-                if time.time() - os.path.getmtime(lock) > LOCK_STALE_SEC:
-                    os.remove(lock)  # 干掉残留锁
+                if _lock_holder_stale(lock):
+                    os.remove(lock)  # 干掉残留锁（已确认持有者不在）
                     continue
             except OSError:
                 pass
@@ -847,6 +958,119 @@ def _http_get_text(url, proxy, timeout=10):
         return resp.status, resp.read(4096).decode("utf-8", "replace").strip()
 
 
+def _classify_webrtc(ips, proxy_ip=None):
+    """ICE 候选 → 泄漏结论（A23 判定口径，纯函数便于回归）。"""
+    ips = [str(x) for x in (ips or [])]
+    pub = [ip for ip in ips if _is_public_ip(ip)]
+    if not ips:
+        status = "clean"                 # 被策略屏蔽，或只拿到 mDNS 名
+    elif not pub:
+        status = "private_only"
+    elif not proxy_ip:
+        status = "public_unknown"
+    elif proxy_ip in pub:
+        status = "via_proxy"
+    else:
+        status = "leaked"
+    out = {"status": status, "ips": ips, "public_ips": pub}
+    if status == "leaked":
+        out["error"] = "WebRTC 泄漏：公网候选 %s 与代理出口 %s 不一致" % (pub, proxy_ip)
+    elif status == "public_unknown":
+        out["error"] = "拿到公网候选 %s，但没有代理出口 IP 可比对" % (pub,)
+    return out
+
+
+def _is_public_ip(ip):
+    """是否公网 IP（WebRTC 泄漏只关心公网地址）。"""
+    try:
+        a = ipaddress.ip_address(str(ip).strip("[]"))
+    except ValueError:
+        return False
+    return not (a.is_private or a.is_loopback or a.is_link_local
+                or a.is_multicast or a.is_reserved or a.is_unspecified)
+
+
+JS_WEBRTC = r"""
+new Promise((resolve) => {
+  const out = {status: "ok", ips: []};
+  const done = () => resolve(JSON.stringify(out));
+  if (!window.RTCPeerConnection) { out.status = "unsupported"; return done(); }
+  const ips = new Set();
+  let pc;
+  try {
+    pc = new RTCPeerConnection({iceServers: [{urls: "stun:stun.l.google.com:19302"}]});
+  } catch (e) { out.status = "error"; out.error = String(e); return done(); }
+  try { pc.createDataChannel("probe"); } catch (e) {}
+  pc.onicecandidate = (e) => {
+    const c = e.candidate && e.candidate.candidate;
+    if (!c) return;
+    const m = /([0-9]{1,3}(?:\.[0-9]{1,3}){3}|[0-9a-f]{1,4}(?::[0-9a-f]{0,4}){2,7})/i.exec(c);
+    if (m) ips.add(m[1]);
+  };
+  pc.createOffer().then(o => pc.setLocalDescription(o)).catch(() => {});
+  setTimeout(() => { try { pc.close(); } catch (e) {} out.ips = Array.from(ips); done(); }, 5000);
+})
+"""
+
+
+SITE_PROBE_URL = "https://chatgpt.com/"
+
+
+def probe_site(proxy=None, timeout=25):
+    """A26：不只量 IP，要验**目标站本身**。量 IP 通但站点回 403 是真实事故形态。
+
+    判定：
+      ok           200
+      challenge    403 + Cloudflare 挑战页（浏览器能过，说明出口本身没被封）
+      blocked_vpn  403 + "Unable to load site ... turn it off"：出口 IP 被按 VPN 封
+      forbidden    403 但非已知页型（附正文前 160 字，别猜）
+      http_<code>  其他状态码
+      unreachable  连不上（隧道断/超时/TLS 失败）
+    """
+    url = resolve_proxy() if proxy is None else normalize_proxy(proxy)
+    out = {"url": SITE_PROBE_URL, "status": None, "verdict": "", "note": "", "ok": False}
+    try:
+        opener = build_opener_for(url)
+        rq = urllib.request.Request(SITE_PROBE_URL, headers={
+            "User-Agent": UA, "Accept": "text/html,application/xhtml+xml"})
+        try:
+            with opener.open(rq, timeout=timeout) as resp:
+                st = resp.status
+                body = resp.read(65536).decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            st = e.code
+            try:
+                body = e.read(65536).decode("utf-8", "replace")
+            except Exception:
+                body = ""
+    except Exception as e:
+        out["verdict"] = "unreachable"
+        out["note"] = "%s: %s" % (type(e).__name__, e)
+        return out
+
+    out["status"] = st
+    low = body.lower()
+    if st == 200:
+        out["verdict"] = "ok"
+        out["ok"] = True
+    elif st == 403 and "unable to load site" in low:
+        out["verdict"] = "blocked_vpn"
+        out["note"] = "出口 IP 被按 VPN 封；换节点，不要在 cookie/PoW 上白折腾"
+    elif st == 403 and any(k in low for k in ("just a moment", "challenge-platform",
+                                              "cf_chl", "enable javascript", "cf-mitigated")):
+        out["verdict"] = "challenge"
+        out["ok"] = True
+        out["note"] = "CF 挑战页：浏览器侧可过，API 直连仍可能 403"
+    elif st == 403:
+        out["verdict"] = "forbidden"
+    else:
+        out["verdict"] = "http_%d" % st
+    if not out["note"] and not out["ok"]:
+        vis = re.sub(r"(?s)<(script|style).*?</\1>", " ", body)
+        out["note"] = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", vis)).strip()[:160]
+    return out
+
+
 def check_egress(proxy=None, timeout=10):
     """量出口：代理侧 IP vs 直连侧 IP。两者相同即说明代理没生效。"""
     url = resolve_proxy() if proxy is None else normalize_proxy(proxy)
@@ -1074,6 +1298,8 @@ class ChatGPTAPI:
         self.proxy_source = info.get("source", "")
         self._opener = build_opener_for(self.proxy, CTX)
         self.last_headers = {}
+        self.last_body = ""
+        self.last_status = 0
         self.quota = {}  # 观测用：最近一次响应的限速相关头
 
     # ---------- 匿名态设备身份 ----------
@@ -1169,14 +1395,97 @@ class ChatGPTAPI:
                 out[k] = v
         return out
 
-    def _retry_after(self, default):
-        """优先服从服务端 Retry-After；夹在 [5, 180] 之间，避免被超大值卡死。"""
+    def _retry_after(self, default, body=None):
+        """限速退避时长（用户裁定 2026-11-19）：按返回体/头里的真实时限，不搞固定秒数。
+
+        取值顺序：① 响应体限速字段（resets_in / retry_after / resets_in_seconds /
+        rate_limit.reset 等）→ ② Retry-After 头 → ③ 都没有才用 default 并注明。
+        服务端声明值夹在 [5, 3600]；仅 default 兜底沿用 [5, 180] 旧口径。
+        """
+        raw = body if body is not None else getattr(self, "last_body", None)
+        if raw:
+            try:
+                d = json.loads(raw)
+            except Exception:
+                d = None
+            val = self._rate_seconds_from(d)
+            if val is not None:
+                return int(max(5, min(val, 3600)))
         raw = (self.last_headers or {}).get("retry-after")
         try:
             val = float(raw)
         except (TypeError, ValueError):
-            val = float(default)
-        return int(max(5, min(val, 180)))
+            print("限速响应未提供时限，按默认 %ss 退避" % default, flush=True)
+            return int(max(5, min(float(default), 180)))
+        return int(max(5, min(val, 3600)))
+
+    @staticmethod
+    def _rate_seconds_from(d):
+        """从响应体挖限速重置秒数；挖不到返回 None。绝对 epoch 也换算成秒。"""
+        if not isinstance(d, dict):
+            return None
+        # 常见形态：{"detail":{"rate_limit":{"resets_in":N}}} / {"resets_in":N} / {"retry_after":N}
+        cands = [d]
+        for key in ("detail", "error", "rate_limit", "rateLimit"):
+            v = d.get(key)
+            if isinstance(v, dict):
+                cands.append(v)
+                for k2 in ("rate_limit", "rateLimit", "reset"):
+                    v2 = v.get(k2)
+                    if isinstance(v2, dict):
+                        cands.append(v2)
+        for c in cands:
+            for key in ("resets_in", "resets_in_seconds", "retry_after", "retry_after_seconds"):
+                v = c.get(key)
+                if isinstance(v, (int, float)) and v >= 0:
+                    return float(v)
+            for key in ("reset", "resets_at", "retry_at"):
+                v = c.get(key)
+                if isinstance(v, (int, float)):
+                    # >1e9 视为 epoch
+                    if v > 1e9:
+                        return max(0.0, v - time.time())
+                    if v >= 0:
+                        return float(v)
+        return None
+
+    @staticmethod
+    def classify_failure(status, body):
+        """失败定性（用户裁定 2026-11-19）：先分清代理/网络问题还是上游限速/风控。
+
+        返回 'proxy' | 'ratelimit' | 'risk' | 'other'。
+        - proxy：连接层失败（SSL EOF、重置、超时、status 0）→ 修代理，不计时死等。
+        - ratelimit：429 或响应体带限速字段 → 按返回体时限退避。
+        - risk：403 Unusual activity 等风控 → 补 cookie/PoW 流程。
+        """
+        if status == 0:
+            return "proxy"
+        b = body or ""
+        if b.startswith("EXC"):
+            return "proxy"
+        if status == 429:
+            return "ratelimit"
+        if status == 403 and "Unusual activity" in b:
+            return "risk"
+        if status == 403 and b.lstrip().startswith("<html"):
+            return "risk"  # Cloudflare 质询页 = 出口/指纹被拦，但归属风控处置链
+        return "other"
+
+    def repair_proxy(self):
+        """代理问题跟进修复：重新探测出口并重建 opener。返回新出口 url（可能为空）。"""
+        print("定性=代理/网络问题 —— 重新探测出口并重建连接（不盲等）", flush=True)
+        try:
+            info = resolve_proxy_info(refresh=True)
+            url = info.get("url") or ""
+        except SystemExit:
+            url = ""
+        self.proxy = url
+        if url:
+            self._opener = build_opener_for(url, CTX)
+            print("代理已切换/恢复：%s（%s）" % (url, info.get("source")), flush=True)
+        else:
+            print("代理探测仍无可用出口，需人工跟进代理工具（--proxy-check 诊断）", flush=True)
+        return url
 
     @staticmethod
     def _decompress(data, enc):
@@ -1201,6 +1510,7 @@ class ChatGPTAPI:
             if not self.cookie:
                 self.ensure_device_cookie()
             url = url.replace("/backend-api/", "/backend-anon/")
+        self.last_truncated = False
         raw = json.dumps(body).encode("utf-8") if body is not None else None
         rq = urllib.request.Request(url, data=raw, method=method)
         rq.add_header("User-Agent", UA)
@@ -1226,16 +1536,37 @@ class ChatGPTAPI:
                 data = self._decompress(data, resp.headers.get("Content-Encoding"))
                 self.last_headers = {k.lower(): v for k, v in resp.headers.items()}
                 self.quota = self._quota_from_headers(self.last_headers)
-                return resp.status, data.decode("utf-8", "replace")
+                text = data.decode("utf-8", "replace")
+                self.last_body = text
+                self.last_status = resp.status
+                return resp.status, text
         except urllib.error.HTTPError as e:
             rraw = e.read()
             rraw = self._decompress(rraw, (e.headers or {}).get("Content-Encoding"))
             self.last_headers = {k.lower(): v for k, v in (e.headers or {}).items()}
             self.quota = self._quota_from_headers(self.last_headers)
-            return e.code, rraw.decode("utf-8", "replace")[:300]
+            text = rraw.decode("utf-8", "replace")[:300]
+            self.last_body = text
+            self.last_status = e.code
+            return e.code, text
+        except http.client.IncompleteRead as e:
+            # 流被截断（实测：思考模式单条 SSE 可达 23MB，隧道中途断流）。
+            # 关键：已收到的字节里通常已包含 conversation_id 与大部分回复，
+            # 整包当失败会导致「换身份重投 → 同一 prompt 建出两个会话」。
+            partial = getattr(e, "partial", b"") or b""
+            self.last_truncated = True
+            self.last_headers = {}
+            self.quota = {}
+            self.last_body = ""
+            self.last_status = 200
+            print("WARN: 响应流被截断（IncompleteRead，已收 %d 字节），按已收内容解析，稍后用 GET 补全文"
+                  % len(partial), flush=True)
+            return 200, partial.decode("utf-8", "replace")
         except Exception as e:
             self.last_headers = {}
             self.quota = {}
+            self.last_body = ""
+            self.last_status = 0
             return 0, "EXC " + str(e)
 
     # ---------- tail ----------
@@ -1271,9 +1602,16 @@ class ChatGPTAPI:
             st, body = self.req("GET", API_BASE + "/backend-api/conversation/" + conv_id, timeout=90)
             if st == 200:
                 return self.tail_from_mapping(body), body
-            print("GET %s -> %s (try %d)" % (id8(conv_id), st, attempt + 1), flush=True)
+            kind = self.classify_failure(st, body)
+            print("GET %s -> %s (try %d, 定性=%s)" % (id8(conv_id), st, attempt + 1, kind), flush=True)
             if attempt + 1 < tries:
-                time.sleep(self._retry_after(90 if st == 429 else 20))
+                if kind == "proxy":
+                    self.repair_proxy()   # 修代理，不盲等
+                    time.sleep(3)
+                elif kind == "ratelimit":
+                    time.sleep(self._retry_after(90, body))  # 按返回体真实时限
+                else:
+                    time.sleep(self._retry_after(20, body))
         return None, None
 
     def list_conversations(self, page_size=28, max_pages=100):
@@ -1328,14 +1666,14 @@ class ChatGPTAPI:
         return d.get("token"), solve(p.get("seed", ""), p.get("difficulty", "0"))
 
     # ---------- send ----------
-    def send(self, conv_id, text, parent_message_id, req_token, proof, timeout=420):
+    def send(self, conv_id, text, parent_message_id, req_token, proof, timeout=420, model=None):
         body = {
             "action": "next",
             "messages": [{"id": str(uuid.uuid4()), "author": {"role": "user"},
                           "content": {"content_type": "text", "parts": [text]},
                           "metadata": {}}],
             "parent_message_id": parent_message_id,
-            "model": "auto",
+            "model": model or "auto",
             "timezone_offset_min": 480,
             "suggestions": [],
             "history_and_training_disabled": False,
@@ -1351,6 +1689,53 @@ class ChatGPTAPI:
             "OpenAI-Sentinel-Chat-Requirements-Token": req_token,
             "OpenAI-Sentinel-Proof-Token": proof,
         }, timeout=timeout)
+
+    # ---------- 思考模式 ----------
+    @staticmethod
+    def resolve_thinking_model(api, cache={}):
+        """开思考模式时该用哪个 model slug。
+
+        实测（2026-11-19，/backend-api/models）：同一标题有两个 slug，
+        带 `-t-` 的 max_tokens=262144，不带的是 34834 —— `-t-` 就是 thinking 变体，
+        也正是浏览器里「思考」按钮切换的那个。默认会话用 `auto`，不思考。
+
+        优先级：CHATGPT_MODEL 显式指定 > 默认模型的 `-t-` 同名变体 > 任意大窗口 `-t-` 模型。
+        """
+        key = api.account
+        if key in cache:
+            return cache[key]
+        chosen = os.environ.get("CHATGPT_MODEL") or ""
+        if not chosen:
+            st, body = api.req("GET", API_BASE + "/backend-api/models")
+            if st != 200:
+                print("WARN: 取不到模型清单（st=%s），思考模式回退 auto" % st, flush=True)
+                return cache.setdefault(key, "auto")
+            try:
+                d = json.loads(body)
+            except Exception:
+                return cache.setdefault(key, "auto")
+            models = d.get("models") or []
+            default = d.get("default_model_slug") or "auto"
+            by_slug = {m.get("slug"): m for m in models}
+            if "-t-" in default:
+                chosen = default
+            else:
+                want_title = (by_slug.get(default) or {}).get("title")
+                for m in models:
+                    slug = m.get("slug") or ""
+                    if "-t-" in slug and want_title and m.get("title") == want_title:
+                        chosen = slug
+                        break
+                if not chosen:
+                    for m in models:
+                        slug = m.get("slug") or ""
+                        if "-t-" in slug and (m.get("max_tokens") or 0) > 100000:
+                            chosen = slug
+                            break
+        chosen = chosen or "auto"
+        cache[key] = chosen
+        print("thinking model: %s（默认 %s）" % (chosen, "auto"), flush=True)
+        return chosen
 
     # ---------- harvest ----------
     @staticmethod
@@ -1474,7 +1859,15 @@ class AnonBrowser:
         script = os.path.join(self.cdp_dir, "start_chrome.py")
         if not os.path.exists(script):
             return False
-        cmd = [sys.executable, script, "--temp", "--port", str(self.port)]
+        # 每个端口独立 profile：`--temp` 的目录是固定的，多端口并存时第二实例会被
+        # Edge/Chrome 的单实例机制吞掉（实测：CDP 永不就绪）。
+        prof = os.path.join(tempfile.gettempdir(), "cdp-anon-%d" % self.port)
+        cmd = [sys.executable, script, "--profile", prof, "--port", str(self.port),
+               # A23：WebRTC 走 UDP，--proxy-server 管不住。开关名是
+               # `--webrtc-ip-handling-policy`（实测 2026-11-19：Edge 157 认这个；
+               # 带 `force-` 前缀的旧名字被忽略，仍会漏出公网 IPv4/IPv6）。
+               "--chrome-arg=--webrtc-ip-handling-policy=disable_non_proxied_udp",
+               "--chrome-arg=--force-webrtc-ip-handling-policy=disable_non_proxied_udp"]
         if self.proxy:
             cmd += ["--proxy", self.proxy]   # 与 API 同一出口，宁可起不来也不要裸连
         try:
@@ -1661,6 +2054,59 @@ class AnonBrowser:
             except Exception:
                 pass
         return ip
+
+    def webrtc_probe(self, proxy_ip=None, timeout=25):
+        """A23：WebRTC 走 UDP 直连，`--proxy-server` 管不住它 —— 唯一的隐蔽泄漏面。
+
+        在一次性标签页里跑真实 ICE，返回
+          status: clean（没拿到任何候选/IP）/ private_only / via_proxy /
+                  leaked（拿到公网 IP 且不是代理出口）/ public_unknown / unverified
+        `unverified` 必须当作「没验成」，不得报告全链路出口通过。
+        """
+        CDPClient = self._cdp()
+        self.client()
+        tid = ""
+        try:
+            b = CDPClient(port=self.port, timeout=timeout)
+            try:
+                b.connect_browser()
+                res = b.send("Target.createTarget", {"url": "about:blank"})
+            finally:
+                try:
+                    b.close()
+                except Exception:
+                    pass
+            tid = (res or {}).get("targetId") or ""
+        except Exception as e:
+            return {"status": "unverified", "error": "无法新建探测标签页：%s" % e, "ips": []}
+        if not tid:
+            return {"status": "unverified", "error": "无 targetId：%r" % (res,), "ips": []}
+        try:
+            cl = CDPClient(port=self.port, timeout=timeout)
+            cl.connect_page(tid)
+            r = cl.send("Runtime.evaluate", {"expression": JS_WEBRTC,
+                                             "awaitPromise": True,
+                                             "returnByValue": True,
+                                             "userGesture": True},
+                        timeout=timeout + 10)
+            val = ((r or {}).get("result") or {}).get("value") or ""
+            data = json.loads(val) if val else {}
+            if data.get("status") != "ok":
+                return {"status": "unverified",
+                        "error": data.get("error") or data.get("status") or "无返回值", "ips": []}
+            ips = [str(x) for x in (data.get("ips") or [])]
+        except Exception as e:
+            return {"status": "unverified",
+                    "error": "%s: %s" % (type(e).__name__, e), "ips": []}
+        finally:
+            try:
+                b2 = CDPClient(port=self.port, timeout=15)
+                b2.connect_browser()
+                b2.send("Target.closeTarget", {"targetId": tid})
+                b2.close()
+            except Exception:
+                pass
+        return _classify_webrtc(ips, proxy_ip)
 
     # ---------- 页面动作 ----------
     def _wait(self, expr, timeout=30, interval=0.6):
@@ -2067,10 +2513,11 @@ def send_anon(api, conv_id, prompt_file, text):
     return (200 if reply else st or 0), path, cid
 
 
-def send_prompt(api, conv_id, prompt_file, new_chat=False):
+def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
     """完整投递流程：tail → requirements+PoW → POST → 收割 → 落盘。
 
     返回 (status, reply_path, real_conv_id)；real_conv_id 用于登记会话归属。
+    thinking=True 时用思考模型（`-t-` 变体）；None = 读 CHATGPT_THINKING 环境变量。
     """
     if conv_id:
         conv_id = safe_id(conv_id, "conv_id")
@@ -2102,6 +2549,24 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False):
             print("FAIL: no parent_message_id (GET 被限速且无缓存 tail)", flush=True)
             return 0, None, None
 
+    if thinking is None:
+        thinking = os.environ.get("CHATGPT_THINKING", "") not in ("", "0", "false", "False")
+    model = None
+    if thinking:
+        model = api.resolve_thinking_model(api)
+        # A27 硬要求：显式要思考就必须真开了思考。解析不出 `-t-` 一律拒绝投递（exit 1），
+        # 不允许静默回落 auto —— 否则「审查会话」会以不思考的身份跑完还被当正常。
+        if not model or "-t-" not in str(model):
+            if os.environ.get("CHATGPT_ALLOW_NON_THINKING", "") in ("1", "true", "True"):
+                print("WARN: 思考模型解析失败（%r），按 CHATGPT_ALLOW_NON_THINKING=1 降级为 auto"
+                      % (model,), flush=True)
+                model = None
+            else:
+                print("FAIL: 要求思考模式但解析不出 -t- 模型（model=%r）。"
+                      "先确认 /backend-api/models 可达；确实要降级请显式设 "
+                      "CHATGPT_ALLOW_NON_THINKING=1" % (model,), flush=True)
+                raise SystemExit(1)
+
     st, resp = 0, ""
     for attempt in (1, 2):
         req_token, proof = api.requirements()
@@ -2110,14 +2575,22 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False):
                 # 匿名态拿不到 requirements（服务端 401），不做 60s 重试，直接让轮转换身份
                 print("FAIL: nologin 无法获取 requirements（服务端要求登录）", flush=True)
                 return 401, None, None
-            time.sleep(60)
+            # 失败定性（用户裁定 2026-11-19）：代理问题修代理；上游限速按返回体时限退避
+            kind = api.classify_failure(getattr(api, "last_status", 0),
+                                        getattr(api, "last_body", ""))
+            print("requirements 失败，定性=%s" % kind, flush=True)
+            if kind == "proxy":
+                api.repair_proxy()
+                time.sleep(3)
+            else:
+                time.sleep(api._retry_after(60, getattr(api, "last_body", "")))
             req_token, proof = api.requirements()
             if not req_token:
                 print("FAIL: no requirements token", flush=True)
                 return 0, None, None
 
         t0 = time.time()
-        st, resp = api.send(conv_id, text, tail, req_token, proof)
+        st, resp = api.send(conv_id, text, tail, req_token, proof, model=model)
         print("SEND %s -> %s respLen=%d in %.0fs" % (pfile, st, len(resp), time.time() - t0), flush=True)
         if st == 403 and "Unusual activity" in (resp or "") and attempt == 1:
             print("403 Unusual activity —— 补 Cloudflare cookie 并重跑 requirements + PoW 重试一次", flush=True)
@@ -2163,11 +2636,25 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False):
         print("WARN: 落入了不同会话! target=%s real=%s" % (conv_id, real_conv), flush=True)
 
     reply = api.extract_reply_sse(resp) or api.harvest_mapping(resp)
+    if getattr(api, "last_truncated", False) and (conv_id or real_conv):
+        # 流被截断：SSE 里的回复可能只到一半。用 GET 拉 mapping 取全文，
+        # 避免把半截内容当定稿落盘（归档是唯一副本）。
+        full = ""
+        gst, gbody = api.req("GET", API_BASE + "/backend-api/conversation/" + (conv_id or real_conv),
+                             timeout=120)
+        if gst == 200:
+            full = api.harvest_mapping(gbody)
+        if len(full) > len(reply or ""):
+            print("补全文：SSE %d 字符 → GET %d 字符" % (len(reply or ""), len(full)), flush=True)
+            reply = full
+        else:
+            print("WARN: 流被截断且 GET 未取到更完整内容（GET st=%s，现有 %d 字符）"
+                  % (gst, len(reply or "")), flush=True)
     path = api.save_reply(conv_id or real_conv, pfile, reply)
     return st, path, (conv_id or real_conv)
 
 
-def _attempt_create(st, name, prompt_file, attempts):
+def _attempt_create(st, name, prompt_file, attempts, thinking=None):
     """用指定身份建会话并记录结果；返回 (status, conv_id)。"""
     try:
         api = ChatGPTAPI(account=name)
@@ -2181,7 +2668,7 @@ def _attempt_create(st, name, prompt_file, attempts):
         print("rotate: %s 凭据不可用，跳过（%s）" % (name, e), flush=True)
         return "INIT_FAIL", None
     try:
-        status, _path, conv = send_prompt(api, None, prompt_file, new_chat=True)
+        status, _path, conv = send_prompt(api, None, prompt_file, new_chat=True, thinking=thinking)
     except Exception as e:
         status, conv = 0, None
         print("rotate: %s 通道异常（%s）" % (name, e), flush=True)
@@ -2229,7 +2716,7 @@ def _mark_success(st, name, conv, prompt_file, attempts):
                       "attempts": attempts}, ensure_ascii=False), flush=True)
 
 
-def create_chat_rotating(prompt_file):
+def create_chat_rotating(prompt_file, thinking=None):
     """登录态优先建会话：acct1/acct2 均分轮转；仅当两者都 429 才用匿名兜底。
 
     匿名会话不进任何账号历史（会话列表恒为空），只按 conv_id 短期可读，
@@ -2251,7 +2738,7 @@ def create_chat_rotating(prompt_file):
         "；跳过 " + json.dumps(skipped, ensure_ascii=False) if skipped else ""), flush=True)
 
     for name in plan:
-        status, conv = _attempt_create(st, name, prompt_file, attempts)
+        status, conv = _attempt_create(st, name, prompt_file, attempts, thinking)
         outcomes[name] = status
         if conv:
             _mark_success(st, name, conv, prompt_file, attempts)
@@ -2267,7 +2754,7 @@ def create_chat_rotating(prompt_file):
     block = anon_fallback_block_reason(st, outcomes)
     if block is None:
         print("两个登录态均 429 —— 启用匿名兜底（不入历史，仅短期可读，勿用于长任务）", flush=True)
-        status, conv = _attempt_create(st, "nologin", prompt_file, attempts)
+        status, conv = _attempt_create(st, "nologin", prompt_file, attempts, thinking)
         if conv:
             _mark_success(st, "nologin", conv, prompt_file, attempts)
             print("WARN: 该会话为匿名会话，不出现在任何账号的会话列表，勿用于需留存的长任务", flush=True)
@@ -2310,6 +2797,9 @@ def rotation_summary():
 
 def main():
     args = sys.argv[1:]
+    thinking_flag = "--thinking" in args
+    if thinking_flag:
+        args = [a for a in args if a != "--thinking"]
     account, explicit_account = "default", False
     if args and args[0] in ("--help", "-h"):
         print(__doc__)
@@ -2357,23 +2847,52 @@ def main():
         info = resolve_proxy_info(refresh=True)
         res = check_egress(info["url"])
         res["source"] = info["source"] or None
+        # A26：量到 IP 不等于能用；必须再验一次目标站
+        res["site"] = probe_site(info["url"])
         if "--browser" in args[1:] and info["url"]:
             # 浏览器侧出口：单独开一次性标签页量，避免污染正在续聊的 /uc/<id>
+            br = AnonBrowser()
             try:
-                res["browser_ip"] = AnonBrowser().egress_ip()
+                res["browser_ip"] = br.egress_ip()
             except Exception as e:
                 res["browser_ip"] = None
                 res["browser_error"] = str(e)
+            # A23：WebRTC 走 UDP，--proxy-server 管不住；必须单独验
+            try:
+                res["webrtc"] = br.webrtc_probe(proxy_ip=res.get("proxy_ip"))
+            except Exception as e:
+                res["webrtc"] = {"status": "unverified", "error": str(e), "ips": []}
             if res.get("browser_ip") and res.get("proxy_ip"):
                 res["browser_match"] = res["browser_ip"] == res["proxy_ip"]
-        ok = bool(res.get("proxy_ip")) and not res.get("same")
+        site = res.get("site") or {}
+        ok = bool(res.get("proxy_ip")) and not res.get("same") and bool(site.get("ok"))
+        if not site.get("ok"):
+            msg = ("目标站不可用（%s）：%s"
+                   % (site.get("verdict"), site.get("note") or ""))[:240]
+            prev = res.get("verdict") or ""
+            res["verdict"] = (prev + "；" + msg) if prev and prev != "代理生效" else msg
+        reasons = []
+        if res.get("verdict") and res["verdict"] != "代理生效":
+            reasons.append(res["verdict"])
         if "--browser" in args[1:] and res.get("browser_ip") is None:
             ok = False      # 要求验浏览器却没验成，不能算通过
+            reasons.append("要求验浏览器但未取到 browser_ip")
         if res.get("browser_match") is False:
             ok = False
-            res["verdict"] = "浏览器出口与 API 不一致：浏览器没走代理，重启浏览器并带 --proxy"
+            reasons.append("浏览器出口与 API 不一致：浏览器没走代理，重启浏览器并带 --proxy")
+        wt = (res.get("webrtc") or {}).get("status")
+        if wt == "leaked":
+            ok = False
+            reasons.append((res["webrtc"].get("error") or "WebRTC 泄漏"))
+        elif wt in ("unverified", "public_unknown"):
+            ok = False
+            reasons.append("WebRTC 出口未验证（%s）：不能声称全链路走代理" % wt)
+        res["full_chain_verified"] = bool(ok)
+        if reasons:
+            res["verdict"] = "；".join(reasons)[:400]
         print(json.dumps(res, ensure_ascii=False, indent=2))
-        return 0 if ok else 1
+        # 出口不满足 → 3（未满足联网条件），不是业务失败（A24 语义）
+        return 0 if ok else 3
     # ---- 轮转管理（纯本地状态，不触网）----
     if args and args[0] in ("--rotation", "--rotation-status"):
         print(json.dumps(rotation_summary(), ensure_ascii=False, indent=2))
@@ -2512,7 +3031,8 @@ def main():
             return 2
         api = ChatGPTAPI(account="nologin")
         try:
-            status, _p, conv = send_prompt(api, cid, args[2])
+            status, _p, conv = send_prompt(api, cid, args[2],
+                                              thinking=True if thinking_flag else None)
         except Exception as e:
             print(json.dumps({"conv_id": cid, "result": "error", "detail": str(e)},
                              ensure_ascii=False))
@@ -2565,7 +3085,7 @@ def main():
     # ---- 开新会话 ----
     if args[0] == "--new":
         if len(args) != 2:
-            print("usage: [--account acct1|acct2|nologin|auto] --new <prompt_file>", flush=True)
+            print("usage: [--account acct1|acct2|nologin|auto] [--thinking] --new <prompt_file>", flush=True)
             return 2
         if explicit_account and account != "auto":
             api = build(account)
@@ -2575,7 +3095,8 @@ def main():
                 print("nologin：走匿名浏览器通道（需 CDP 端口 %s 的未登录浏览器）"
                       % os.environ.get("CHATGPT_ANON_CDP_PORT", "9333"), flush=True)
             try:
-                status, _path, conv = send_prompt(api, None, args[1], new_chat=True)
+                status, _path, conv = send_prompt(api, None, args[1], new_chat=True,
+                                                  thinking=True if thinking_flag else None)
             except Exception as e:
                 print(json.dumps({"result": "error", "detail": str(e)}, ensure_ascii=False))
                 return 1
@@ -2583,7 +3104,8 @@ def main():
                 record_conv(conv, account, args[1])
                 print("NEW_CONV %s account=%s" % (conv, account), flush=True)
             return 0 if status == 200 else 1
-        return create_chat_rotating(args[1])  # 默认：acct1/acct2 均分轮转，双 429 才匿名兜底
+        # 默认：acct1/acct2 均分轮转，双 429 才匿名兜底
+        return create_chat_rotating(args[1], thinking=True if thinking_flag else None)
 
     # ---- 既有会话：未显式指定身份时按登记归属路由 ----
     # 先做参数校验，别在缺参数时索引越界（曾导致 `--tail` 空参数直接 IndexError）
@@ -2624,7 +3146,8 @@ def main():
         print("usage: [--account acct1|acct2|nologin] <conv_id> <prompt_file>", flush=True)
         return 2
     try:
-        status, _path, _conv = send_prompt(api, conv_id, args[1])
+        status, _path, _conv = send_prompt(api, conv_id, args[1],
+                                             thinking=True if thinking_flag else None)
     except Exception as e:
         print(json.dumps({"conv_id": conv_id, "result": "error", "detail": str(e)}, ensure_ascii=False))
         return 1

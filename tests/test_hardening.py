@@ -7,7 +7,9 @@
 覆盖的都是「出过事或一想就疼」的点：id 路径穿越、状态文件损坏被静默覆盖、
 归档写半截、回复被静默截断、锁重入与 stale 回收、轮转兜底判定。
 """
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -18,6 +20,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.environ.get("CHATGPT_SEND_PY") or os.path.join(HERE, "..", "scripts", "chatgpt_send.py")
@@ -282,9 +285,24 @@ class TestMisc(TmpBase):
 
     def test_retry_after_is_clamped(self):
         api = object.__new__(m.ChatGPTAPI)
-        for raw, want in (("1", 5), ("30", 30), ("99999", 180), (None, 42), ("junk", 42)):
+        for raw, want in (("1", 5), ("30", 30), ("99999", 3600), (None, 42), ("junk", 42)):
             api.last_headers = {} if raw is None else {"retry-after": raw}
             self.assertEqual(api._retry_after(42), want)
+
+    def test_retry_after_prefers_body_rate_limit(self):
+        # 用户裁定 2026-11-19：限速等待按返回体真实时限，body 优先于 Retry-After 头
+        api = object.__new__(m.ChatGPTAPI)
+        api.last_headers = {"retry-after": "30"}
+        self.assertEqual(api._retry_after(90, '{"detail":{"rate_limit":{"resets_in":300}}}'), 300)
+        self.assertEqual(api._retry_after(90, '{"resets_in":45}'), 45)
+        self.assertEqual(api._retry_after(90, '{"retry_after":60}'), 60)
+        # body 没有时限字段 -> 回退 Retry-After 头
+        self.assertEqual(api._retry_after(90, '{"detail":"quota"}'), 30)
+        # 代理/网络类失败定性：status 0 / EXC 一律 proxy，429 是 ratelimit
+        self.assertEqual(m.ChatGPTAPI.classify_failure(0, "EXC SSL EOF"), "proxy")
+        self.assertEqual(m.ChatGPTAPI.classify_failure(429, '{"detail":"rate"}'), "ratelimit")
+        self.assertEqual(m.ChatGPTAPI.classify_failure(403, "Unusual activity"), "risk")
+        self.assertEqual(m.ChatGPTAPI.classify_failure(500, "oops"), "other")
 
     def test_extract_reply_sse_takes_last_assistant(self):
         sse = "\n".join([
@@ -503,6 +521,14 @@ class FakeAPI:
         self.sse = sse
         self.sent = []
         self.last_headers = {}
+        self.last_truncated = False
+        self.gets = []
+        self.get_status = 200
+        self.get_body = "{}"
+
+    def req(self, method, url, body=None, extra_headers=None, timeout=120):
+        self.gets.append((method, url))
+        return self.get_status, self.get_body
 
     def live_tail(self, conv_id, tries=2):
         return "parent-msg-1", '{"mapping": {}}'
@@ -513,8 +539,9 @@ class FakeAPI:
     def requirements(self):
         return "req-token", "proof-token"
 
-    def send(self, conv_id, text, parent_message_id, req_token, proof, timeout=420):
-        self.sent.append({"conv_id": conv_id, "parent": parent_message_id, "text": text})
+    def send(self, conv_id, text, parent_message_id, req_token, proof, timeout=420, model=None):
+        self.sent.append({"conv_id": conv_id, "parent": parent_message_id, "text": text,
+                          "model": model})
         return self.send_status, self.sse or ""
 
     def warm_cookies(self):
@@ -557,6 +584,49 @@ class TestSendFlow(TmpBase):
         self.assertEqual(api.sent[0]["conv_id"], cid)
         self.assertEqual(api.sent[0]["text"], "真正的正文")
         self.assertIn("hello", _read(path))
+
+    def test_thinking_uses_thinking_slug(self):
+        """CHATGPT_THINKING 开启时必须把 -t- 思考模型传进 POST body。"""
+        api = FakeAPI(os.path.join(self.tmp, "auth"))
+        api.resolve_thinking_model = lambda _a: "gpt-6-t-mini"
+        old = os.environ.get("CHATGPT_THINKING")
+        os.environ["CHATGPT_THINKING"] = "1"
+        try:
+            status, _p, _c = m.send_prompt(api, None, self._prompt("x"), new_chat=True)
+        finally:
+            if old is None:
+                os.environ.pop("CHATGPT_THINKING", None)
+            else:
+                os.environ["CHATGPT_THINKING"] = old
+        self.assertEqual(status, 200)
+        self.assertEqual(api.sent[-1]["model"], "gpt-6-t-mini")
+
+    def test_truncated_stream_completed_by_get(self):
+        """A28：流被截断时用 GET 补全文落盘，且不得换身份重投（sent 只 1 条）。"""
+        cid = "11111111-2222-4333-8444-555555555555"
+        api = FakeAPI(os.path.join(self.tmp, "auth"),
+                      sse='data: {"conversation_id": "%s"}\n\ndata: [DONE]' % cid)
+        api.last_truncated = True
+        api.extract_reply_sse = lambda raw: "HALF-ANSWER"
+        api.get_body = json.dumps({"mapping": {"n1": {"message": {
+            "author": {"role": "assistant"},
+            "content": {"parts": ["FULL-ANSWER-END"]},
+            "create_time": 9}}}})
+        status, path, conv = m.send_prompt(api, None, self._prompt("x"), new_chat=True,
+                                           thinking=False)
+        self.assertEqual(status, 200)
+        self.assertEqual(conv, cid)
+        self.assertEqual(len(api.sent), 1, "截断不得触发重投")
+        self.assertTrue(any(cid in u for _m, u in api.gets), "必须 GET 拉全文")
+        with open(path, encoding="utf-8") as f:
+            self.assertIn("FULL-ANSWER-END", f.read())
+
+    def test_default_keeps_auto_model(self):
+        """未开启思考模式时不覆写 model（保持 auto）。"""
+        api = FakeAPI(os.path.join(self.tmp, "auth"))
+        status, _p, _c = m.send_prompt(api, None, self._prompt("x"), new_chat=True)
+        self.assertEqual(status, 200)
+        self.assertIsNone(api.sent[-1]["model"])
 
     def test_new_chat_has_no_parent(self):
         cid = "11111111-2222-4333-8444-555555555555"
@@ -831,6 +901,154 @@ class TestProxy(TmpBase):
             self.assertEqual(m.check_egress("http://p:1")["verdict"][:5], "代理不可用")
         finally:
             m._http_get_text = real
+
+
+    # ---- A26：探活必须验目标站，不能只量 IP ----
+    def _probe_with(self, status, body):
+        class _Resp(object):
+            def __init__(self, st, b):
+                self.status = st
+                self._b = b
+
+            def read(self, n=None):
+                return self._b
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        class _Opener(object):
+            def open(self, rq, timeout=None):
+                if status >= 400:
+                    raise urllib.error.HTTPError(rq.full_url, status, "x", {}, io.BytesIO(body))
+                return _Resp(status, body)
+
+        real = m.build_opener_for
+        m.build_opener_for = lambda *a, **k: _Opener()
+        try:
+            return m.probe_site("http://127.0.0.1:1", timeout=1)
+        finally:
+            m.build_opener_for = real
+
+    def test_probe_site_ok(self):
+        res = self._probe_with(200, b"<html>ok</html>")
+        self.assertEqual(res["verdict"], "ok")
+        self.assertTrue(res["ok"])
+
+    def test_probe_site_blocked_by_vpn(self):
+        """实测事故页型：IP 通、站点 403「Unable to load site」→ 必须判死。"""
+        res = self._probe_with(403, b"<p>Unable to load site. If you are using a VPN, try turning it off.</p>")
+        self.assertEqual(res["verdict"], "blocked_vpn")
+        self.assertFalse(res["ok"])
+
+    def test_probe_site_challenge_is_usable(self):
+        """CF 挑战页说明出口没被封，浏览器能过 → 不算失败。"""
+        res = self._probe_with(403, b"<title>Just a moment...</title><script src='/cdn-cgi/challenge-platform/x'></script>")
+        self.assertEqual(res["verdict"], "challenge")
+        self.assertTrue(res["ok"])
+
+    def test_probe_site_other_status_not_ok(self):
+        res = self._probe_with(500, b"boom")
+        self.assertEqual(res["verdict"], "http_500")
+        self.assertFalse(res["ok"])
+
+    # ---- A23：WebRTC 泄漏判定（纯函数）----
+    def test_webrtc_no_candidates_is_clean(self):
+        self.assertEqual(m._classify_webrtc([])["status"], "clean")
+
+    def test_webrtc_private_only(self):
+        self.assertEqual(m._classify_webrtc(["10.0.0.3", "192.168.1.9"])["status"], "private_only")
+
+    def test_webrtc_via_proxy(self):
+        self.assertEqual(m._classify_webrtc(["1.2.3.4"], "1.2.3.4")["status"], "via_proxy")
+
+    def test_webrtc_leak_detected(self):
+        res = m._classify_webrtc(["1.2.3.4"], "5.6.7.8")
+        self.assertEqual(res["status"], "leaked")
+        self.assertIn("泄漏", res["error"])
+
+    def test_webrtc_public_without_expected_ip(self):
+        self.assertEqual(m._classify_webrtc(["1.2.3.4"], None)["status"], "public_unknown")
+
+    # ---- A22：锁持有者身份校验 ----
+    def _write_lock(self, path, payload):
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+
+    def test_lock_live_holder_not_reclaimed(self):
+        """进程还活着但租约过期：不得回收（旧逻辑会按 mtime 直接删）。"""
+        lock = os.path.join(self.tmp, "a.json.lock")
+        self._write_lock(lock, {"pid": os.getpid(),
+                                "process_start_time": m._proc_start_time(os.getpid()),
+                                "created_at": time.time() - 999})
+        self.assertFalse(m._lock_holder_stale(lock))
+
+    def test_lock_dead_holder_reclaimed(self):
+        lock = os.path.join(self.tmp, "b.json.lock")
+        self._write_lock(lock, {"pid": 999999, "process_start_time": 1,
+                                "created_at": time.time() - 999})
+        self.assertTrue(m._lock_holder_stale(lock))
+
+    def test_lock_pid_reused_reclaimed(self):
+        """PID 被复用（存活但启动时间不符）→ 视为残留。"""
+        lock = os.path.join(self.tmp, "c.json.lock")
+        real = m._proc_start_time(os.getpid())
+        self._write_lock(lock, {"pid": os.getpid(),
+                                "process_start_time": (real or 0) + 12345,
+                                "created_at": time.time() - 999})
+        self.assertTrue(m._lock_holder_stale(lock))
+
+    def test_lock_unknown_identity_kept(self):
+        """进程身份读不到 → 宁可等超时也不误删活锁。"""
+        lock = os.path.join(self.tmp, "d.json.lock")
+        real_alive, real_start = m._proc_alive, m._proc_start_time
+        try:
+            m._proc_alive = lambda pid: True
+            m._proc_start_time = lambda pid: None
+            self._write_lock(lock, {"pid": 4242, "process_start_time": 7,
+                                    "created_at": time.time() - 999})
+            self.assertFalse(m._lock_holder_stale(lock))
+        finally:
+            m._proc_alive, m._proc_start_time = real_alive, real_start
+
+    def test_lock_legacy_format_uses_mtime(self):
+        """老格式（无 pid）退化为 mtime 判据，保持兼容。"""
+        lock = os.path.join(self.tmp, "e.json.lock")
+        with open(lock, "w", encoding="utf-8") as f:
+            f.write("")
+        os.utime(lock, (time.time() - 999, time.time() - 999))
+        self.assertTrue(m._lock_holder_stale(lock))
+
+    def test_lock_records_holder_identity(self):
+        """加锁时必须把 pid/启动时间写进锁文件（供下一次回收判定）。"""
+        path = os.path.join(self.tmp, "f.json")
+        with m._file_lock(path):
+            data = json.load(open(path + ".lock", encoding="utf-8"))
+        self.assertEqual(data["pid"], os.getpid())
+        self.assertIsNotNone(data["process_start_time"])
+
+    def test_proxy_check_requires_site_ok(self):
+        """--proxy-check 的 ok 必须同时满足「代理生效」与「目标站可用」。"""
+        real_eg, real_site, real_res = m.check_egress, m.probe_site, m.resolve_proxy_info
+        real_argv = sys.argv
+        try:
+            m.resolve_proxy_info = lambda refresh=False: {"url": "http://p:1", "source": "test"}
+            m.check_egress = lambda url=None, timeout=10: {
+                "proxy": url, "proxy_ip": "1.2.3.4", "direct_ip": "5.6.7.8",
+                "same": False, "verdict": "代理生效", "errors": []}
+            m.probe_site = lambda url=None, timeout=25: {
+                "verdict": "blocked_vpn", "ok": False, "note": "turn it off", "status": 403}
+            sys.argv = ["chatgpt_send.py", "--proxy-check"]
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = m.main()
+            self.assertEqual(rc, 3)   # 出口不满足 = 未满足联网条件，不是业务失败
+            self.assertIn("目标站不可用", buf.getvalue())
+        finally:
+            m.check_egress, m.probe_site, m.resolve_proxy_info = real_eg, real_site, real_res
+            sys.argv = real_argv
 
 
 if __name__ == "__main__":

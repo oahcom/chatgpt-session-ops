@@ -55,6 +55,22 @@ JS_COMPOSER_LEN = """(function(){
   return ta ? ((ta.innerText || ta.value || '').length) : -1;
 })()"""
 
+# 思考模式开关：输入框右侧有个文字为「思考」的按钮，aria-pressed 表示状态。
+# 实测（2026-11-19）：未开时 aria-pressed="false"，点一次变 "true" 且 class 增加 accentSubtle-*
+JS_THINKING = """(function(){
+  var btns = document.querySelectorAll('button');
+  for (var i = 0; i < btns.length; i++) {
+    var t = (btns[i].innerText || '').trim();
+    var a = (btns[i].getAttribute('aria-label') || '');
+    if (t === '思考' || t === 'Thinking' || /^(思考|Thinking)$/.test(a)) {
+      var r = btns[i].getBoundingClientRect();
+      return JSON.stringify({found: true, pressed: btns[i].getAttribute('aria-pressed'),
+                             x: r.x + r.width / 2, y: r.y + r.height / 2});
+    }
+  }
+  return JSON.stringify({found: false});
+})()"""
+
 JS_SEND = """(function(){
   var btns = document.querySelectorAll('button');
   for (var i = 0; i < btns.length; i++) {
@@ -93,6 +109,30 @@ def real_click(c, x, y):
             "type": typ, "x": x, "y": y, "button": "left", "clickCount": 1,
         })
     time.sleep(2)
+
+
+def enable_thinking(c):
+    """把「思考」按钮点到开启（幂等）。返回 ALREADY / ENABLED / NO_TOGGLE / ERROR。
+
+    用户明示（2026-11-19）：启动 ChatGPT 时必须开思考模式。不开的话回复更浅、
+    更「防御性」，评审类任务质量明显下降。CHATGPT_NO_THINKING=1 可显式关闭。
+    """
+    if os.environ.get("CHATGPT_NO_THINKING", "") not in ("", "0", "false"):
+        return "SKIPPED"
+    try:
+        info = json.loads(c.evaluate(JS_THINKING).get("value") or "{}")
+    except Exception as e:
+        return "ERROR:%s" % e
+    if not info.get("found"):
+        return "NO_TOGGLE"      # 匿名态/旧版 UI 没有这个按钮，不算失败
+    if info.get("pressed") == "true":
+        return "ALREADY"
+    real_click(c, info["x"], info["y"])
+    try:
+        again = json.loads(c.evaluate(JS_THINKING).get("value") or "{}")
+    except Exception:
+        return "ENABLED?"       # 点了但读不回状态
+    return "ENABLED" if again.get("pressed") == "true" else "FAILED_TO_TOGGLE"
 
 
 def fill_prompt(c, text):
@@ -151,6 +191,9 @@ def main():
         print("ERROR: 读不到页面状态（页面白屏或 JS 异常），不继续盲点", flush=True)
         return 2
 
+    # 先开思考模式（幂等；关闭后才填词，避免切换模型把输入框里的内容吃掉）
+    print("thinking:", enable_thinking(c), flush=True)
+
     # 尝试直接发送（可能已可发）
     print("fill:", fill_prompt(c, prompt), flush=True)
     time.sleep(1)
@@ -208,6 +251,7 @@ def main():
               % (e, old_id, new_id), flush=True)
 
     # 新会话重发
+    print("thinking2:", enable_thinking(c), flush=True)
     print("fill2:", fill_prompt(c, prompt), flush=True)
     time.sleep(1)
     print("send2:", c.evaluate(JS_SEND).get("value"), flush=True)

@@ -1,12 +1,12 @@
 ---
 name: chatgpt-session-ops
-description: ChatGPT 会话操控与生命周期管理（API 直连 + PoW + CDP 续接）。当需要向 ChatGPT 会话投递提示词、收割回复、管理多会话协调（开新会话、满员续接、限速重试）、扮演 Owner 裁决会话、或跨 WorkBuddy 会话同步操控规范时使用。触发词：操控 ChatGPT、投递提示词、chatgpt 会话管理、收割回复、PoW、Unusual activity、conversation_too_large、开始新聊天、会话满员、定时任务排程、automation 粒度、1 小时维度。核心纪律：提示词正文必须由 ChatGPT 自产，操控层只做输入输出与生命周期管理。
+description: ChatGPT 会话操控与生命周期管理（API 直连 + PoW + CDP 续接）。当需要向 ChatGPT 会话投递提示词、收割回复、管理多会话协调（开新会话、满员续接、限速重试）、扮演 Owner 裁决会话、或跨 WorkBuddy 会话同步操控规范时使用。触发词：操控 ChatGPT、投递提示词、chatgpt 会话管理、收割回复、PoW、Unusual activity、conversation_too_large、开始新聊天、会话满员、定时任务排程、automation 粒度、1 小时维度。核心纪律：所有逻辑规划实现必须由 ChatGPT 主导，提示词正文由 ChatGPT 自产，操控层只做输入输出与生命周期管理。
 agent_created: true
 ---
 
 # chatgpt-session-ops
 
-ChatGPT 会话操控与生命周期管理。把"手和眼"（I/O、投递、收割、续接）与"脑"（提示词内容）严格分离：**提示词正文必须由 ChatGPT 会话自产**（其回复中的"下一步/FollowUp/自包含提示词"原文引用），操控层只做选项拾取、事实转达、路由与投递，不自撰任务内容、不改写自产提示词。
+ChatGPT 会话操控与生命周期管理。把"手和眼"（I/O、投递、收割、续接）与"脑"（逻辑规划、实现方案、提示词内容）严格分离：**所有逻辑规划与实现必须由 ChatGPT 主导**，提示词正文必须由 ChatGPT 会话自产（其回复中的"下一步/FollowUp/自包含提示词"原文引用），操控层只做选项拾取、事实转达、路由与投递，不自撰任务内容、不自做规划与实现、不改写自产提示词。
 
 ## 开发基线（用户裁定 2026-11-19，最高优先级）
 
@@ -16,6 +16,30 @@ ChatGPT 会话操控与生命周期管理。把"手和眼"（I/O、投递、收�
 - **禁止停等人类**：不得把 R3 真人专家审查、main 合并批准、配额解除、生产激活等列为停点抛回用户等待；此类生产级门槛一律标 `OUT-OF-SCOPE(dev-baseline)`——**不伪造其已完成，也不以其阻塞收敛**。
 - **收敛口径**：开发基线全链闭环（代码链 + Owner 验收 + PR/合并 + 登记归档）全部完成即收敛；错误模式是把生产级门槛当开发基线停点、把操作抛回用户。
 - 用户已授权：**所有 Issue/PR 由 ChatGPT 会话自行闭环**；Git 写入等机械操作由协调方代执行（会话产内容、协调方提交），属正常分工不算人类决策点。
+- **逻辑主导权（用户裁定 2026-11-19，与本节同级）**：**所有逻辑规划与实现必须由 ChatGPT 主导**。方案设计、规划拆解、判定口径、实现内容全部出自 ChatGPT 会话自产；协调方/操控层**不得自行规划、自行实现、自行补全方案**——包括未来对应的开发仓库与子仓库（同套规划同样只由 ChatGPT 主导落地）。操控层职责仅有四类：事实转达（API/git 实测证据原文逐字转达）、选项拾取（按 ChatGPT 回复给出的选项继续）、Git/文件机械操作（提交、落盘、回填）、投递与收割。ChatGPT 给的方案不完整时**回问 ChatGPT 补全**，不自行脑补。
+
+## 基线（A/B 类，可判定）
+
+**详细条款、判定口径、违例后果、现成配方见 `references/baselines.md`。** 这里是索引，不是全文——条款冲突时以该文件为准，用户明示的管理基线又高于该文件。
+
+| 类 | 主题 | 编号 | 一句话 |
+|---|---|---|---|
+| **A1–A4** | 内容主权 | A1–A4 | 逻辑规划/实现/提示词全部由 ChatGPT 主导自产、逐字节搬运、裁决必投全新会话 |
+| **A5–A9** | 通道与身份 | A5–A9 | 登录态优先、401/403 不兜底、匿名只认设备身份、可写窗口=原标签页 |
+| **A10–A14** | 投递与收割 | A10–A14 | 必带 `conversation_id`、200 即停轮转、大交付对 raw mapping、全文落盘、先落设备 |
+| **A15–A18** | 限速与失败 | A15–A18 | 单 GET 进程、会话间 ≥60s、**`Retry-After` 是下限（不得向下截 180s）**、401/403/429 分级 |
+| **A19–A22** | 存储与安全 | A19–A22 | id 白名单、原子写、损坏隔离、锁按线程判重入 + **回收前校验 PID 启动时间** |
+| **A23–A26** | 出口 | A23–A26 | 单一出口、fail-closed(exit 3)、探活真握手、探活要验目标站、**WebRTC 不许漏真实 IP** |
+| **A27–A28** | 思考模式 / 流截断 | A27–A28 | 要思考就必须真开（解析不出 `-t-` 直接 `exit 1`）；**`IncompleteRead` ≠ 失败**，保留半截 + GET 补全文 |
+| **B1–B5** | 排程 | B1–B5 | 1 小时维度、条件巡检、validFrom/Until 收窗、看门狗 ≤1h、过期即 PAUSED |
+| **B6–B9** | 执行可靠性 | B6–B9 | prompt 自包含（含路径**类型**校验）、task/step 状态机幂等续跑、**RUNNING ≤3 且原子领槽**、删前先 PAUSED |
+| **B10–B15** | 行为契约 | B10–B15 | 命名正则即契约、argv 白名单只读、无事静默、重试上限 N=3、不与 A 类打架、**实例按 PID+启动时间+run_id 回收** |
+
+**§0 验收三分法（审查补入）**：命令成功（exit 0）≠ 业务成功（服务端确实做了）≠ 证据成功（落盘 + SHA-256 + id 对齐）。**把前两层当第三层，是本 skill 最危险的失败模式。**
+
+最容易被忽略的六条（写在这里，因为踩过）：**A10**（缺 `conversation_id` 静默落新会话）、**A22**（锁按路径记 → 多线程丢更新；PID 复用被当活锁）、**A23**（WebRTC UDP 绕过代理，实测漏出本机公网 IP `59.34.82.8`）、**A26**（`ipify` 通 ≠ 目标站可达）、**A28**（23MB 流被截断判失败 → 换身份重投）、**B8**（同分钟挂超过 3 个 → 被 enqueue 等效漏跑）。
+
+> v1.1 已吸收 ChatGPT 思考模式对外对抗审查（裁定 `NEEDS-REVISION`，A 类 12 WEAK / 2 MISSING，B 类 10 WEAK / 4 MISSING）；未采纳项（Asia/Tokyo、7 分钟统一超时、WebRTC 硬门禁）与理由见 `references/baselines.md` §F。
 
 ## 通道优先级（固定）
 
@@ -117,6 +141,7 @@ python scripts/chatgpt_send.py --account acct2 <conv_id> <prompt_file>
 ### 2. 开全新会话（Owner 裁决模式，登录态优先）
 
 ```bash
+python scripts/chatgpt_send.py --thinking --new <prompt_file>       # 思考模式（评审/裁决必开）
 python scripts/chatgpt_send.py --new <prompt_file>                  # 默认：acct1/acct2 均分
 python scripts/chatgpt_send.py --account acct2 --new <prompt_file>  # 指定身份
 python scripts/chatgpt_send.py --rotation                           # 游标/计数/兜底次数
@@ -155,12 +180,16 @@ python scripts/chatgpt_send.py --tail <conv_id>
 
 1. **防撞车**：开工前查目标仓库 open PR/Issue；撞车即停，走"证据归并到主 PR + 关重复件"。
 2. **事实仲裁**：跨会话冲突一律以 GitHub API / git log 的 exact head 为准，不以任何会话转述为准；中间提交的 CI 失败不代表当前 head。
-3. **限速纪律**：同一账号同时只允许一个 GET 进程；发送器与补采器错峰；429 退避 ≥90s 只用缓存 tail；会话间发送 ≥60s。
+3. **限速纪律（先定性，再退避；用户裁定 2026-11-19，取代固定 90 秒口径）**：同一账号同时只允许一个 GET 进程；发送器与补采器错峰；会话间发送 ≥60s。任何失败**先定性**（`ChatGPTAPI.classify_failure`）：
+   - **代理/网络问题**（`proxy`：status 0、SSL EOF、连接重置/超时、`EXC …`）→ **跟进修复代理**（`repair_proxy()` 重新探测出口/换端口重建连接，或 `--proxy-check` 诊断后修代理工具），修好即重试，**不做计时死等**；反复探测无出口要明确报"代理需人工跟进"，不得伪装成限速。
+   - **上游限速**（`ratelimit`：429，或响应体带限速字段）→ 退避时长**按返回体/头里的真实时限**（取值顺序：响应体 `resets_in` / `retry_after` / `rate_limit.reset` 等 → `Retry-After` 头 → 都没有才用默认值并注明），禁止固定 90 秒；服务端声明值夹在 [5,3600] 秒。
+   - **风控**（`risk`：403 Unusual activity、Cloudflare 质询页）→ 补 cookie（`warm_cookies()`）+ 重跑 PoW 流程，仍失败进冷却，不定时硬闯。
+   - GET 被限速时用 `conv-api/` 缓存 tail 兜底 parent_message_id。
 4. **账号路由**：`--new` 默认登录态均分；既有会话按 `conv-accounts.json` 自动路由；显式 `--account` 优先，与登记冲突时告警。
 5. **匿名纪律**：匿名只做限速兜底与一次性短任务；**需要留存、归档、跨机续接的会话必须用 acct1/acct2**。匿名会话丢设备 cookie 即永久失联，且从不进历史。
 6. **落盘约定**：`prompts/`（编号前缀 NN-topic.md）、`replies/`（reply-<conv_id8>-<topic>.md 全文不截断）、`conv-api/`（GET 缓存）、`newchat-map.json`、`sessions-registry.json`、`send-queue-log.md`。
-7. **禁止**：自撰/改写自产提示词；POST 不带 conversation_id 发进既有任务会话；并发抢 GET 配额；未查 open PR 就开同主题实现；删除任何会话产物。
-8. **定时任务粒度（用户明示强制 2026-11-19）**：**所有定时任务一律按 1 小时维度排程，禁止天维度（天维度过久）**。落地口径：循环任务用每小时（间隔 ≤1h）；到期处置/远期复核不得挂天级 one-shot，改为**每小时条件巡检**（提示词内置"未到点→静默退出；已到点且未处置→执行；已处置→静默退出"门控）；一次性看门狗/闹钟 ≤1h。违规排程（DAILY、数日后 one-shot）一律改小时维度。**本条为管理基线**（管理所有 AI 代理的 WorkBuddy automation 排程）：创建/修改任何 automation 前先读本条；过期 one-shot 一律 PAUSED 归档，不得留 ACTIVE 尸体；跨天/跨周的到期项用每小时条件巡检 + validFrom/validUntil 收窗，避免无效空转。
+7. **禁止**：自撰/改写自产提示词；**自行做逻辑规划/实现方案/补全设计**（一切逻辑规划实现必须由 ChatGPT 主导，方案不完整回问 ChatGPT 补全）；POST 不带 conversation_id 发进既有任务会话；并发抢 GET 配额；未查 open PR 就开同主题实现；删除任何会话产物。
+8. **定时任务粒度（用户明示强制 2026-11-19）**：**所有定时任务一律按 1 小时维度排程，禁止天维度（天维度过久）**。落地口径：循环任务用每小时（间隔 ≤1h）；到期处置/远期复核不得挂天级 one-shot，改为**每小时条件巡检**（提示词内置"未到点→静默退出；已到点且未处置→执行；已处置→静默退出"门控）；一次性看门狗/闹钟 ≤1h。违规排程（DAILY、数日后 one-shot）一律改小时维度。**本条为管理基线**（管理所有 AI 代理的 WorkBuddy automation 排程）：创建/修改任何 automation 前先读本条；过期 one-shot 一律 PAUSED 归档，不得留 ACTIVE 尸体；跨天/跨周的到期项用每小时条件巡检 + validFrom/validUntil 收窗，避免无效空转。完整条款见 `references/baselines.md` 的 **B1–B14**（含并发上限 3、`unknown_interrupted` 幂等续跑、只读看门狗零写副作用、无事静默）。
 
 ## 健壮性加固（2026-11-19 第三轮）
 
@@ -172,7 +201,7 @@ python scripts/chatgpt_send.py --tail <conv_id>
 | 落盘原子性 | 一律 `tmp → fsync → replace`；失败清 tmp | 匿名归档是唯一副本，写半截等于会话彻底丢失 |
 | 回复全文 | 默认不截断；只有显式设 `CHATGPT_REPLY_MAX_CHARS` 才截，且头部注明 | 旧版静默只留**末尾** 2 万字，结论常常在前半段 |
 | 凭据权限 | POSIX 上 `cookies.json` 等落盘后 chmod 600 | 默认 umask 会让同机其他用户可读 |
-| 429 退避 | 优先服从 `Retry-After`，夹在 [5,180] 秒 | 固定 90 秒既可能太快也可能白等 |
+| 429 退避 | 先定性再退避；上游限速按返回体 `resets_in`/`retry_after`/`Retry-After` 的真实时限（缺省才默认，封顶 3600 秒）；代理类失败不退避、改修代理 | 固定 90 秒既可能太快也可能白等，且会把代理故障误当限速 |
 | 文件锁重入 | 按**线程**记持有者（`path -> thread ident`） | 旧版按路径记集合，同进程第二个线程会跳过加锁，多线程下照样丢更新（已由单测锁死） |
 | `--tail` 退出码 | 没取到内容返回 1 | 否则脚本编排层无法区分「读到了」和「被限速」 |
 | 匿名等待预算 | `CHATGPT_ANON_IDLE_SEC`（默认 900） | 超长回复不必改代码 |
@@ -189,7 +218,8 @@ python scripts/chatgpt_send.py --tail <conv_id>
 
 环境变量：`CHATGPT_PROXY`（出口代理，最高优先级）、`CHATGPT_ALLOW_DIRECT=1`（显式放行直连，仅调试）、
 `CHATGPT_REPLY_MAX_CHARS`（默认 0=全文）、`CHATGPT_ANON_IDLE_SEC`（默认 900）、
-`CHATGPT_CDP_PORT`（`continue_full.py` / `extract_auth.py` 用，默认 9222）、`CHATGPT_ANON_CDP_PORT`（匿名通道，默认 9333）。
+`CHATGPT_CDP_PORT`（`continue_full.py` / `extract_auth.py` 用，默认 9222）、`CHATGPT_ANON_CDP_PORT`（匿名通道，默认 9333）、
+`CHATGPT_THINKING=1`（等价 `--thinking`，新会话走 `-t-` 思考模型）、`CHATGPT_MODEL`（直接指定 model slug，优先级最高）、`CHATGPT_NO_THINKING=1`（浏览器侧显式不点「思考」）。
 
 回归测试（离线，不触网、不需要凭据）：
 
@@ -217,7 +247,7 @@ python -m unittest discover -s tests -v
 
 ```bash
 python scripts/chatgpt_send.py --proxy-show                 # 出口来自哪里、绕过了什么
-python scripts/chatgpt_send.py --proxy-check                # 量出口 IP（代理侧 + 直连侧对照）
+python scripts/chatgpt_send.py --proxy-check                # 量出口 IP + 验目标站（A26），ok 需两者同时满足
 python scripts/chatgpt_send.py --proxy-check --browser      # 再验浏览器侧出口是否一致
 python scripts/chatgpt_send.py --proxy-set socks5h://u:p@1.2.3.4:1080
 python scripts/chatgpt_send.py --proxy-clear                # 清掉 proxy.json 的 url
@@ -229,6 +259,8 @@ python scripts/chatgpt_send.py --proxy-clear                # 清掉 proxy.json 
 - **socks 不是装饰**：urllib 的 `ProxyHandler` 只认 http 代理，`socks5h://` 塞进去会 `unknown url type`；这里用自定义 `http.client` 连接类做 RFC1928 握手（含用户名密码认证，`socks5h` = 远端 DNS）。
 
 > 实测坑（2026-11-19）：本机 **7890 端口还在监听、CONNECT 也回 200，但隧道立刻断流**，TLS 一律 `UNEXPECTED_EOF`；同期 **7897 正常**。所以自动探测只「看端口通不通」会稳定选到死节点 —— 现在必须先握手成功才采用，`--proxy-check` 也会把两侧 IP 摆出来给你看。
+>
+> 更坑的一层（同日 13:37）：**IP 量得通、目标站回 403**。`curl api.ipify.org` 一切正常，业务请求全 403，页面写 `Unable to load site … If you are using a VPN, try turning it off`（出口被按 VPN 封）。所以 `--proxy-check` 现在多打一次 `https://chatgpt.com/`，输出 `site.verdict`：`ok` / `challenge`（CF 挑战，浏览器能过）/ `blocked_vpn`（换节点）/ `forbidden` / `unreachable` / `http_<code>`；只有 `ok|challenge` 才算通过。
 
 ## 故障速查
 
@@ -248,9 +280,11 @@ python scripts/chatgpt_send.py --proxy-clear                # 清掉 proxy.json 
 | 回复文件明显比预期短 | 设了 `CHATGPT_REPLY_MAX_CHARS` | 取消该变量即全文落盘；文件头有截断标注 |
 | 匿名页点击发送无反应 | 窗口未显示 → `visibilityState=hidden` | 脚本已启用 `Emulation.setFocusEmulationEnabled`；仍无效则确认窗口可见 |
 | 消息落入全新会话 | POST 缺 conversation_id | 补字段重发；核对 SSE 返回的 conversation_id |
-| GET 429 | 配额紧张 | 退避 + `conv-api/` 缓存 tail 兜底 parent_message_id |
+| GET 429 | 上游配额紧张 | **按返回体/`Retry-After` 的真实时限退避**（不固定 90s）+ `conv-api/` 缓存 tail 兜底 parent_message_id |
+| status 0 / `EXC SSL EOF` / 连接重置、超时 | **代理/网络问题**，不是上游限速 | 先修代理：`--proxy-check` 诊断、换端口/换出口、重启代理工具；修好立即重试，不计时死等；探测仍无出口要报"代理需人工跟进" |
+| 403 Cloudflare HTML 质询页 | 出口 IP/指纹被拦（多为代理出口劣化） | 视同代理问题跟进修复（换出口）；或借已登录浏览器过质询后取 `cf_clearance`/走浏览器通道；单纯 sleep 无用 |
 | 收割 DONE chars 远小于会话实际产出 | 收割器只截到部分（流式截断/轮询取短） | **大交付必用 raw mapping**（GET `/backend-api/conversation/<id>` 取全部 assistant parts 拼合）核对总长，勿凭 DONE chars 判截断要求重发 |
-| `FAIL: no requirements token` | 并发 POST 撞 sentinel 限速/瞬态 | 错峰 60s 重投；先单独探测 `chat-requirements` 返回 200 再发 |
+| `FAIL: no requirements token` | 先定性：代理故障（定性=proxy）→ 修代理；上游 sentinel 限速（定性=ratelimit）→ **按返回体时限退避**后重投 | 修代理或按返回体时限错峰重投；先单独探测 `chat-requirements` 返回 200 再发 |
 | 私有仓库事实包 raw URL 404 | 未认证 raw.githubusercontent 对私有仓恒 404；分支名含 `/` 的 ref 也可能解析不到 | 事实包**内联字节原文**（Git Blob SHA + sha256 供自校验）或走已认证 GitHub 通道；规范类文件注意所在分支（如 AI-EXEC 只在 main） |
 | 413 conversation_too_large | 会话满员 | continue_full.py 摘要续接 |
 | 流读取为空 | `with` 提前关连接 | 读到 EOF（chatgpt_send.py 已正确处理） |
@@ -281,6 +315,7 @@ python scripts/chatgpt_send.py --proxy-clear                # 清掉 proxy.json 
 
 ### references/
 
+- `baselines.md` — **A/B 类基线（可判定版）**：每条带判定口径与违例后果，附 C 类现成配方（每小时巡检、落盘看门狗、到期处置、配额哨兵）、D 类事故→条款映射、E 类变更纪律。**开工前扫 A0/B0 清单，排程前读 B1–B14，改代码前读对应条款。**
 - `api-protocol.md` — 实测协议细节：端点、PoW 算法、POST 请求体全字段、SSE 解析、mapping tail 计算、状态码处置、限速纪律。改脚本前先读。
 
 ### tests/

@@ -53,6 +53,27 @@
 - `parent_message_id` = GET conversation 的 mapping 中 `create_time` 最大的节点 id。GET 429 时用本地缓存 `conv-api/<id8>.json` 同法计算兜底。
 - 开全新会话（Owner 模式）时**故意不带** `conversation_id`，此时也无 parent。
 
+## `model` 字段与思考模式（实测 2026-11-19）
+
+`GET /backend-api/models` 里同一标题会出现**两个 slug**：
+
+| slug 形态 | 实测 `max_tokens` | 含义 |
+|---|---|---|
+| `gpt-5-6-mini` | 34834 | 普通变体（不思考） |
+| `gpt-5-6-t-mini` | 262144 | **思考变体**（`-t-` = thinking） |
+
+- 默认会话发 `"model": "auto"`，服务端自行选普通变体 → 回复更短更浅。
+- 要思考：把 body 的 `model` 换成解析出的 `-t-` slug（脚本 `resolve_thinking_model()`；`--thinking` 或 `CHATGPT_THINKING=1` 启用）。解析失败**回落 auto 并 WARN**，不静默失败。
+- 代价：单条回复 5–19 分钟，SSE 体可达 **23 MB**（普通变体通常几百 KB）。
+- 浏览器侧对应的是输入框旁的 `思考` 按钮（`aria-pressed`），与 API 的 `-t-` 是两套开关，互不影响。
+
+## 流截断（`IncompleteRead`）—— 思考模式下的常态
+
+- 23 MB 流经隧道时容易中途断流，`urllib` 抛 `http.client.IncompleteRead`，异常对象带 `e.partial`（已收到的字节）。
+- **不能当发送失败**：字节里通常已含 `conversation_id` 与大部分回复。判失败会导致「换身份重投 → 同一 prompt 建出两个会话」。
+- 正确处置：把 `e.partial` 按 200 语义解析（`last_truncated=True`），再 `GET /backend-api/conversation/<id>` 用 mapping 取全文；只有 GET 结果更长才替换。
+- `harvest_mapping()` 取「`create_time` 最大的 assistant 消息」，对截断流同样适用（比 SSE 增量拼接可靠）。
+
 ## SSE 响应解析
 
 - 每行 `data: <json>`，`data: [DONE]` 结束。POST 返回 200 即消息已提交，流只是收发。
