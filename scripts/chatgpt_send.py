@@ -336,6 +336,7 @@ def _lock_holder_stale(lock):
 
 @contextlib.contextmanager
 def _file_lock(path, timeout=LOCK_TIMEOUT_SEC):
+    """文件锁：fail-closed——获取失败必须终止，绝不放行未持锁者进入临界区。"""
     me = threading.get_ident()
     if _LOCK_HELD.get(path) == me:  # 同线程重入：直接放行（避免自锁）
         yield
@@ -355,8 +356,18 @@ def _file_lock(path, timeout=LOCK_TIMEOUT_SEC):
                     "thread": me,
                     "path": os.path.basename(path),
                 }).encode("utf-8"))
-            except OSError:
-                pass
+            except OSError as e:
+                # 元数据写失败→锁无法被正确识别持有者→清理并 fail-closed
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    os.remove(lock)
+                except OSError:
+                    pass
+                raise OSError("锁持有者元数据写入失败（%s）：%s ——fail-closed"
+                              % (os.path.basename(path), e)) from e
             break
         except FileExistsError:
             try:
@@ -366,12 +377,16 @@ def _file_lock(path, timeout=LOCK_TIMEOUT_SEC):
             except OSError:
                 pass
             if time.time() >= end:
-                print("WARN: 状态文件锁等待超时，跳过加锁（%s）" % os.path.basename(path), flush=True)
-                break
+                raise TimeoutError(
+                    "状态文件锁等待超时（%s）——fail-closed，不进入临界区"
+                    % os.path.basename(path))
             time.sleep(0.1)
         except OSError as e:
-            print("WARN: 状态文件加锁失败（%s）：%s" % (os.path.basename(path), e), flush=True)
-            break
+            raise OSError("状态文件加锁失败（%s）：%s ——fail-closed，不进入临界区"
+                          % (os.path.basename(path), e)) from e
+    # 只有真实拿到锁（fd 不为 None）才登记持锁并进入临界区
+    if fd is None:
+        raise RuntimeError("_file_lock: 锁未获取但流程到达临界区入口——异常状态，拒绝进入")
     _LOCK_HELD[path] = me
     try:
         yield
@@ -626,13 +641,20 @@ def release_slot(slot_path, run_id=None):
 
 
 def _update_json(path, mutate, default):
-    """锁内读-改-写，杜绝并发丢更新。mutate(data) 就地修改，返回 False 表示无需落盘。"""
-    with _file_lock(path):
-        data = _load_json(path, default)
-        if mutate(data) is False:
-            return data
-        _save_json(path, data)
-        return data
+    """锁内读-改-写，杜绝并发丢更新。mutate(data) 就地修改，返回 False 表示无需落盘。
+    锁超时由调用方重试（fail-closed 不放行未持锁者，但业务语义要求写入不丢失）。"""
+    for attempt in range(8):
+        try:
+            with _file_lock(path, timeout=LOCK_TIMEOUT_SEC * 2):
+                data = _load_json(path, default)
+                if mutate(data) is False:
+                    return data
+                _save_json(path, data)
+                return data
+        except TimeoutError:
+            if attempt == 7:
+                raise
+            time.sleep(0.02 * (attempt + 1))  # 退避后重试
 
 
 def _normalize_rotation(st):
