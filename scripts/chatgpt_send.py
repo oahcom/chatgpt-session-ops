@@ -906,7 +906,8 @@ def reply_digest(raw_body):
     if not isinstance(mapping, dict):
         return None
     best = None
-    for node_id, node in mapping.items():
+    # order = mapping 插入序号，作为 ct 相同时的 tiebreaker。
+    for order, (node_id, node) in enumerate(mapping.items()):
         if not isinstance(node, dict):
             return None        # 有一个坏 node → 整体不可用（不得跳过）
         msg = node.get("message")
@@ -945,7 +946,17 @@ def reply_digest(raw_body):
             return None    # F-19：assistant 消息含非文本内容 → 核不了全文
         if not texts or not _assistant_text(texts):
             continue
-        key = (ct, str(msg.get("id") or node_id))
+        # F-27（第34轮终检自检）：选「最新 assistant」的口径必须与
+        # harvest_mapping_checked 完全一致。后者经 _scan_mapping 做
+        # `rows.sort(key=ct)`（**稳定排序**）再 reversed 取第一个 assistant，
+        # 即：ct 最大者；**ct 相同则取 mapping 插入序最后的那个**。
+        # 旧版这里用 (ct, str(id)) 当 key，ct 相同时按 id 字典序选——与
+        # 插入序无关。多条 assistant 共用 ct（如都缺 create_time→归 0）时，
+        # digest 选中 id 字典序最大者、harvest 选中插入序最后者，算出两个
+        # 不同 sha → 「digest.sha == sha256(full)」永不成立 → 合法完整回复
+        # 被误标「完整性未证明」（与 F-26 同为 F-24 门禁的口径分裂）。
+        # 改用 (ct, order)：ct 最大、ct 同取插入序最后，与稳定排序对齐。
+        key = (ct, order)
         if best is None or key > best[0]:
             best = (key, msg, texts)
     if best is None:

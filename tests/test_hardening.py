@@ -1203,6 +1203,29 @@ class TestSendFlow(TmpBase):
         self.assertEqual(dg["sha256"], hashlib.sha256(full.encode("utf-8")).hexdigest(),
                          "摘要 sha 必须与落盘全文逐字节一致（F-26）")
 
+    def test_reply_digest_selects_same_assistant_as_harvest_on_ct_tie(self):
+        """F-27：多条 assistant 的 create_time 相同时，digest 选中的节点必须与 harvest 一致。
+
+        旧版 reply_digest 用 (ct, id字符串) 选字典序最大者，harvest 经 _scan_mapping
+        稳定排序 + reversed 取插入序最后者。两者在 ct 相同（含都缺失归 0）时选出
+        不同节点 → sha 不等 → 合法完整回复被误标「完整性未证明」（F-24 门禁口径分裂）。
+        """
+        import hashlib
+        # 插入序 zzz 先、aaa 后；都缺 create_time → ct 均归 0；id 字典序 zzz > aaa
+        raw = json.dumps({"mapping": {
+            "zzz": {"message": {"id": "zzz", "author": {"role": "assistant"},
+                                "content": {"parts": ["ZZZ 节点"]}}},
+            "aaa": {"message": {"id": "aaa", "author": {"role": "assistant"},
+                                "content": {"parts": ["AAA 节点"]}}},
+        }})
+        dg = m.reply_digest(raw)
+        full, complete = m.ChatGPTAPI.harvest_mapping_checked(raw)
+        self.assertTrue(complete)
+        self.assertEqual(full, "AAA 节点", "harvest 取插入序最后者")
+        self.assertEqual(dg["message_id"], "aaa", "digest 必须选中同一节点，而非 id 字典序最大者")
+        self.assertEqual(dg["sha256"], hashlib.sha256(full.encode("utf-8")).hexdigest(),
+                         "同 ct 时摘要仍须与落盘全文一致（F-27）")
+
     def test_timeout_is_split_by_thinking(self):
         """A16：思考模式给 30 分钟，非思考给 7 分钟；同一条预算会误杀 19 分钟的思考回复。"""
         cid = "11111111-2222-4333-8444-555555555555"
@@ -2513,6 +2536,36 @@ class TestLandingMismatch(TmpBase):
         self.assertTrue(saved, "必须落盘归档")
         self.assertNotIn("完整性未证明", saved[0][1],
                          "完整回复不得被误标不完整")
+
+    def test_ct_tie_full_reply_is_proven_complete(self):
+        """F-27：GET 拉回多条同 ct 的 assistant、最新那条约完整回复，仍须证明完整。
+
+        端到端钉住 F-24 门禁：旧版 digest 选 id 字典序最大者、harvest 选插入序
+        最后者，同 ct 时算出不同 sha → 合法完整回复被误标「完整性未证明」。
+        """
+        class TieGetStub(self._Stub):
+            def req(self, method, url, body=None, timeout=60):
+                self.gets.append(url)
+                gbody = json.dumps({"mapping": {
+                    "zzz": {"message": {"id": "zzz", "author": {"role": "assistant"},
+                                        "content": {"parts": ["旧节点"]}}},
+                    "aaa": {"message": {"id": "aaa", "author": {"role": "assistant"},
+                                        "content": {"parts": ["\n最新完整回复  \n"]}}},
+                }})
+                return 200, gbody
+
+        saved, gets = [], []
+        api = TieGetStub(os.path.join(self.tmp, "auth"), self._plain_incomplete(),
+                         saved, gets, False)
+        status, path, conv = m.send_prompt(api, self.TARGET, self._prompt(), thinking=False)
+        self.assertEqual(status, 200)
+        self.assertTrue(gets, "不完整 SSE 必须触发 GET 补全")
+        self.assertIs(getattr(conv, "reply_complete", None), True,
+                      "同 ct 的完整回复仍须被证明完整（F-27）")
+        self.assertTrue(saved)
+        self.assertIn("最新完整回复", saved[0][1])
+        self.assertNotIn("完整性未证明", saved[0][1],
+                         "同 ct 不得导致完整回复被误标不完整")
 
     def test_completeness_requires_get_evidence_not_selfratio(self):
         """F-24：digest 必须真正参与放行——GET 补全失败时不得标 reply_complete=True。"""

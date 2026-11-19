@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**三十三轮对外对抗审查**逐条改写（第三十三轮为收敛后终检自检，其余为对外会话裁定；每轮裁定见 §F；**第二十五轮 `PASS`——锁子系统全文最终确认·收敛**，第二十二轮 `PASS`（F-10 残留定向复审），**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至二十三轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08）、锁元数据写入失败进临界区（F-09）、损坏启动时间误判 pid_reused（F-10）、归档覆盖（F-11）、超长 pid 串 int() 异常逃逸（F-07 残留）、**收割/对账解析器畸形 JSON 崩溃（F-12，41 处）**、**落点不一致只 WARN 导致会话身份与回复归属分裂（F-13）**、**RRULE 校验语义 ≠ 下发语义（F-14）**、**解析边界与证据保全缺口（F-15～F-19）**、**落点正则绕过与回复完整性 fail-open（F-13/F-16 残留 + F-23～F-25）**、**浮点精度与首尾换行边界（F-12c/F-22 残留 + N-01/N-02）**、**对账器跨角色畸形漏检（D-01）**——前 11 组已在第二十五轮核销，**F-12～F-25 + D-01 全部核销，三十二轮对抗审查收敛**），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 271 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**三十四轮对外对抗审查**逐条改写（第三十三、三十四轮为收敛后终检自检，其余为对外会话裁定；每轮裁定见 §F；**第二十五轮 `PASS`——锁子系统全文最终确认·收敛**，第二十二轮 `PASS`（F-10 残留定向复审），**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至二十三轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08）、锁元数据写入失败进临界区（F-09）、损坏启动时间误判 pid_reused（F-10）、归档覆盖（F-11）、超长 pid 串 int() 异常逃逸（F-07 残留）、**收割/对账解析器畸形 JSON 崩溃（F-12，41 处）**、**落点不一致只 WARN 导致会话身份与回复归属分裂（F-13）**、**RRULE 校验语义 ≠ 下发语义（F-14）**、**解析边界与证据保全缺口（F-15～F-19）**、**落点正则绕过与回复完整性 fail-open（F-13/F-16 残留 + F-23～F-25）**、**浮点精度与首尾换行边界（F-12c/F-22 残留 + N-01/N-02）**、**对账器跨角色畸形漏检（D-01）**——前 11 组已在第二十五轮核销，**F-12～F-25 + D-01 全部核销，三十二轮对抗审查收敛**），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 273 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -34,7 +34,7 @@
 | 2 | 这个会话归谁 | `--owner <conv_id>` | 输出唯一账号 |
 | 3 | 配额有没有冷却 | `--rotation` | `unavailable` 为空或目标账号不在其中 |
 | 4 | 匿名要用先看设备 | `--anon-devices` | 目标设备 `jar=true` |
-| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 271 条） |
+| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 273 条） |
 
 ### A1–A4 内容主权（不可协商）
 
@@ -335,7 +335,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | automation 名称 / 排程 | 同上 + `--check-name`、`--check-schedule`、`--check-oneshot` | B1/B4/B5/B10/B11 |
 | 排程口径 | `automation_update list` 全量盘点 | B1–B5 |
 
-**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 271 条。
+**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 273 条。
 
 ---
 
@@ -451,13 +451,16 @@ X=2` 会被当成单个合法 VALUE 放行；改为 `([^;
 
 **第三十轮改了什么（依新会话裁定）**：① **F-12c**——`_as_ctime` 的 float 分支补安全整数边界：`abs(value)>2^53−1 且 value==int(value)` 判不可用，非整数型 float（1.5）仍接受；实测 `9007199254740992.0`/`1e20`→`(False,0.0)`。② **F-22**——`check_schedule` 在 `.strip()` **之前**检查原始串 CR/LF，含换行一律拒绝（首尾换行也不许预处理替用户消除）。③ **F-18/N-01**——响应保全移到 body 构造**之前**，`header.resp_preserved`/`resp_error` 随结果变化；档案正文按 `resp_ok` 动态生成「已保全 / 保全失败 + 需人工重取」两种声明，失败时不再声称成功。④ **N-02**——占名后改 `_atomic_write(path, body)`（临时文件完整写 + fsync + os.replace 发布），失败则删除占名空壳，不留部分档案。⑤ **`_record_pending_claim` 并发**——JSONL append 纳入 `_file_lock(path, strict=True)` 跨进程互斥，LockTimeout 与 OSError 都返回 False（fail-closed）。⑥ 补 3 条回归（265→268）。
 | 32 | v1.8 修订 | **`PASS`（三子系统收敛）** | 新会话 6aff2f4d 单点增量复审 D-01：修改位置正确（`_split_parts` 已移到角色判断前，所有节点先查非法 part，用户合法结构化 part 仍放行）；三对照全部一致（user 非法→None、user 合法结构化→非空摘要、assistant 非法→None）。裁定原文：『可以宣告回复完整性/收割链路增量收敛；定时任务契约维持已宣告的增量收敛；锁子系统不重审』。|
-| 33 | v1.8 修订 | **`PASS`（收敛后终检自检：F-26）** | 第 32 轮宣告收敛后，终检对「回复完整性/收割链路」做实现级复核，抓出 F-26：`reply_digest` 按**未 strip** 的 parts 算 chars/sha，`_scan_mapping`/`harvest_mapping_checked` 返回 **strip 后**的 full，而 `send_prompt` 的 F-24 放行门禁拿两者逐字节比对（`digest.sha == sha256(full)`）。合法完整回复只要首尾带空白（LLM 输出极常见），两侧拼接永不等 → `digest_ok=False` → 被误标「完整性未证明」，F-24 门禁失去区分度。方向保守（不 fail-open），但属刚收敛子系统的实现级口径缺陷。修复：抽 `code:_assistant_text`（拼接+strip）为唯一口径，`_scan_mapping` 与 `reply_digest` 共用。补 2 条回归（269→271）：`test_reply_digest_matches_harvest_with_whitespace`（直接层）+ `test_whitespace_padded_full_reply_is_proven_complete`（端到端门禁层）。
+| 33 | v1.8 修订 | **`PASS`（收敛后终检自检：F-26）** | 第 32 轮宣告收敛后，终检对「回复完整性/收割链路」做实现级复核，抓出 F-26：`reply_digest` 按**未 strip** 的 parts 算 chars/sha，`_scan_mapping`/`harvest_mapping_checked` 返回 **strip 后**的 full，而 `send_prompt` 的 F-24 放行门禁拿两者逐字节比对（`digest.sha == sha256(full)`）。合法完整回复只要首尾带空白（LLM 输出极常见），两侧拼接永不等 → `digest_ok=False` → 被误标「完整性未证明」，F-24 门禁失去区分度。方向保守（不 fail-open），但属刚收敛子系统的实现级口径缺陷。修复：抽 `code:_assistant_text`（拼接+strip）为唯一口径，`_scan_mapping` 与 `reply_digest` 共用。补 2 条回归（269→271）：`test_reply_digest_matches_harvest_with_whitespace`（直接层）+ `test_whitespace_padded_full_reply_is_proven_complete`（端到端门禁层）。|
 
 **第三十三轮改了什么（收敛后终检自检，非新会话裁定）**：**F-26**——① 新增 `_assistant_text(texts)` = `"".join(texts).strip()`，作为 assistant 文本的唯一规范化口径；② `_scan_mapping` 的 `text = "".join(texts).strip()` 与 `reply_digest` 的摘要拼接（chars/sha）都改走 `_assistant_text`，消灭「落盘 strip / 对账不 strip」的口径分裂；③ 探针实测三种输入（无空白／首尾空白／多 part 尾部换行）修复后 `chars==len(full)` 且 `sha256` 逐字节相等、`digest_ok` 全 True；④ 补 2 条回归钉住直接层与门禁层。**自检裁定：F-26 关闭；该缺陷严格保守（只误标完整→不完整，不把不完整放行成完整），修复未触动三子系统的其它判定口径；回归 271 全绿（1 条 POSIX-only skip）。** 本轮为收敛后主动终检的一处自检修复，修复面仅限回复完整性对账口径。
+| 34 | v1.8 修订 | **`PASS`（收敛后终检自检：F-27）** | 第 33 轮修复 F-26 后，沿「两函数对同一份数据各自实现」模式继续终检，抓出 F-27：`reply_digest` 用 `(ct, id字符串)` 选最新 assistant，`harvest_mapping_checked` 经 `_scan_mapping` 稳定排序 + reversed 取插入序最后者；多条 assistant 的 ct 相同（含都缺 create_time→归 0）时两者选出不同节点 → sha 不等 → 合法完整回复被误标「完整性未证明」，是 F-24 门禁继 F-26 后的第二处口径分裂（选节点口径）。方向保守（不 fail-open）。修复：选节点 key 改 `(ct, order)`（ct 最大、ct 同取插入序最后），与 `_scan_mapping` 稳定排序对齐。补 2 条回归（271→273）：`test_reply_digest_selects_same_assistant_as_harvest_on_ct_tie`（直接层）+ `test_ct_tie_full_reply_is_proven_complete`（端到端门禁层）。|
+
+**第三十四轮改了什么（收敛后终检自检，非新会话裁定）**：**F-27**——① `reply_digest` 的选节点 key 从 `(ct, str(id))` 改为 `(ct, order)`（`order`=mapping 插入序号），与 `_scan_mapping` 的 `rows.sort(key=ct)` 稳定排序 + `reversed` 取插入序最后一条 assistant 的语义对齐；② 探针实测四种场景（同 ct 缺失两种插入序、同 ct 显式、正常不同 ct）digest 与 harvest 全部选中同一节点、`digest_ok` 全 True；③ 补 2 条回归钉住直接层（选中 id）与门禁层（端到端 `reply_complete=True`）。**自检裁定：F-27 关闭；与 F-26 同为严格保守缺陷（只误标完整→不完整），修复面仅限选节点口径，未触动三子系统其它判定；回归 273 全绿（1 条 POSIX-only skip）。** 本轮与第 33 轮同属收敛后主动终检的自检修复。
 
 **第三十一轮改了什么（依新会话裁定）**：**D-01**——`reply_digest` 将 `_split_parts(parts)` 与 `if malformed: return None` 移到 `author.get("role") != "assistant"` 判断**之前**（时间戳校验之后），确保**所有角色**的非法 part 都让完整性证明器整体不可用；assistant 的结构化 part 与「无文本」判断仍保留在角色判断之后，用户合法多模态 part 照常放行。补 1 条回归（268→269），三对照实测：user 非法 part→None、user 合法结构化 part→摘要成立、assistant 非法 part→None。
 
-**收敛声明（第 32 轮，第 33 轮终检后仍成立）**：经三十二轮对抗审查，三个子系统全部收敛——①**锁/进程身份**：第 25 轮全文最终确认 PASS（逐函数 12 项 + 逐组合 7 组）；②**定时任务契约**：第 31 轮增量收敛（CR/LF 首尾绕过、内部空白、重复 rule part、非法/超长 INTERVAL、大小写不敏感、规范化下发、缺省语义全部覆盖，无新绕过路径）；③**回复完整性/收割链路**：第 32 轮增量收敛（D-01 关闭，F-12～F-25 + D-01 全部核销），第 33 轮收敛后终检自检补修 F-26（digest/full 口径统一），未推翻前述收敛结论。回归 **271 条全绿**（1 条 POSIX-only skip）。收敛后不再开启新一轮对抗审查；新增功能或改动这三个子系统的实现时需重新走对抗审查。
+**收敛声明（第 32 轮，第 33/34 轮终检后仍成立）**：经三十二轮对抗审查，三个子系统全部收敛——①**锁/进程身份**：第 25 轮全文最终确认 PASS（逐函数 12 项 + 逐组合 7 组）；②**定时任务契约**：第 31 轮增量收敛（CR/LF 首尾绕过、内部空白、重复 rule part、非法/超长 INTERVAL、大小写不敏感、规范化下发、缺省语义全部覆盖，无新绕过路径）；③**回复完整性/收割链路**：第 32 轮增量收敛（D-01 关闭，F-12～F-25 + D-01 全部核销），第 33 轮收敛后终检自检补修 F-26（digest/full 拼接口径统一）、第 34 轮补修 F-27（选节点口径对齐），均未推翻前述收敛结论。回归 **273 条全绿**（1 条 POSIX-only skip）。收敛后不再开启新一轮对抗审查；新增功能或改动这三个子系统的实现时需重新走对抗审查。
 
 **第十四轮之后补的一条**：审查把「`_record_corruption("lease-recovery-failed")` 自己失败会怎样」列为残余风险 3，虽不构成裁定理由，但这是能离线证明的，于是补 `test_quarantine_failed_row_write_failure_is_survivable`（第一次登记成功、第二次返回 `None`，断言不抛异常、仍返回 `quarantine_failed`、租约原样在）。**属于 PASS 后的加证，不改变任何条款口径**，故不重开一轮审查。
 
