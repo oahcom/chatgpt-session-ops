@@ -1590,6 +1590,112 @@ class TestProxy(TmpBase):
         self.assertEqual(data["pid"], os.getpid())
         self.assertIsNotNone(data["process_start_time"])
 
+    # ---- F-08 补充：非法 UTF-8 不得穿透为异常 ----
+    def test_lock_invalid_utf8_not_reclaimed(self):
+        """锁文件含非法 UTF-8 字节：读取失败 → 不回收，不得抛 UnicodeDecodeError。"""
+        lock = os.path.join(self.tmp, "bad-utf8.lock")
+        with open(lock, "wb") as f:
+            f.write(b"\xff\xfe\x00garbage\x80\x81")
+        os.utime(lock, (time.time() - 999, time.time() - 999))
+        self.assertFalse(m._lock_holder_stale(lock))  # 不抛异常、不回收
+
+    # ---- F-09：锁身份写入失败/短写不得进临界区 ----
+    def test_lock_write_failure_does_not_enter_critical_section(self):
+        """os.write 抛 OSError：必须抛 LockTimeout，临界区不执行，锁文件被清理。"""
+        path = os.path.join(self.tmp, "f09a.json")
+        entered = []
+        real_write = m.os.write
+
+        def boom(fd, data):
+            raise OSError("模拟磁盘写失败")
+        try:
+            m.os.write = boom
+            with self.assertRaises(m.LockTimeout):
+                with m._file_lock(path, strict=True):
+                    entered.append(1)
+        finally:
+            m.os.write = real_write
+        self.assertEqual(entered, [], "写入失败绝不能进临界区")
+        self.assertFalse(os.path.exists(path + ".lock"), "半成品锁必须清理")
+
+    def test_lock_short_write_does_not_enter_critical_section(self):
+        """os.write 短写（返回字节数不足）：必须抛 LockTimeout，不得当成功。"""
+        path = os.path.join(self.tmp, "f09b.json")
+        entered = []
+        real_write = m.os.write
+        state = {"first": True}
+
+        def short(fd, data):
+            if state["first"]:
+                state["first"] = False
+                return max(1, len(data) // 3)   # 只写 1/3
+            raise OSError("模拟后续写失败")
+        try:
+            m.os.write = short
+            with self.assertRaises(m.LockTimeout):
+                with m._file_lock(path, strict=True):
+                    entered.append(1)
+        finally:
+            m.os.write = real_write
+        self.assertEqual(entered, [], "短写不得进临界区")
+
+    def test_lock_write_failure_non_strict_also_blocks(self):
+        """非 strict 模式下写入失败同样不得进临界区（身份缺失 ≠ 锁竞争超时）。"""
+        path = os.path.join(self.tmp, "f09c.json")
+        entered = []
+        real_write = m.os.write
+
+        def boom(fd, data):
+            raise OSError("模拟写失败")
+        try:
+            m.os.write = boom
+            with self.assertRaises(m.LockTimeout):
+                with m._file_lock(path, strict=False):
+                    entered.append(1)
+        finally:
+            m.os.write = real_write
+        self.assertEqual(entered, [], "非 strict 也不能带着空锁进临界区")
+
+    # ---- F-10：process_start_time 损坏值不得当 pid_reused 证据 ----
+    def test_lock_corrupt_start_time_not_reclaimed(self):
+        """存储的 process_start_time 是垃圾串：不得当 pid_reused 证据回收。"""
+        for bad in ("corrupted", True, False, [1], {"x": 1}, float("nan")):
+            lock = os.path.join(self.tmp, "f10-%s.lock" % str(bad)[:8])
+            self._write_lock(lock, {"pid": os.getpid(),
+                                    "process_start_time": bad,
+                                    "created_at": time.time() - 999})
+            with self.subTest(value=bad):
+                self.assertFalse(m._lock_holder_stale(lock),
+                                 "损坏 start_time=%r 不得触发回收" % (bad,))
+
+    def test_lock_valid_start_time_mismatch_is_reclaimed(self):
+        """合法数字但确实不等（PID 复用）→ 可回收（不能矫枉过正）。"""
+        lock = os.path.join(self.tmp, "f10-valid.lock")
+        real = m._proc_start_time(os.getpid())
+        self._write_lock(lock, {"pid": os.getpid(),
+                                "process_start_time": (real or 0) + 99999,
+                                "created_at": time.time() - 999})
+        self.assertTrue(m._lock_holder_stale(lock))
+
+    def test_parse_start_time_contract(self):
+        """_parse_start_time 直接契约测试：None/合法/损坏三类。"""
+        # None → 旧格式兼容
+        ok, v = m._parse_start_time(None)
+        self.assertTrue(ok)
+        self.assertIsNone(v)
+        # 合法 int / float → 原值返回（不转 float，防 FILETIME 精度丢失）
+        for good in (12345, 12345.678, 0):
+            ok, v = m._parse_start_time(good)
+            self.assertTrue(ok, "合法值 %r 应通过" % (good,))
+            self.assertEqual(v, good, "必须原值返回，不得 float() 归一化")
+        # 损坏 → False
+        for bad in (True, False, "12345", [1], {"a": 1}, float("nan"), None):
+            if bad is None:
+                continue  # None 是合法的旧格式
+            ok, v = m._parse_start_time(bad)
+            self.assertFalse(ok, "损坏值 %r 应判无效" % (bad,))
+            self.assertIsNone(v)
+
     def test_proxy_check_requires_site_ok(self):
         """--proxy-check 的 ok 必须同时满足「代理生效」与「目标站可用」。"""
         real_eg, real_site, real_res = m.check_egress, m.probe_site, m.resolve_proxy_info
@@ -1973,15 +2079,15 @@ class TestSlotsAndLease(TmpBase):
                        "approved_at": "2026-11-19T16:00:00+08:00",
                        "approver": "owner", "reason": "dead",
                        "identity_evidence": "ps snapshot"}, f)
-        real = m.os.replace
+        real = m._rename_no_overwrite
 
         def boom(src, dst):
             raise OSError("模拟改名失败 WinError 5")
         try:
-            m.os.replace = boom
+            m._rename_no_overwrite = boom
             ok, why = m.lease_force_release(path, approval)
         finally:
-            m.os.replace = real
+            m._rename_no_overwrite = real
         self.assertFalse(ok)
         self.assertEqual(why, "quarantine_failed")
         self.assertTrue(os.path.exists(path), "改名失败却动了租约")
@@ -2010,7 +2116,7 @@ class TestSlotsAndLease(TmpBase):
                        "approved_at": "2026-11-19T16:00:00+08:00",
                        "approver": "owner", "reason": "dead",
                        "identity_evidence": "ps snapshot"}, f)
-        real_record, real_replace = m._record_corruption, m.os.replace
+        real_record, real_rename = m._record_corruption, m._rename_no_overwrite
         calls = []
 
         def record_once(kind, p, why):
@@ -2023,14 +2129,114 @@ class TestSlotsAndLease(TmpBase):
             raise OSError("模拟改名失败 WinError 5")
         try:
             m._record_corruption = record_once
-            m.os.replace = boom
+            m._rename_no_overwrite = boom
             ok, why = m.lease_force_release(path, approval)
         finally:
-            m._record_corruption, m.os.replace = real_record, real_replace
+            m._record_corruption, m._rename_no_overwrite = real_record, real_rename
         self.assertFalse(ok)
         self.assertEqual(why, "quarantine_failed")
         self.assertEqual(calls, ["lease-recovery", "lease-recovery-failed"])
         self.assertTrue(os.path.exists(path), "补记行写失败不该把租约搞丢")
+
+    # ---- F-10：_lease_reclaimable 的 process_start_time 损坏值不得当 pid_reused ----
+    def test_lease_reclaimable_corrupt_start_time_not_reclaimed(self):
+        """存储的 process_start_time 是垃圾值：返回 identity_unreadable，禁止回收。"""
+        for bad in ("corrupted", True, False, [1], {"x": 1}, float("nan")):
+            info = {"run_id": "r1", "pid": os.getpid(),
+                    "lease_until": 0, "process_start_time": bad}
+            with self.subTest(value=bad):
+                ok, why = m._lease_reclaimable(info, now=self._now())
+                self.assertFalse(ok, "损坏 start_time=%r 不得回收" % (bad,))
+                self.assertEqual(why, "identity_unreadable")
+
+    def test_lease_reclaimable_valid_start_time_mismatch_is_pid_reused(self):
+        """合法数字但确实不等（PID 复用）→ pid_reused（不能矫枉过正）。"""
+        real = m._proc_start_time(os.getpid())
+        info = {"run_id": "r1", "pid": os.getpid(),
+                "lease_until": 0, "process_start_time": (real or 0) + 99999}
+        ok, why = m._lease_reclaimable(info, now=self._now())
+        self.assertTrue(ok)
+        self.assertEqual(why, "pid_reused")
+
+    def test_lease_reclaimable_none_start_time_alive(self):
+        """process_start_time=None（旧格式）且进程存活 → alive，不回收。"""
+        info = {"run_id": "r1", "pid": os.getpid(),
+                "lease_until": 0, "process_start_time": None}
+        ok, why = m._lease_reclaimable(info, now=self._now())
+        self.assertFalse(ok)
+        self.assertEqual(why, "alive")
+
+    # ---- F-11：隔离归档不覆盖已有归档 ----
+    def test_force_release_preserves_existing_archive(self):
+        """目标归档已存在时：旧归档内容不得被覆盖，新损坏租约落到唯一名。"""
+        path = os.path.join(self.tmp, "lease-f11.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{broken-lease")
+        # 预建同秒归档（模拟同一秒二次恢复/预存文件）
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        existing = "%s.corrupt-%s" % (path, ts)
+        with open(existing, "w", encoding="utf-8") as f:
+            f.write("PRECIOUS-OLD-ARCHIVE")
+        approval = os.path.join(self.tmp, "approve-f11.json")
+        with open(approval, "w", encoding="utf-8") as f:
+            json.dump({"sha256": m._sha256_file(path),
+                       "approved_at": "2026-11-19T16:00:00+08:00",
+                       "approver": "owner", "reason": "dead",
+                       "identity_evidence": "ps snapshot"}, f)
+        ok, why = m.lease_force_release(path, approval)
+        self.assertTrue(ok, "归档冲突时应自动找唯一名，不该失败")
+        self.assertEqual(why, "quarantined")
+        # 旧归档内容不变
+        with open(existing, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "PRECIOUS-OLD-ARCHIVE",
+                             "R7：旧归档不得被覆盖")
+        # 新归档落到不同名字
+        found = [fn for fn in os.listdir(self.tmp)
+                 if fn.startswith(os.path.basename(path) + ".corrupt-")
+                 and fn != os.path.basename(existing)]
+        self.assertTrue(found, "新损坏租约必须归档到唯一名")
+        # 原路径空出
+        self.assertFalse(os.path.exists(path))
+
+    def test_force_release_archive_conflict_many(self):
+        """多个同名归档冲突时逐个追加序号，绝不覆盖。"""
+        path = os.path.join(self.tmp, "lease-f11b.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{broken-b")
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        for i in range(3):
+            p = "%s.corrupt-%s" % (path, ts) if i == 0 else "%s.corrupt-%s.%d" % (path, ts, i)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("OLD-%d" % i)
+        approval = os.path.join(self.tmp, "approve-f11b.json")
+        with open(approval, "w", encoding="utf-8") as f:
+            json.dump({"sha256": m._sha256_file(path),
+                       "approved_at": "2026-11-19T16:00:00+08:00",
+                       "approver": "owner", "reason": "dead",
+                       "identity_evidence": "ps snapshot"}, f)
+        ok, why = m.lease_force_release(path, approval)
+        self.assertTrue(ok)
+        self.assertEqual(why, "quarantined")
+        # 三个旧归档都完好
+        for i in range(3):
+            p = "%s.corrupt-%s" % (path, ts) if i == 0 else "%s.corrupt-%s.%d" % (path, ts, i)
+            with open(p, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "OLD-%d" % i, "旧归档 %d 被覆盖了" % i)
+
+    def test_rename_no_overwrite_conflict_raises(self):
+        """_rename_no_overwrite 基础契约：目标存在时抛 FileExistsError。"""
+        src = os.path.join(self.tmp, "rn-src.txt")
+        dst = os.path.join(self.tmp, "rn-dst.txt")
+        with open(src, "w") as f:
+            f.write("new")
+        with open(dst, "w") as f:
+            f.write("old")
+        with self.assertRaises(FileExistsError):
+            m._rename_no_overwrite(src, dst)
+        with open(dst, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "old", "目标不得被覆盖")
+        with open(src, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "new", "源不得被搬走")
 
     def test_rejected_recovery_leaves_no_audit_row_for_hash_and_identity(self):
         """被 sha256/身份依据拒绝的恢复，同样不许留下「已批准恢复」的假记录。"""

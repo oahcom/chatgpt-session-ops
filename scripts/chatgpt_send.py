@@ -739,6 +739,50 @@ def _proc_start_time(pid):
         return None
 
 
+def _parse_start_time(value):
+    """验证存储的 process_start_time 合法性（F-10）。
+
+    返回 (valid, normalized_value)。
+    None       → (True, None)   旧格式兼容，视为未记录启动时间。
+    bool/str/非 int|float/NaN → (False, None)  字段损坏——不得当 pid_reused 证据，
+                  调用方应按 identity_unreadable 处理（禁止回收）。
+    int / float → (True, value)  原值返回。**不转 float**——Windows FILETIME 是
+                  17 位大整数，float() 丢精度会把同一个值判成不等（误报 pid_reused）。
+    """
+    if value is None:
+        return True, None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False, None
+    if isinstance(value, float) and value != value:  # NaN
+        return False, None
+    return True, value
+
+
+def _write_all(fd, data):
+    """完整写入，处理短写（F-09）。返回写入字节数；失败抛 OSError。"""
+    written = 0
+    while written < len(data):
+        n = os.write(fd, data[written:])
+        if n <= 0:
+            raise OSError("write returned %d" % n)
+        written += n
+    return written
+
+
+def _rename_no_overwrite(src, dst):
+    """原子重命名，目标已存在时抛 FileExistsError（R7 不覆盖，F-11）。
+
+    Windows: os.rename 天然拒绝覆盖已存在目标。
+    POSIX:   os.rename 会覆盖，改用 os.link（硬链接，目标存在则失败）+ os.remove(src)。
+    src/dst 必须同盘（归档名派生自原路径，恒满足）。
+    """
+    if os.name == "nt":
+        os.rename(src, dst)
+    else:
+        os.link(src, dst)
+        os.remove(src)
+
+
 def _lock_holder_stale(lock):
     """锁能否回收：租约过期 + 原持有者确认不在（或 PID 已被复用）。
 
@@ -763,8 +807,11 @@ def _lock_holder_stale(lock):
     try:
         with open(lock, "r", encoding="utf-8") as f:
             raw = f.read()
-    except OSError:
-        return False            # F-08：读不出内容，保守不回收
+    except (OSError, ValueError):
+        # F-08：读不出内容（权限/瞬时错误/非法 UTF-8 均属读取失败），保守不回收。
+        # UnicodeDecodeError 是 ValueError 子类，必须在这里拦住，否则异常会穿过
+        # _try_reclaim_stale 炸掉 _file_lock，而不是走「不可回收」路径。
+        return False
     if not raw.strip():
         # 老格式锁的字面形态：空文件（旧实现建锁后不写身份）。超龄才算残留。
         try:
@@ -800,7 +847,12 @@ def _lock_holder_stale(lock):
     cur = _proc_start_time(pid)
     if cur is None:
         return False
-    return info.get("process_start_time") not in (None, cur)
+    # F-10：存储的启动时间必须先验格式——损坏值（"corrupted"/bool/dict/NaN）
+    # 不得当 pid_reused 证据，否则存活进程的锁会被误回收。
+    stored_ok, stored = _parse_start_time(info.get("process_start_time"))
+    if not stored_ok:
+        return False
+    return stored is not None and stored != cur
 
 
 class LockTimeout(RuntimeError):
@@ -907,16 +959,29 @@ def _file_lock(path, timeout=LOCK_TIMEOUT_SEC, strict=True):
             try:
                 fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 # 锁里写持有者身份：只靠 mtime 会在 PID 复用/长任务时误判（A22）
+                # F-09：身份必须完整写入才算加锁成功。短写/OSError 都不得进临界区
+                # ——空锁会走 mtime 兼容被其他进程回收，等于没锁。
+                payload = json.dumps({
+                    "pid": os.getpid(),
+                    "process_start_time": _proc_start_time(os.getpid()),
+                    "created_at": time.time(),
+                    "thread": me,
+                    "path": os.path.basename(path),
+                }).encode("utf-8")
                 try:
-                    os.write(fd, json.dumps({
-                        "pid": os.getpid(),
-                        "process_start_time": _proc_start_time(os.getpid()),
-                        "created_at": time.time(),
-                        "thread": me,
-                        "path": os.path.basename(path),
-                    }).encode("utf-8"))
-                except OSError:
-                    pass
+                    _write_all(fd, payload)
+                except OSError as e:
+                    # 清理半成品锁，绝不把空锁/残锁留给 mtime 兼容路径
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    fd = None
+                    try:
+                        os.remove(lock)
+                    except OSError:
+                        pass
+                    raise LockTimeout("锁身份写入失败（%s）：%s" % (os.path.basename(path), e))
                 break
             except FileExistsError:
                 # F-02：判定与删除必须同处内核锁守卫内。旧代码「_lock_holder_stale()
@@ -1006,7 +1071,12 @@ def _lease_reclaimable(info, now=None, expect_run_id=None):
     cur = _proc_start_time(info.get("pid"))
     if cur is None:
         return False, "identity_unreadable"
-    if info.get("process_start_time") not in (None, cur):
+    # F-10：存储的 process_start_time 先验格式。损坏值（bool/str/dict/NaN）
+    # 不得当 pid_reused 证据——那等于把「身份不可读」错误升级成「允许回收」。
+    stored_ok, stored = _parse_start_time(info.get("process_start_time"))
+    if not stored_ok:
+        return False, "identity_unreadable"
+    if stored is not None and stored != cur:
         return True, "pid_reused"
     return False, "alive"
 
@@ -1224,14 +1294,27 @@ def _force_release_locked(path, approval_path):
     if _record_corruption("lease-recovery", path, "approved_recovery") is None:
         return False, "audit_registration_failed"
     bad = "%s.corrupt-%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
-    try:
-        os.replace(path, bad)      # R7：隔离归档，不覆盖
-    except OSError as e:
-        _diag("租约隔离改名失败，原文件仍在", path, e)
-        # 登记行已经写成「已批准恢复」，但隔离没成——必须补一条失败行，否则审计上
-        # 只看到 approved_recovery、看不到恢复其实没落地，等于谎报一次已完成的恢复。
-        _record_corruption("lease-recovery-failed", path, "quarantine_failed")
-        return False, "quarantine_failed"
+    # F-11 / R7：隔离归档绝不覆盖已有归档。os.replace 会覆盖目标——旧归档
+    # （同一秒二次恢复/预存同名文件）会被静默销毁。改用 _rename_no_overwrite，
+    # 冲突时追加序号找唯一名。
+    n = 0
+    while True:
+        try:
+            _rename_no_overwrite(path, bad)
+            break
+        except FileExistsError:
+            n += 1
+            if n > 100:
+                _diag("归档名冲突重试超限", path, bad)
+                _record_corruption("lease-recovery-failed", path, "quarantine_failed")
+                return False, "quarantine_failed"
+            bad = "%s.corrupt-%s.%d" % (path, time.strftime("%Y%m%d-%H%M%S"), n)
+        except OSError as e:
+            _diag("租约隔离改名失败，原文件仍在", path, e)
+            # 登记行已经写成「已批准恢复」，但隔离没成——必须补一条失败行，否则审计上
+            # 只看到 approved_recovery、看不到恢复其实没落地，等于谎报一次已完成的恢复。
+            _record_corruption("lease-recovery-failed", path, "quarantine_failed")
+            return False, "quarantine_failed"
     # R8：隔离后确认原路径确实空出来了，别把别人的新租约当成自己的战果
     if os.path.exists(path):
         _diag("隔离改名返回成功但原路径仍存在", path, path)
