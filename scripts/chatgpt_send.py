@@ -1,0 +1,1606 @@
+# -*- coding: utf-8 -*-
+"""chatgpt_send.py — 统一发送/收割器（API 直连 + PoW，P0 通道）。
+
+用法：
+    python chatgpt_send.py <conv_id> <prompt_file>          # 投递到既有会话
+    python chatgpt_send.py --new <prompt_file>              # 开全新会话（默认按身份轮转均分）
+    python chatgpt_send.py --tail <conv_id>                 # 只收割末条 assistant 回复
+    python chatgpt_send.py --account acct2 --tail <conv_id> # 显式选择账号
+    python chatgpt_send.py --account acct1 --list       # 查询单账号会话
+    python chatgpt_send.py --list-all                  # 聚合本机已配置账号可见会话
+    python chatgpt_send.py --rotation                  # 查看轮转状态（游标/计数/不可用身份）
+    python chatgpt_send.py --rotation-reset            # 重置游标与计数（不清不可用标记）
+    python chatgpt_send.py --rotation-enable  nologin  # 清除不可用标记，下次重新尝试该身份
+    python chatgpt_send.py --rotation-disable nologin  # 手动把身份移出轮转
+    python chatgpt_send.py --owner <conv_id>           # 查会话归属账号
+    python chatgpt_send.py --anon-list                 # 匿名会话 id 对照表（留存记录）
+    python chatgpt_send.py --anon-read <conv_id>       # 按 id 读取匿名会话全文（API，标签页丢了也能读）
+    python chatgpt_send.py --anon-send <conv_id> <prompt_file>  # 按 id 启用匿名通道续聊
+
+匿名通道（nologin）可用性（实测 2026-11-19）：
+    能建会话、能多轮对话（同一标签页内连续发送，session id 不变）、能按 id 经 API 读全文。
+    限制：匿名会话只在**创建它的标签页**内可写，新开标签页访问 /uc/<id> 会被重定向到首页；
+          不进任何会话历史（会话列表恒 0 条），只与设备身份 oai-did 绑定；
+          服务端可能回收，故 skill 侧用 anon-sessions.json 留存 id 对照表。
+
+建会话身份优先级（--new 默认行为）：
+    第一优先：acct1 / acct2 均分轮转（游标只在两者之间推进）。
+    兜底：仅当两个登录态都 429（本次命中或处于 429 冷却）时，才启用 nologin 匿名通道。
+    不兜底的情形：401（认证失效，应重新提取凭据）、403（PoW/风控，短冷却后自愈）。
+    为什么匿名只做兜底：匿名会话不入任何会话列表（list 恒为空），与设备身份(oai-did)绑定，
+    换设备即 404 conversation_inaccessible，随时可能被服务端回收——不能承担需要留存的任务。
+    失败分级：401 封 6h；403 补 cookie + 重跑 PoW 重试一次，仍失败冷却 15min；
+    429 冷却 180s；匿名浏览器通道不可用冷却 30min。成功后把 conv_id -> 账号
+    登记到 conv-accounts.json，后续投递/收割未显式指定 --account 时按记录路由。
+    环境变量：CHATGPT_ANON_FALLBACK=0 彻底禁用匿名兜底。
+
+--list-all 输出：
+    conversations  扁平列表（每条标注 account）
+    by_account     按账号分组，便于归档
+    summary        各账号会话计数
+    quota          各账号最近一次响应的限速观测头（只读）
+    errors         不可用账号 / 接口错误
+
+账号凭据放在 accounts/<acct1|acct2>/{cookies.json,access_token.txt}。
+--list-all 只聚合各身份获准查看的会话；429 时停止扫描。
+
+前置：acct1/default 认证文件在本脚本目录；acct2 在 accounts/acct2/ 下：
+    cookies.json      由 extract_auth.py 从 Edge CDP 提取
+    access_token.txt  同上（accessToken）
+    pow_solver.py     PoW 解算器
+    nologin           匿名态：不加载认证文件，走浏览器通道（AnonBrowser）
+                      —— 建/发必须过 Cloudflare Turnstile，纯 API POST 恒 403；
+                      故 UI 建会话（https://chatgpt.com/uc/<id>）+ API GET 收割。
+
+协议要点（血泪条款，勿删）：
+    - POST /backend-api/conversation 必须带 conversation_id，否则静默落入新会话；
+      --new 模式故意不带，用于开 Owner 新会话。
+    - 403 "Unusual activity" = PoW 缺失，不是风控；必须带
+      OpenAI-Sentinel-Chat-Requirements-Token + OpenAI-Sentinel-Proof-Token。
+    - GET 429 时退避 ≥90s；可用 conv-api/<id8>.json 缓存 tail 兜底 parent_message_id。
+    - POST 200 即消息已提交；SSE 流只用于收割，需读到 EOF（勿提前关连接）。
+    - 413 conversation_too_large → 用 continue_full.py 走「开始新聊天」摘要续接。
+"""
+import contextlib
+import gzip
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+import zlib
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pow_solver import solve  # noqa: E402
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36 Edg/157.0.4341.60")
+CTX = ssl.create_default_context()
+# CHATGPT_BASE：API 根。默认直连；指向闸口时走 asip/chatgpt_l7.py
+#   （http://127.0.0.1:17892，429 适配：账号层退避短路 + transport 换 ok）。
+API_BASE = os.environ.get("CHATGPT_BASE", "https://chatgpt.com").rstrip("/")
+
+# ---------- 建会话身份轮转 ----------
+# 优先登录态：acct1 / acct2 均分轮转；nologin（匿名）只作兜底——
+# 实测匿名会话不进任何会话历史（list 返回 0 条），随时可能被服务端回收，
+# 仅按 conv_id 在短期内可读，因此只在两个登录态都 429 时启用。
+ROTATION_ORDER = ("acct1", "acct2", "nologin")
+ROTATION_PRIMARY = ("acct1", "acct2")
+ROTATION_FALLBACK = ("nologin",)
+ROTATION_FILE = os.path.join(BASE, "account-rotation.json")
+CONV_MAP_FILE = os.path.join(BASE, "conv-accounts.json")
+ANON_SESSIONS_FILE = os.path.join(BASE, "anon-sessions.json")
+UNAVAILABLE_TTL = 6 * 3600  # 不可用标记有效期：过期后容许再试一次（凭据可能已刷新）
+COOLDOWN_429 = 180          # 429 只是临时限速，短冷却后重新纳入轮转
+COOLDOWN_403 = 900          # 403 多为 PoW/风控或隐性限速，15 分钟后允许重试
+
+
+def _now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _load_json(path, default):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+# ---------- 状态文件跨进程锁 ----------
+# 三个 json 都是「读-改-写」，两个进程同时跑会互相覆盖（比如两个发送器同时推进游标，
+# 就会把均分打成 2:0）。这里用 O_EXCL 锁文件做排他，带 stale 检测与进程内重入保护。
+_LOCK_HELD = set()
+LOCK_STALE_SEC = 60        # 锁文件超过这个年龄视为残留（进程被杀）
+LOCK_TIMEOUT_SEC = 8.0     # 抢不到锁就放弃加锁继续业务，绝不阻塞发送
+
+
+@contextlib.contextmanager
+def _file_lock(path, timeout=LOCK_TIMEOUT_SEC):
+    if path in _LOCK_HELD:  # 重入：同一进程已持有，直接放行（避免自锁）
+        yield
+        return
+    lock = path + ".lock"
+    end = time.time() + timeout
+    fd = None
+    while True:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(lock) > LOCK_STALE_SEC:
+                    os.remove(lock)  # 干掉残留锁
+                    continue
+            except OSError:
+                pass
+            if time.time() >= end:
+                print("WARN: 状态文件锁等待超时，跳过加锁（%s）" % os.path.basename(path), flush=True)
+                break
+            time.sleep(0.1)
+        except OSError as e:
+            print("WARN: 状态文件加锁失败（%s）：%s" % (os.path.basename(path), e), flush=True)
+            break
+    _LOCK_HELD.add(path)
+    try:
+        yield
+    finally:
+        _LOCK_HELD.discard(path)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                os.remove(lock)
+            except OSError:
+                pass
+
+
+def _save_json(path, data):
+    with _file_lock(path):
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+
+
+def _update_json(path, mutate, default):
+    """锁内读-改-写，杜绝并发丢更新。mutate(data) 就地修改，返回 False 表示无需落盘。"""
+    with _file_lock(path):
+        data = _load_json(path, default)
+        if mutate(data) is False:
+            return data
+        _save_json(path, data)
+        return data
+
+
+def _normalize_rotation(st):
+    order = [a for a in st.get("order") or ROTATION_ORDER if a in ROTATION_ORDER]
+    for a in ROTATION_ORDER:  # 保证三身份齐全且顺序稳定
+        if a not in order:
+            order.append(a)
+    st["order"] = order
+    # 游标只在登录态身份之间推进（匿名是兜底，不参与均分）
+    st["cursor"] = int(st.get("cursor") or 0) % len(ROTATION_PRIMARY)
+    st.setdefault("created", {a: 0 for a in order})
+    st.setdefault("failures", {a: 0 for a in order})
+    st.setdefault("unavailable", {})
+    st.setdefault("fallback_uses", 0)
+    for a in order:
+        st["created"].setdefault(a, 0)
+        st["failures"].setdefault(a, 0)
+    return st
+
+
+def load_rotation():
+    return _normalize_rotation(_load_json(ROTATION_FILE, {}))
+
+
+def mutate_rotation(fn):
+    """锁内读-改-写轮转状态；fn(st) 就地修改。并发建会话时计数/游标不会互相覆盖。"""
+    out = {}
+
+    def mutate(st):
+        _normalize_rotation(st)
+        fn(st)
+        st["updated"] = _now()
+        out.update(st)
+
+    _update_json(ROTATION_FILE, mutate, {})
+    return _normalize_rotation(out)
+
+
+def save_rotation(st):
+    st["updated"] = _now()
+    _save_json(ROTATION_FILE, st)
+
+
+def mark_unavailable(st, account, reason, ttl=None):
+    st.setdefault("unavailable", {})[account] = {
+        "reason": reason, "at": _now(), "epoch": time.time(),
+        "ttl": UNAVAILABLE_TTL if ttl is None else ttl,
+    }
+
+
+def is_unavailable(st, account):
+    info = (st.get("unavailable") or {}).get(account)
+    if not info:
+        return False
+    ttl = float(info.get("ttl") or UNAVAILABLE_TTL)
+    return time.time() - float(info.get("epoch") or 0) <= ttl
+
+
+def purge_expired(st):
+    """清掉过期的不可用标记（is_unavailable 只读，不再隐式改状态）。"""
+    changed = False
+    for a in list(st.get("unavailable") or {}):
+        info = st["unavailable"][a] or {}
+        ttl = float(info.get("ttl") or UNAVAILABLE_TTL)
+        if time.time() - float(info.get("epoch") or 0) > ttl:
+            st["unavailable"].pop(a, None)
+            changed = True
+    return changed
+
+
+def rotation_plan(st):
+    """登录取证身份（acct1/acct2）从游标起顺次尝试；不可用的排到末尾（避免死锁）。
+    匿名态不进入该计划——它只在两者都 429 时由 anon_fallback_ready() 决定是否兜底。"""
+    n = len(ROTATION_PRIMARY)
+    seq = [ROTATION_PRIMARY[(st["cursor"] + i) % n] for i in range(n)]
+    return [a for a in seq if not is_unavailable(st, a)] + [a for a in seq if is_unavailable(st, a)]
+
+
+def anon_fallback_block_reason(st, outcomes):
+    """兜底放行条件：两个登录态**全部**因 429（本次命中或 429 冷却中）失败。
+
+    outcomes: {account: 状态码或 "SKIP:<原因>"}
+    返回 None 表示放行；否则返回一句人话说明为什么没放行。
+    """
+    if os.environ.get("CHATGPT_ANON_FALLBACK", "1") == "0":
+        return "CHATGPT_ANON_FALLBACK=0（匿名兜底被环境变量禁用）"
+    if not outcomes:
+        return "没有任何登录态尝试结果，不启用兜底"
+    if not all("429" in str(v) for v in outcomes.values()):
+        return "登录态并非全部 429（401=凭据失效、403=风控，都不该用匿名顶）"
+    info = (st.get("unavailable") or {}).get("nologin") or {}
+    if "manually disabled" in (info.get("reason") or ""):
+        return "nologin 已被手动禁用（--rotation-enable nologin 解封）"
+    if is_unavailable(st, "nologin"):
+        ttl = float(info.get("ttl") or UNAVAILABLE_TTL)
+        left = int(ttl - (time.time() - float(info.get("epoch") or 0)))
+        return "匿名通道冷却中（%s），约 %d 秒后可重试" % (info.get("reason") or "unknown", max(left, 0))
+    return None
+
+
+def anon_fallback_ready(st, outcomes):
+    return anon_fallback_block_reason(st, outcomes) is None
+
+
+def record_conv(conv_id, account, prompt_file):
+    if not conv_id:
+        return
+
+    def mutate(data):
+        data[conv_id] = {"account": account, "prompt": prompt_file, "ts": _now()}
+        if len(data) > 500:  # 只保留最近 500 条
+            for k in sorted(data, key=lambda x: (data[x] or {}).get("ts") or "")[:len(data) - 500]:
+                data.pop(k, None)
+
+    _update_json(CONV_MAP_FILE, mutate, {})
+
+
+def conv_owner(conv_id):
+    info = _load_json(CONV_MAP_FILE, {}).get(conv_id)
+    return (info or {}).get("account")
+
+
+# ---------- 匿名会话 id 对照表（服务端不给历史，skill 侧自己留存） ----------
+def load_anon_sessions():
+    data = _load_json(ANON_SESSIONS_FILE, {})
+    data.setdefault("sessions", {})
+    return data
+
+
+def save_anon_sessions(data):
+    data["updated"] = _now()
+    _save_json(ANON_SESSIONS_FILE, data)
+
+
+def record_anon_session(conv_id, tab=None, prompt="", reply="", device=""):
+    """登记/更新匿名会话：conv_id -> 标签页、prompt、最后回复、设备号、可读状态。"""
+    if not conv_id:
+        return None
+    out = {}
+
+    def mutate(data):
+        data.setdefault("sessions", {})
+        s = data["sessions"].setdefault(conv_id, {"created": _now()})
+        s.setdefault("created", _now())
+        s["updated"] = _now()
+        if tab:
+            s["tab"] = tab
+        if prompt:
+            s["prompt"] = os.path.basename(prompt)
+        if reply:
+            s["reply_excerpt"] = reply.strip().replace("\n", " ")[:200]
+            s["replied"] = _now()
+        if device:
+            s["device"] = device
+        s["status"] = "live" if tab else s.get("status", "archived")
+        out.update(s)
+
+    _update_json(ANON_SESSIONS_FILE, mutate, {"sessions": {}})
+    return out
+
+
+def anon_session(conv_id):
+    return (load_anon_sessions().get("sessions") or {}).get(conv_id)
+
+
+def mark_anon_archived(conv_id, reason=""):
+    def mutate(data):
+        data.setdefault("sessions", {})
+        s = (data.get("sessions") or {}).get(conv_id)
+        if not s:
+            return False
+        s["status"] = "archived"
+        s["archived_reason"] = reason
+        s["updated"] = _now()
+
+    _update_json(ANON_SESSIONS_FILE, mutate, {"sessions": {}})
+
+
+# ---------- 匿名设备身份留存 ----------
+# 匿名会话只认 oai-did：浏览器换 profile 后设备号变了，新 cookie 读旧会话会 404。
+# 因此除「最新一份」外，再按设备号分档存一份，读旧会话时按 anon-sessions.json 里
+# 记录的 device 取回对应 cookie —— 这是匿名会话能跨浏览器重启留存的关键。
+def anon_device_dir():
+    return os.path.join(BASE, "accounts", "nologin", "devices")
+
+
+def save_device_cookie(cookie):
+    if not cookie:
+        return ""
+    did = ""
+    for part in cookie.split(";"):
+        part = part.strip()
+        if part.startswith("oai-did="):
+            did = part.split("=", 1)[1]
+            break
+    try:
+        os.makedirs(anon_device_dir(), exist_ok=True)
+        with open(os.path.join(BASE, "accounts", "nologin", "device-cookie.txt"),
+                  "w", encoding="utf-8") as f:
+            f.write(cookie)
+        if did:
+            with open(os.path.join(anon_device_dir(), did + ".txt"), "w", encoding="utf-8") as f:
+                f.write(cookie)
+    except OSError:
+        pass
+    return did
+
+
+def load_device_cookie(did):
+    if not did:
+        return ""
+    try:
+        return open(os.path.join(anon_device_dir(), did + ".txt"), encoding="utf-8").read().strip()
+    except OSError:
+        return ""
+
+
+class ChatGPTAPI:
+    def __init__(self, base_dir=None, account="default"):
+        # CHATGPT_AUTH_DIR selects credential/cache root; account data stays isolated.
+        root = base_dir or os.environ.get("CHATGPT_AUTH_DIR") or BASE
+        if account not in ("default", "acct1", "acct2", "nologin"):
+            raise ValueError("account must be default, acct1, acct2, or nologin")
+        b = root if account in ("default", "acct1") else os.path.join(root, "accounts", account)
+        self.account = account
+        self.base_dir = b
+        self.is_anon = account == "nologin"  # 匿名态：走 /backend-anon/，POST 需浏览器过 Turnstile
+        self.anon = None
+        if account == "nologin":
+            self.cookies, self.token, self.cookie = [], "", ""
+        else:
+            self.cookies = json.load(open(os.path.join(b, "cookies.json"), encoding="utf-8"))
+            self.token = open(os.path.join(b, "access_token.txt"), encoding="utf-8").read().strip()
+            self.cookie = "; ".join(
+                "%s=%s" % (ck["name"], ck["value"])
+                for ck in self.cookies
+                if "chatgpt.com" in (ck.get("domain") or "") or "openai.com" in (ck.get("domain") or "")
+            )
+        # 代理支持：CHATGPT_PROXY=http://host:port 或 socks5h://host:port
+        proxy_url = os.environ.get("CHATGPT_PROXY", "")
+        handlers = [urllib.request.HTTPSHandler(context=CTX)]
+        if proxy_url:
+            handlers.insert(0, urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+        self._opener = urllib.request.build_opener(*handlers)
+        self.last_headers = {}
+        self.quota = {}  # 观测用：最近一次响应的限速相关头
+
+    # ---------- 匿名态设备身份 ----------
+    def device_cookie_path(self):
+        return os.path.join(BASE, "accounts", "nologin", "device-cookie.txt")
+
+    def ensure_device_cookie(self, refresh=False):
+        """匿名态的 cookie 来源：优先当前浏览器，其次上次落盘的 device-cookie.txt。"""
+        if self.cookie and not refresh:
+            return self.cookie
+        if not refresh:
+            try:
+                saved = open(self.device_cookie_path(), encoding="utf-8").read().strip()
+            except OSError:
+                saved = ""
+        else:
+            saved = ""
+        if saved and not refresh:
+            self.cookie = saved
+            return self.cookie
+        try:
+            br = self.anon or AnonBrowser()
+            self.anon = br
+            live = br.cookie()
+        except Exception:
+            live = ""
+        self.cookie = live or saved
+        if live:
+            save_device_cookie(live)
+        return self.cookie
+
+    def _device_id(self):
+        for part in (self.cookie or "").split(";"):
+            part = part.strip()
+            if part.startswith("oai-did="):
+                return part.split("=", 1)[1]
+        return ""
+
+    def warm_cookies(self):
+        """补齐 Cloudflare 侧 cookie（__cf_bm/_cfuvid/__cflb）。
+
+        凭据只存了 session-token 的身份（如 acct2 提取时只拿到 2 个 cookie），GET 一切正常，
+        但 POST /conversation 会被判 403 "Unusual activity"——缺的正是首页下发的那几个 CF cookie。
+        做法：用现有 cookie 访问首页接收 Set-Cookie，合并后回写 cookies.json。
+        """
+        if self.is_anon:
+            return False
+        try:
+            import http.cookiejar
+            jar = http.cookiejar.CookieJar()
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(jar),
+                urllib.request.HTTPSHandler(context=CTX))
+            for ck in self.cookies:
+                jar.set_cookie(http.cookiejar.Cookie(
+                    0, ck["name"], ck["value"], None, False,
+                    ck.get("domain") or ".chatgpt.com", False, False, "/", True,
+                    False, None, False, None, None, {}))
+            # CF cookie 只在站点根下发；API_BASE 可能指向本地闸口（127.0.0.1:xxxx），
+            # 对闸口发请求拿不到 __cf_bm，所以这里固定打真实站点。
+            host = API_BASE.split("//", 1)[-1].split("/", 1)[0]
+            warm_url = (API_BASE + "/") if "chatgpt.com" in host else "https://chatgpt.com/"
+            with opener.open(urllib.request.Request(warm_url, headers={"User-Agent": UA}), timeout=45) as r:
+                r.read()
+        except Exception as e:
+            print("warm_cookies failed: %s" % e, flush=True)
+            return False
+        known = {c["name"]: c for c in self.cookies}
+        changed = []
+        for ck in jar:
+            if ck.name not in known:
+                self.cookies.append({"name": ck.name, "value": ck.value,
+                                     "domain": ck.domain or ".chatgpt.com"})
+                changed.append(ck.name)
+            elif ck.value != known[ck.name].get("value"):
+                known[ck.name]["value"] = ck.value
+                changed.append(ck.name + "(更新)")
+        if not changed:
+            return False
+        try:
+            _save_json(os.path.join(self.base_dir, "cookies.json"), self.cookies)
+        except OSError:
+            pass
+        self.cookie = "; ".join(
+            "%s=%s" % (c["name"], c["value"])
+            for c in self.cookies
+            if "chatgpt.com" in (c.get("domain") or "") or "openai.com" in (c.get("domain") or "")
+        )
+        print("warm_cookies: 补充 %s" % ", ".join(changed), flush=True)
+        return True
+
+    @staticmethod
+    def _quota_from_headers(headers):
+        """摘出限速相关响应头，仅作观测，不做调度。"""
+        out = {}
+        for k, v in headers.items():
+            if "ratelimit" in k or k in ("retry-after", "x-request-id"):
+                out[k] = v
+        return out
+
+    @staticmethod
+    def _decompress(data, enc):
+        """按 Content-Encoding 解压；不认识的编码原样返回，绝不让解压失败吞掉响应。"""
+        enc = (enc or "").lower()
+        if not data or not enc:
+            return data
+        try:
+            if enc == "gzip":
+                return gzip.decompress(data)
+            if enc == "deflate":
+                try:
+                    return zlib.decompress(data)
+                except zlib.error:
+                    return zlib.decompress(data, -zlib.MAX_WBITS)
+        except Exception:
+            pass
+        return data
+
+    def req(self, method, url, body=None, extra_headers=None, timeout=120):
+        if self.is_anon:
+            if not self.cookie:
+                self.ensure_device_cookie()
+            url = url.replace("/backend-api/", "/backend-anon/")
+        raw = json.dumps(body).encode("utf-8") if body is not None else None
+        rq = urllib.request.Request(url, data=raw, method=method)
+        rq.add_header("User-Agent", UA)
+        rq.add_header("Accept", "application/json, text/event-stream")
+        rq.add_header("Accept-Encoding", "gzip, deflate")
+        if self.cookie:
+            rq.add_header("Cookie", self.cookie)
+        if self.token:
+            rq.add_header("Authorization", "Bearer " + self.token)
+        if self.is_anon:
+            dev = self._device_id()
+            rq.add_header("OAI-Device-Id", dev or str(uuid.uuid4()))
+            rq.add_header("OAI-Language", "zh-CN")
+        rq.add_header("Origin", "https://chatgpt.com")
+        rq.add_header("Referer", "https://chatgpt.com/")
+        if raw is not None:
+            rq.add_header("Content-Type", "application/json")
+        for k, v in (extra_headers or {}).items():
+            rq.add_header(k, v)
+        try:
+            with self._opener.open(rq, timeout=timeout) as resp:
+                data = resp.read()  # 读到 EOF，勿提前 close
+                data = self._decompress(data, resp.headers.get("Content-Encoding"))
+                self.last_headers = {k.lower(): v for k, v in resp.headers.items()}
+                self.quota = self._quota_from_headers(self.last_headers)
+                return resp.status, data.decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            rraw = e.read()
+            rraw = self._decompress(rraw, (e.headers or {}).get("Content-Encoding"))
+            self.last_headers = {k.lower(): v for k, v in (e.headers or {}).items()}
+            self.quota = self._quota_from_headers(self.last_headers)
+            return e.code, rraw.decode("utf-8", "replace")[:300]
+        except Exception as e:
+            self.last_headers = {}
+            self.quota = {}
+            return 0, "EXC " + str(e)
+
+    # ---------- tail ----------
+    @staticmethod
+    def tail_from_mapping(raw_body):
+        try:
+            data = json.loads(raw_body)
+        except Exception:
+            return None
+        mapping = data.get("mapping") or {}
+        best_id, best_t = None, 0
+        for nid, node in mapping.items():
+            m = node.get("message")
+            if not m:
+                continue
+            t = m.get("create_time") or 0
+            if t > best_t:
+                best_t, best_id = t, nid
+        return best_id
+
+    def cached_tail(self, conv_id):
+        p = os.path.join(self.base_dir, "conv-api", conv_id[:8] + ".json")
+        if not os.path.exists(p):
+            return None
+        try:
+            return self.tail_from_mapping(open(p, encoding="utf-8").read())
+        except Exception:
+            return None
+
+    def live_tail(self, conv_id, tries=2):
+        for attempt in range(tries):
+            st, body = self.req("GET", API_BASE + "/backend-api/conversation/" + conv_id, timeout=90)
+            if st == 200:
+                return self.tail_from_mapping(body), body
+            print("GET %s -> %s (try %d)" % (conv_id[:8], st, attempt + 1), flush=True)
+            time.sleep(90 if st == 429 else 20)
+        return None, None
+
+    def list_conversations(self, page_size=28, max_pages=100):
+        """Fetch visible conversation metadata for this authenticated identity."""
+        assert 1 <= page_size <= 100 and 1 <= max_pages <= 1000
+        from urllib.parse import urlencode
+
+        conversations, seen = [], set()
+        for page in range(max_pages):
+            query = urlencode({"offset": page * page_size, "limit": page_size, "sort": "updated"})
+            status, body = self.req("GET", API_BASE + "/backend-api/conversations?" + query, timeout=90)
+            if status != 200:
+                return conversations, status, body
+            try:
+                payload = json.loads(body)
+            except json.JSONDecodeError:
+                return conversations, status, "invalid JSON in conversation list"
+            items = payload if isinstance(payload, list) else payload.get("items", payload.get("conversations", []))
+            if not isinstance(items, list):
+                return conversations, status, "unrecognized conversation list response"
+            fresh = 0
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                cid = item.get("id") or item.get("conversation_id")
+                if not cid or cid in seen:
+                    continue
+                seen.add(cid)
+                conversations.append({
+                    "account": self.account,
+                    "id": cid,
+                    "title": item.get("title") or "",
+                    "updated": item.get("update_time") or item.get("updated_at") or item.get("create_time"),
+                })
+                fresh += 1
+            if not items or fresh == 0 or len(items) < page_size:
+                return conversations, status, ""
+        return conversations, 200, "page limit reached; result may be incomplete"
+
+    # ---------- PoW ----------
+    def requirements(self):
+        st, body = self.req("POST", API_BASE + "/backend-api/sentinel/chat-requirements",
+                            {"p": None, "generator": "chat_requirements_cache_key", "proofofwork": None})
+        if st != 200:
+            return None, None
+        d = json.loads(body)
+        p = d.get("proofofwork") or {}
+        return d.get("token"), solve(p.get("seed", ""), p.get("difficulty", "0"))
+
+    # ---------- send ----------
+    def send(self, conv_id, text, parent_message_id, req_token, proof, timeout=420):
+        body = {
+            "action": "next",
+            "messages": [{"id": str(uuid.uuid4()), "author": {"role": "user"},
+                          "content": {"content_type": "text", "parts": [text]},
+                          "metadata": {}}],
+            "parent_message_id": parent_message_id,
+            "model": "auto",
+            "timezone_offset_min": 480,
+            "suggestions": [],
+            "history_and_training_disabled": False,
+            "conversation_mode_kind": "primary_assistant",
+            "force_paragen": False,
+            "force_rate_limit": False,
+            "reset_rate_limits": False,
+            "websocket_request_id": str(uuid.uuid4()),
+        }
+        if conv_id:  # 空 = 开新会话（Owner 模式）；非空必须带上，否则静默落新会话
+            body["conversation_id"] = conv_id
+        return self.req("POST", API_BASE + "/backend-api/conversation", body, {
+            "OpenAI-Sentinel-Chat-Requirements-Token": req_token,
+            "OpenAI-Sentinel-Proof-Token": proof,
+        }, timeout=timeout)
+
+    # ---------- harvest ----------
+    @staticmethod
+    def extract_reply_sse(raw_text):
+        last = ""
+        for line in raw_text.splitlines():
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                continue
+            try:
+                obj = json.loads(payload)
+            except Exception:
+                continue
+            msg = obj.get("message") or {}
+            parts = (msg.get("content") or {}).get("parts") or []
+            txt = "".join(p for p in parts if isinstance(p, str))
+            if (msg.get("author") or {}).get("role") == "assistant" and txt.strip():
+                last = txt
+        return last
+
+    @staticmethod
+    def harvest_mapping(raw_body):
+        try:
+            data = json.loads(raw_body)
+        except Exception:
+            return ""
+        msgs = []
+        for node in (data.get("mapping") or {}).values():
+            m = node.get("message")
+            if not m:
+                continue
+            role = (m.get("author") or {}).get("role")
+            text = "".join(p for p in ((m.get("content") or {}).get("parts") or []) if isinstance(p, str)).strip()
+            if role in ("user", "assistant") and text:
+                msgs.append((m.get("create_time") or 0, role, text))
+        msgs.sort(key=lambda x: x[0])
+        for _, role, text in reversed(msgs):
+            if role == "assistant":
+                return text
+        return ""
+
+    @staticmethod
+    def harvest_transcript(raw_body):
+        """按时间顺序返回整段对话 [(role, text), ...]，用于匿名会话留存。"""
+        try:
+            data = json.loads(raw_body)
+        except Exception:
+            return []
+        rows = []
+        for node in (data.get("mapping") or {}).values():
+            m = node.get("message")
+            if not m:
+                continue
+            role = (m.get("author") or {}).get("role")
+            text = "".join(p for p in ((m.get("content") or {}).get("parts") or [])
+                           if isinstance(p, str)).strip()
+            if role in ("user", "assistant") and text:
+                rows.append((m.get("create_time") or 0, role, text))
+        rows.sort(key=lambda x: x[0])
+        return [(role, text) for _, role, text in rows]
+
+    def save_reply(self, conv_id, pfile, text):
+        if not text:
+            return None
+        os.makedirs(os.path.join(self.base_dir, "replies"), exist_ok=True)
+        name = "replies/reply-%s-%s.md" % ((conv_id or "new")[:8], datetime.now().strftime("%H%M%S"))
+        path = os.path.join(self.base_dir, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# reply for %s (prompt %s)\n\n%s\n" % ((conv_id or "new")[:8], pfile, text[-20000:]))
+        print("saved reply -> %s (%d chars)" % (name, len(text)), flush=True)
+        return path
+
+
+class AnonBrowser:
+    """匿名（无登录）会话的浏览器通道。
+
+    匿名态建会话必须过 Cloudflare Turnstile：纯 API 的
+    POST /backend-anon/conversation 恒返回 403 "Unusual activity"，
+    而真实浏览器里 UI 可正常建会话（落点 https://chatgpt.com/uc/<id>）。
+    因此：建/发走 UI，收割走 API（backend-anon GET 带页面 cookie 可用）。
+
+    依赖：browser-automation-cdp 的 cdp.py，且浏览器须以调试端口启动：
+        python start_chrome.py --temp --port 9333
+    """
+
+    COMPOSER = "#mobile-composer-prompt, #prompt-textarea"
+
+    def __init__(self, port=None, cdp_dir=None):
+        self.port = int(port or os.environ.get("CHATGPT_ANON_CDP_PORT") or 9333)
+        self.cdp_dir = cdp_dir or os.environ.get("CHATGPT_CDP_DIR") or os.path.join(
+            os.path.expanduser("~"), ".workbuddy", "skills", "browser-automation-cdp", "scripts")
+        self._client = None
+        self.last_cid = None   # 最近一次成功发送落到的会话 id（供异常时登记，避免孤儿会话）
+        self.last_tab = None
+
+    # ---------- 连接 ----------
+    def _autostart(self):
+        """CDP 未就绪时自动拉起临时 profile 的有头浏览器（CHATGPT_ANON_AUTOSTART=0 可关）。"""
+        if os.environ.get("CHATGPT_ANON_AUTOSTART", "1") == "0":
+            return False
+        script = os.path.join(self.cdp_dir, "start_chrome.py")
+        if not os.path.exists(script):
+            return False
+        try:
+            subprocess.Popen([sys.executable, script, "--temp", "--port", str(self.port)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print("autostart 浏览器失败：%s" % e, flush=True)
+            return False
+        end = time.time() + 30
+        from cdp import CDPClient as _C
+        while time.time() < end:
+            time.sleep(2)
+            try:
+                if _C(port=self.port, timeout=5).is_alive():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def client(self):
+        if self._client is None:
+            if self.cdp_dir not in sys.path:
+                sys.path.insert(0, self.cdp_dir)
+            try:
+                from cdp import CDPClient
+            except Exception as e:
+                raise RuntimeError("CDP 客户端不可用（%s）：%s" % (self.cdp_dir, e))
+            cl = CDPClient(port=self.port, timeout=90)
+            if not cl.is_alive() and self._autostart():
+                cl = CDPClient(port=self.port, timeout=90)
+            if not cl.is_alive():
+                raise RuntimeError(
+                    "CDP 端口 %d 未就绪：先运行 python start_chrome.py --temp --port %d" % (self.port, self.port))
+            try:
+                cl.ensure_page(url_contains="chatgpt.com")
+            except Exception:
+                cl.ensure_page()  # 刚启动的实例只有 about:blank
+                cl.navigate("https://chatgpt.com/", timeout=60)
+            # 未显示的窗口会让页面 visibilityState=hidden，应用会挂起发送
+            cl.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
+            self._client = cl
+        return self._client
+
+    def _js(self, expr):
+        r = self.client().evaluate(expr)
+        return r.get("value") if isinstance(r, dict) else r
+
+    def cookie(self):
+        return self._js("document.cookie") or ""
+
+    # ---------- 页面动作 ----------
+    def _wait(self, expr, timeout=30, interval=0.6):
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                if self._js(expr):
+                    return True
+            except Exception:
+                pass
+            time.sleep(interval)
+        return False
+
+    def _clear_composer(self):
+        self._js("""(() => {
+            const t = document.querySelector('%s');
+            if (!t) return false;
+            t.focus();
+            const d = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+            if (d && t.tagName === 'TEXTAREA') {
+                d.set.call(t, '');
+                t.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'deleteContentBackward'}));
+            } else {
+                document.execCommand('selectAll', false, null);
+                document.execCommand('delete', false, null);
+            }
+            return true;
+        })()""" % self.COMPOSER)
+
+    def _send_button(self):
+        return self._js("""(() => {
+            const bs = [...document.querySelectorAll('button')].filter(b =>
+                /发送消息|Send message/i.test(b.getAttribute('aria-label') || '') ||
+                b.getAttribute('data-testid') === 'send-button');
+            for (const b of bs) {
+                const r = b.getBoundingClientRect();
+                if (r.width > 10 && r.height > 10 && b.getAttribute('aria-disabled') !== 'true') {
+                    return {x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2)};
+                }
+            }
+            return null;
+        })()""")
+
+    def _idle(self):
+        """停止生成按钮消失 + 文本长度连续 3 次不变。"""
+        stable, last = 0, -1
+        end = time.time() + 900
+        while time.time() < end:
+            state = self._js("""(() => ({
+                generating: [...document.querySelectorAll('button')].some(b =>
+                    /停止生成|Stop generating|stop streaming/i.test(b.getAttribute('aria-label') || '')),
+                len: (document.body.innerText || '').length
+            }))()""")
+            if not state:
+                return False
+            if not state.get("generating") and state.get("len") == last:
+                stable += 1
+                if stable >= 3:
+                    return True
+            else:
+                stable = 0
+            last = state.get("len")
+            time.sleep(3)
+        return False
+
+    def _conv_id(self):
+        u = self.client().page_url() or ""
+        for key in ("/uc/", "/c/"):
+            if key in u:
+                cid = u.split(key, 1)[1].split("?")[0].split("/")[0]
+                if len(cid) >= 8:
+                    return cid
+        return None
+
+    # ---------- 标签页定位（匿名会话只在原标签页内可写） ----------
+    def probe_tabs(self):
+        """只读探测标签页，不自动拉起浏览器（供 --anon-list 使用）。"""
+        cl = None
+        try:
+            if self.cdp_dir not in sys.path:
+                sys.path.insert(0, self.cdp_dir)
+            from cdp import CDPClient
+            cl = CDPClient(port=self.port, timeout=10)
+            if not cl.is_alive():
+                return []
+            return [t for t in cl.targets() if t.get("type") == "page"]
+        except Exception:
+            return []
+        finally:
+            if cl is not None:
+                try:
+                    cl.close()
+                except Exception:
+                    pass
+
+
+    def find_tab(self, conv_id):
+        """按 URL（/uc/<id>）找仍然存活的匿名会话标签页。
+
+        只探测不自动拉起浏览器：浏览器都没起，那条会话的标签页必然也没了，
+        去 autostart 一个空浏览器只会白等 30 秒并让调用方误判。
+        """
+        for t in self.probe_tabs():
+            if "/uc/" + conv_id in (t.get("url") or ""):
+                return t
+        return None
+
+    def alive(self):
+        """CDP 端口是否可连（不触发自动拉起）。"""
+        try:
+            if self.cdp_dir not in sys.path:
+                sys.path.insert(0, self.cdp_dir)
+            from cdp import CDPClient
+            return CDPClient(port=self.port, timeout=8).is_alive()
+        except Exception:
+            return False
+
+    def _attach(self, target_id):
+        from cdp import CDPClient
+        if self._client is not None:
+            try:
+                self._client.close()  # 换页时关掉旧 ws，避免长跑进程堆积连接
+            except Exception:
+                pass
+        cl = CDPClient(port=self.port, timeout=90)
+        cl.connect_page(target_id)
+        cl.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
+        self._client = cl
+        return cl
+
+    def _new_tab(self, url="https://chatgpt.com/"):
+        """另开一个标签页并附上去。
+
+        必须另开而不是导航现有页：匿名会话只在**创建它的标签页**内可写，
+        把已有 /uc/<id> 页导航到首页等于永久毁掉那条会话的可写通道。
+        """
+        from cdp import CDPClient
+        b = CDPClient(port=self.port, timeout=90)
+        try:
+            b.connect_browser()
+            res = b.send("Target.createTarget", {"url": url})
+        finally:
+            b.close()
+        tid = (res or {}).get("targetId")
+        if not tid:
+            raise RuntimeError("新建标签页失败：%r" % (res,))
+        time.sleep(1.0)
+        return self._attach(tid)
+
+    def send(self, text, conv_id=None):
+        """匿名会话发消息：返回 (conv_id, reply_text, tab_target_id)。
+
+        关键实测结论：匿名会话只在**创建它的那个标签页**内可写；
+        重新导航/新标签页打开 /uc/<id> 会被重定向回首页。
+        因此有 conv_id 时只复用存活标签页，不重新导航。
+        """
+        if conv_id:
+            tab = self.find_tab(conv_id)
+            if not tab:
+                if not self.alive():
+                    # 浏览器没起 ≠ 会话丢失：别顺手把对照表标成 archived
+                    raise RuntimeError(
+                        "CDP 端口 %d 未运行，无法确认匿名会话 %s 的标签页：先启动浏览器"
+                        "（python scripts/start_chrome.py --temp --port %d）再试；"
+                        "若浏览器确实重启过，该标签页已丢失，会话仍可用 `--anon-read %s` 读取。"
+                        % (self.port, conv_id[:8], self.port, conv_id))
+                mark_anon_archived(conv_id, "标签页已不存在（匿名会话无法重开，直接访问 /uc/ 会重定向）")
+                raise RuntimeError(
+                    "匿名会话 %s 的标签页已不存在，无法续聊：匿名会话只在创建它的标签页内可写，"
+                    "重新打开 /uc/<id> 会被重定向到首页。可用 `--anon-read %s` 从 API 读取全文，"
+                    "或改用登录态账号重建该会话。" % (conv_id[:8], conv_id))
+            cl = self._attach(tab["id"])
+        else:
+            cl = self.client()
+            cur = cl.page_url() or ""
+            if "/uc/" in cur or "/c/" in cur:
+                # 当前页正挂着一条匿名会话：导航走就永久失去它的可写标签页 → 另开新页
+                print("anon: 当前页是既有匿名会话，另开标签页建新会话", flush=True)
+                cl = self._new_tab("https://chatgpt.com/")
+            else:
+                cl.navigate("https://chatgpt.com/", timeout=60)
+        if not self._wait("!!document.querySelector('%s')" % self.COMPOSER, timeout=45):
+            raise RuntimeError("匿名页输入框未出现（可能是 Cloudflare 质询，重启浏览器实例一次）")
+        self._clear_composer()
+        cl.evaluate("(() => { const t = document.querySelector('%s'); t && t.focus(); return true; })()" % self.COMPOSER)
+        cl.send("Input.insertText", {"text": text})
+        btn = None
+        for _ in range(30):
+            btn = self._send_button()
+            if btn:
+                break
+            time.sleep(0.6)
+        if not btn:
+            raise RuntimeError("发送按钮不可用（输入可能未进 React 状态）")
+        for kind in ("mousePressed", "mouseReleased"):
+            cl.send("Input.dispatchMouseEvent",
+                    {"type": kind, "x": btn["x"], "y": btn["y"], "button": "left", "clickCount": 1})
+        cid = None
+        end = time.time() + 120
+        while time.time() < end:
+            cid = self._conv_id()
+            if cid:
+                break
+            time.sleep(1.5)
+        if not cid:
+            raise RuntimeError("发送后未拿到匿名会话 ID（/uc/<id>）")
+        # 先记下来：万一后面等待/收割异常，上层还能把这条会话登记进对照表（避免孤儿会话）
+        self.last_cid, self.last_tab = cid, (cl.target_id or "")
+        if conv_id and cid != conv_id:
+            raise RuntimeError("匿名会话续接失败：目标 %s 实际落入 %s（请改用登录态账号重建）"
+                               % (conv_id[:8], cid[:8]))
+        if not self._idle():
+            print("WARN: 15 分钟内未确认生成结束，按当前 DOM 内容收割（回复可能不完整，可用 --anon-read 补读）",
+                  flush=True)
+        reply = self._js("""(() => {
+            const nodes = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
+            const last = nodes[nodes.length - 1];
+            return last ? (last.innerText || '').trim() : '';
+        })()""") or ""
+        return cid, reply, (cl.target_id or "")
+
+
+def anon_archive_path(conv_id):
+    """归档文件路径：默认 id8，若该前缀已被别的会话占用则加后缀，避免互相覆盖。"""
+    base = os.path.join(BASE, "anon-sessions", conv_id[:8])
+    path = base + ".md"
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                head = f.readline()
+        except OSError:
+            head = ""
+        if conv_id not in head:
+            path = base + "-" + conv_id[-4:] + ".md"
+    return path
+
+
+def read_anon(api, conv_id, save=True):
+    """按 id 读取匿名会话全文（API 侧仍可读，即便标签页已丢失）。"""
+    info = anon_session(conv_id) or {}
+    snap = load_device_cookie(info.get("device") or "")
+    if snap:
+        api.cookie = snap  # 用会话所属设备的身份读；浏览器换 profile 后新 cookie 会 404
+    st, body = api.req("GET", API_BASE + "/backend-api/conversation/" + conv_id, timeout=90)
+    if st != 200:
+        return st, "", []
+    transcript = api.harvest_transcript(body)
+    last = ""
+    for role, text in reversed(transcript):
+        if role == "assistant":
+            last = text
+            break
+    if save and transcript:
+        # 全文留存在本地：服务端不给历史，这是唯一归档手段
+        path = anon_archive_path(conv_id)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# 匿名会话 %s（%s）\n\n" % (conv_id, _now()))
+            for role, text in transcript:
+                f.write("## %s\n\n%s\n\n" % (role, text))
+        record_anon_session(conv_id, reply=last, device=api._device_id())
+    return st, last, transcript
+
+
+def probe_anon(api, conv_id, tries=2):
+    """探测匿名会话是否还可访问：区分「会话真失效」与「限速/网络抖动」。
+
+    只有 404（conversation_inaccessible）和 403 才说明会话不可用；
+    429/0/5xx 是通道问题，重试后再报「暂时读不到」，绝不误判成会话丢失。
+    """
+    st = 0
+    for i in range(tries):
+        st, _ = api.req("GET", API_BASE + "/backend-api/conversation/" + conv_id, timeout=60)
+        if st == 200:
+            return 200, None
+        if st in (403, 404):
+            return st, "会话不可访问"
+        if st in (0, 429, 500, 502, 503, 504) and i + 1 < tries:
+            time.sleep(5)
+            continue
+        break
+    return st, "通道异常"
+
+
+def send_anon(api, conv_id, prompt_file, text):
+    """匿名态投递：浏览器发送 + API 收割（backend-anon GET 已验证可用）。"""
+    br = api.anon or AnonBrowser()
+    api.anon = br
+    if conv_id:
+        # 先确认会话仍可访问：匿名会话绑定设备身份，失效后无法续接（404 conversation_inaccessible）
+        snap = load_device_cookie((anon_session(conv_id) or {}).get("device") or "")
+        if snap:
+            api.cookie = snap
+        probe, kind = probe_anon(api, conv_id)
+        if probe != 200:
+            if kind == "会话不可访问":
+                raise RuntimeError(
+                    "匿名会话 %s 不可访问（HTTP %s）：匿名会话与设备身份绑定、不入历史，"
+                    "换设备或清 profile 后即失效；请改用登录态账号重建该会话"
+                    % (conv_id[:8], probe))
+            raise RuntimeError(
+                "匿名会话 %s 暂时读不到（HTTP %s：限速或网络抖动），**不代表会话已丢失**；"
+                "等几分钟重试，或用 --anon-read 直接读取" % (conv_id[:8], probe))
+    try:
+        cid, dom_reply, tab = br.send(text, conv_id)
+    except Exception:
+        # 发送流程中途异常时会话可能已经建成：登记下来，别让它变成查不到的孤儿会话
+        if getattr(br, "last_cid", None):
+            record_anon_session(br.last_cid, tab=getattr(br, "last_tab", None),
+                                prompt=prompt_file, device=api._device_id())
+            print("WARN: 匿名会话 %s 已建立但发送流程异常，已登记到对照表（status=live 需确认）"
+                  % br.last_cid[:8], flush=True)
+        raise
+    api.cookie = br.cookie() or api.cookie
+    if api.cookie:
+        save_device_cookie(api.cookie)
+    reply = ""
+    st, body = api.req("GET", API_BASE + "/backend-api/conversation/" + cid, timeout=90)
+    if st == 200:
+        reply = api.harvest_mapping(body)
+    if not reply:
+        reply = dom_reply
+    path = api.save_reply(cid, os.path.basename(prompt_file), reply)
+    record_anon_session(cid, tab=tab, prompt=prompt_file, reply=reply, device=api._device_id())
+    print("ANON_SEND %s -> %s replyLen=%d tab=%s" % (cid[:8], st, len(reply or ""), (tab or "-")[:8]), flush=True)
+    return (200 if reply else st or 0), path, cid
+
+
+def send_prompt(api, conv_id, prompt_file, new_chat=False):
+    """完整投递流程：tail → requirements+PoW → POST → 收割 → 落盘。
+
+    返回 (status, reply_path, real_conv_id)；real_conv_id 用于登记会话归属。
+    """
+    text = open(prompt_file, encoding="utf-8").read()
+    lines = [l for l in text.splitlines() if not l.strip().startswith("#")]
+    text = "\n".join(lines).strip()
+    pfile = os.path.basename(prompt_file)
+
+    if api.is_anon:
+        # 匿名态 POST 恒 403（Turnstile），必须走浏览器通道
+        return send_anon(api, conv_id, prompt_file, text)
+
+    if new_chat:
+        tail = None  # 新会话无 parent
+    else:
+        tail, raw = api.live_tail(conv_id, tries=2)
+        if not tail:
+            tail = api.cached_tail(conv_id)
+            print("using cached tail:", tail, flush=True)
+        if not tail:
+            print("FAIL: no parent_message_id (GET 被限速且无缓存 tail)", flush=True)
+            return 0, None, None
+
+    st, resp = 0, ""
+    for attempt in (1, 2):
+        req_token, proof = api.requirements()
+        if not req_token:
+            if api.account == "nologin":
+                # 匿名态拿不到 requirements（服务端 401），不做 60s 重试，直接让轮转换身份
+                print("FAIL: nologin 无法获取 requirements（服务端要求登录）", flush=True)
+                return 401, None, None
+            time.sleep(60)
+            req_token, proof = api.requirements()
+            if not req_token:
+                print("FAIL: no requirements token", flush=True)
+                return 0, None, None
+
+        t0 = time.time()
+        st, resp = api.send(conv_id, text, tail, req_token, proof)
+        print("SEND %s -> %s respLen=%d in %.0fs" % (pfile, st, len(resp), time.time() - t0), flush=True)
+        if st == 403 and "Unusual activity" in (resp or "") and attempt == 1:
+            print("403 Unusual activity —— 补 Cloudflare cookie 并重跑 requirements + PoW 重试一次", flush=True)
+            api.warm_cookies()
+            time.sleep(3)
+            continue
+        break
+
+    if st == 413 or "conversation_too_large" in resp:
+        print("413 conversation_too_large —— 用 continue_full.py 走「开始新聊天」摘要续接", flush=True)
+        return 413, None, None
+    if st != 200:
+        print("resp: %s" % resp[:200], flush=True)
+        return st, None, None
+
+    # 校验 conversation_id：防静默落新会话事故
+    # 三级兜底：SSE 逐行解析 → 整包 JSON → 精确正则（流被截断时仍能捞出 id）
+    real_conv = conv_id
+    for line in resp.splitlines():
+        if line.startswith("data:"):
+            try:
+                obj = json.loads(line[5:].strip())
+                cid = obj.get("conversation_id")
+                if cid:
+                    real_conv = cid
+                    break
+            except Exception:
+                pass
+    if not (conv_id or real_conv):
+        try:
+            real_conv = json.loads(resp).get("conversation_id") or real_conv
+        except Exception:
+            pass
+    if not real_conv:
+        m = re.search(r'"conversation_id"\s*:\s*"([0-9a-fA-F-]{36})"', resp or "")
+        if m:
+            real_conv = m.group(1)
+            print("conversation_id 由正则兜底解析得到：%s" % real_conv, flush=True)
+    if conv_id and real_conv != conv_id:
+        print("WARN: 落入了不同会话! target=%s real=%s" % (conv_id, real_conv), flush=True)
+
+    reply = api.extract_reply_sse(resp) or api.harvest_mapping(resp)
+    path = api.save_reply(conv_id or real_conv, pfile, reply)
+    return st, path, (conv_id or real_conv)
+
+
+def _attempt_create(st, name, prompt_file, attempts):
+    """用指定身份建会话并记录结果；返回 (status, conv_id)。"""
+    try:
+        api = ChatGPTAPI(account=name)
+    except (ValueError, OSError, json.JSONDecodeError) as e:
+        def init_fail(s):
+            mark_unavailable(s, name, "credentials unavailable: %s" % e)
+            s["failures"][name] = s.get("failures", {}).get(name, 0) + 1
+
+        st.update(mutate_rotation(init_fail))
+        attempts.append({"account": name, "status": "INIT_FAIL", "detail": str(e)})
+        print("rotate: %s 凭据不可用，跳过（%s）" % (name, e), flush=True)
+        return "INIT_FAIL", None
+    try:
+        status, _path, conv = send_prompt(api, None, prompt_file, new_chat=True)
+    except Exception as e:
+        status, conv = 0, None
+        print("rotate: %s 通道异常（%s）" % (name, e), flush=True)
+    attempts.append({"account": name, "status": status, "conv_id": conv})
+    if status == 200:
+        # conv 可能为 None（POST 成功但 SSE 未解析出 id）；不能当失败去试下一个身份，
+        # 否则会重复建会话、把一条 prompt 花两次配额。
+        return status, conv
+    reason, ttl = None, None
+    if status == 401:
+        reason = "HTTP 401（认证失效，需重新提取凭据）"
+    elif status == 403:
+        # PoW/风控或隐性限速，可自愈：短冷却，勿长期封禁
+        reason, ttl = "HTTP 403（PoW/风控，冷却后重试）", COOLDOWN_403
+    elif status == 429:
+        reason, ttl = "HTTP 429 限速冷却", COOLDOWN_429
+    elif status == 0 and name == "nologin":
+        reason, ttl = "匿名浏览器通道不可用（CDP/Turnstile）", 1800
+
+    def failed(s):
+        s["failures"][name] = s.get("failures", {}).get(name, 0) + 1
+        if reason:
+            mark_unavailable(s, name, reason, ttl)
+
+    st.update(mutate_rotation(failed))
+    print("rotate: %s 建会话失败(st=%s)，切下一身份" % (name, status), flush=True)
+    return status, None
+
+
+def _mark_success(st, name, conv, prompt_file, attempts):
+    def mutate(s):
+        s["created"][name] = s.get("created", {}).get(name, 0) + 1
+        if name in ROTATION_PRIMARY:
+            s["cursor"] = (ROTATION_PRIMARY.index(name) + 1) % len(ROTATION_PRIMARY)
+        else:
+            # 兜底不推进游标：登录态恢复后仍按原均分顺序轮转，否则会白跳过一个账号的轮次
+            s["fallback_uses"] = s.get("fallback_uses", 0) + 1
+        s["unavailable"].pop(name, None)  # 成功即解封（可能之前是 403/429 冷却）
+        s["last"] = {"account": name, "conv_id": conv, "prompt": prompt_file, "ts": _now()}
+
+    st.update(mutate_rotation(mutate))  # 锁内重读再改，避免并发丢计数
+    record_conv(conv, name, prompt_file)
+    print("NEW_CONV %s account=%s" % (conv, name), flush=True)
+    print(json.dumps({"result": "ok", "conv_id": conv, "account": name,
+                      "attempts": attempts}, ensure_ascii=False), flush=True)
+
+
+def create_chat_rotating(prompt_file):
+    """登录态优先建会话：acct1/acct2 均分轮转；仅当两者都 429 才用匿名兜底。
+
+    匿名会话不进任何账号历史（会话列表恒为空），只按 conv_id 短期可读，
+    因此只作为限速时的应急产能，不承担需要留存/续接的任务。
+    """
+    st = load_rotation()
+    if purge_expired(st):  # 过期解封显式落盘，不再靠 is_unavailable 的副作用
+        save_rotation(st)
+    outcomes, attempts, skipped = {}, [], {}
+    for name in ROTATION_PRIMARY:
+        if is_unavailable(st, name):
+            reason = (st["unavailable"].get(name) or {}).get("reason", "unavailable")
+            skipped[name] = reason
+            outcomes[name] = "SKIP:" + reason
+    plan = [a for a in rotation_plan(st) if a not in skipped]
+    print("rotation plan: %s (cursor=%s)%s" % (
+        " -> ".join(plan) or "(无可用登录态)", st["cursor"],
+        "；跳过 " + json.dumps(skipped, ensure_ascii=False) if skipped else ""), flush=True)
+
+    for name in plan:
+        status, conv = _attempt_create(st, name, prompt_file, attempts)
+        outcomes[name] = status
+        if conv:
+            _mark_success(st, name, conv, prompt_file, attempts)
+            return 0
+        if status == 200:
+            print("WARN: %s 建会话返回 200 但未解析出 conv_id（消息可能已送达），"
+                  "为免重复建会话停止轮转" % name, flush=True)
+            print(json.dumps({"result": "ok_no_conv_id", "account": name,
+                              "attempts": attempts}, ensure_ascii=False), flush=True)
+            return 0
+
+    # ---- 兜底：两个登录态都 429（本次命中或 429 冷却中）才允许用匿名 ----
+    block = anon_fallback_block_reason(st, outcomes)
+    if block is None:
+        print("两个登录态均 429 —— 启用匿名兜底（不入历史，仅短期可读，勿用于长任务）", flush=True)
+        status, conv = _attempt_create(st, "nologin", prompt_file, attempts)
+        if conv:
+            _mark_success(st, "nologin", conv, prompt_file, attempts)
+            print("WARN: 该会话为匿名会话，不出现在任何账号的会话列表，勿用于需留存的长任务", flush=True)
+            return 0
+        if status == 200:
+            print("WARN: 匿名会话已建立但未解析出 conv_id，停止重试以免重复建会话", flush=True)
+            print(json.dumps({"result": "ok_no_conv_id", "account": "nologin",
+                              "attempts": attempts}, ensure_ascii=False), flush=True)
+            return 0
+        outcomes["nologin"] = status
+    else:
+        print("匿名兜底未放行：%s" % block, flush=True)
+
+    print(json.dumps({"result": "failed", "outcomes": outcomes, "attempts": attempts}, ensure_ascii=False), flush=True)
+    return 1
+
+
+def rotation_summary():
+    st = load_rotation()
+    created = st.get("created", {})
+    prim = {a: created.get(a, 0) for a in ROTATION_PRIMARY}
+    prim_total = sum(prim.values()) or 1
+    return {
+        "policy": "acct1/acct2 均分轮转；nologin 仅在两者都 429 时兜底（其会话不入历史）",
+        "primary": list(ROTATION_PRIMARY),
+        "fallback": list(ROTATION_FALLBACK),
+        "cursor": st["cursor"],
+        "next": ROTATION_PRIMARY[st["cursor"]],
+        "created": created,
+        # share 只在登录态之间算，兜底的匿名次数单列，避免把 1/3 当成「没均分好」
+        "share": {k: round(v / float(prim_total), 2) for k, v in prim.items()},
+        "fallback_uses": st.get("fallback_uses", 0),
+        "failures": st.get("failures", {}),
+        "unavailable": st.get("unavailable", {}),
+        "unavailable_ttl_sec": UNAVAILABLE_TTL,
+        "last": st.get("last"),
+        "updated": st.get("updated"),
+    }
+
+
+def main():
+    args = sys.argv[1:]
+    account, explicit_account = "default", False
+    if args and args[0] in ("--help", "-h"):
+        print(__doc__)
+        return 0
+    # --account 先摘出来：否则 `--account acct1 --owner/--anon-xxx` 会被当成位置参数
+    if len(args) >= 2 and args[0] == "--account":
+        account, explicit_account = args[1], True
+        args = args[2:]
+        if not args:
+            print(__doc__)
+            return 1
+    # ---- 轮转管理（纯本地状态，不触网）----
+    if args and args[0] in ("--rotation", "--rotation-status"):
+        print(json.dumps(rotation_summary(), ensure_ascii=False, indent=2))
+        return 0
+    if len(args) == 2 and args[0] in ("--rotation-enable", "--rotation-disable"):
+        name = args[1]
+        if name not in ROTATION_ORDER:
+            print("usage: %s acct1|acct2|nologin" % args[0], flush=True)
+            return 2
+        enable = args[0] == "--rotation-enable"
+
+        def mutate(s):
+            if enable:
+                s["unavailable"].pop(name, None)
+                s["failures"][name] = 0
+            else:
+                mark_unavailable(s, name, "manually disabled")
+
+        mutate_rotation(mutate)
+        print(json.dumps(rotation_summary(), ensure_ascii=False, indent=2))
+        return 0
+    if args and args[0] == "--rotation-reset":
+        def reset(s):
+            s["cursor"] = 0
+            s["fallback_uses"] = 0
+            s["created"] = {a: 0 for a in s["order"]}
+            s["failures"] = {a: 0 for a in s["order"]}
+            s.pop("last", None)
+
+        mutate_rotation(reset)
+        print(json.dumps(rotation_summary(), ensure_ascii=False, indent=2))
+        return 0
+    if len(args) == 2 and args[0] == "--owner":
+        owner = conv_owner(args[1])
+        print(json.dumps({"conv_id": args[1], "account": owner, "known": bool(owner)}, ensure_ascii=False))
+        return 0 if owner else 1
+    # ---- 匿名会话 id 对照表 ----
+    if args and args[0] == "--anon-list":
+        data = load_anon_sessions()
+        live_ids = set()
+        try:
+            live_ids = {t.get("id") for t in AnonBrowser().probe_tabs()}
+        except Exception:
+            pass
+        rows = []
+        for cid, s in sorted((data.get("sessions") or {}).items(),
+                             key=lambda kv: kv[1].get("updated") or "", reverse=True):
+            if live_ids:
+                alive = s.get("tab") in live_ids
+                status = "live" if alive else "archived"
+            else:
+                alive = None
+                status = "unknown（CDP 未就绪，无法确认标签页）" if s.get("status") == "live" else (s.get("status") or "archived")
+            rows.append({
+                "conv_id": cid,
+                "status": status,
+                "tab_alive": alive,
+                "prompt": s.get("prompt"),
+                "reply_excerpt": s.get("reply_excerpt"),
+                "created": s.get("created"),
+                "updated": s.get("updated"),
+            })
+        print(json.dumps({"count": len(rows), "sessions": rows,
+                          "note": "live=标签页仍在，可直接续聊；archived=只能用 --anon-read 读全文"},
+                         ensure_ascii=False, indent=2))
+        return 0
+    if len(args) == 2 and args[0] == "--anon-read":
+        api = ChatGPTAPI(account="nologin")
+        status, last, transcript = read_anon(api, args[1])
+        print(json.dumps({"conv_id": args[1], "status": status,
+                          "turns": len(transcript), "last_reply": last,
+                          "transcript": [{"role": r, "text": t} for r, t in transcript],
+                          "saved": "anon-sessions/" + os.path.basename(anon_archive_path(args[1]))
+                          if transcript else None},
+                         ensure_ascii=False, indent=2))
+        return 0 if status == 200 else 1
+    if len(args) == 3 and args[0] == "--anon-send":
+        api = ChatGPTAPI(account="nologin")
+        try:
+            status, _p, conv = send_prompt(api, args[1], args[2])
+        except Exception as e:
+            print(json.dumps({"conv_id": args[1], "result": "error", "detail": str(e)},
+                             ensure_ascii=False))
+            return 1
+        print(json.dumps({"conv_id": conv, "status": status}, ensure_ascii=False))
+        return 0 if status == 200 else 1
+    # ---- 会话清单 ----
+    if args and args[0] == "--list-all":
+        combined = []
+        errors = []
+        quota = {}
+        for name in ("acct1", "acct2", "nologin"):
+            try:
+                api = ChatGPTAPI(account=name)
+            except (OSError, json.JSONDecodeError) as e:
+                if name != "nologin":
+                    errors.append("%s: credentials unavailable (%s)" % (name, e))
+                    continue
+                raise
+            items, status, error = api.list_conversations()
+            combined.extend(items)
+            quota[name] = api.quota
+            if status != 200 or error:
+                errors.append("%s: HTTP %s %s" % (name, status, error))
+                if status == 429:
+                    break
+        by_account = {}
+        for c in combined:
+            by_account.setdefault(c["account"], []).append(c)
+        summary = {k: len(v) for k, v in by_account.items()}
+        print(json.dumps({
+            "conversations": combined,
+            "by_account": by_account,
+            "summary": summary,
+            "quota": quota,
+            "errors": errors,
+        }, ensure_ascii=False, indent=2))
+        return 1 if errors else 0
+    if not args:
+        print(__doc__)
+        return 1
+
+    def build(name):
+        try:
+            return ChatGPTAPI(account=name)
+        except (ValueError, OSError, json.JSONDecodeError) as e:
+            print("FAIL: account auth unavailable: %s" % e, flush=True)
+            return None
+
+    # ---- 开新会话 ----
+    if args[0] == "--new":
+        if len(args) != 2:
+            print("usage: [--account acct1|acct2|nologin|auto] --new <prompt_file>", flush=True)
+            return 2
+        if explicit_account and account != "auto":
+            api = build(account)
+            if api is None:
+                return 2
+            if account == "nologin":
+                print("nologin：走匿名浏览器通道（需 CDP 端口 %s 的未登录浏览器）"
+                      % os.environ.get("CHATGPT_ANON_CDP_PORT", "9333"), flush=True)
+            status, _path, conv = send_prompt(api, None, args[1], new_chat=True)
+            if status == 200 and conv:
+                record_conv(conv, account, args[1])
+                print("NEW_CONV %s account=%s" % (conv, account), flush=True)
+            return 0 if status == 200 else 1
+        return create_chat_rotating(args[1])  # 默认：acct1/acct2 均分轮转，双 429 才匿名兜底
+
+    # ---- 既有会话：未显式指定身份时按登记归属路由 ----
+    # 先做参数校验，别在缺参数时索引越界（曾导致 `--tail` 空参数直接 IndexError）
+    if args[0] == "--list" and len(args) != 1:
+        print("usage: [--account acct1|acct2|nologin] --list", flush=True)
+        return 2
+    if args[0] == "--tail" and len(args) != 2:
+        print("usage: [--account acct1|acct2|nologin] --tail <conv_id>", flush=True)
+        return 2
+    conv_id = args[1] if args[0] == "--tail" else (args[0] if not args[0].startswith("--") else "")
+    owner = conv_owner(conv_id) if conv_id else None
+    if not explicit_account and owner and owner != account:
+        print("route: 会话 %s 登记归属 %s，自动切换身份" % (conv_id[:8], owner), flush=True)
+        account = owner
+    elif explicit_account and owner and owner != account:
+        print("WARN: 会话 %s 登记归属 %s，当前显式使用 %s（可能 404/403）"
+              % (conv_id[:8], owner, account), flush=True)
+    api = build(account)
+    if api is None:
+        return 2
+    if args[0] == "--list":
+        items, status, error = api.list_conversations()
+        print(json.dumps({"account": account, "conversations": items, "status": status, "error": error, "quota": api.quota}, ensure_ascii=False, indent=2))
+        return 0 if status == 200 and not error else 1
+    if args[0] == "--tail":
+        tail, raw = api.live_tail(args[1], tries=2)
+        print("tail:", tail)
+        if raw:
+            print(api.harvest_mapping(raw)[-4000:])
+        return 0
+    if len(args) != 2:
+        print("usage: [--account acct1|acct2|nologin] <conv_id> <prompt_file>", flush=True)
+        return 2
+    try:
+        status, _path, _conv = send_prompt(api, args[0], args[1])
+    except Exception as e:
+        print(json.dumps({"conv_id": args[0], "result": "error", "detail": str(e)}, ensure_ascii=False))
+        return 1
+    if status == 200:
+        record_conv(args[0], account, args[1])
+    return 0 if status == 200 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

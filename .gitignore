@@ -1,0 +1,46 @@
+# ==========================================================
+# 凭据 / 身份（绝不入库：泄露等于账号被接管）
+# ==========================================================
+cookies.json
+access_token.txt
+**/cookies.json
+**/access_token.txt
+scripts/accounts/*/cookies.json
+scripts/accounts/*/access_token.txt
+scripts/accounts/nologin/device-cookie.txt
+scripts/accounts/nologin/devices/
+*.token
+*.pem
+*.key
+.env
+.env.*
+
+# ==========================================================
+# 运行态与会话产物（本机生成，含私有对话内容）
+# ==========================================================
+account-rotation.json
+conv-accounts.json
+anon-sessions.json
+anon-sessions/
+newchat-map.json
+sessions-registry.json
+quick-send-log.jsonl
+send-queue-log.md
+replies/
+prompts/
+conv-api/
+*.lock
+
+# ==========================================================
+# 语言 / 系统
+# ==========================================================
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/

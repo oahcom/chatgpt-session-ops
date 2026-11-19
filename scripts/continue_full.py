@@ -1,0 +1,156 @@
+# -*- coding: utf-8 -*-
+"""continue_full.py — 413 满员续接器（P1 通道：CDP + 真实鼠标事件）。
+
+当 chatgpt_send.py 返回 413 conversation_too_large 时使用：
+    python continue_full.py <old_conv_id> <prompt_file>
+
+流程：
+    1. 打开 chatgpt.com/c/<old_conv_id>，填入提示词尝试点发送
+    2. 若弹出「长度上限」横幅 → 真实鼠标点「开始新聊天 / 在新会话中继续」
+    3. 摘要续接产生新会话后重发提示词
+    4. 新旧 conv_id 映射追加写入 newchat-map.json
+
+依赖：browser-automation-cdp 技能的 cdp.py（Edge 调试端口 9222）。
+"""
+import json
+import os
+import sys
+import time
+
+_CDP_DIR = os.environ.get("CHATGPT_CDP_DIR") or os.path.join(
+    os.path.expanduser("~"), ".workbuddy", "skills", "browser-automation-cdp", "scripts")
+sys.path.insert(0, _CDP_DIR)
+from cdp import CDPClient  # noqa: E402
+
+BASE = os.path.dirname(os.path.abspath(__file__))
+MAP = os.path.join(BASE, "newchat-map.json")
+
+JS_STATE = """(function(){
+  var body = document.body.innerText || '';
+  var ta = document.querySelector('.ProseMirror[contenteditable=true]') || document.querySelector('#prompt-textarea') || document.querySelector('textarea');
+  var composer = ta ? (ta.innerText || ta.value || '') : '';
+  return JSON.stringify({
+    url: location.href,
+    composerLen: composer.length,
+    ctxLimit: /上下文窗口已达上限|已达长度上限|长度上限/.test(body),
+    hasFup: /开新会话|在新会话中继续|继续聊天|新会话中继续/.test(body),
+    streaming: [...document.querySelectorAll('button')].some(function(b){return /停止生成|stop/i.test(b.getAttribute('aria-label')||'');})
+  });
+})()"""
+
+JS_FILL = """(function(text){
+  var ta = document.querySelector('.ProseMirror[contenteditable=true]') || document.querySelector('#prompt-textarea') || document.querySelector('textarea');
+  if (!ta) return 'NO_COMPOSER';
+  ta.focus();
+  document.execCommand('selectAll', false, null);
+  document.execCommand('insertText', false, text);
+  return 'SET:' + ((ta.innerText || ta.value || '').length);
+})"""
+
+JS_SEND = """(function(){
+  var btns = document.querySelectorAll('button');
+  for (var i = 0; i < btns.length; i++) {
+    var lbl = (btns[i].getAttribute('aria-label') || '') + '|' + (btns[i].getAttribute('data-testid') || '');
+    if (/send|发送/i.test(lbl) && !btns[i].disabled && btns[i].getAttribute('aria-disabled') !== 'true') {
+      btns[i].click(); return 'SENT_BTN';
+    }
+  }
+  return 'NO_SEND';
+})()"""
+
+# 真实鼠标事件点击（js click 可能被 React 忽略）
+JS_CLICK_FUP = """(function(){
+  var all = [...document.querySelectorAll('button, a[role=button]')];
+  var labels = ['开新会话', '在新会话中继续', '在新聊天中继续', '继续聊天', '新会话中继续', 'Continue in a new chat', 'Start a new chat'];
+  var bs = all.filter(function(b){
+    var t = (b.innerText||'').trim();
+    return labels.some(function(l){ return t === l || t.indexOf(l) >= 0; });
+  });
+  if (!bs.length) return JSON.stringify({clicked:false, reason:'NO_BTN'});
+  var r = bs[0].getBoundingClientRect();
+  return JSON.stringify({clicked:true, label:(bs[0].innerText||'').trim().slice(0,25), x:Math.round(r.x+r.width/2), y:Math.round(r.y+r.height/2)});
+})()"""
+
+
+def state(c):
+    try:
+        return json.loads(c.evaluate(JS_STATE).get("value") or "{}")
+    except Exception:
+        return {}
+
+
+def real_click(c, x, y):
+    for typ in ("mousePressed", "mouseReleased"):
+        c.send("Input.dispatchMouseEvent", {
+            "type": typ, "x": x, "y": y, "button": "left", "clickCount": 1,
+        })
+    time.sleep(2)
+
+
+def conv_id_from_url(url):
+    import re
+    m = re.search(r"/c/([0-9a-f-]{36})", url or "")
+    return m.group(1) if m else None
+
+
+def main():
+    old_id, prompt_file = sys.argv[1], sys.argv[2]
+    prompt = open(prompt_file, encoding="utf-8").read()
+    lines = [l for l in prompt.splitlines() if not l.strip().startswith("#")]
+    prompt = "\n".join(lines).strip()
+
+    c = CDPClient(host="127.0.0.1", port=9222, timeout=30)
+    c.ensure_page(url_contains="chatgpt.com")
+    c.navigate("https://chatgpt.com/c/" + old_id, wait=25)
+    time.sleep(6)
+
+    st = state(c)
+    print("state:", st, flush=True)
+
+    # 尝试直接发送（可能已可发）
+    print(c.evaluate(JS_FILL.replace("text", json.dumps(prompt))).get("value"), flush=True)
+    time.sleep(1)
+    print("send:", c.evaluate(JS_SEND).get("value"), flush=True)
+    time.sleep(4)
+    st = state(c)
+    print("state2:", st, flush=True)
+
+    if not (st.get("ctxLimit") or st.get("hasFup")):
+        print("已发送或无需续接，退出")
+        return 0
+
+    # 点「开始新聊天」续接（真实鼠标）
+    r = c.evaluate(JS_CLICK_FUP).get("value")
+    print("fup btn:", r, flush=True)
+    try:
+        d = json.loads(r)
+        if d.get("clicked"):
+            real_click(c, d["x"], d["y"])
+    except Exception:
+        pass
+    time.sleep(10)
+
+    new_id = conv_id_from_url(state(c).get("url", ""))
+    print("new conv:", new_id, flush=True)
+    if not new_id:
+        print("FAIL: 未拿到新会话 id")
+        return 2
+
+    # 记录映射
+    m = {}
+    if os.path.exists(MAP):
+        m = json.load(open(MAP, encoding="utf-8"))
+    m[old_id] = new_id
+    json.dump(m, open(MAP, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
+    # 新会话重发
+    print(c.evaluate(JS_FILL.replace("text", json.dumps(prompt))).get("value"), flush=True)
+    time.sleep(1)
+    print("send2:", c.evaluate(JS_SEND).get("value"), flush=True)
+    time.sleep(4)
+    print("done ->", state(c), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
