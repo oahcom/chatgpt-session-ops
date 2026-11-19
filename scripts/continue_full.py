@@ -39,14 +39,17 @@ JS_STATE = """(function(){
   });
 })()"""
 
-JS_FILL = """(function(text){
+JS_FOCUS = """(function(){
   var ta = document.querySelector('.ProseMirror[contenteditable=true]') || document.querySelector('#prompt-textarea') || document.querySelector('textarea');
   if (!ta) return 'NO_COMPOSER';
   ta.focus();
-  document.execCommand('selectAll', false, null);
-  document.execCommand('insertText', false, text);
-  return 'SET:' + ((ta.innerText || ta.value || '').length);
-})"""
+  return 'FOCUSED';
+})()"""
+
+JS_COMPOSER_LEN = """(function(){
+  var ta = document.querySelector('.ProseMirror[contenteditable=true]') || document.querySelector('#prompt-textarea') || document.querySelector('textarea');
+  return ta ? ((ta.innerText || ta.value || '').length) : -1;
+})()"""
 
 JS_SEND = """(function(){
   var btns = document.querySelectorAll('button');
@@ -88,8 +91,20 @@ def real_click(c, x, y):
     time.sleep(2)
 
 
+def fill_prompt(c, text):
+    """填入提示词：先聚焦，再用 CDP Input.insertText（原生 setter/execCommand 常被 React 忽略）。
+
+    旧实现用字符串替换把提示词塞进 JS —— 那会把函数签名里的同名字符串
+    一起换掉，直接产出语法错误的表达式，页面侧必然失败。
+    """
+    if c.evaluate(JS_FOCUS).get("value") == "NO_COMPOSER":
+        return "NO_COMPOSER"
+    c.send("Input.insertText", {"text": text})
+    time.sleep(0.8)
+    return "LEN:%s" % (c.evaluate(JS_COMPOSER_LEN).get("value"),)
+
+
 def conv_id_from_url(url):
-    import re
     m = re.search(r"/c/([0-9a-f-]{36})", url or "")
     return m.group(1) if m else None
 
@@ -114,16 +129,26 @@ def main():
         print("ERROR: 提示词没有正文（只有注释行）：%s" % prompt_file, flush=True)
         return 2
 
-    c = CDPClient(host="127.0.0.1", port=9222, timeout=30)
-    c.ensure_page(url_contains="chatgpt.com")
-    c.navigate("https://chatgpt.com/c/" + old_id, wait=25)
+    port = int(os.environ.get("CHATGPT_CDP_PORT") or 9222)
+    c = CDPClient(host="127.0.0.1", port=port, timeout=30)
+    try:
+        c.ensure_page(url_contains="chatgpt.com")
+        # 注意：navigate 的参数名是 timeout，不是 wait（写错直接 TypeError）
+        c.navigate("https://chatgpt.com/c/" + old_id, timeout=30)
+    except Exception as e:
+        print("ERROR: CDP 端口 %d 不可用或页面打不开：%s" % (port, e), flush=True)
+        print("提示：先 python start_chrome.py --port %d，并确认已登录" % port, flush=True)
+        return 2
     time.sleep(6)
 
     st = state(c)
     print("state:", st, flush=True)
+    if not st:
+        print("ERROR: 读不到页面状态（页面白屏或 JS 异常），不继续盲点", flush=True)
+        return 2
 
     # 尝试直接发送（可能已可发）
-    print(c.evaluate(JS_FILL.replace("text", json.dumps(prompt))).get("value"), flush=True)
+    print("fill:", fill_prompt(c, prompt), flush=True)
     time.sleep(1)
     print("send:", c.evaluate(JS_SEND).get("value"), flush=True)
     time.sleep(4)
@@ -164,14 +189,22 @@ def main():
             m = {}
     m[old_id] = new_id
     tmp = MAP + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(m, f, ensure_ascii=False, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, MAP)
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(m, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, MAP)
+    except OSError as e:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        print("WARN: newchat-map.json 落盘失败（%s）：续接已发生，请手工记下 %s -> %s"
+              % (e, old_id, new_id), flush=True)
 
     # 新会话重发
-    print(c.evaluate(JS_FILL.replace("text", json.dumps(prompt))).get("value"), flush=True)
+    print("fill2:", fill_prompt(c, prompt), flush=True)
     time.sleep(1)
     print("send2:", c.evaluate(JS_SEND).get("value"), flush=True)
     time.sleep(4)

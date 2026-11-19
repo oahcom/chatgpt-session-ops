@@ -18,7 +18,7 @@
 | 会话满员 413 `conversation_too_large` | `continue_full.py` 真实鼠标点「开始新聊天」→ 摘要续接 |
 | 单账号 429 就全线停摆 | `acct1 / acct2` 均分轮转 + 冷却 + 兜底 |
 | 匿名态 `POST` 恒 403 `Unusual activity` | UI 建会话 + API 收割 |
-| 匿名会话不入历史、换浏览器就读不到 | `conv_id` 对照表 + 全文归档 + 按设备分档的 cookie 快照 |
+| 匿名会话不入历史、换浏览器就读不到 | `conv_id` 对照表 + 全文归档 + 按设备分档的 cookie jar（含 HttpOnly）|
 
 核心纪律写在 [SKILL.md](SKILL.md)：**提示词正文必须由 ChatGPT 会话自产，操控层只做输入输出与生命周期管理**——不自撰、不改写、不替换任务内容。
 
@@ -69,13 +69,13 @@ scripts/
 
 `CHATGPT_AUTH_DIR` 可把 acct1 的凭据目录指到别处（便于多机共用或把密钥放在加密盘）。
 
-提取方式：启动带 CDP 的 Edge（默认端口 9222），**用户本人**登录 ChatGPT 后运行
+提取方式：启动带 CDP 的 Edge（默认端口 9222，`CHATGPT_CDP_PORT` 可改），**用户本人**登录 ChatGPT 后运行
 
 ```bash
 python scripts/extract_auth.py
 ```
 
-只处理默认账号。**不要**在聊天、issue、commit 里粘贴 cookie 或 access token。
+一次写出两个文件：`cookies.json`（只保留 chatgpt.com / openai.com 域，含 HttpOnly）与 `access_token.txt`（取自 `/api/auth/session`），落盘即 chmod 600。只处理当前浏览器已登录的默认账号。**不要**在聊天、issue、commit 里粘贴 cookie 或 access token。
 
 ---
 
@@ -128,9 +128,12 @@ python scripts/continue_full.py <old_conv_id> prompts/02-next.md
 python <CDP_DIR>/start_chrome.py --temp --port 9333
 
 python scripts/chatgpt_send.py --account nologin --new prompts/x.md
-python scripts/chatgpt_send.py --anon-list                 # 对照表：live / archived
+python scripts/chatgpt_send.py --anon-list                 # 对照表：live / archived / 设备是否留存
 python scripts/chatgpt_send.py --anon-send <conv_id> prompts/y.md   # 复用原标签页续聊
 python scripts/chatgpt_send.py --anon-read <conv_id>       # 读全文并归档（标签页没了也能读）
+python scripts/chatgpt_send.py --anon-devices              # 本地留存了哪些设备身份
+python scripts/chatgpt_send.py --anon-relink <conv_id> <device>     # 手工修正归属设备
+python scripts/chatgpt_send.py --anon-restore <device>     # 把留存身份回灌浏览器
 ```
 
 留存四件套：
@@ -140,9 +143,15 @@ python scripts/chatgpt_send.py --anon-read <conv_id>       # 读全文并归档�
 | id 对照表 | `anon-sessions.json` | `conv_id → targetId / prompt / 回复摘要 / 设备号 / 状态` |
 | 全文归档 | `anon-sessions/<conv_id8>.md` | `--anon-read` 落盘全部轮次 |
 | 设备身份（最新） | `accounts/nologin/device-cookie.txt` | 当前浏览器的 `oai-did` |
-| 设备身份（分档） | `accounts/nologin/devices/<oai-did>.txt` | 每设备一份快照，换 profile 后旧会话仍可读 |
+| 设备身份（分档） | `accounts/nologin/devices/<oai-did>.{txt,json}` | Cookie 头 + 完整 jar（含 HttpOnly），换 profile 后旧会话仍可读 |
 
-**边界（实测）**：同标签页可多轮；重开 `/uc/<id>` 会被重定向到首页，所以续聊只能复用原标签页；会话只与 `oai-did` 绑定，丢设备 cookie 即永久失联。**需要长期留存、归档、跨机续接的会话，请用 acct1/acct2。**
+设备身份是这条通道唯一的「钥匙」，所以脚本把它当一等公民：
+
+- 每次投递**先留存再发送**：走 CDP `Storage.getCookies` 抓完整 jar（`document.cookie` 读不到 HttpOnly），按 `oai-did` 落盘；发送中途异常也用浏览器侧的 did 登记，不留读不回的死档。
+- 读取时**按设备逐个试**：先试对照表登记的 `device`，不匹配再试其他留存设备（新→旧，≤8），命中即自动修正归属；429/0/5xx 立刻停手，不拿限速配额去遍历。
+- 落盘前**剔除登录态 token**（`*-session-token`/`authjs`/`next-auth`/`access_token`）：匿名通道只要 `oai-did` 与 CF 系列。
+
+**边界（实测）**：同标签页可多轮；重开 `/uc/<id>` 会被重定向到首页，所以续聊只能复用原标签页；会话只与 `oai-did` 绑定，丢设备 jar 即永久失联。**需要长期留存、归档、跨机续接的会话，请用 acct1/acct2。**
 
 ---
 
@@ -159,6 +168,10 @@ python scripts/chatgpt_send.py --anon-read <conv_id>       # 读全文并归档�
 | 凭据权限 | POSIX 上落盘后 chmod 600 |
 | 429 退避 | 优先服从 `Retry-After`，夹在 [5,180] 秒 |
 | 文件锁 | 跨进程 `O_EXCL` + stale 60s，重入按**线程**判定（按路径记会让同进程第二个线程跳过加锁，实测丢 21/80 次更新） |
+| 设备身份 | CDP 抓完整 jar 落 `.txt` + `.json`，读旧会话时多设备回退并自愈归属；jar 落盘前剔除 session token |
+| 413 续接 | 填词改走 CDP `Input.insertText`；`navigate` 用正确的 `timeout` 参数；CDP 不可用给人话 |
+| 凭据提取 | 只落 ChatGPT 域 cookie，并真正抓 `accessToken` 写 `access_token.txt` |
+| PoW | 解不出时返回空 proof 并告警，不再返回写死的假 token |
 
 环境变量：
 
@@ -171,11 +184,12 @@ python scripts/chatgpt_send.py --anon-read <conv_id>       # 读全文并归档�
 | `CHATGPT_ANON_FALLBACK` | 1 | 设 0 彻底禁用匿名兜底 |
 | `CHATGPT_ANON_AUTOSTART` | 1 | 匿名通道是否自动拉起浏览器 |
 | `CHATGPT_CDP_DIR` | `~/.workbuddy/skills/browser-automation-cdp/scripts` | `cdp.py` 所在目录 |
+| `CHATGPT_CDP_PORT` | 9222 | `continue_full.py` / `extract_auth.py` 用的调试端口 |
 | `CHATGPT_REPLY_MAX_CHARS` | 0（全文） | 回复落盘上限 |
 | `CHATGPT_ANON_IDLE_SEC` | 900 | 匿名等待生成结束的预算 |
 
 ```bash
-python -m unittest discover -s tests -v      # 35 条，零依赖
+python -m unittest discover -s tests -v      # 49 条，零依赖
 ```
 
 ---
@@ -203,7 +217,7 @@ python -m unittest discover -s tests -v      # 35 条，零依赖
 | 403 `Unusual activity` | cookie 残缺，或缺 PoW | 脚本自动 `warm_cookies()` + 重跑 PoW；仍失败说明该身份被风控 |
 | 只有 2 条 cookie 就 403 | 缺 `__cf_bm` / `_cfuvid` / `__cflb` | 访问首页接 Set-Cookie（脚本已自动）或重新提取 |
 | 匿名建会话 403 | 纯 API 过不了 Turnstile | 必须浏览器通道（`--temp` 有头 + CDP） |
-| 匿名会话 404 `conversation_inaccessible` | 设备身份变了或会话被回收 | 不可恢复；改用登录态重建（脚本显式报错，不静默分叉） |
+| 匿名会话 404 `conversation_inaccessible` | 设备身份变了、快照丢失或会话被回收 | `--anon-devices` 看留存设备；`--anon-read` 会自动逐个快照试并修好归属；没有快照就只能重建 |
 | 匿名续聊「标签页已不存在」 | 匿名会话只在原标签页可写 | `--anon-read` 读全文；继续对话请用登录态 |
 | 匿名页点发送无反应 | 窗口不可见 → `visibilityState=hidden` | 已启用 `Emulation.setFocusEmulationEnabled`；仍无效则让窗口可见 |
 | GET 429 | 配额紧张 | 退避 ≥90s + `conv-api/` 缓存 tail |
@@ -217,7 +231,7 @@ python -m unittest discover -s tests -v      # 35 条，零依赖
 - **本仓库只放代码与协议文档**。cookie、access token、`oai-did`、对话正文一律 `.gitignore`。
 - 仅供账号持有人管理自己的会话。不要用它访问他人会话、绕过他人配额，或做任何违反 ChatGPT 服务条款的事。
 - 匿名通道只用于明确公开、服务端允许匿名访问的一次性短任务。
-- 匿名会话的设备 cookie 等于该会话的全部凭据（`devices/` 被扫掉 = 永久失联）。
+- 匿名会话的设备 jar 等于该会话的全部凭据（`devices/` 被扫掉 = 永久失联），因此落盘即 chmod 600，且剔除登录态 token。
 
 ---
 
@@ -226,12 +240,12 @@ python -m unittest discover -s tests -v      # 35 条，零依赖
 ```
 SKILL.md                    技能定义与完整操作手册（纪律、工作流、边界）
 references/api-protocol.md  实测协议细节：端点、PoW、请求体全字段、SSE 解析
-scripts/chatgpt_send.py     统一投递 / 收割 / 轮转 / 匿名通道（1600 行，核心）
+scripts/chatgpt_send.py     统一投递 / 收割 / 轮转 / 匿名通道 / 设备身份留存（核心）
 scripts/continue_full.py    413 满员续接
 scripts/pow_solver.py       PoW 解算器
 scripts/extract_auth.py     从 Edge CDP 提取凭据
 scripts/accounts/README.md  凭据目录结构（不含任何真实凭据）
-tests/test_hardening.py     离线回归（id 校验、损坏隔离、原子写、锁并发、兜底判定、投递主流程）
+tests/test_hardening.py     离线回归（id 校验、损坏隔离、原子写、锁并发、兜底判定、设备回退、投递主流程）
 tools/sync.sh               从本机技能目录同步 + 提交前敏感信息拦截
 ```
 

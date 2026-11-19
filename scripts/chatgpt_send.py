@@ -16,12 +16,18 @@
     python chatgpt_send.py --anon-list                 # 匿名会话 id 对照表（留存记录）
     python chatgpt_send.py --anon-read <conv_id>       # 按 id 读取匿名会话全文（API，标签页丢了也能读）
     python chatgpt_send.py --anon-send <conv_id> <prompt_file>  # 按 id 启用匿名通道续聊
+    python chatgpt_send.py --anon-devices              # 本地留存了哪些设备身份（oai-did）
+    python chatgpt_send.py --anon-relink <conv_id> <device>     # 手工修正会话->设备归属
+    python chatgpt_send.py --anon-restore <device>     # 把留存设备身份回灌当前浏览器
 
 匿名通道（nologin）可用性（实测 2026-11-19）：
     能建会话、能多轮对话（同一标签页内连续发送，session id 不变）、能按 id 经 API 读全文。
     限制：匿名会话只在**创建它的标签页**内可写，新开标签页访问 /uc/<id> 会被重定向到首页；
           不进任何会话历史（会话列表恒 0 条），只与设备身份 oai-did 绑定；
           服务端可能回收，故 skill 侧用 anon-sessions.json 留存 id 对照表。
+    设备身份：每次投递都把浏览器 cookie jar（含 HttpOnly）按 oai-did 存到
+          accounts/nologin/devices/<did>.{txt,json}；读旧会话时按登记设备取回身份，
+          对不上就依次试其他留存设备并自动修正归属（--anon-devices 可查）。
 
 建会话身份优先级（--new 默认行为）：
     第一优先：acct1 / acct2 均分轮转（游标只在两者之间推进）。
@@ -457,41 +463,196 @@ def mark_anon_archived(conv_id, reason=""):
 
 # ---------- 匿名设备身份留存 ----------
 # 匿名会话只认 oai-did：浏览器换 profile 后设备号变了，新 cookie 读旧会话会 404。
-# 因此除「最新一份」外，再按设备号分档存一份，读旧会话时按 anon-sessions.json 里
-# 记录的 device 取回对应 cookie —— 这是匿名会话能跨浏览器重启留存的关键。
+# 因此把设备身份完整落在本地（都在 accounts/nologin/ 下，已 gitignore）：
+#   device-cookie.txt        最新一份 Cookie 头（兼容旧版用法）
+#   devices/<did>.txt        按设备号分档的 Cookie 头
+#   devices/<did>.json       完整 cookie jar（含 HttpOnly / 过期时间），可回灌浏览器
+# 读旧会话时按 anon-sessions.json 记录的 device 取回身份；记录缺失或对不上时依次试
+# 其他留存设备（新→旧），命中即自动修正归属 —— 这是跨浏览器重启存活的关键。
+AUTH_COOKIE_RE = re.compile(
+    r"(?i)(session[-_]?token|authjs|next-auth|access[-_]?token|refresh[-_]?token)")
+DEVICE_TRY_MAX = 8          # 一次读取最多试几个设备快照：别把 429 配额烧在遍历上
+
+
 def anon_device_dir():
     return os.path.join(BASE, "accounts", "nologin", "devices")
 
 
+def _read_text(path, default=""):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+def parse_cookie_header(cookie):
+    """Cookie 头 → {name: value}；坏片段直接丢弃，不抛错。"""
+    out = {}
+    for part in (cookie or "").split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        k = k.strip()
+        if k:
+            out[k] = v.strip()
+    return out
+
+
+def cookie_header(jar):
+    """[{'name','value',...}] → "k=v; k2=v2"（保持顺序，同名只留第一个）。"""
+    pairs, seen = [], set()
+    for ck in jar or []:
+        if not isinstance(ck, dict):
+            continue
+        k = (ck.get("name") or "").strip()
+        if not k or k in seen:
+            continue
+        seen.add(k)
+        pairs.append("%s=%s" % (k, ck.get("value", "")))
+    return "; ".join(pairs)
+
+
+def device_id_from_cookie(cookie):
+    return parse_cookie_header(cookie).get("oai-did", "")
+
+
+def _device_txt(did):
+    return os.path.join(anon_device_dir(), did + ".txt")
+
+
+def _device_jar(did):
+    return os.path.join(anon_device_dir(), did + ".json")
+
+
+def _sanitize_jar(jar):
+    """剔除登录态凭据类 cookie，只留设备身份与 CF 系列。
+
+    浏览器若恰好处于登录态（用户手动开过这个 profile），把整包 jar 写盘
+    等于把 session token 存进 nologin 目录。宁可不留，也不落凭据。
+    """
+    out, dropped = [], []
+    for ck in jar or []:
+        if not isinstance(ck, dict) or not ck.get("name"):
+            continue
+        name = ck["name"]
+        if AUTH_COOKIE_RE.search(name):
+            dropped.append(name)
+            continue
+        out.append({k: ck[k] for k in
+                    ("name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite")
+                    if ck.get(k) is not None})
+    if dropped:
+        print("WARN: 设备快照丢弃登录态 cookie（%s）：匿名通道不需要，且不该落盘"
+              % ", ".join(sorted(set(dropped))), flush=True)
+    return out
+
+
 def save_device_cookie(cookie):
+    """把设备身份落盘（Cookie 头字符串或 cookie dict 列表都接受）。
+
+    返回设备号（oai-did）；拿不到合法设备号就不落分档快照，避免拼出非法文件名。
+    """
     if not cookie:
         return ""
-    did = ""
-    for part in cookie.split(";"):
-        part = part.strip()
-        if part.startswith("oai-did="):
-            did = part.split("=", 1)[1]
-            break
-    # 设备号同样会拼进 devices/<did>.txt：非法值一律不落分档快照
-    did_safe = did if _ID_RE.match(did or "") else ""
+    if isinstance(cookie, str):
+        jar = _sanitize_jar([{"name": k, "value": v, "domain": ".chatgpt.com", "path": "/"}
+                             for k, v in parse_cookie_header(cookie).items()])
+        header = cookie_header(jar)
+    else:
+        jar = _sanitize_jar(cookie)
+        header = cookie_header(jar)
+    did = device_id_from_cookie(header)
+    if not _ID_RE.match(did or ""):
+        return ""
     try:
         os.makedirs(anon_device_dir(), exist_ok=True)
-        _atomic_write(os.path.join(BASE, "accounts", "nologin", "device-cookie.txt"), cookie)
-        if did_safe:
-            _atomic_write(os.path.join(anon_device_dir(), did_safe + ".txt"), cookie)
-    except OSError:
+        _atomic_write(os.path.join(BASE, "accounts", "nologin", "device-cookie.txt"), header)
+        if jar:
+            _atomic_write(_device_jar(did), json.dumps(jar, ensure_ascii=False, indent=2))
+        _atomic_write(_device_txt(did), header)
+    except OSError as e:
+        print("WARN: 设备快照落盘失败：%s" % e, flush=True)
+    return did
+
+
+def load_device_jar(did):
+    """完整 jar；只有 .txt 的老快照按 Cookie 头重建（会缺 HttpOnly，但身份可用）。"""
+    if not did or not _ID_RE.match(did):
+        return []
+    try:
+        with open(_device_jar(did), encoding="utf-8") as f:
+            jar = json.load(f)
+        if isinstance(jar, list) and jar:
+            return jar
+    except (OSError, json.JSONDecodeError):
         pass
-    return did_safe
+    return [{"name": k, "value": v, "domain": ".chatgpt.com", "path": "/"}
+            for k, v in parse_cookie_header(_read_text(_device_txt(did))).items()]
 
 
 def load_device_cookie(did):
+    """取设备 Cookie 头：优先 .txt；只有 jar 时从 jar 重建，老快照同样读得回。"""
     if not did or not _ID_RE.match(did):
         return ""
+    txt = _read_text(_device_txt(did)).strip()
+    if txt:
+        return txt
+    return cookie_header(load_device_jar(did))
+
+
+def list_device_ids(limit=50):
+    """已留存设备号，按快照时间倒序（新→旧）。"""
     try:
-        with open(os.path.join(anon_device_dir(), did + ".txt"), encoding="utf-8") as f:
-            return f.read().strip()
+        names = os.listdir(anon_device_dir())
     except OSError:
-        return ""
+        return []
+    stamps = {}
+    for n in names:
+        base, ext = os.path.splitext(n)
+        if ext not in (".txt", ".json") or not _ID_RE.match(base):
+            continue
+        try:
+            mt = os.path.getmtime(os.path.join(anon_device_dir(), n))
+        except OSError:
+            continue
+        stamps[base] = max(stamps.get(base, 0), mt)
+    ordered = sorted(stamps.items(), key=lambda kv: kv[1], reverse=True)
+    return [d for d, _ in ordered[:max(1, limit)]]
+
+
+def device_summary():
+    """--anon-devices 用：留存了哪些设备身份、各自绑了几条会话。"""
+    sessions = (load_anon_sessions().get("sessions") or {})
+    counts = {}
+    for s in sessions.values():
+        d = (s or {}).get("device")
+        if d:
+            counts[d] = counts.get(d, 0) + 1
+    current = device_id_from_cookie(
+        _read_text(os.path.join(BASE, "accounts", "nologin", "device-cookie.txt")))
+    rows = []
+    for did in list_device_ids(limit=200):
+        jar = load_device_jar(did)
+        full = os.path.exists(_device_jar(did))
+        txt = load_device_cookie(did)
+        try:
+            p = _device_txt(did) if os.path.exists(_device_txt(did)) else _device_jar(did)
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(p)))
+        except OSError:
+            stamp = ""
+        rows.append({
+            "device": did,
+            "cookies": len(jar) or len(parse_cookie_header(txt)),
+            "full_jar": full,
+            "sessions": counts.get(did, 0),
+            "current": did == current,
+            "snapshot_at": stamp,
+        })
+    return {"count": len(rows), "devices": rows,
+            "note": ("current=最新快照（新浏览器会拿它当默认身份）；"
+                     "full_jar=false 表示该快照由 Cookie 头重建，缺 HttpOnly 项")}
 
 
 class ChatGPTAPI:
@@ -539,25 +700,20 @@ class ChatGPTAPI:
         """匿名态的 cookie 来源：优先当前浏览器，其次上次落盘的 device-cookie.txt。"""
         if self.cookie and not refresh:
             return self.cookie
-        if not refresh:
-            try:
-                saved = open(self.device_cookie_path(), encoding="utf-8").read().strip()
-            except OSError:
-                saved = ""
-        else:
-            saved = ""
+        saved = "" if refresh else _read_text(self.device_cookie_path()).strip()
         if saved and not refresh:
             self.cookie = saved
             return self.cookie
         try:
             br = self.anon or AnonBrowser()
             self.anon = br
-            live = br.cookie()
+            jar = br.cookie_jar()
+            live = cookie_header(jar)
         except Exception:
-            live = ""
+            live, jar = "", []
         self.cookie = live or saved
         if live:
-            save_device_cookie(live)
+            save_device_cookie(jar or live)
         return self.cookie
 
     def _device_id(self):
@@ -977,8 +1133,86 @@ class AnonBrowser:
         r = self.client().evaluate(expr)
         return r.get("value") if isinstance(r, dict) else r
 
+    # ---------- 设备身份（oai-did）----------
+    def cookie_jar(self):
+        """浏览器侧完整 cookie（含 HttpOnly）。
+
+        document.cookie 读不到 HttpOnly，而匿名会话的设备身份与 CF 系列 cookie
+        恰恰可能落在这些上面 —— 只存 JS 可见的那部分，换 profile 后就会 404。
+        故优先走 CDP Storage.getCookies，失败才退化为 document.cookie。
+        """
+        try:
+            if self.cdp_dir not in sys.path:
+                sys.path.insert(0, self.cdp_dir)
+            from cdp import CDPClient
+            b = CDPClient(port=self.port, timeout=20)
+            try:
+                b.connect_browser()
+                res = b.send("Storage.getCookies", {})
+            finally:
+                try:
+                    b.close()
+                except Exception:
+                    pass
+            jar = []
+            for ck in (res or {}).get("cookies") or []:
+                domain = (ck.get("domain") or "").lstrip(".").lower()
+                if "chatgpt.com" not in domain and "openai.com" not in domain:
+                    continue
+                jar.append({k: ck[k] for k in
+                            ("name", "value", "domain", "path", "expires", "httpOnly",
+                             "secure", "sameSite") if ck.get(k) is not None})
+            if jar:
+                return jar
+        except Exception:
+            pass
+        return [{"name": k, "value": v}
+                for k, v in parse_cookie_header(self._js("document.cookie") or "").items()]
+
     def cookie(self):
-        return self._js("document.cookie") or ""
+        jar = self.cookie_jar()
+        return cookie_header(jar) or (self._js("document.cookie") or "")
+
+    def identity(self):
+        """把当前浏览器的设备身份落盘，返回设备号。
+
+        建会话流程一启动就调用：哪怕后面发送失败，设备号也已留存，
+        不会出现「会话建出来了但没人知道它属于哪台设备」的死档。
+        """
+        return save_device_cookie(self.cookie_jar())
+
+    def restore_identity(self, did):
+        """把留存设备身份回灌到当前浏览器（换 profile 后找回同一个 oai-did）。
+
+        只回灌 cookie，不负责找回标签页 —— 匿名会话的可写通道仍然是原标签页。
+        """
+        jar = load_device_jar(did)
+        if not jar:
+            return 0
+        cl = self.client()
+        cookies = []
+        for ck in jar:
+            item = {"name": ck.get("name"), "value": ck.get("value"),
+                    "domain": ck.get("domain") or ".chatgpt.com",
+                    "path": ck.get("path") or "/"}
+            if ck.get("expires"):
+                item["expires"] = ck["expires"]
+            if ck.get("httpOnly"):
+                item["httpOnly"] = True
+            if ck.get("secure"):
+                item["secure"] = True
+            if ck.get("sameSite"):
+                item["sameSite"] = ck["sameSite"]
+            if item["name"]:
+                cookies.append(item)
+        if not cookies:
+            return 0
+        try:
+            cl.send("Network.enable", {})
+        except Exception:
+            pass
+        cl.send("Network.setCookies", {"cookies": cookies})
+        return len(cookies)
 
     # ---------- 页面动作 ----------
     def _wait(self, expr, timeout=30, interval=0.6):
@@ -1230,16 +1464,58 @@ def anon_archive_path(conv_id):
     return path
 
 
-def read_anon(api, conv_id, save=True):
-    """按 id 读取匿名会话全文（API 侧仍可读，即便标签页已丢失）。"""
+def _read_device_order(recorded, devices=None, limit=DEVICE_TRY_MAX):
+    """读匿名会话时该按什么顺序试设备身份：先是登记的那台，再是其余留存快照（新→旧）。"""
+    order = []
+    if recorded and _ID_RE.match(recorded):
+        order.append(recorded)
+    for did in (list_device_ids(limit=limit * 2) if devices is None else devices):
+        if did and _ID_RE.match(did) and did not in order:
+            order.append(did)
+        if len(order) >= limit:
+            break
+    return order
+
+
+def read_anon(api, conv_id, save=True, devices=None):
+    """按 id 读取匿名会话全文（API 侧仍可读，即便标签页已丢失）。
+
+    设备身份对不上会 404 conversation_inaccessible。记录里的设备若已失效（换了
+    profile、快照被清），依次试其他留存设备；命中就自动把归属修好，省得人工比对。
+    """
     conv_id = safe_id(conv_id, "conv_id")
     info = anon_session(conv_id) or {}
-    snap = load_device_cookie(info.get("device") or "")
-    if snap:
+    recorded = info.get("device") or ""
+    order = _read_device_order(recorded, devices)
+    st, body, used, tried = 0, "", "", []
+    for did in order:
+        snap = load_device_cookie(did)
+        if not snap:
+            continue
         api.cookie = snap  # 用会话所属设备的身份读；浏览器换 profile 后新 cookie 会 404
-    st, body = api.req("GET", API_BASE + "/backend-api/conversation/" + conv_id, timeout=90)
+        tried.append(did)
+        st, body = api.req("GET", API_BASE + "/backend-api/conversation/" + conv_id, timeout=90)
+        if st == 200:
+            used = did
+            break
+        if st in (0, 429) or st >= 500:
+            break  # 通道问题：换设备也一样，别把余下快照全试一遍
+        print("anon-read: 设备 %s 读不到（HTTP %s），换下一个留存设备"
+              % (did[:8], st), flush=True)
+    if st != 200 and not tried:
+        # 一份快照都没有（首次在新机器上读旧会话）：退回当前浏览器/最新快照再试
+        try:
+            api.cookie = ""
+            api.ensure_device_cookie()
+        except Exception:
+            pass
+        st, body = api.req("GET", API_BASE + "/backend-api/conversation/" + conv_id, timeout=90)
+        used = api._device_id()
     if st != 200:
         return st, "", []
+    if used and used != recorded:
+        print("anon-read: 设备归属已修正 %s -> %s（原记录缺失或设备已换）"
+              % ((recorded or "-")[:8], used[:8]), flush=True)
     transcript = api.harvest_transcript(body)
     last = ""
     for role, text in reversed(transcript):
@@ -1254,7 +1530,7 @@ def read_anon(api, conv_id, save=True):
         for role, text in transcript:
             chunks.append("## %s\n\n%s\n\n" % (role, text))
         _atomic_write(path, "".join(chunks))
-        record_anon_session(conv_id, reply=last, device=api._device_id())
+        record_anon_session(conv_id, reply=last, device=used or api._device_id())
     return st, last, transcript
 
 
@@ -1284,6 +1560,13 @@ def send_anon(api, conv_id, prompt_file, text):
         conv_id = safe_id(conv_id, "conv_id")
     br = api.anon or AnonBrowser()
     api.anon = br
+    # 先留存浏览器当前的设备身份：后面无论发送成功还是中途炸掉，
+    # 这条会话的 oai-did 都已经在本地，不会变成「建出来了但读不回来」的死档。
+    did = ""
+    try:
+        did = br.identity()
+    except Exception as e:
+        print("WARN: 设备身份留存失败（%s），继续投递" % e, flush=True)
     if conv_id:
         # 先确认会话仍可访问：匿名会话绑定设备身份，失效后无法续接（404 conversation_inaccessible）
         snap = load_device_cookie((anon_session(conv_id) or {}).get("device") or "")
@@ -1294,24 +1577,34 @@ def send_anon(api, conv_id, prompt_file, text):
             if kind == "会话不可访问":
                 raise RuntimeError(
                     "匿名会话 %s 不可访问（HTTP %s）：匿名会话与设备身份绑定、不入历史，"
-                    "换设备或清 profile 后即失效；请改用登录态账号重建该会话"
-                    % (conv_id[:8], probe))
+                    "换设备或清 profile 后即失效；可用 `--anon-read %s` 按留存设备快照重试，"
+                    "或改用登录态账号重建该会话" % (conv_id[:8], probe, conv_id))
             raise RuntimeError(
                 "匿名会话 %s 暂时读不到（HTTP %s：限速或网络抖动），**不代表会话已丢失**；"
                 "等几分钟重试，或用 --anon-read 直接读取" % (conv_id[:8], probe))
     try:
         cid, dom_reply, tab = br.send(text, conv_id)
     except Exception:
-        # 发送流程中途异常时会话可能已经建成：登记下来，别让它变成查不到的孤儿会话
+        # 发送流程中途异常时会话可能已经建成：登记下来，别让它变成查不到的孤儿会话。
+        # 设备号必须取浏览器侧的（api.cookie 此时可能为空，取它等于把归属丢了）。
         if getattr(br, "last_cid", None):
+            try:
+                did = save_device_cookie(br.cookie_jar()) or did
+            except Exception:
+                pass
             record_anon_session(br.last_cid, tab=getattr(br, "last_tab", None),
-                                prompt=prompt_file, device=api._device_id())
-            print("WARN: 匿名会话 %s 已建立但发送流程异常，已登记到对照表（status=live 需确认）"
-                  % br.last_cid[:8], flush=True)
+                                prompt=prompt_file, device=did or api._device_id())
+            print("WARN: 匿名会话 %s 已建立但发送流程异常，已登记到对照表（status=live 需确认，device=%s）"
+                  % (br.last_cid[:8], (did or "-")[:8]), flush=True)
         raise
-    api.cookie = br.cookie() or api.cookie
-    if api.cookie:
-        save_device_cookie(api.cookie)
+    try:
+        jar = br.cookie_jar()
+        api.cookie = cookie_header(jar) or api.cookie
+        did = save_device_cookie(jar) or did
+    except Exception:
+        pass
+    if not api.cookie:
+        api.cookie = load_device_cookie(did)
     reply = ""
     st, body = api.req("GET", API_BASE + "/backend-api/conversation/" + cid, timeout=90)
     if st == 200:
@@ -1319,8 +1612,10 @@ def send_anon(api, conv_id, prompt_file, text):
     if not reply:
         reply = dom_reply
     path = api.save_reply(cid, os.path.basename(prompt_file), reply)
-    record_anon_session(cid, tab=tab, prompt=prompt_file, reply=reply, device=api._device_id())
-    print("ANON_SEND %s -> %s replyLen=%d tab=%s" % (cid[:8], st, len(reply or ""), (tab or "-")[:8]), flush=True)
+    record_anon_session(cid, tab=tab, prompt=prompt_file, reply=reply,
+                        device=did or api._device_id())
+    print("ANON_SEND %s -> %s replyLen=%d tab=%s device=%s"
+          % (cid[:8], st, len(reply or ""), (tab or "-")[:8], (did or "-")[:8]), flush=True)
     return (200 if reply else st or 0), path, cid
 
 
@@ -1638,15 +1933,53 @@ def main():
                 "conv_id": cid,
                 "status": status,
                 "tab_alive": alive,
+                "device": s.get("device"),
+                "device_known": bool(load_device_cookie(s.get("device") or "")),
                 "prompt": s.get("prompt"),
                 "reply_excerpt": s.get("reply_excerpt"),
                 "created": s.get("created"),
                 "updated": s.get("updated"),
             })
         print(json.dumps({"count": len(rows), "sessions": rows,
-                          "note": "live=标签页仍在，可直接续聊；archived=只能用 --anon-read 读全文"},
-                         ensure_ascii=False, indent=2))
+                          "note": ("live=标签页仍在，可直接续聊；archived=只能用 --anon-read 读全文；"
+                                   "device_known=false 说明没有该设备的本地快照，读取会 404"),
+                          }, ensure_ascii=False, indent=2))
         return 0
+    if args and args[0] == "--anon-devices":
+        print(json.dumps(device_summary(), ensure_ascii=False, indent=2))
+        return 0
+    if len(args) == 3 and args[0] == "--anon-relink":
+        cid = cli_id(args[1])
+        if cid is None:
+            return 2
+        try:
+            did = safe_id(args[2], "device")
+        except ValueError as e:
+            print("ERROR: %s" % e, flush=True)
+            return 2
+        if not load_device_cookie(did):
+            print(json.dumps({"conv_id": cid, "device": did, "result": "error",
+                              "detail": "本地没有该设备快照，无法建立归属"}, ensure_ascii=False))
+            return 1
+        record_anon_session(cid, device=did)
+        print(json.dumps({"conv_id": cid, "device": did, "relinked": True}, ensure_ascii=False))
+        return 0
+    if len(args) == 2 and args[0] == "--anon-restore":
+        try:
+            did = safe_id(args[1], "device")
+        except ValueError as e:
+            print("ERROR: %s" % e, flush=True)
+            return 2
+        try:
+            n = AnonBrowser().restore_identity(did)
+        except Exception as e:
+            print(json.dumps({"device": did, "result": "error", "detail": str(e)}, ensure_ascii=False))
+            return 1
+        print(json.dumps({"device": did, "restored_cookies": n,
+                          "note": ("已把留存身份回灌当前浏览器；刷新页面后生效。"
+                                   "注意别在仍存活的 /uc/ 标签页上刷新——那会毁掉该会话的可写通道")},
+                         ensure_ascii=False))
+        return 0 if n else 1
     if len(args) == 2 and args[0] == "--anon-read":
         cid = cli_id(args[1])
         if cid is None:
@@ -1658,12 +1991,19 @@ def main():
             print(json.dumps({"conv_id": cid, "result": "error", "detail": str(e)},
                              ensure_ascii=False))
             return 1
-        print(json.dumps({"conv_id": cid, "status": status,
-                          "turns": len(transcript), "last_reply": last,
-                          "transcript": [{"role": r, "text": t} for r, t in transcript],
-                          "saved": "anon-sessions/" + os.path.basename(anon_archive_path(cid))
-                          if transcript else None},
-                         ensure_ascii=False, indent=2))
+        out = {"conv_id": cid, "status": status,
+               "device": api._device_id() or None,
+               "turns": len(transcript), "last_reply": last,
+               "transcript": [{"role": r, "text": t} for r, t in transcript],
+               "saved": "anon-sessions/" + os.path.basename(anon_archive_path(cid))
+               if transcript else None}
+        if status in (403, 404):
+            out["hint"] = ("会话与设备身份绑定：已按登记设备与所有本地快照依次尝试仍读不到。"
+                           "用 --anon-devices 看留存了哪些设备，确认目标设备快照是否还在；"
+                           "快照丢失则无法再读回这条会话")
+        elif status == 429:
+            out["hint"] = "限速（通道问题，不代表会话丢失），等几分钟重试"
+        print(json.dumps(out, ensure_ascii=False, indent=2))
         return 0 if status == 200 else 1
     if len(args) == 3 and args[0] == "--anon-send":
         cid = cli_id(args[1])

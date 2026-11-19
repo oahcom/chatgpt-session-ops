@@ -9,7 +9,11 @@ import time
 
 
 def fnv1a_hex(s: str) -> str:
-    """FNV-1a 32-bit with avalanche, returns 8-hex padded (JS: >>>0 ops)."""
+    """FNV-1a 32-bit + avalanche，返回 8 位十六进制（对齐 JS 的 >>>0 语义）。
+
+    注意：JS 的 charCodeAt 按 UTF-16 码元迭代，这里按 Python 码点迭代。
+    BMP 内字符（含中文）一致；emoji 等非 BMP 字符会差一个码元，指纹里别放。
+    """
     t = 0x811C9DC5
     for ch in s:
         t ^= ord(ch)
@@ -45,7 +49,10 @@ def solve(seed: str, difficulty: str, fp=None) -> str:
         h = fnv1a_hex(seed + i)
         if h[: len(difficulty)] <= difficulty:
             return "gAAAAAB" + i + "~S"
-    return "gAAAAAB" + "wQ8Lk5FbGpA2NcR9dShT6gYjU7VxZ4D" + encode_payload("e")
+    # 旧版这里返回一个写死的假 proof —— 服务端必然 403，却看不出是解算失败。
+    # 宁可返回空串让上层显式失败，也不要拿假 token 去撞风控。
+    print("WARN: PoW 未在 50 万次内收敛（difficulty=%s），proof 置空" % (difficulty,), flush=True)
+    return ""
 
 
 def build_fingerprint(browser_facts: dict = None) -> list:

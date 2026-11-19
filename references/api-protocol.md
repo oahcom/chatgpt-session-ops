@@ -120,6 +120,10 @@
 | 归属 | 不属于任何账号，只与设备身份 `oai-did` 绑定；清 profile / 丢设备 cookie 即永久失联 |
 | 唯一留存手段 | skill 侧 `anon-sessions.json`（id 对照表）+ `anon-sessions/<id8>.md`（全文归档） |
 | 跨浏览器重启回读 | **可以**，前提是按设备分档存了 cookie：`accounts/nologin/devices/<oai-did>.txt`；`--anon-read` 用对照表里的 `device` 取对应快照（实测把 latest 换成陌生设备后仍 `200`） |
+| 设备身份怎么取才完整 | `document.cookie` 只有 JS 可见项；HttpOnly 那些（`__cf_bm` 等）必须走 CDP `Storage.getCookies`。只存 `document.cookie` 时换 profile 后可能 404 |
+| 记录对不上怎么办 | 依次试其他留存设备（新→旧，≤8）：命中即 `200` 并自动改写 `anon-sessions.json` 的 `device`；429/0/5xx 立即停（通道问题，换设备无意义） |
+
+设备身份的存法：`devices/<oai-did>.txt` 存 Cookie 头（人可读、兼容旧版），`devices/<oai-did>.json` 存完整 jar（含 `httpOnly`/`expires`），`--anon-restore` 可用它 `Network.setCookies` 回灌新浏览器。jar 落盘前剔除 `*-session-token` / `authjs` / `next-auth` / `access_token`：匿名通道只需要 `oai-did` 与 CF 系列，浏览器若恰好是登录态也不能把凭据写进 nologin 目录。
 
 因此匿名通道的定位是**限速应急产能 + 一次性短任务**，不承担需要长期留存或跨机续接的任务。
 

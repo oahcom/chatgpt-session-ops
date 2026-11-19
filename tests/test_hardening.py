@@ -307,6 +307,186 @@ class TestMisc(TmpBase):
         self.assertTrue(solve("seed", "0"))
         self.assertTrue(solve("", "0"))
 
+    def test_continue_full_does_not_string_substitute_js(self):
+        """占位符替换会连 `function(text)` 一起换掉，产出语法错误的 JS。"""
+        src = _read(os.path.join(HERE, "..", "scripts", "continue_full.py"))
+        self.assertNotIn('.replace("text"', src)
+        self.assertIn("Input.insertText", src)
+        self.assertNotIn("wait=", src, "cdp.navigate 的参数名是 timeout")
+
+
+# ---------------------------------------------------------------- 设备身份留存
+DEV_A = "aaaaaaaa-1111-4111-8111-111111111111"
+DEV_B = "bbbbbbbb-2222-4222-8222-222222222222"
+
+
+class TestDeviceIdentity(TmpBase):
+    def _jar(self, did, extra=None):
+        jar = [{"name": "oai-did", "value": did, "domain": ".chatgpt.com", "path": "/",
+                "httpOnly": False, "secure": True},
+               {"name": "__cf_bm", "value": "cf-value", "domain": ".chatgpt.com", "path": "/",
+                "httpOnly": True}]
+        jar.extend(extra or [])
+        return jar
+
+    def test_parse_header_tolerates_junk_and_equals_in_value(self):
+        got = m.parse_cookie_header(" a=1; b=2=3 ;; =empty; c ;d=4 ")
+        self.assertEqual(got, {"a": "1", "b": "2=3", "d": "4"})
+
+    def test_jar_is_persisted_and_header_is_readable(self):
+        did = m.save_device_cookie(self._jar(DEV_A))
+        self.assertEqual(did, DEV_A)
+        self.assertTrue(os.path.exists(os.path.join(m.anon_device_dir(), DEV_A + ".json")))
+        self.assertTrue(os.path.exists(os.path.join(m.anon_device_dir(), DEV_A + ".txt")))
+        header = m.load_device_cookie(DEV_A)
+        self.assertIn("oai-did=" + DEV_A, header)
+        self.assertIn("__cf_bm=cf-value", header, "HttpOnly cookie 也必须留在快照里")
+        self.assertEqual(len(m.load_device_jar(DEV_A)), 2)
+
+    def test_auth_cookies_are_never_written_to_disk(self):
+        jar = self._jar(DEV_A, [{"name": "__Secure-next-auth.session-token", "value": "SECRET",
+                                 "domain": ".chatgpt.com", "path": "/"}])
+        m.save_device_cookie(jar)
+        raw = _read(os.path.join(m.anon_device_dir(), DEV_A + ".json")) + \
+            _read(os.path.join(m.anon_device_dir(), DEV_A + ".txt"))
+        self.assertNotIn("SECRET", raw, "登录态 token 不该落到 nologin 目录")
+        self.assertNotIn("session-token", raw)
+
+    def test_cookie_header_only_snapshot_still_works(self):
+        m.save_device_cookie("oai-did=%s; __cf_bm=x" % DEV_A)
+        self.assertTrue(m.load_device_cookie(DEV_A).startswith("oai-did="))
+        # 删掉 .txt 后应能从 jar 重建（老快照只有 json 的兼容路径）
+        os.remove(os.path.join(m.anon_device_dir(), DEV_A + ".txt"))
+        self.assertIn(DEV_A, m.load_device_cookie(DEV_A))
+
+    def test_header_string_also_drops_auth_cookie(self):
+        m.save_device_cookie("oai-did=%s; __Secure-next-auth.session-token=SECRET2" % DEV_A)
+        self.assertNotIn("SECRET2", m.load_device_cookie(DEV_A))
+
+    def test_device_list_is_newest_first(self):
+        m.save_device_cookie(self._jar(DEV_A))
+        time.sleep(0.05)
+        m.save_device_cookie(self._jar(DEV_B))
+        self.assertEqual(m.list_device_ids()[:2], [DEV_B, DEV_A])
+
+    def test_device_summary_counts_bound_sessions(self):
+        m.save_device_cookie(self._jar(DEV_A))
+        m.record_anon_session("11111111-2222-4333-8444-555555555555", device=DEV_A)
+        m.record_anon_session("22222222-3333-4444-8555-666666666666", device=DEV_A)
+        row = [r for r in m.device_summary()["devices"] if r["device"] == DEV_A][0]
+        self.assertEqual(row["sessions"], 2)
+        self.assertTrue(row["full_jar"])
+        self.assertEqual(row["cookies"], 2)
+
+    def test_read_order_prefers_recorded_then_rest(self):
+        m.save_device_cookie(self._jar(DEV_A))
+        m.save_device_cookie(self._jar(DEV_B))
+        order = m._read_device_order(DEV_B)
+        self.assertEqual(order[0], DEV_B)
+        self.assertEqual(set(order), {DEV_A, DEV_B})
+
+
+class FakeAnonAPI:
+    """read_anon 用：按 cookie 里的设备号返回预设状态码。"""
+
+    account = "nologin"
+    is_anon = True
+
+    def __init__(self, status_by_device, body='{"mapping": {}}'):
+        self.cookie = ""
+        self.status_by_device = status_by_device
+        self.body = body
+        self.calls = []
+
+    def req(self, method, url, body=None, extra_headers=None, timeout=120):
+        did = m.device_id_from_cookie(self.cookie)
+        self.calls.append(did)
+        return self.status_by_device.get(did, 404), self.body
+
+    def harvest_transcript(self, raw):
+        return [("user", "q"), ("assistant", "a")]
+
+    def _device_id(self):
+        return m.device_id_from_cookie(self.cookie)
+
+    def ensure_device_cookie(self, refresh=False):
+        self.cookie = "oai-did=%s" % DEV_B
+        return self.cookie
+
+
+class TestAnonReadFallback(TmpBase):
+    CID = "33333333-4444-4555-8666-777777777777"
+
+    def test_falls_back_to_other_device_and_repairs_mapping(self):
+        m.save_device_cookie("oai-did=%s" % DEV_A)
+        m.save_device_cookie("oai-did=%s" % DEV_B)
+        m.record_anon_session(self.CID, device=DEV_A)   # 记录的设备已失效
+        api = FakeAnonAPI({DEV_B: 200})
+        status, last, transcript = m.read_anon(api, self.CID)
+        self.assertEqual(status, 200)
+        self.assertEqual(last, "a")
+        self.assertEqual(api.calls, [DEV_A, DEV_B])
+        self.assertEqual(m.anon_session(self.CID)["device"], DEV_B, "命中后应自动修正归属")
+
+    def test_stops_immediately_on_rate_limit(self):
+        m.save_device_cookie("oai-did=%s" % DEV_A)
+        m.save_device_cookie("oai-did=%s" % DEV_B)
+        m.record_anon_session(self.CID, device=DEV_A)   # 先试登记设备，它是 429
+        api = FakeAnonAPI({DEV_A: 429, DEV_B: 200})
+        status, _last, _t = m.read_anon(api, self.CID)
+        self.assertEqual(status, 429)
+        self.assertEqual(api.calls, [DEV_A], "429 是通道问题，换设备没有意义")
+
+    def test_no_snapshot_falls_back_to_live_browser(self):
+        api = FakeAnonAPI({DEV_B: 200})
+        status, _last, _t = m.read_anon(api, self.CID)
+        self.assertEqual(status, 200)
+        self.assertEqual(api.calls, [DEV_B])
+
+    def test_archive_written_when_transcript_saved(self):
+        m.save_device_cookie("oai-did=%s" % DEV_A)
+        m.record_anon_session(self.CID, device=DEV_A)
+        api = FakeAnonAPI({DEV_A: 200})
+        m.read_anon(api, self.CID)
+        path = m.anon_archive_path(self.CID)
+        self.assertTrue(os.path.exists(path))
+        self.assertIn(self.CID, _read(path))
+
+
+class FakeBrowser:
+    """send_anon 用：只实现发送前的身份留存与发送失败。"""
+
+    def __init__(self, did, last_cid=None):
+        self.did = did
+        self.last_cid = last_cid
+        self.last_tab = "tab-1"
+
+    def cookie_jar(self):
+        return [{"name": "oai-did", "value": self.did, "domain": ".chatgpt.com", "path": "/"}]
+
+    def identity(self):
+        return m.save_device_cookie(self.cookie_jar())
+
+    def cookie(self):
+        return "oai-did=" + self.did
+
+    def send(self, text, conv_id=None):
+        raise RuntimeError("boom")
+
+
+class TestAnonSendFailure(TmpBase):
+    def test_orphan_session_keeps_its_device(self):
+        api = object.__new__(m.ChatGPTAPI)
+        api.account = "nologin"
+        api.is_anon = True
+        api.cookie = ""
+        api.anon = FakeBrowser(DEV_A, last_cid="44444444-5555-4666-8777-888888888888")
+        with self.assertRaises(RuntimeError):
+            m.send_anon(api, None, "p.md", "hello")
+        s = m.anon_session("44444444-5555-4666-8777-888888888888")
+        self.assertIsNotNone(s, "异常路径也必须登记会话，否则就是查不到的孤儿")
+        self.assertEqual(s.get("device"), DEV_A, "设备号必须取浏览器侧的，不能取空的 api.cookie")
+
 
 # ---------------------------------------------------------------- 投递流程（离线桩）
 class FakeAPI:
