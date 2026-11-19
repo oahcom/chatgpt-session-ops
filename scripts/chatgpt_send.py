@@ -688,6 +688,20 @@ def _split_parts(parts):
     return texts, structured, malformed
 
 
+def _assistant_text(texts):
+    """把 assistant 的文本 parts 拼成**唯一可比对口径**：拼接后 strip。
+
+    落盘文本（`_scan_mapping` → `harvest_mapping_checked`）与完整性对账
+    （`reply_digest`）必须对同一份 body 得到**同一个字符串**，否则 F-24 的
+    「digest.sha256 == sha256(full)」比的是两个不同口径的拼接：合法完整回复
+    只要首尾带空白（LLM 输出极常见），digest 算未 strip、full 是 strip，
+    两者永不相等 → 被误标「完整性未证明」，门禁失去区分度（F-26）。
+
+    收敛在**一个函数**里，杜绝两处各自拼接再次漂移。
+    """
+    return "".join(texts).strip()
+
+
 def _scan_sse(raw_text):
     """扫描 SSE 文本，返回 (text, complete, detail)。
 
@@ -863,7 +877,7 @@ def _scan_mapping(raw_body):
         ok, ct = _as_ctime(m.get("create_time"))
         if not ok:
             complete = False             # 时间戳不可用 → 顺序不可信
-        text = "".join(texts).strip()
+        text = _assistant_text(texts)
         if role in ("user", "assistant") and text:
             rows.append((ct, role, text))
     rows.sort(key=lambda x: x[0])
@@ -929,7 +943,7 @@ def reply_digest(raw_body):
             continue        # 非 assistant 节点不参与对账（含用户多模态消息，F-19）
         if structured:
             return None    # F-19：assistant 消息含非文本内容 → 核不了全文
-        if not texts or not "".join(texts).strip():
+        if not texts or not _assistant_text(texts):
             continue
         key = (ct, str(msg.get("id") or node_id))
         if best is None or key > best[0]:
@@ -937,11 +951,14 @@ def reply_digest(raw_body):
     if best is None:
         return None
     _key, msg, texts = best
-    joined = "".join(texts).encode("utf-8")
+    # F-26：对账口径必须与 harvest_mapping_checked 落盘的 full 完全一致——
+    # 两者都走 _assistant_text（拼接 + strip）。旧版 digest 算未 strip、full
+    # 是 strip，合法回复首尾带空白时 sha/chars 永不相等，完整回复被误标不完整。
+    text = _assistant_text(texts)
     return {"message_id": msg.get("id") or "",
             "parts": [len(p) for p in texts],
-            "chars": sum(len(p) for p in texts),
-            "sha256": hashlib.sha256(joined).hexdigest()}
+            "chars": len(text),
+            "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
 
 
 def _load_json(path, default):

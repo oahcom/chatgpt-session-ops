@@ -1182,6 +1182,27 @@ class TestSendFlow(TmpBase):
         self.assertIsNone(m.reply_digest('{"mapping": {}}'))
         self.assertIsNone(m.reply_digest("not json"))
 
+    def test_reply_digest_matches_harvest_with_whitespace(self):
+        """F-26：digest 与 harvest 必须同口径——首尾带空白的合法回复不能被误判不完整。
+
+        旧版 reply_digest 按未 strip 的 parts 算 chars/sha，harvest_mapping_checked
+        返回 strip 后的 full；send_prompt 逐字节比对两者，合法完整回复只要首尾带
+        空白（LLM 输出极常见）就永不相等 → 被误标「完整性未证明」，F-24 门禁失去
+        区分度。修复后两者共用 _assistant_text，本用例钉住口径一致。
+        """
+        import hashlib
+        raw = json.dumps({"mapping": {"a": {"message": {
+            "id": "msg-ws", "author": {"role": "assistant"},
+            "content": {"parts": ["\nHello  ", " world\n"]},
+            "create_time": 5}}}})
+        dg = m.reply_digest(raw)
+        full, complete = m.ChatGPTAPI.harvest_mapping_checked(raw)
+        self.assertTrue(complete)
+        self.assertEqual(full, "Hello   world", "harvest 按 strip 口径返回")
+        self.assertEqual(dg["chars"], len(full), "摘要字数必须与落盘全文同口径")
+        self.assertEqual(dg["sha256"], hashlib.sha256(full.encode("utf-8")).hexdigest(),
+                         "摘要 sha 必须与落盘全文逐字节一致（F-26）")
+
     def test_timeout_is_split_by_thinking(self):
         """A16：思考模式给 30 分钟，非思考给 7 分钟；同一条预算会误杀 19 分钟的思考回复。"""
         cid = "11111111-2222-4333-8444-555555555555"
@@ -2463,6 +2484,35 @@ class TestLandingMismatch(TmpBase):
         self.assertIs(getattr(conv, "reply_complete", None), False)
         self.assertTrue(saved and "完整性未证明" in saved[0][1],
                         "归档文本必须自带不完整声明，不得冒充定稿")
+
+    def test_whitespace_padded_full_reply_is_proven_complete(self):
+        """F-26：GET 补全拉回带首尾空白的完整回复，仍须证明完整、不误标「完整性未证明」。
+
+        端到端钉住 F-24 门禁：旧版 digest（未 strip）与 full（strip）口径不一致，
+        GET 回来的完整回复只要首尾带空白就被判 digest_ok=False → reply_complete=False
+        → 归档件错误地挂上「完整性未证明」。这里断言 reply_complete=True 且归档正文
+        不含该声明。
+        """
+        class WsGetStub(self._Stub):
+            def req(self, method, url, body=None, timeout=60):
+                self.gets.append(url)
+                gbody = json.dumps({"mapping": {"n": {"message": {
+                    "id": "m-ws", "author": {"role": "assistant"},
+                    "content": {"parts": ["\n这是完整回复的正文  \n"]},
+                    "create_time": 9}}}})
+                return 200, gbody
+
+        saved, gets = [], []
+        api = WsGetStub(os.path.join(self.tmp, "auth"), self._plain_incomplete(),
+                        saved, gets, False)
+        status, path, conv = m.send_prompt(api, self.TARGET, self._prompt(), thinking=False)
+        self.assertEqual(status, 200)
+        self.assertTrue(gets, "不完整 SSE 必须触发 GET 补全")
+        self.assertIs(getattr(conv, "reply_complete", None), True,
+                      "带首尾空白的完整回复仍须被证明完整（F-26）")
+        self.assertTrue(saved, "必须落盘归档")
+        self.assertNotIn("完整性未证明", saved[0][1],
+                         "完整回复不得被误标不完整")
 
     def test_completeness_requires_get_evidence_not_selfratio(self):
         """F-24：digest 必须真正参与放行——GET 补全失败时不得标 reply_complete=True。"""
