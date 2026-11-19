@@ -146,6 +146,40 @@ python scripts/chatgpt_send.py --anon-read <conv_id>       # 读全文并归档�
 
 ---
 
+## 健壮性加固
+
+这一层是踩过坑之后补的，测试都写在 `tests/` 里（离线跑，不触网）：
+
+| 加固点 | 行为 |
+|---|---|
+| id 校验 | `conv_id` / 设备号只允许字母数字与 `_-`；非法值 CLI 直接 exit 2。它们会拼进文件名，`--anon-read ../../evil` 曾能写到工作目录外 |
+| 状态文件损坏 | 损坏的 json 隔离成 `.corrupt-<ts>` 并告警，而不是静默清空后覆盖（`conv-accounts` 最多 500 条归属） |
+| 原子落盘 | 一律 `tmp → fsync → replace`。匿名归档是唯一副本，写半截等于会话丢失 |
+| 回复全文 | 默认不截断，只有显式设 `CHATGPT_REPLY_MAX_CHARS` 才截并在文件头标注 |
+| 凭据权限 | POSIX 上落盘后 chmod 600 |
+| 429 退避 | 优先服从 `Retry-After`，夹在 [5,180] 秒 |
+| 文件锁 | 跨进程 `O_EXCL` + stale 60s，重入按**线程**判定（按路径记会让同进程第二个线程跳过加锁，实测丢 21/80 次更新） |
+
+环境变量：
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `CHATGPT_AUTH_DIR` | 脚本目录 | acct1 凭据根 |
+| `CHATGPT_BASE` | `https://chatgpt.com` | API 根（可指向本地闸口） |
+| `CHATGPT_PROXY` | 空 | `http://` 或 `socks5h://` 代理 |
+| `CHATGPT_ANON_CDP_PORT` | 9333 | 匿名通道 CDP 端口 |
+| `CHATGPT_ANON_FALLBACK` | 1 | 设 0 彻底禁用匿名兜底 |
+| `CHATGPT_ANON_AUTOSTART` | 1 | 匿名通道是否自动拉起浏览器 |
+| `CHATGPT_CDP_DIR` | `~/.workbuddy/skills/browser-automation-cdp/scripts` | `cdp.py` 所在目录 |
+| `CHATGPT_REPLY_MAX_CHARS` | 0（全文） | 回复落盘上限 |
+| `CHATGPT_ANON_IDLE_SEC` | 900 | 匿名等待生成结束的预算 |
+
+```bash
+python -m unittest discover -s tests -v      # 29 条，零依赖
+```
+
+---
+
 ## 运行态文件
 
 本机生成，不入库：
@@ -197,6 +231,7 @@ scripts/continue_full.py    413 满员续接
 scripts/pow_solver.py       PoW 解算器
 scripts/extract_auth.py     从 Edge CDP 提取凭据
 scripts/accounts/README.md  凭据目录结构（不含任何真实凭据）
+tests/test_hardening.py     离线回归测试（id 校验、损坏隔离、原子写、锁并发、兜底判定）
 tools/sync.sh               从本机技能目录同步 + 提交前敏感信息拦截
 ```
 

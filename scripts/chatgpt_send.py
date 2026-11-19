@@ -62,13 +62,16 @@
     - 413 conversation_too_large → 用 continue_full.py 走「开始新聊天」摘要续接。
 """
 import contextlib
+import copy
 import gzip
+import hashlib
 import json
 import os
 import re
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -106,25 +109,114 @@ def _now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+# ---------- 外部 id 校验 ----------
+# conv_id / 设备号都会拼进文件名（replies/、conv-api/、anon-sessions/、devices/）。
+# 不校验就等于把 `../../x` 当文件名用：`--anon-read ../../evil` 会在工作目录外落盘。
+_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,79}$")
+
+
+def safe_id(value, what="id"):
+    """校验外部传入的会话 id / 设备号；不合法直接抛错，不留给下游拼接。"""
+    v = (value or "").strip()
+    if not _ID_RE.match(v):
+        raise ValueError("%s 非法：%r（只允许字母数字与 _-，长度 1-80）" % (what, value))
+    return v
+
+
+def id8(conv_id, fallback="new"):
+    """取 8 位短前缀做文件名；非法 id 退化为哈希，绝不拼出路径分隔符。"""
+    v = (conv_id or "").strip()
+    if not v:
+        return fallback
+    if _ID_RE.match(v):
+        return v[:8]
+    return hashlib.sha1(v.encode("utf-8", "replace")).hexdigest()[:8]
+
+
+def cli_id(value):
+    """CLI 入口校验：打印人话并返回 None，调用方据此 return 2。"""
+    try:
+        return safe_id(value, "conv_id")
+    except ValueError as e:
+        print("ERROR: %s" % e, flush=True)
+        print("提示：conv_id 形如 11111111-2222-4333-8444-555555555555，只含字母数字与 _-", flush=True)
+        return None
+
+
+def _harden_perms(path):
+    """凭据/状态文件在 POSIX 上收成 0600；Windows 无此语义，静默跳过。"""
+    if os.name != "posix":
+        return
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def _atomic_write(path, text):
+    """tmp → fsync → replace。状态 json 与匿名归档都只有这一份副本，写半截就全丢。"""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    _harden_perms(path)
+
+
 def _load_json(path, default):
+    """读状态 json。文件损坏时隔离为 .corrupt-<ts> 并告警，而不是静默返回空。
+
+    静默返回空最危险的地方在于：下一次 _save_json 会把原来的内容永久覆盖掉
+    （conv-accounts 最多 500 条归属记录会一次性清空）。
+    """
     try:
         with open(path, encoding="utf-8") as f:
             return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return default
+    except FileNotFoundError:
+        return copy.deepcopy(default)
+    except (OSError, json.JSONDecodeError) as e:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        if size > 0:
+            bad = "%s.corrupt-%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
+            try:
+                os.replace(path, bad)
+                print("WARN: 状态文件损坏已隔离 %s -> %s（后续按空状态重建，旧内容在隔离文件里）"
+                      % (os.path.basename(path), os.path.basename(bad)), flush=True)
+                return copy.deepcopy(default)
+            except OSError:
+                pass
+        print("WARN: 读取 %s 失败：%s" % (os.path.basename(path), e), flush=True)
+        return copy.deepcopy(default)
 
 
 # ---------- 状态文件跨进程锁 ----------
 # 三个 json 都是「读-改-写」，两个进程同时跑会互相覆盖（比如两个发送器同时推进游标，
-# 就会把均分打成 2:0）。这里用 O_EXCL 锁文件做排他，带 stale 检测与进程内重入保护。
-_LOCK_HELD = set()
+# 就会把均分打成 2:0）。这里用 O_EXCL 锁文件做排他，带 stale 检测与线程级重入保护。
+# 重入保护必须按线程记（早先按路径记一个集合，等于让同进程的第二个线程直接跳过加锁，
+# 并发下照样丢更新）；跨进程仍然靠 O_EXCL 锁文件。
+_LOCK_HELD = {}            # path -> 持有者线程 ident
 LOCK_STALE_SEC = 60        # 锁文件超过这个年龄视为残留（进程被杀）
 LOCK_TIMEOUT_SEC = 8.0     # 抢不到锁就放弃加锁继续业务，绝不阻塞发送
 
 
 @contextlib.contextmanager
 def _file_lock(path, timeout=LOCK_TIMEOUT_SEC):
-    if path in _LOCK_HELD:  # 重入：同一进程已持有，直接放行（避免自锁）
+    me = threading.get_ident()
+    if _LOCK_HELD.get(path) == me:  # 同线程重入：直接放行（避免自锁）
         yield
         return
     lock = path + ".lock"
@@ -148,11 +240,11 @@ def _file_lock(path, timeout=LOCK_TIMEOUT_SEC):
         except OSError as e:
             print("WARN: 状态文件加锁失败（%s）：%s" % (os.path.basename(path), e), flush=True)
             break
-    _LOCK_HELD.add(path)
+    _LOCK_HELD[path] = me
     try:
         yield
     finally:
-        _LOCK_HELD.discard(path)
+        _LOCK_HELD.pop(path, None)
         if fd is not None:
             try:
                 os.close(fd)
@@ -166,10 +258,7 @@ def _file_lock(path, timeout=LOCK_TIMEOUT_SEC):
 
 def _save_json(path, data):
     with _file_lock(path):
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
+        _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def _update_json(path, mutate, default):
@@ -287,6 +376,9 @@ def anon_fallback_ready(st, outcomes):
 def record_conv(conv_id, account, prompt_file):
     if not conv_id:
         return
+    if not _ID_RE.match(conv_id):  # 外部传入的 id 先过校验再进状态表，避免污染/穿越
+        print("WARN: 拒绝登记非法 conv_id：%r" % (conv_id,), flush=True)
+        return
 
     def mutate(data):
         data[conv_id] = {"account": account, "prompt": prompt_file, "ts": _now()}
@@ -318,6 +410,11 @@ def record_anon_session(conv_id, tab=None, prompt="", reply="", device=""):
     """登记/更新匿名会话：conv_id -> 标签页、prompt、最后回复、设备号、可读状态。"""
     if not conv_id:
         return None
+    if not _ID_RE.match(conv_id):
+        print("WARN: 拒绝登记非法匿名会话 id：%r" % (conv_id,), flush=True)
+        return None
+    if device and not _ID_RE.match(device):
+        device = ""  # 设备号也会拼进 devices/<did>.txt，非法值直接丢弃
     out = {}
 
     def mutate(data):
@@ -375,24 +472,24 @@ def save_device_cookie(cookie):
         if part.startswith("oai-did="):
             did = part.split("=", 1)[1]
             break
+    # 设备号同样会拼进 devices/<did>.txt：非法值一律不落分档快照
+    did_safe = did if _ID_RE.match(did or "") else ""
     try:
         os.makedirs(anon_device_dir(), exist_ok=True)
-        with open(os.path.join(BASE, "accounts", "nologin", "device-cookie.txt"),
-                  "w", encoding="utf-8") as f:
-            f.write(cookie)
-        if did:
-            with open(os.path.join(anon_device_dir(), did + ".txt"), "w", encoding="utf-8") as f:
-                f.write(cookie)
+        _atomic_write(os.path.join(BASE, "accounts", "nologin", "device-cookie.txt"), cookie)
+        if did_safe:
+            _atomic_write(os.path.join(anon_device_dir(), did_safe + ".txt"), cookie)
     except OSError:
         pass
-    return did
+    return did_safe
 
 
 def load_device_cookie(did):
-    if not did:
+    if not did or not _ID_RE.match(did):
         return ""
     try:
-        return open(os.path.join(anon_device_dir(), did + ".txt"), encoding="utf-8").read().strip()
+        with open(os.path.join(anon_device_dir(), did + ".txt"), encoding="utf-8") as f:
+            return f.read().strip()
     except OSError:
         return ""
 
@@ -411,12 +508,19 @@ class ChatGPTAPI:
         if account == "nologin":
             self.cookies, self.token, self.cookie = [], "", ""
         else:
-            self.cookies = json.load(open(os.path.join(b, "cookies.json"), encoding="utf-8"))
-            self.token = open(os.path.join(b, "access_token.txt"), encoding="utf-8").read().strip()
+            ck_path = os.path.join(b, "cookies.json")
+            tk_path = os.path.join(b, "access_token.txt")
+            with open(ck_path, encoding="utf-8") as f:
+                self.cookies = json.load(f)
+            with open(tk_path, encoding="utf-8") as f:
+                self.token = f.read().strip()
+            if not isinstance(self.cookies, list):
+                raise ValueError("%s 格式不对：应为 cookie 数组" % ck_path)
             self.cookie = "; ".join(
                 "%s=%s" % (ck["name"], ck["value"])
                 for ck in self.cookies
-                if "chatgpt.com" in (ck.get("domain") or "") or "openai.com" in (ck.get("domain") or "")
+                if isinstance(ck, dict) and ("chatgpt.com" in (ck.get("domain") or "")
+                                             or "openai.com" in (ck.get("domain") or ""))
             )
         # 代理支持：CHATGPT_PROXY=http://host:port 或 socks5h://host:port
         proxy_url = os.environ.get("CHATGPT_PROXY", "")
@@ -525,6 +629,15 @@ class ChatGPTAPI:
                 out[k] = v
         return out
 
+    def _retry_after(self, default):
+        """优先服从服务端 Retry-After；夹在 [5, 180] 之间，避免被超大值卡死。"""
+        raw = (self.last_headers or {}).get("retry-after")
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            val = float(default)
+        return int(max(5, min(val, 180)))
+
     @staticmethod
     def _decompress(data, enc):
         """按 Content-Encoding 解压；不认识的编码原样返回，绝不让解压失败吞掉响应。"""
@@ -604,11 +717,12 @@ class ChatGPTAPI:
         return best_id
 
     def cached_tail(self, conv_id):
-        p = os.path.join(self.base_dir, "conv-api", conv_id[:8] + ".json")
+        p = os.path.join(self.base_dir, "conv-api", id8(conv_id) + ".json")
         if not os.path.exists(p):
             return None
         try:
-            return self.tail_from_mapping(open(p, encoding="utf-8").read())
+            with open(p, encoding="utf-8") as f:
+                return self.tail_from_mapping(f.read())
         except Exception:
             return None
 
@@ -617,8 +731,9 @@ class ChatGPTAPI:
             st, body = self.req("GET", API_BASE + "/backend-api/conversation/" + conv_id, timeout=90)
             if st == 200:
                 return self.tail_from_mapping(body), body
-            print("GET %s -> %s (try %d)" % (conv_id[:8], st, attempt + 1), flush=True)
-            time.sleep(90 if st == 429 else 20)
+            print("GET %s -> %s (try %d)" % (id8(conv_id), st, attempt + 1), flush=True)
+            if attempt + 1 < tries:
+                time.sleep(self._retry_after(90 if st == 429 else 20))
         return None, None
 
     def list_conversations(self, page_size=28, max_pages=100):
@@ -664,7 +779,11 @@ class ChatGPTAPI:
                             {"p": None, "generator": "chat_requirements_cache_key", "proofofwork": None})
         if st != 200:
             return None, None
-        d = json.loads(body)
+        try:
+            d = json.loads(body)
+        except json.JSONDecodeError:
+            print("WARN: chat-requirements 返回非 JSON：%r" % (body[:200],), flush=True)
+            return None, None
         p = d.get("proofofwork") or {}
         return d.get("token"), solve(p.get("seed", ""), p.get("difficulty", "0"))
 
@@ -756,14 +875,30 @@ class ChatGPTAPI:
         return [(role, text) for _, role, text in rows]
 
     def save_reply(self, conv_id, pfile, text):
+        """落盘回复全文。默认不截断（旧版静默只留末尾 2 万字，等于丢结论）。
+
+        需要控制体积时设 CHATGPT_REPLY_MAX_CHARS（>0 才生效，保留开头并在头部注明）。
+        """
         if not text:
             return None
-        os.makedirs(os.path.join(self.base_dir, "replies"), exist_ok=True)
-        name = "replies/reply-%s-%s.md" % ((conv_id or "new")[:8], datetime.now().strftime("%H%M%S"))
-        path = os.path.join(self.base_dir, name)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("# reply for %s (prompt %s)\n\n%s\n" % ((conv_id or "new")[:8], pfile, text[-20000:]))
-        print("saved reply -> %s (%d chars)" % (name, len(text)), flush=True)
+        short = id8(conv_id)
+        body, note = text, ""
+        try:
+            limit = int(os.environ.get("CHATGPT_REPLY_MAX_CHARS") or 0)
+        except ValueError:
+            limit = 0  # 变量写错不该让整次收割白跑
+        if limit > 0 and len(text) > limit:
+            body = text[:limit]
+            note = "\n> 已按 CHATGPT_REPLY_MAX_CHARS=%d 截断，原文 %d 字符\n" % (limit, len(text))
+        rel = "replies/reply-%s-%s.md" % (short, datetime.now().strftime("%H%M%S"))
+        path = os.path.join(self.base_dir, rel)
+        seq = 1
+        while os.path.exists(path):  # 同一秒重复收割，别互相覆盖
+            rel = "replies/reply-%s-%s-%d.md" % (short, datetime.now().strftime("%H%M%S"), seq)
+            path = os.path.join(self.base_dir, rel)
+            seq += 1
+        _atomic_write(path, "# reply for %s (prompt %s)\n%s\n%s\n" % (short, pfile, note, body))
+        print("saved reply -> %s (%d chars)" % (rel, len(text)), flush=True)
         return path
 
 
@@ -888,9 +1023,16 @@ class AnonBrowser:
         })()""")
 
     def _idle(self):
-        """停止生成按钮消失 + 文本长度连续 3 次不变。"""
+        """停止生成按钮消失 + 文本长度连续 3 次不变。
+
+        预算默认 900 秒，可用 CHATGPT_ANON_IDLE_SEC 覆盖（长回复可调大）。
+        """
         stable, last = 0, -1
-        end = time.time() + 900
+        try:
+            budget = int(os.environ.get("CHATGPT_ANON_IDLE_SEC") or 900)
+        except ValueError:
+            budget = 900
+        end = time.time() + max(budget, 30)
         while time.time() < end:
             state = self._js("""(() => ({
                 generating: [...document.querySelectorAll('button')].some(b =>
@@ -1050,14 +1192,16 @@ class AnonBrowser:
             time.sleep(1.5)
         if not cid:
             raise RuntimeError("发送后未拿到匿名会话 ID（/uc/<id>）")
+        if not _ID_RE.match(cid):
+            raise RuntimeError("发送后拿到的会话 ID 不合规（%r），可能是页面异常" % (cid,))
         # 先记下来：万一后面等待/收割异常，上层还能把这条会话登记进对照表（避免孤儿会话）
         self.last_cid, self.last_tab = cid, (cl.target_id or "")
         if conv_id and cid != conv_id:
             raise RuntimeError("匿名会话续接失败：目标 %s 实际落入 %s（请改用登录态账号重建）"
                                % (conv_id[:8], cid[:8]))
         if not self._idle():
-            print("WARN: 15 分钟内未确认生成结束，按当前 DOM 内容收割（回复可能不完整，可用 --anon-read 补读）",
-                  flush=True)
+            print("WARN: %s 秒内未确认生成结束，按当前 DOM 内容收割（回复可能不完整，可用 --anon-read 补读）"
+                  % os.environ.get("CHATGPT_ANON_IDLE_SEC", "900"), flush=True)
         reply = self._js("""(() => {
             const nodes = [...document.querySelectorAll('[data-message-author-role="assistant"]')];
             const last = nodes[nodes.length - 1];
@@ -1067,8 +1211,13 @@ class AnonBrowser:
 
 
 def anon_archive_path(conv_id):
-    """归档文件路径：默认 id8，若该前缀已被别的会话占用则加后缀，避免互相覆盖。"""
-    base = os.path.join(BASE, "anon-sessions", conv_id[:8])
+    """归档文件路径：默认 id8，若该前缀已被别的会话占用则加后缀，避免互相覆盖。
+
+    文件名只由 id8() 产出的安全短 id 拼成，非法 conv_id 会退化为哈希，
+    因此 `--anon-read ../../x` 之类不会在工作目录外写出文件。
+    """
+    short = id8(conv_id, "unknown")
+    base = os.path.join(BASE, "anon-sessions", short)
     path = base + ".md"
     if os.path.exists(path):
         try:
@@ -1077,12 +1226,13 @@ def anon_archive_path(conv_id):
         except OSError:
             head = ""
         if conv_id not in head:
-            path = base + "-" + conv_id[-4:] + ".md"
+            path = base + "-" + short[-4:] + ".md"
     return path
 
 
 def read_anon(api, conv_id, save=True):
     """按 id 读取匿名会话全文（API 侧仍可读，即便标签页已丢失）。"""
+    conv_id = safe_id(conv_id, "conv_id")
     info = anon_session(conv_id) or {}
     snap = load_device_cookie(info.get("device") or "")
     if snap:
@@ -1097,13 +1247,13 @@ def read_anon(api, conv_id, save=True):
             last = text
             break
     if save and transcript:
-        # 全文留存在本地：服务端不给历史，这是唯一归档手段
+        # 全文留存在本地：服务端不给历史，这是唯一归档手段。
+        # 先写 tmp 再 replace —— 崩在半路也不能留个截断的归档（那是唯一副本）。
         path = anon_archive_path(conv_id)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write("# 匿名会话 %s（%s）\n\n" % (conv_id, _now()))
-            for role, text in transcript:
-                f.write("## %s\n\n%s\n\n" % (role, text))
+        chunks = ["# 匿名会话 %s（%s）\n\n" % (conv_id, _now())]
+        for role, text in transcript:
+            chunks.append("## %s\n\n%s\n\n" % (role, text))
+        _atomic_write(path, "".join(chunks))
         record_anon_session(conv_id, reply=last, device=api._device_id())
     return st, last, transcript
 
@@ -1130,6 +1280,8 @@ def probe_anon(api, conv_id, tries=2):
 
 def send_anon(api, conv_id, prompt_file, text):
     """匿名态投递：浏览器发送 + API 收割（backend-anon GET 已验证可用）。"""
+    if conv_id:
+        conv_id = safe_id(conv_id, "conv_id")
     br = api.anon or AnonBrowser()
     api.anon = br
     if conv_id:
@@ -1177,9 +1329,19 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False):
 
     返回 (status, reply_path, real_conv_id)；real_conv_id 用于登记会话归属。
     """
-    text = open(prompt_file, encoding="utf-8").read()
+    if conv_id:
+        conv_id = safe_id(conv_id, "conv_id")
+    try:
+        with open(prompt_file, encoding="utf-8") as f:
+            text = f.read()
+    except OSError as e:
+        raise RuntimeError("读不到提示词文件 %s：%s" % (prompt_file, e))
+    if not text.strip():
+        raise RuntimeError("提示词文件为空：%s" % prompt_file)
     lines = [l for l in text.splitlines() if not l.strip().startswith("#")]
     text = "\n".join(lines).strip()
+    if not text:
+        raise RuntimeError("提示词没有正文（只有注释行）：%s" % prompt_file)
     pfile = os.path.basename(prompt_file)
 
     if api.is_anon:
@@ -1251,6 +1413,9 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False):
         if m:
             real_conv = m.group(1)
             print("conversation_id 由正则兜底解析得到：%s" % real_conv, flush=True)
+    if real_conv and not _ID_RE.match(real_conv):
+        print("WARN: 解析出的 conversation_id 不合规（%r），按原 id 处理" % (real_conv,), flush=True)
+        real_conv = conv_id or ""
     if conv_id and real_conv != conv_id:
         print("WARN: 落入了不同会话! target=%s real=%s" % (conv_id, real_conv), flush=True)
 
@@ -1328,8 +1493,9 @@ def create_chat_rotating(prompt_file):
     因此只作为限速时的应急产能，不承担需要留存/续接的任务。
     """
     st = load_rotation()
-    if purge_expired(st):  # 过期解封显式落盘，不再靠 is_unavailable 的副作用
-        save_rotation(st)
+    if purge_expired(st):
+        # 锁内重读再清：解封动作不能把并发进程刚写进去的计数/游标覆盖回旧值
+        st = mutate_rotation(purge_expired)
     outcomes, attempts, skipped = {}, [], {}
     for name in ROTATION_PRIMARY:
         if is_unavailable(st, name):
@@ -1445,8 +1611,11 @@ def main():
         print(json.dumps(rotation_summary(), ensure_ascii=False, indent=2))
         return 0
     if len(args) == 2 and args[0] == "--owner":
-        owner = conv_owner(args[1])
-        print(json.dumps({"conv_id": args[1], "account": owner, "known": bool(owner)}, ensure_ascii=False))
+        cid = cli_id(args[1])
+        if cid is None:
+            return 2
+        owner = conv_owner(cid)
+        print(json.dumps({"conv_id": cid, "account": owner, "known": bool(owner)}, ensure_ascii=False))
         return 0 if owner else 1
     # ---- 匿名会话 id 对照表 ----
     if args and args[0] == "--anon-list":
@@ -1479,21 +1648,32 @@ def main():
                          ensure_ascii=False, indent=2))
         return 0
     if len(args) == 2 and args[0] == "--anon-read":
+        cid = cli_id(args[1])
+        if cid is None:
+            return 2
         api = ChatGPTAPI(account="nologin")
-        status, last, transcript = read_anon(api, args[1])
-        print(json.dumps({"conv_id": args[1], "status": status,
+        try:
+            status, last, transcript = read_anon(api, cid)
+        except Exception as e:
+            print(json.dumps({"conv_id": cid, "result": "error", "detail": str(e)},
+                             ensure_ascii=False))
+            return 1
+        print(json.dumps({"conv_id": cid, "status": status,
                           "turns": len(transcript), "last_reply": last,
                           "transcript": [{"role": r, "text": t} for r, t in transcript],
-                          "saved": "anon-sessions/" + os.path.basename(anon_archive_path(args[1]))
+                          "saved": "anon-sessions/" + os.path.basename(anon_archive_path(cid))
                           if transcript else None},
                          ensure_ascii=False, indent=2))
         return 0 if status == 200 else 1
     if len(args) == 3 and args[0] == "--anon-send":
+        cid = cli_id(args[1])
+        if cid is None:
+            return 2
         api = ChatGPTAPI(account="nologin")
         try:
-            status, _p, conv = send_prompt(api, args[1], args[2])
+            status, _p, conv = send_prompt(api, cid, args[2])
         except Exception as e:
-            print(json.dumps({"conv_id": args[1], "result": "error", "detail": str(e)},
+            print(json.dumps({"conv_id": cid, "result": "error", "detail": str(e)},
                              ensure_ascii=False))
             return 1
         print(json.dumps({"conv_id": conv, "status": status}, ensure_ascii=False))
@@ -1553,7 +1733,11 @@ def main():
             if account == "nologin":
                 print("nologin：走匿名浏览器通道（需 CDP 端口 %s 的未登录浏览器）"
                       % os.environ.get("CHATGPT_ANON_CDP_PORT", "9333"), flush=True)
-            status, _path, conv = send_prompt(api, None, args[1], new_chat=True)
+            try:
+                status, _path, conv = send_prompt(api, None, args[1], new_chat=True)
+            except Exception as e:
+                print(json.dumps({"result": "error", "detail": str(e)}, ensure_ascii=False))
+                return 1
             if status == 200 and conv:
                 record_conv(conv, account, args[1])
                 print("NEW_CONV %s account=%s" % (conv, account), flush=True)
@@ -1568,7 +1752,10 @@ def main():
     if args[0] == "--tail" and len(args) != 2:
         print("usage: [--account acct1|acct2|nologin] --tail <conv_id>", flush=True)
         return 2
-    conv_id = args[1] if args[0] == "--tail" else (args[0] if not args[0].startswith("--") else "")
+    raw_id = args[1] if args[0] == "--tail" else (args[0] if not args[0].startswith("--") else "")
+    conv_id = cli_id(raw_id) if raw_id else ""
+    if raw_id and conv_id is None:
+        return 2
     owner = conv_owner(conv_id) if conv_id else None
     if not explicit_account and owner and owner != account:
         print("route: 会话 %s 登记归属 %s，自动切换身份" % (conv_id[:8], owner), flush=True)
@@ -1584,21 +1771,24 @@ def main():
         print(json.dumps({"account": account, "conversations": items, "status": status, "error": error, "quota": api.quota}, ensure_ascii=False, indent=2))
         return 0 if status == 200 and not error else 1
     if args[0] == "--tail":
-        tail, raw = api.live_tail(args[1], tries=2)
+        tail, raw = api.live_tail(conv_id, tries=2)
         print("tail:", tail)
         if raw:
             print(api.harvest_mapping(raw)[-4000:])
+        if not raw:
+            print("FAIL: 未取到会话内容（限速或会话不可访问）", flush=True)
+            return 1
         return 0
     if len(args) != 2:
         print("usage: [--account acct1|acct2|nologin] <conv_id> <prompt_file>", flush=True)
         return 2
     try:
-        status, _path, _conv = send_prompt(api, args[0], args[1])
+        status, _path, _conv = send_prompt(api, conv_id, args[1])
     except Exception as e:
-        print(json.dumps({"conv_id": args[0], "result": "error", "detail": str(e)}, ensure_ascii=False))
+        print(json.dumps({"conv_id": conv_id, "result": "error", "detail": str(e)}, ensure_ascii=False))
         return 1
     if status == 200:
-        record_conv(args[0], account, args[1])
+        record_conv(conv_id, account, args[1])
     return 0 if status == 200 else 1
 
 

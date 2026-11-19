@@ -152,6 +152,31 @@ python scripts/chatgpt_send.py --tail <conv_id>
 7. **禁止**：自撰/改写自产提示词；POST 不带 conversation_id 发进既有任务会话；并发抢 GET 配额；未查 open PR 就开同主题实现；删除任何会话产物。
 8. **定时任务粒度（用户明示强制 2026-11-19）**：**所有定时任务一律按 1 小时维度排程，禁止天维度（天维度过久）**。落地口径：循环任务用每小时（间隔 ≤1h）；到期处置/远期复核不得挂天级 one-shot，改为**每小时条件巡检**（提示词内置"未到点→静默退出；已到点且未处置→执行；已处置→静默退出"门控）；一次性看门狗/闹钟 ≤1h。违规排程（DAILY、数日后 one-shot）一律改小时维度。**本条为管理基线**（管理所有 AI 代理的 WorkBuddy automation 排程）：创建/修改任何 automation 前先读本条；过期 one-shot 一律 PAUSED 归档，不得留 ACTIVE 尸体；跨天/跨周的到期项用每小时条件巡检 + validFrom/validUntil 收窗，避免无效空转。
 
+## 健壮性加固（2026-11-19 第三轮）
+
+| 加固点 | 行为 | 为什么 |
+|---|---|---|
+| conv_id / 设备号校验 | `safe_id()`：只允许字母数字与 `_-`，长度 1-80；CLI 入口非法直接 exit 2 | 这些 id 会拼进 `replies/`、`conv-api/`、`anon-sessions/`、`devices/`，不校验等于把 `../../x` 当文件名 |
+| 非法 id 退化命名 | `id8()`：非法 id 用 sha1 前 8 位兜底，永不产出路径分隔符 | 宁可文件名难看，也不能写到工作目录外 |
+| 状态 json 损坏 | 隔离为 `<name>.corrupt-<ts>` 并 WARN，再按空状态重建 | 旧版静默返回空，下次落盘就把 `conv-accounts` 的 500 条归属永久清空 |
+| 落盘原子性 | 一律 `tmp → fsync → replace`；失败清 tmp | 匿名归档是唯一副本，写半截等于会话彻底丢失 |
+| 回复全文 | 默认不截断；只有显式设 `CHATGPT_REPLY_MAX_CHARS` 才截，且头部注明 | 旧版静默只留**末尾** 2 万字，结论常常在前半段 |
+| 凭据权限 | POSIX 上 `cookies.json` 等落盘后 chmod 600 | 默认 umask 会让同机其他用户可读 |
+| 429 退避 | 优先服从 `Retry-After`，夹在 [5,180] 秒 | 固定 90 秒既可能太快也可能白等 |
+| 文件锁重入 | 按**线程**记持有者（`path -> thread ident`） | 旧版按路径记集合，同进程第二个线程会跳过加锁，多线程下照样丢更新（已由单测锁死） |
+| `--tail` 退出码 | 没取到内容返回 1 | 否则脚本编排层无法区分「读到了」和「被限速」 |
+| 匿名等待预算 | `CHATGPT_ANON_IDLE_SEC`（默认 900） | 超长回复不必改代码 |
+
+新增环境变量：`CHATGPT_REPLY_MAX_CHARS`（默认 0=全文）、`CHATGPT_ANON_IDLE_SEC`（默认 900）。
+
+回归测试（离线，不触网、不需要凭据）：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+29 条，覆盖 id 校验与路径穿越、状态文件损坏隔离、原子写与 tmp 清理、锁重入/stale 回收/并发 80 次不丢更新、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性。**改锁、改落盘、改 id 处理前先跑一遍。**
+
 ## 故障速查
 
 | 症状 | 根因 | 处置 |
@@ -164,6 +189,9 @@ python scripts/chatgpt_send.py --tail <conv_id>
 | 匿名续聊报「CDP 端口未运行」 | 浏览器没起，无法确认标签页（会话未必丢） | 先 `start_chrome.py --temp --port 9333` 再试；只读需求直接用 `--anon-read` |
 | 匿名续聊报「暂时读不到（429/0/5xx）」 | 限速或网络抖动，**不是**会话失效 | 等几分钟重试；`--anon-read` 直接读 |
 | 状态文件出现 `*.lock` 残留 | 进程被强杀，锁文件没清 | 超过 60 秒自动视为 stale 并回收；急用可手动删 `*.lock` |
+| 出现 `conv-accounts.json.corrupt-<ts>` | 上次写入被强杀，json 只写了一半 | 损坏件已隔离，状态按空重建；需要旧数据就从隔离文件里捞（它是合法前缀时手工补 `}`） |
+| 报 `conv_id 非法：'…'` | id 含 `/`、`..`、空格或超长 | 复制完整 id（形如 `11111111-2222-4333-8444-555555555555`），别手改 |
+| 回复文件明显比预期短 | 设了 `CHATGPT_REPLY_MAX_CHARS` | 取消该变量即全文落盘；文件头有截断标注 |
 | 匿名页点击发送无反应 | 窗口未显示 → `visibilityState=hidden` | 脚本已启用 `Emulation.setFocusEmulationEnabled`；仍无效则确认窗口可见 |
 | 消息落入全新会话 | POST 缺 conversation_id | 补字段重发；核对 SSE 返回的 conversation_id |
 | GET 429 | 配额紧张 | 退避 + `conv-api/` 缓存 tail 兜底 parent_message_id |
@@ -195,6 +223,10 @@ python scripts/chatgpt_send.py --tail <conv_id>
 ### references/
 
 - `api-protocol.md` — 实测协议细节：端点、PoW 算法、POST 请求体全字段、SSE 解析、mapping tail 计算、状态码处置、限速纪律。改脚本前先读。
+
+### tests/
+
+- `test_hardening.py` — 离线回归（29 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW。
 
 ## 协议细节
 
