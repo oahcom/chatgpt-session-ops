@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**二十六轮对外对抗审查**逐条改写（每轮裁定见 §F；**第二十五轮 `PASS`——锁子系统全文最终确认·收敛**，第二十二轮 `PASS`（F-10 残留定向复审），**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至二十三轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08）、锁元数据写入失败进临界区（F-09）、损坏启动时间误判 pid_reused（F-10）、归档覆盖（F-11）、超长 pid 串 int() 异常逃逸（F-07 残留）、**收割/对账解析器畸形 JSON 崩溃（F-12，41 处）**——前 11 组已在第二十五轮核销，F-12 已修待复审），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 218 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**二十七轮对外对抗审查**逐条改写（每轮裁定见 §F；**第二十五轮 `PASS`——锁子系统全文最终确认·收敛**，第二十二轮 `PASS`（F-10 残留定向复审），**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至二十三轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08）、锁元数据写入失败进临界区（F-09）、损坏启动时间误判 pid_reused（F-10）、归档覆盖（F-11）、超长 pid 串 int() 异常逃逸（F-07 残留）、**收割/对账解析器畸形 JSON 崩溃（F-12，41 处）**、**落点不一致只 WARN 导致会话身份与回复归属分裂（F-13）**、**RRULE 校验语义 ≠ 下发语义（F-14）**——前 11 组已在第二十五轮核销，F-12/F-13/F-14 已修待复审），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 240 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -34,7 +34,7 @@
 | 2 | 这个会话归谁 | `--owner <conv_id>` | 输出唯一账号 |
 | 3 | 配额有没有冷却 | `--rotation` | `unavailable` 为空或目标账号不在其中 |
 | 4 | 匿名要用先看设备 | `--anon-devices` | 目标设备 `jar=true` |
-| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 218 条） |
+| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 240 条） |
 
 ### A1–A4 内容主权（不可协商）
 
@@ -65,8 +65,8 @@
 
 | 编号 | 基线 | 判定口径 | 违例后果 |
 |---|---|---|---|
-| **A10** | 发进既有会话**必带** `conversation_id` | 请求体含该字段；发送后 SSE 首个 `data:` 的 `conversation_id` 与目标**相等** | 消息静默落入全新会话（已发生事故） |
-| **A11** | 200 即停止轮转 | 200 后立刻停止；id 解析顺序 SSE → 整包 JSON → 严格字段匹配；只接受**唯一、非空、符合 A19 白名单**的 id；解析不出或不合规 → **返回 1、不落盘、不重投**（不许回落到传入 id 粉饰成功） | 同一 prompt 建出多个会话 |
+| **A10** | 发进既有会话**必带** `conversation_id`，且**落点必须一致** | 请求体含该字段；发送后 SSE **首个带 `conversation_id` 的** `data:` 事件的 id 与目标**相等**；同一响应出现两个不同 id → 无法确认落点，**判失败**；落点不一致 → **判失败**（不返回成功、不归档为目标会话的正常回复）、回复写入**独立隔离归档**（记 `target_conv_id`/`actual_conv_id`/异常原因/原始响应证据）、失败返回**携带两个 id**，**禁止静默改归属** | 消息静默落入全新会话（已发生事故）；回复落在别的会话却被当成 A 的回复继续操作 |
+| **A11** | 200 即停止轮转 | 200 后立刻停止；id 解析顺序 SSE（**首个带 id 的事件**，坏事件跳过但不得改用后面的 id）→ 整包 JSON → 严格字段匹配；只接受**唯一、非空、符合 A19 白名单**的 id；解析不出、不合规、或同一响应出现多个不同 id → **返回 1、不落盘、不重投**（不许回落到传入 id 粉饰成功） | 同一 prompt 建出多个会话 |
 | **A12** | 大交付用 raw mapping 核对 | GET 全量 → 按原始顺序取目标 assistant 全部 parts → 记录 `message_id / part数 / 各part字符数 / 拼接 SHA-256`；与 `DONE chars` 同口径比对；缺 part、重复消息、口径不一致 → 判**不完整**（结论：补采，不是要模型重发）；保留原始 mapping 备查 | 流截断与真实生成失败无法区分 |
 | **A13** | 回复默认全文落盘 | `CHATGPT_REPLY_MAX_CHARS` 默认 0；非 0 时文件头必须写明截断点与原始长度 | 归档只留尾巴，结论丢失 |
 | **A14** | 投递前先落设备身份 | 发送**开始前**经 CDP `Storage.getCookies` 取 jar（含 HttpOnly），从目标浏览器上下文读 `oai-did`（**不得**用可能为空的 `api.cookie`）；写盘后**重新读取并校验 SHA-256 与 oai-did 一致**；任一失败 `exit 1` 禁止发送 | 会话建出来但读不回来（死档） |
@@ -179,7 +179,7 @@
 
 | 编号 | 基线 | 判定口径 | 违例后果 |
 |---|---|---|---|
-| **B1** | 周期任务固定 1 小时 | `rrule` 必须 `FREQ=HOURLY;INTERVAL=1`；禁止 `DAILY/WEEKLY/MONTHLY`；**禁止用 `INTERVAL<1` 表示高频**；同一 automation 实际触发间隔 ≥60 分钟；时区统一 `Asia/Shanghai`，缺失即禁止启用 | 天维度过久 / 语义漂移 |
+| **B1** | 周期任务固定 1 小时 | `rrule` 必须 `FREQ=HOURLY;INTERVAL=1`；禁止 `DAILY/WEEKLY/MONTHLY`；**禁止用 `INTERVAL<1` 表示高频**；**禁止重复 rule part**（RFC 5545 §3.3.10，如 `FREQ=DAILY;FREQ=HOURLY` 一律拒绝）；`INTERVAL` 按 RFC 十进制整数严格解析、不得含内部空白；**下发必须是校验后重建的规范化 RRULE**，不得下发用户原始串；枚举值大小写不敏感（`freq=hourly` 合法，规范化为 `HOURLY`）；同一 automation 实际触发间隔 ≥60 分钟；时区统一 `Asia/Shanghai`，缺失即禁止启用 | 天维度过久 / 语义漂移；校验按「最后一个同名 key」而下发按「第一个」——周期被确定性绕过 |
 | **B2** | 到期项走每小时条件巡检 | 状态文件持久化三态 `PENDING/RUNNING/DONE`：未到点→`exit 0` 静默；到点且 `PENDING`→**原子领取**后才可执行；`RUNNING` 且租约有效→退出；`DONE`→`exit 0`；`FAILED`→按 B13；**先持久化 `DONE` 再结束**；状态文件读写失败→`exit 1` 禁止处置 | 重复处置、漏处置 |
 | **B3** | 长周期用 `validFrom/validUntil` 收窗 | 带时区 ISO 8601，窗口**左闭右开** `[from, until)`；窗口外 `exit 0` 不做业务；`until` 到点标 `EXPIRED`，不得再执行（除非新实例） | 窗外执行或永久残留 |
 | **B4** | 一次性看门狗寿命 ≤1h | `scheduledAt` 带时区；创建时 `0 < scheduledAt - now ≤ 3600s`；已过去的不得建成 ACTIVE；更远的需求改 B2；单次运行上限 3600s，超时先取消执行体、**确认执行体已停**才记 `TIMEOUT` 并释放租约（执行体不响应取消 → `TIMEOUT_ORPHAN` 保留租约，见 B15，不得在此处擅自释放） | 远期单点触发 / 长期占并发槽 |
@@ -218,9 +218,9 @@
 
 **不要用 `^.+ .+ .+$` 这类贪婪正则代替分词**——它连四段、五段一起放行，正是本轮审查抓到的口径漏洞。
 
-**B10/B11 实现（v1.8）**：`--check-name "<名称>" [--argv "<命令串>"]` 把上面两张表落成代码——分词判段数、动作词与词表**整段相等**比对、只读名的 argv 必须全部命中 `READONLY_ARGV`；任一条不成立 `exit 2`。别再自己写正则：`startswith("--rotation")` 会放行 `--rotation-reset`，`查看并删除` 会被包含匹配当成只读。回归 `TestScheduleContract`（19 条）覆盖四段名、全角空格、`（只读）+ 写动词`、白名单四个越权命令。
+**B10/B11 实现（v1.8）**：`--check-name "<名称>" [--argv "<命令串>"]` 把上面两张表落成代码——分词判段数、动作词与词表**整段相等**比对、只读名的 argv 必须全部命中 `READONLY_ARGV`；任一条不成立 `exit 2`。别再自己写正则：`startswith("--rotation")` 会放行 `--rotation-reset`，`查看并删除` 会被包含匹配当成只读。回归 `TestScheduleContract`（26 条）覆盖四段名、全角空格、`（只读）+ 写动词`、白名单四个越权命令，以及 RRULE 的重复属性/内部空白/严格十进制/规范化下发。
 
-**B1/B4/B5 实现（v1.8）**：`--check-schedule "FREQ=HOURLY;INTERVAL=1"` 只认 HOURLY：`INTERVAL` **缺省按 RFC 语义等价 1，允许**；显式给出则必须为 1（`INTERVAL=0` 表示高频、`INTERVAL=2` 一律 `exit 2`），天维度直接 `exit 2`。**只验 rrule 本身**——「实际触发间隔 ≥60 分钟」与「时区 Asia/Shanghai」两项依赖调度器观测与参数，仍属人判（B1 等级 FULL 指 rrule 这一半）；`--check-oneshot <ISO8601>` 要求带时区、距今 `0 < Δ ≤ 3600s`——已过点（本该按 B5 归档）和超过 1 小时（本该走 B2 条件巡检）两头都在建之前堵住。
+**B1/B4/B5 实现（v1.8，第二十七轮修订）**：`--check-schedule "FREQ=HOURLY;INTERVAL=1"` 只认 HOURLY：`INTERVAL` **缺省按 RFC 语义等价 1，允许**；显式给出则必须为 1（`INTERVAL=0` 表示高频、`INTERVAL=2` 一律 `exit 2`），天维度直接 `exit 2`。**校验语义必须等于下发语义**（F-14）：①解析阶段**拒绝任何重复 rule part**（旧版用字典解析、同名取最后一个，`FREQ=DAILY;FREQ=HOURLY` 校验通过却下发原始串——调度器取第一个就变成 DAILY）；②**下发用已验证字段重建的规范化 RRULE**（`FREQ=HOURLY;INTERVAL=1`），不再下发用户原始串；③`INTERVAL` 按 RFC 十进制整数严格解析（`int()` 会接受 `1_0` 这类串，必须用正则）；④**拒绝内部空白**（旧版 `.replace(" ", "")` 会把 `FREQ=HO URLY` 悄悄修补成合法输入）；⑤**枚举值大小写不敏感**（RFC 5545 §2）——`freq=hourly` 合法，接受后规范化为 `HOURLY`，大小写本身不是违规，不能拿来当拒绝理由。**只验 rrule 本身**——「实际触发间隔 ≥60 分钟」与「时区 Asia/Shanghai」两项依赖调度器观测与参数，仍属人判（B1 等级 FULL 指 rrule 这一半）；`--check-oneshot <ISO8601>` 要求带时区、距今 `0 < Δ ≤ 3600s`——已过点（本该按 B5 归档）和超过 1 小时（本该走 B2 条件巡检）两头都在建之前堵住。
 
 **B8/B15 实现**：`acquire_slot()` / `release_slot()` 在同一把跨进程锁内完成「回收死槽 + 计数 + 占位」，返回 `(slot_path, run_id)`，满员返回 `(None, run_id)` 由调用方记 `QUEUED`；`lease_acquire/heartbeat/release/reclaim` + `_lease_reclaimable()` 覆盖 `lease_valid / process_gone / pid_reused / identity_unreadable / run_id_mismatch / alive` 六种回收判定。回归含 6 进程同时抢槽（断言有效槽位 ≤3 且互不重叠）与租约六态。超时分两档（B15 硬要求）：执行体响应 cancel 且确实停下 → `TIMEOUT` 并释放租约；**执行体不响应取消、仍在跑 → `TIMEOUT_ORPHAN` 且保留租约**（此时释放租约等于放第二个实例进来，双跑比僵尸更危险）。心跳与超时由 `lease_run()` 落地：`HEARTBEAT_SEC=15`、`LEASE_SEC=60`、`RUN_MAX_SEC=3600` 三个常量可注入，回归用**按比例缩小的秒数**（如 lease 0.4s / heartbeat 0.1s / max 0.2s）验证同一套逻辑——证明「运行超过租约时心跳确实续期、不会被判过期」以及「超 `RUN_MAX_SEC` 时，执行体已停 → `TIMEOUT` + 释放租约，执行体不停 → `TIMEOUT_ORPHAN` + 保留租约」，不需要真等 15 分钟和 1 小时。
 
@@ -335,7 +335,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | automation 名称 / 排程 | 同上 + `--check-name`、`--check-schedule`、`--check-oneshot` | B1/B4/B5/B10/B11 |
 | 排程口径 | `automation_update list` 全量盘点 | B1–B5 |
 
-**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 218 条。
+**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 240 条。
 
 ---
 
@@ -427,8 +427,11 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 **第二十五轮说明**：定向复审（仅 F-10 残留 + docstring），非全文裁定。第二十轮「全文最终确认」曾抓出 F-09/F-10/F-11，修复后需全文确认才能收敛。
 
 | 26 | v1.8 修订 | `NEEDS-REVISION`（F-12） | **换靶到回复完整性/收割链路（A10/A12/A13/A14）**——前二十五轮火力全在锁子系统，这批条款从未做过实现级对抗审查。判 F-12 成立：`reply_digest`/`harvest_mapping`/`harvest_transcript`/`tail_from_mapping`/`extract_reply_sse` 对「JSON 合法但形状不符」的响应体抛未捕获异常（探针实测 41 处）；`reply_digest` 的异常确实阻断 `save_reply`（归档唯一副本丢失）；`extract_reply_sse` 在主收割路径 7/7 全崩。**并给出差异化降级要求**：①`reply_digest` 是完整性证明器——任何畸形**整体判不可用**，不得跳过坏 node 拿剩余 part 算摘要；②收割类必须**暴露不完整状态**；③`tail_from_mapping` 是尾部确认——畸形即整体 None；④SSE 须**记录坏事件数与是否 [DONE] 收尾**，不得把部分流冒充完整回复；⑤**辅助对账器不得成为归档的前置硬依赖**。第 3 项（全文件枚举同类位置）未完成——审查方把「通读全文」理解为去读 GitHub 仓库 `oahcom/AiMemoryBrainArchitecture`，该仓库 main 无此文件 |
+| 27 | v1.8 修订 | `NEEDS-REVISION`（F-12a/b/c + F-13 + F-14） | **F-12 尚有完整性缺口**：①**F-12a**——`"".join(p for p in parts if isinstance(p, str))` 把 `parts` 里的非字符串元素**静默丢掉**，内容凭空消失而完整性仍报 True；`_scan_mapping` 应跳过该节点并 `complete=False`，`reply_digest` 应整体 `None`，`_scan_sse` 应跳过该事件并 `bad += 1`。②**F-12b**——SSE 里带 `message` 却缺 `author`/`author` 非 dict 的事件未计入坏事件，`complete` 可能错误地为 True。③**F-12c**——`_as_ctime` 的 `float(value)` 未捕获 `OverflowError`、接受 NaN/±inf，且大整数转 float 会静默丢精度。**F-13（实现级）**：落点不一致只 WARN 一句，随后 `save_reply(conv_id or real_conv)` 把落在 B 的回复归档在 A 名下、返回 A + 200 —— **会话身份与回复归属分裂**，下游会据错误的 conversation id 继续操作。要求四件事一起做：判失败、隔离保全（记两个 id 与原始响应证据）、禁止静默改归属、失败返回携带两个 id；并确认 `parsed` 确实来自**首个** `data:` 事件而非最后一次事件/GET 响应，无法确认唯一 id 时失败关闭。**F-14（实现级）**：①`check_schedule` 用字典解析（同名 key 取最后一个）却下发原始串——RFC 5545 §3.3.10 规定 rule part 不得重复，`FREQ=DAILY;FREQ=HOURLY` 可绕过「周期固定 1 小时」；②应下发由**已验证字段重建**的规范化 RRULE；③`INTERVAL` 应按 RFC 十进制数字语法严格解析，缺省按 1；④`norm = raw.upper().replace(" ", "")` 会删除内部空白（`FREQ=HO URLY` 被修补成合法输入），应拒绝。**并纠正一处错误依据**：审查方指出 RFC 5545 §2 枚举属性值**不区分大小写**，故 `freq=hourly` 不构成 RFC 违规——不能把大小写本身当拒绝理由，接受后规范化即可 |
 
 **第二十六轮改了什么**：① 新增 `_as_dict`/`_as_seq`/`_as_ctime` 三个形状收敛工具（`_as_ctime` 返回 `(ok, float)`，`ok=False` 表示时间值不可用、记录无效不得参与排序）；② 新增 `_scan_sse`（返回 text/complete/detail，记坏事件数与 [DONE]）与 `_scan_mapping`（返回 rows/complete，坏 node 跳过但**必须标记不完整**）两个扫描层；③ `reply_digest` 改**严格整体判定**：任何畸形（mapping/node/message/author/content/parts 形状不对或时间戳不可用）一律返回 None；④ `tail_from_mapping` 改**严格尾部确认**：任何畸形整体返回 None；⑤ 新增 `extract_reply_sse_checked`/`harvest_mapping_checked`/`harvest_transcript_checked` 三个带完整度信号的伴随接口（旧接口保留为薄包装，调用方不受影响）；⑥ `send_prompt` 用带完整度的接口，**坏流/不完整 mapping 明确打 WARN**；⑦ `reply_digest` 调用包 try/except 且**对账失败也继续 `save_reply`**——辅助对账器不再是归档的前置硬依赖；⑧ 匿名留存（`read_anon`）在归档头部写入「留存不完整」标注；⑨ `requirements`（PoW 关键路径）/ 模型清单 / 对话列表 / `conv_owner` 补形状守卫；⑩ 补 12 条回归（206→218）。
+
+**第二十七轮改了什么**：① **F-13 落点不一致改 fail-closed**：新增 `_sse_conv_ids()`（只取**首个**带 id 的 `data:` 事件，并汇总全部出现过的 id 供唯一性检查）、`ConvRef`（str 子类，失败返回同时携带 `target_conv_id`/`actual_conv_id`/`mismatch`）、`_quarantine_reply()`（写入 `replies/quarantine/` 独立隔离档案，头部记两个 id、HTTP 状态、原始响应摘要、回复 sha256 与全文）；`send_prompt` 里落点不一致时**判失败（状态 409）**、**不归档为目标会话的正常回复**、**不静默改归属**，截断补全文的 GET 目标改为**服务器实际写入的会话**（旧版按目标会话拉回来的是别的会话内容）；CLI 两个入口在失败时输出 `landing_mismatch` + 两个 id + 隔离档案路径。② **F-14 重写 `check_schedule`**：解析阶段**拒绝重复 rule part**、拒绝空/畸形 rule part、拒绝内部空白、`INTERVAL` 按 RFC 十进制整数正则严格解析（缺省按 1）、枚举值大小写不敏感但规范化为大写、拒绝 FREQ/INTERVAL 之外的 rule part；**下发改为由已验证字段重建的规范化 RRULE**（`FREQ=HOURLY;INTERVAL=1`），原始串只作为 `rrule_input_echo` 留档不下发。③ **F-12a/b/c**：`parts` 里混进非字符串元素时，`_scan_mapping` 跳过该节点并置 `complete=False`、`reply_digest` 整体返回 `None`、`_scan_sse` 跳过该事件并 `bad += 1`；SSE 里带 `message` 却缺 `author`/`author` 非 dict 的事件计入坏事件；`_as_ctime` 捕获大整数溢出、拒 NaN/±inf、拒超出 float64 精确整数范围的值；新增 `_parts_are_strings()` 统一判定。④ 补 22 条回归（218→240），新增 `TestMalformedParts`（8 条）、`TestLandingMismatch`（7 条）与 7 条 RRULE 契约用例。
 
 **第十四轮之后补的一条**：审查把「`_record_corruption("lease-recovery-failed")` 自己失败会怎样」列为残余风险 3，虽不构成裁定理由，但这是能离线证明的，于是补 `test_quarantine_failed_row_write_failure_is_survivable`（第一次登记成功、第二次返回 `None`，断言不抛异常、仍返回 `quarantine_failed`、租约原样在）。**属于 PASS 后的加证，不改变任何条款口径**，故不重开一轮审查。
 
@@ -483,7 +486,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 
 **矩阵自身有回归**：`TestEvidenceMatrix` 三条断言——条款集合 = 矩阵行集合（不漏、不多、不重复）；每个 `test:`/`code:` 引用都能解析；每行至少一种证据。它的作用是让「文档漂移」变成红灯，而不是等下一次审查才被发现。
 
-**当前分布（49 条，按等级）**：**FULL 20 条**（核心判定 + 失败分支都有独立断言）；**PARTIAL 13 条**（含 A7/A20/B15：跨平台持久化与进程身份无法离线穷举，见矩阵）；**CODE_ONLY 3 条**（A9 A15 A18，有实现无回归）；**HUMAN 13 条**（A0 B0 B2 B3 B6 B7 B9 B13 B14 C1–C4）。**只有 FULL 才算「已机械化」**——按「有没有 test:」计数会系统性高估，这是第九轮审查的结论。
+**当前分布（49 条，按等级）**：**FULL 21 条**（核心判定 + 失败分支都有独立断言）；**PARTIAL 12 条**（含 A7/A20/B15：跨平台持久化与进程身份无法离线穷举，见矩阵）；**CODE_ONLY 3 条**（A9 A15 A18，有实现无回归）；**HUMAN 13 条**（A0 B0 B2 B3 B6 B7 B9 B13 B14 C1–C4）。**只有 FULL 才算「已机械化」**——按「有没有 test:」计数会系统性高估，这是第九轮审查的结论。
 
 **已知缺口（按危害排序，写着就是为了下次被追）**：
 

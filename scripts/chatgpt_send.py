@@ -436,30 +436,73 @@ def check_automation_name(name, argv=None):
             "verb": verb, "argv": cmds}
 
 
+_RRULE_PART_RE = re.compile(r"^([A-Za-z][A-Za-z0-9-]*)=(.+)$", re.S)
+_RRULE_INT_RE = re.compile(r"^[+-]?[0-9]+$")
+_RRULE_ALLOWED = ("FREQ", "INTERVAL")
+
+
 def check_schedule(rrule):
-    """B1：周期任务固定 1 小时。天维度、INTERVAL≠1（含用 0 表示高频）一律拒绝。"""
+    """B1：周期任务固定 1 小时。天维度、INTERVAL≠1（含用 0 表示高频）一律拒绝。
+
+    F-14（第二十七轮审查口径）——三条硬约束，缺一条就等于「校验语义 ≠ 下发语义」：
+
+    1. **重复 rule part 一律拒绝**（RFC 5545 §3.3.10：rule part 不得重复）。
+       旧版用字典解析，同名 key 取最后一个：`FREQ=DAILY;FREQ=HOURLY` 校验时读到
+       HOURLY 判通过，下发时却发原始串——调度器若取第一个就变成 DAILY，
+       「周期固定 1 小时」被确定性绕过。
+    2. **下发规范化 RRULE**：只用**已验证字段**重新构造（`FREQ=HOURLY;INTERVAL=1`），
+       绝不再把用户原始字符串直接下发——原始串就是重复属性与内部空白的入口。
+    3. **枚举值大小写不敏感**（RFC 5545 §2：enumerated property values are
+       case-insensitive）：`freq=hourly` 合法，接受后规范化为 `HOURLY`。
+       大小写本身不是 RFC 违规，不能拿它当拒绝理由。
+
+    另外两条防御：拒绝内部空白（旧版 `.replace(" ", "")` 会把 `FREQ=HO URLY`
+    悄悄修补成合法输入，等于替用户改输入）；拒绝 FREQ/INTERVAL 之外的 rule part
+    （`BYxxx`/`UNTIL`/`COUNT` 会改变触发语义，不得静默忽略后照样下发）。
+    """
     raw = str(rrule or "").strip()
     if not raw:
         raise ScheduleError("rrule 为空")
-    norm = raw.upper().replace(" ", "")
+    if re.search(r"\s", raw):
+        raise ScheduleError("rrule 含空白字符（内部空格会让 'FREQ=HO URLY' 被悄悄"
+                            "修补成合法输入，等于替用户改了输入）：%r" % raw)
     parts = {}
-    for chunk in norm.split(";"):
-        if "=" in chunk:
-            k, v = chunk.split("=", 1)
-            parts[k] = v
+    for chunk in raw.split(";"):
+        if not chunk:
+            raise ScheduleError("rrule 含空 rule part（分号多写）：%r" % raw)
+        m = _RRULE_PART_RE.match(chunk)
+        if not m:
+            raise ScheduleError("rrule 的 rule part 必须是 NAME=VALUE：%r" % chunk)
+        name, value = m.group(1).upper(), m.group(2)
+        if name in parts:
+            raise ScheduleError("rrule 含重复 rule part %s（RFC 5545 §3.3.10 禁止重复；"
+                                "不同解析器会取到不同的那一个）：%r" % (name, raw))
+        parts[name] = value
+    unsupported = [k for k in parts if k not in _RRULE_ALLOWED]
     freq = parts.get("FREQ")
-    if freq != "HOURLY":
-        raise ScheduleError("FREQ 必须 HOURLY（周期固定 1 小时），收到 %r" % (freq or "缺失"))
+    if freq is None:
+        raise ScheduleError("rrule 缺 FREQ")
+    if freq.upper() != "HOURLY":
+        raise ScheduleError("FREQ 必须 HOURLY（周期固定 1 小时），收到 %r" % freq)
     iv = parts.get("INTERVAL")
-    if iv is not None:
-        try:
-            n = int(iv)
-        except ValueError:
-            raise ScheduleError("INTERVAL 不是整数：%r" % iv)
+    if iv is None:
+        interval = 1                      # RFC 5545：INTERVAL 缺省即 1
+    else:
+        if not _RRULE_INT_RE.match(iv):
+            raise ScheduleError("INTERVAL 不是 RFC 十进制整数：%r" % iv)
+        n = int(iv)
         if n != 1:
             raise ScheduleError("INTERVAL 必须为 1：%d 会变成 %s 小时一次，"
                                 "高频也不能用 INTERVAL<1 表示" % (n, n))
-    return {"result": "ok", "rrule": raw, "freq": "HOURLY", "interval": 1}
+        interval = n
+    if unsupported:
+        raise ScheduleError("rrule 含未支持的 rule part %s：B1 只允许 FREQ 与 INTERVAL"
+                            "（BYxxx/UNTIL/COUNT 会改变触发语义，不得静默忽略）"
+                            % ",".join(sorted(unsupported)))
+    # 下发用规范化串：由**已验证字段**重新构造，不含用户原始串里的任何杂质。
+    canonical = "FREQ=HOURLY;INTERVAL=%d" % interval
+    return {"result": "ok", "rrule": canonical, "rrule_input_echo": raw,
+            "freq": "HOURLY", "interval": interval}
 
 
 def check_oneshot(scheduled_at, now=None):
@@ -537,18 +580,40 @@ def _as_seq(obj):
 
 
 def _as_ctime(value):
-    """规范化 create_time，返回 (ok, float)。
+    """规范化 create_time，返回 (ok, number)。
 
-    ok=False 表示这个时间值**不可用**（类型不是数字、或是 bool）——记录无效，
-    不得靠它参与排序，否则「顺序」就是编出来的。
+    ok=False 表示这个时间值**不可用**——记录无效，不得靠它参与排序，
+    否则「顺序」就是编出来的。
     缺失（None）返回 (True, 0.0)：记录本身没坏，只是没有时间戳，视为最旧，
     内容照收，不影响「取最新」的选择。
+
+    F-12c：数值必须**有限**（拒 NaN / ±inf），且**不得在 float64 精确整数
+    范围外转 float**——那会静默丢精度，把一个 10^18 的时间戳变成一个
+    「相近但不同」的数；精度不可信时宁可判不可用，也不猜。
     """
     if value is None:
         return True, 0.0
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False, 0.0
+    if isinstance(value, int):
+        if value > 9007199254740991 or value < -9007199254740991:
+            return False, 0.0        # 大整数：float() 会丢精度 → 判不可用
+        return True, float(value)
+    if value != value:
+        return False, 0.0            # NaN：非有限数参与排序没有意义
+    if value == float("inf") or value == float("-inf"):
+        return False, 0.0            # ±inf
     return True, float(value)
+
+
+def _parts_are_strings(parts):
+    """parts 是否全为字符串（F-12a）。
+
+    为什么单独判：`"".join(p for p in parts if isinstance(p, str))` 会把
+    非字符串元素**静默丢掉**——内容凭空消失，而「完整性」却报告为 True。
+    跳过坏 node ≠ 证明 mapping 完整；静默丢 part 更糟。
+    """
+    return all(isinstance(p, str) for p in parts)
 
 
 def _scan_sse(raw_text):
@@ -584,6 +649,13 @@ def _scan_sse(raw_text):
         if not isinstance(msg, dict):
             bad += 1
             continue
+        # F-12b：带 message 却没有合法 author 的事件是**畸形**——必须计入坏事件。
+        # 旧版把 role 取成 None 就静默跳过，坏事件不进计数，complete 照样报 True，
+        # 于是一段残缺流被当成完整回复落盘。
+        author = msg.get("author")
+        if not isinstance(author, dict):
+            bad += 1
+            continue
         content = msg.get("content")
         if content is None:
             parts = []
@@ -597,13 +669,53 @@ def _scan_sse(raw_text):
         else:
             bad += 1
             continue
-        author = msg.get("author")
-        role = author.get("role") if isinstance(author, dict) else None
-        txt = "".join(p for p in parts if isinstance(p, str))
+        # F-12a：parts 里混进非字符串元素 → 该段内容会凭空消失。
+        # 宁可判它畸形（坏事件 + 跳过），也不静默过滤后还报告 complete。
+        if not _parts_are_strings(parts):
+            bad += 1
+            continue
+        role = author.get("role")
+        txt = "".join(parts)
         if role == "assistant" and txt.strip():
             last = txt
     detail = "坏事件 %d 个、%s" % (bad, "见到 [DONE]" if saw_done else "未见 [DONE]")
     return last, (bad == 0 and saw_done), detail
+
+
+def _sse_conv_ids(raw_text):
+    """按出现顺序取出 SSE 里的 conversation_id。
+
+    返回 (first, uniq)：first = **首个**能解析出 id 的 data 事件里的 id；
+    uniq = 全部出现过的 id（去重保序）。
+
+    F-13：旧版解析 conversation_id 是「一路往后找，找到就用」，还会在整包
+    JSON、正文正则里继续捞——等于「响应里出现过什么 id 就用哪个」。一旦后面
+    出现另一个 id，落点判定就建立在一个无法确认归属的 id 上。
+    现在只认**首个**事件的 id；一旦发现多个不同 id 就失败关闭。
+    """
+    first = None
+    uniq = []
+    for line in (raw_text or "").splitlines():
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            continue                        # 坏事件跳过，不拿它当 id 来源
+        if not isinstance(obj, dict):
+            continue
+        cid = obj.get("conversation_id")
+        if not isinstance(cid, str) or not cid.strip():
+            continue
+        cid = cid.strip()
+        if first is None:
+            first = cid
+        if cid not in uniq:
+            uniq.append(cid)
+    return first, uniq
 
 
 def _scan_mapping(raw_body):
@@ -651,11 +763,16 @@ def _scan_mapping(raw_body):
         else:
             complete = False
             continue
+        # F-12a：parts 里混进非字符串元素 → 这个节点的内容会凭空消失，
+        # 必须跳过该节点并把整体标成不完整（静默过滤 = 内容丢失却报完整）。
+        if not _parts_are_strings(parts):
+            complete = False
+            continue
         ok, ct = _as_ctime(m.get("create_time"))
         if not ok:
             complete = False             # 时间戳不可用 → 顺序不可信
         role = author.get("role")
-        text = "".join(p for p in parts if isinstance(p, str)).strip()
+        text = "".join(parts).strip()
         if role in ("user", "assistant") and text:
             rows.append((ct, role, text))
     rows.sort(key=lambda x: x[0])
@@ -711,7 +828,11 @@ def reply_digest(raw_body):
             return None        # 时间戳不可用 → 顺序不可信，核不了
         if author.get("role") != "assistant":
             continue
-        parts = [p for p in parts if isinstance(p, str)]
+        # F-12a：parts 里有非字符串元素 → 摘要算出来的 sha256/chars 不再对应
+        # 真实内容。作为完整性证明器，这里必须**整体判不可用**，不能拿过滤后的
+        # 剩余 part 算一个「看起来正常」的摘要。
+        if not _parts_are_strings(parts):
+            return None
         if not parts or not "".join(parts).strip():
             continue
         key = (ct, str(msg.get("id") or node_id))
@@ -3843,6 +3964,75 @@ def send_anon(api, conv_id, prompt_file, text):
     return (200 if reply else st or 0), path, cid
 
 
+class ConvRef(str):
+    """会话 id 引用——str 子类：默认呈现为目标会话 id。
+
+    F-13：落点不一致（投递 A、服务器落在 B）时，**必须同时携带两个 id**。
+    只回一个就把「回复实际落在哪个会话」这条关键信息丢了——而这正是下游
+    继续操作时最需要的东西；把回复悄悄归档到 A 名下则更糟：会话身份与
+    回复归属分裂，下游会拿着错误的 conversation id 继续往下走。
+    """
+
+    def __new__(cls, conv_id, actual_conv_id=None, mismatch=False, reason=""):
+        obj = super().__new__(cls, conv_id or "")
+        obj.target_conv_id = conv_id or ""
+        obj.actual_conv_id = actual_conv_id or ""
+        obj.mismatch = bool(mismatch)
+        obj.reason = reason
+        return obj
+
+
+LANDING_MISMATCH_STATUS = 409
+
+
+def _quarantine_reply(api, target_conv, actual_conv, reply, resp, status, pfile):
+    """落点不一致的回复隔离归档：保全，但不归属。
+
+    为什么必须隔离而不是直接归档到目标会话：回复实际落在 actual_conv，
+    归档到 target_conv 会让下游把别的会话的回复当成本会话的回复继续操作
+    （A10/F-13：会话身份与回复归属分裂）。隔离档案带完整证据——两个 id、
+    HTTP 状态、原始响应摘要、回复全文与 sha256——供人工判定归属。
+
+    隔离档案刻意放在 `replies/quarantine/` 子目录：下游按 `replies/reply-*.md`
+    扫正常归档时扫不到它，不会把隔离件当正常会话回复。
+    """
+    base = getattr(api, "base_dir", BASE)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    rel = os.path.join("replies", "quarantine",
+                       "quarantine-reply-%s-%s-%s.md"
+                       % (id8(target_conv), id8(actual_conv), stamp))
+    path = os.path.join(base, rel)
+    header = {
+        "type": "landing_mismatch_quarantine",
+        "target_conv_id": target_conv,
+        "actual_conv_id": actual_conv,
+        "reason": "投递目标会话与服务器返回的会话不一致；未静默改归属，回复隔离保全待人工判定",
+        "http_status": status,
+        "prompt_file": pfile,
+        "quarantined_at": datetime.now().isoformat(timespec="seconds"),
+        "reply_chars": len(reply or ""),
+        "reply_sha256": hashlib.sha256((reply or "").encode("utf-8")).hexdigest(),
+        "resp_head": (resp or "")[:800],
+    }
+    body = (
+        "# ⚠️ 隔离归档：落点不一致（landing_mismatch）\n\n"
+        "> 这条回复**不是** `%s` 的正常会话回复——服务器实际把它落在 `%s`。\n"
+        "> 本文件只用于保全与人工判定；下游不得把它当成 `%s` 的会话回复，"
+        "也不得据此认为 `%s` 已经回完。\n\n"
+        "```json\n%s\n```\n\n"
+        "## 原始响应摘要\n\n```\n%s\n```\n\n"
+        "## 回复全文（保全）\n\n%s\n"
+    ) % (target_conv, actual_conv, target_conv, target_conv,
+         json.dumps(header, ensure_ascii=False, indent=2),
+         (resp or "")[:2000], reply or "")
+    try:
+        _atomic_write(path, body)
+    except OSError as e:
+        print("FAIL: 隔离归档写入失败（%s）——回复可能丢失！" % e, flush=True)
+        return None
+    return path
+
+
 def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
     """完整投递流程：tail → requirements+PoW → POST → 收割 → 落盘。
 
@@ -3940,28 +4130,41 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
         return st, None, None
 
     # 校验 conversation_id：防静默落新会话事故
-    # 三级兜底：SSE 逐行解析 → 整包 JSON → 精确正则（流被截断时仍能捞出 id）
-    parsed = None
-    for line in resp.splitlines():
-        if line.startswith("data:"):
-            try:
-                obj = json.loads(line[5:].strip())
-                cid = obj.get("conversation_id")
-                if cid:
-                    parsed = cid
-                    break
-            except Exception:
-                pass
+    # F-13：只认**首个** data 事件里的 id，且必须**唯一**。
+    # 旧版是「一路往后找，找到就用」，还会在整包 JSON、正文正则里继续捞——
+    # 等于「响应里出现过什么 id 就用哪个」；一旦后面出现另一个 id，
+    # 落点判定就建立在了一个无法确认归属的 id 上。
+    first_cid, all_cids = _sse_conv_ids(resp)
+    parsed = first_cid
     if not parsed:
+        # 整包 JSON 响应（不是 SSE）——整包只有一个 conversation_id，不存在「取哪个」
         try:
-            parsed = json.loads(resp).get("conversation_id")
+            body_obj = json.loads(resp)
         except Exception:
-            pass
+            body_obj = None
+        if isinstance(body_obj, dict):
+            cid = body_obj.get("conversation_id")
+            if isinstance(cid, str) and cid.strip():
+                parsed = cid.strip()
     if not parsed:
-        m = re.search(r'"conversation_id"\s*:\s*"([0-9a-fA-F-]{36})"', resp or "")
-        if m:
-            parsed = m.group(1)
+        # 正则兜底（流被截断时仍能捞出 id）——必须**唯一**，多个不同 id 一律判失败
+        found = re.findall(r'"conversation_id"\s*:\s*"([0-9a-fA-F-]{36})"', resp or "")
+        uniq = []
+        for x in found:
+            if x not in uniq:
+                uniq.append(x)
+        if len(uniq) > 1:
+            print("FAIL: 响应里出现多个不同的 conversation_id（%s）——无法确认落点，"
+                  "按 A11 判失败，不落盘" % ", ".join(uniq), flush=True)
+            return 1, None, None
+        if uniq:
+            parsed = uniq[0]
             print("conversation_id 由正则兜底解析得到：%s" % parsed, flush=True)
+    # 唯一性：同一响应里出现两个不同 id → 无法证明落点，失败关闭
+    if len(all_cids) > 1:
+        print("FAIL: 同一响应里出现多个 conversation_id（%s）——无法确认落点，"
+              "按 A11 判失败，不落盘" % ", ".join(all_cids), flush=True)
+        return 1, None, None
     # A11 硬要求：解析不出唯一且合规的 id 就判失败，禁止「WARN 一下接着走」或换身份重投。
     # 旧版在 id 不合规时回落到传入的 conv_id 继续落盘，等于把「没认回会话」粉饰成成功。
     if not parsed:
@@ -3973,8 +4176,7 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
               % (parsed,), flush=True)
         return 1, None, None
     real_conv = parsed
-    if conv_id and real_conv != conv_id:
-        print("WARN: 落入了不同会话! target=%s real=%s" % (conv_id, real_conv), flush=True)
+    mismatch = bool(conv_id) and real_conv != conv_id
 
     reply, sse_complete, sse_detail = api.extract_reply_sse_checked(resp)
     if not reply:
@@ -3984,11 +4186,13 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
     elif not sse_complete:
         # 部分流不得冒充完整回复：明确记下来，内容照收（第二十六轮审查口径）
         print("WARN: SSE 流不完整（%s）——本次回复按「部分流」处理" % sse_detail, flush=True)
-    if getattr(api, "last_truncated", False) and (conv_id or real_conv):
+    if getattr(api, "last_truncated", False) and real_conv:
         # 流被截断：SSE 里的回复可能只到一半。用 GET 拉 mapping 取全文，
         # 避免把半截内容当定稿落盘（归档是唯一副本）。
+        # F-13：GET 的目标必须是**服务器实际写入的那个会话**（real_conv），
+        # 不能用 conv_id —— 落点不一致时按目标会话拉回来的，是别的会话的内容。
         full = ""
-        gst, gbody = api.req("GET", API_BASE + "/backend-api/conversation/" + (conv_id or real_conv),
+        gst, gbody = api.req("GET", API_BASE + "/backend-api/conversation/" + real_conv,
                              timeout=120)
         if gst == 200:
             full, gcomplete = api.harvest_mapping_checked(gbody)
@@ -4019,8 +4223,31 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
         else:
             print("WARN: 流被截断且 GET 未取到更完整内容（GET st=%s，现有 %d 字符）"
                   % (gst, len(reply or "")), flush=True)
-    path = api.save_reply(conv_id or real_conv, pfile, reply)
-    return st, path, (conv_id or real_conv)
+
+    if mismatch:
+        # A10/F-13：落点不一致 = 会话身份与回复归属分裂。
+        # 旧版只 WARN 一句，随后把落在 B 的回复归档在 A 名下、还返回 A + 200
+        # —— 下游据此认为「A 已经回完了」，拿着错误的 conversation id 继续操作。
+        # 现在 fail-closed，四件事一起做：
+        #   ① 业务结果判失败（不返回成功、不把回复归档成 A 的正常回复）
+        #   ② 保全已收到的回复（写入独立隔离档案，带两个 id 与原始响应证据）
+        #   ③ 不静默改归属（既不改成 B 蒙混过关，也不丢弃）
+        #   ④ 失败返回携带两个 id（target 与 actual）
+        print("FAIL: 落点不一致——投递 target=%s，服务器实际落在 actual=%s。"
+              "按 A10/F-13 判失败，不静默改归属" % (conv_id, real_conv), flush=True)
+        qpath = _quarantine_reply(api, conv_id, real_conv, reply, resp, st, pfile)
+        if qpath:
+            print("FAIL: 回复已隔离保全 -> %s（不得当成 %s 的正常会话回复）"
+                  % (qpath, conv_id), flush=True)
+        else:
+            print("FAIL: 隔离归档未能落盘——回复可能已丢失，需人工重取 actual=%s"
+                  % real_conv, flush=True)
+        return (LANDING_MISMATCH_STATUS, qpath,
+                ConvRef(conv_id, actual_conv_id=real_conv, mismatch=True,
+                        reason="landing_mismatch: 投递目标与服务器实际落点不一致"))
+
+    path = api.save_reply(real_conv, pfile, reply)
+    return st, path, ConvRef(real_conv)
 
 
 def _attempt_create(st, name, prompt_file, attempts, thinking=None):
@@ -4509,7 +4736,15 @@ def main():
             print(json.dumps({"conv_id": cid, "result": "error", "detail": str(e)},
                              ensure_ascii=False))
             return 1
-        print(json.dumps({"conv_id": conv, "status": status}, ensure_ascii=False))
+        out = {"conv_id": conv, "status": status}
+        if getattr(conv, "mismatch", False):
+            # F-13：落点不一致必须把**两个** id 都报出来，只报一个等于没报
+            out["landing_mismatch"] = True
+            out["target_conv_id"] = getattr(conv, "target_conv_id", cid)
+            out["actual_conv_id"] = getattr(conv, "actual_conv_id", "")
+            out["reason"] = getattr(conv, "reason", "")
+            out["quarantine_path"] = _p
+        print(json.dumps(out, ensure_ascii=False))
         return 0 if status == 200 else 1
     # ---- 会话清单 ----
     if args and args[0] == "--list-all":
@@ -4618,13 +4853,24 @@ def main():
         print("usage: [--account acct1|acct2|nologin] <conv_id> <prompt_file>", flush=True)
         return 2
     try:
-        status, _path, _conv = send_prompt(api, conv_id, args[1],
-                                             thinking=True if thinking_flag else None)
+        status, _path, conv = send_prompt(api, conv_id, args[1],
+                                          thinking=True if thinking_flag else None)
     except Exception as e:
         print(json.dumps({"conv_id": conv_id, "result": "error", "detail": str(e)}, ensure_ascii=False))
         return 1
     if status == 200:
         record_conv(conv_id, account, args[1])
+    elif getattr(conv, "mismatch", False):
+        # F-13：落点不一致 → 业务失败，且必须把两个 id 都带出来（目标 vs 实际落点）
+        print(json.dumps({
+            "result": "error",
+            "status": status,
+            "landing_mismatch": True,
+            "target_conv_id": getattr(conv, "target_conv_id", conv_id),
+            "actual_conv_id": getattr(conv, "actual_conv_id", ""),
+            "reason": getattr(conv, "reason", ""),
+            "quarantine_path": _path,
+        }, ensure_ascii=False), flush=True)
     return 0 if status == 200 else 1
 
 

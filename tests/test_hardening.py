@@ -1979,6 +1979,202 @@ class TestMalformedResponse(TmpBase):
         self.assertEqual(saved[0][0], CONV)
 
 
+class TestMalformedParts(TmpBase):
+    """F-12a/b/c：内容元素形状不符与时间戳不可用的处置。
+
+    事故场景：`"".join(p for p in parts if isinstance(p, str))` 把 parts 里的
+    非字符串元素**静默丢掉**——内容凭空消失，而完整性却报告为 True；
+    SSE 里缺 author / author 不是 dict 的消息事件也不进坏事件计数，
+    于是残缺流被当成完整回复落盘；时间戳侧，NaN/±inf 与超出 float64
+    精确整数范围的大整数都会让「顺序」变成编出来的。
+    """
+
+    CONV = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+
+    def _body(self, parts):
+        return json.dumps({"mapping": {"n1": {"message": {
+            "author": {"role": "assistant"},
+            "content": {"parts": parts},
+            "create_time": 9}}}})
+
+    def test_non_string_part_makes_mapping_incomplete(self):
+        rows, complete = m._scan_mapping(self._body(["ok", 42]))
+        self.assertFalse(complete, "parts 里有非字符串 → mapping 必须报不完整")
+        self.assertEqual(rows, [], "内容不完整的节点不得当有效记录收下")
+
+    def test_non_string_part_makes_reply_digest_none(self):
+        self.assertIsNone(m.reply_digest(self._body(["ok", 42])),
+                          "完整性证明器遇到畸形必须整体判不可用，不得拿剩余 part 算摘要")
+
+    def test_non_string_part_marks_sse_bad_event(self):
+        raw = ('data: {"message": {"author": {"role": "assistant"}, '
+               '"content": {"parts": ["ok", 42]}}}\ndata: [DONE]')
+        text, complete, detail = m._scan_sse(raw)
+        self.assertFalse(complete, "坏 part 的事件必须计入坏事件")
+        self.assertIn("坏事件 1 个", detail)
+        self.assertEqual(text, "", "坏事件不得产出内容")
+
+    def test_sse_missing_author_counts_as_bad_event(self):
+        raw = 'data: {"message": {"content": {"parts": ["hi"]}}}\ndata: [DONE]'
+        _t, complete, detail = m._scan_sse(raw)
+        self.assertFalse(complete, "缺 author 的消息事件是畸形，不能静默跳过")
+        self.assertIn("坏事件 1 个", detail)
+
+    def test_sse_non_dict_author_counts_as_bad_event(self):
+        raw = ('data: {"message": {"author": "assistant", '
+               '"content": {"parts": ["hi"]}}}\ndata: [DONE]')
+        _t, complete, detail = m._scan_sse(raw)
+        self.assertFalse(complete, "author 不是 dict 的消息事件是畸形")
+        self.assertIn("坏事件 1 个", detail)
+
+    def test_sse_event_without_message_is_not_bad(self):
+        """合法非消息事件（如只带 conversation_id）不算畸形，否则正常流会被误报残缺。"""
+        raw = 'data: {"conversation_id": "x"}\ndata: [DONE]'
+        _t, complete, _d = m._scan_sse(raw)
+        self.assertTrue(complete, "没有 message 的事件是正常的")
+
+    def test_as_ctime_rejects_non_finite_and_huge(self):
+        for bad in (float("nan"), float("inf"), float("-inf"), 10 ** 20, -(10 ** 20)):
+            with self.subTest(value=bad):
+                ok, val = m._as_ctime(bad)
+                self.assertFalse(ok, "非有限/超精度时间戳必须判不可用，不得进排序")
+                self.assertEqual(val, 0.0)
+
+    def test_as_ctime_accepts_normal_values(self):
+        self.assertEqual(m._as_ctime(None), (True, 0.0))
+        self.assertEqual(m._as_ctime(5), (True, 5.0))
+        self.assertEqual(m._as_ctime(1.5), (True, 1.5))
+
+
+class TestLandingMismatch(TmpBase):
+    """A10/F-13：投递目标与服务器实际落点不一致时的处置。
+
+    事故场景：投递 A，服务器实际把回复落在 B。旧版只 WARN 一句，随后
+    `save_reply(conv_id or real_conv)` 把落在 B 的回复归档在 A 名下、返回 A + 200
+    ——会话身份与回复归属分裂，下游拿着错误的 conversation id 继续操作。
+    现在必须 fail-closed：判失败 + 隔离保全 + 携带两个 id + 不静默改归属。
+    """
+
+    TARGET = "11111111-2222-4333-8444-555555555555"
+    ACTUAL = "99999999-8888-4777-8666-555555555555"
+
+    class _Stub(object):
+        is_anon = False
+        account = "acct1"
+        last_status = 200
+        last_body = ""
+
+        def __init__(self, base_dir, sse, saved, gets, truncated=False):
+            self.base_dir = base_dir
+            self.sse = sse
+            self.saved = saved
+            self.gets = gets
+            self.last_truncated = truncated
+
+        def live_tail(self, conv_id, tries=2):
+            return ("p1", "{}")
+
+        def cached_tail(self, conv_id):
+            return "p1"
+
+        def resolve_thinking_model(self, api):
+            return "auto"
+
+        def requirements(self):
+            return ("tok", "proof")
+
+        def send(self, conv_id, text, tail, req_token, proof, model=None, timeout=420):
+            return 200, self.sse
+
+        def req(self, method, url, body=None, timeout=60):
+            self.gets.append(url)
+            return 200, "{}"
+
+        def extract_reply_sse_checked(self, raw):
+            return m.ChatGPTAPI.extract_reply_sse_checked(raw)
+
+        def harvest_mapping_checked(self, raw):
+            return m.ChatGPTAPI.harvest_mapping_checked(raw)
+
+        def save_reply(self, conv_id, pfile, text):
+            self.saved.append((conv_id, text))
+            return "<path>"
+
+    def _prompt(self, body="提示词"):
+        p = os.path.join(self.tmp, "p13.md")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(body)
+        return p
+
+    def _sse(self, conv_id, reply="回复正文"):
+        return ('data: {"conversation_id": "%s", "message": {"author": {"role": "assistant"}, '
+                '"content": {"parts": ["%s"]}}}\ndata: [DONE]' % (conv_id, reply))
+
+    def _run(self, sse, target=None, truncated=False):
+        saved, gets = [], []
+        api = self._Stub(os.path.join(self.tmp, "auth"), sse, saved, gets, truncated)
+        status, path, conv = m.send_prompt(api, target or self.TARGET,
+                                           self._prompt(), thinking=False)
+        return status, path, conv, saved, gets
+
+    def test_landing_mismatch_is_failure_not_success(self):
+        status, _path, _conv, saved, _gets = self._run(self._sse(self.ACTUAL, "落在 B 的回复"))
+        self.assertNotEqual(status, 200, "落点不一致不得判成功")
+        self.assertEqual(status, m.LANDING_MISMATCH_STATUS)
+        self.assertEqual(saved, [], "不得把落在 B 的回复归档成 A 的正常回复")
+
+    def test_landing_mismatch_quarantines_reply_with_both_ids(self):
+        _status, path, _conv, _saved, _gets = self._run(self._sse(self.ACTUAL, "落在 B 的回复"))
+        self.assertTrue(path, "必须给出隔离归档路径")
+        self.assertTrue(os.path.exists(path), "隔离归档必须真的落盘")
+        self.assertIn("quarantine", path.replace("\\", "/"), "隔离件必须与正常归档分开存放")
+        content = _read(path)
+        self.assertIn(self.TARGET, content)
+        self.assertIn(self.ACTUAL, content)
+        self.assertIn("落在 B 的回复", content, "回复正文必须被保全，不得丢")
+        self.assertIn("landing_mismatch", content)
+
+    def test_landing_mismatch_return_carries_both_ids(self):
+        _status, _path, conv, _saved, _gets = self._run(self._sse(self.ACTUAL))
+        self.assertTrue(getattr(conv, "mismatch", False), "失败返回必须标记落点不一致")
+        self.assertEqual(conv.target_conv_id, self.TARGET)
+        self.assertEqual(conv.actual_conv_id, self.ACTUAL)
+        self.assertEqual(str(conv), self.TARGET, "默认呈现目标 id")
+
+    def test_same_conversation_is_success(self):
+        status, path, conv, saved, _gets = self._run(self._sse(self.TARGET))
+        self.assertEqual(status, 200)
+        self.assertEqual(conv, self.TARGET)
+        self.assertEqual(len(saved), 1, "正常路径照旧归档")
+        self.assertEqual(saved[0][0], self.TARGET)
+
+    def test_first_event_id_wins_and_repeated_id_is_fine(self):
+        """同一个 id 在多个事件里重复出现是正常的——必须取**首个**事件的 id。"""
+        sse = ("data: {\"conversation_id\": \"%s\"}\n" % self.TARGET +
+               "data: {\"conversation_id\": \"%s\", \"message\": {\"author\": {\"role\": \"assistant\"}, "
+               "\"content\": {\"parts\": [\"ok\"]}}}\n" % self.TARGET + "data: [DONE]")
+        status, _path, conv, _saved, _gets = self._run(sse)
+        self.assertEqual(status, 200)
+        self.assertEqual(conv, self.TARGET)
+
+    def test_multiple_different_ids_fail_closed(self):
+        """同一响应里出现两个不同 id → 无法确认落点，失败关闭，不得落盘。"""
+        sse = ("data: {\"conversation_id\": \"%s\"}\n" % self.TARGET +
+               "data: {\"conversation_id\": \"%s\"}\n" % self.ACTUAL + "data: [DONE]")
+        status, path, _conv, saved, _gets = self._run(sse)
+        self.assertEqual(status, 1, "多个 id 必须判失败")
+        self.assertIsNone(path)
+        self.assertEqual(saved, [])
+
+    def test_truncated_get_targets_actual_conversation(self):
+        """落点不一致时 GET 必须拉服务器实际写入的会话——拉目标会话拿到的是别的内容。"""
+        _status, _path, _conv, _saved, gets = self._run(
+            self._sse(self.ACTUAL, "半截"), truncated=True)
+        self.assertTrue(gets, "截断必须走 GET 补全文")
+        self.assertIn(self.ACTUAL, gets[0])
+        self.assertNotIn(self.TARGET, gets[0])
+
+
 class TestSlotsAndLease(TmpBase):
     """B8 原子领槽 + B15 租约回收的回归（审查要求的实现证据）。"""
 
@@ -2929,6 +3125,72 @@ class TestScheduleContract(unittest.TestCase):
 
     def test_interval_not_one_rejected(self):
         for bad in ("FREQ=HOURLY;INTERVAL=0", "FREQ=HOURLY;INTERVAL=2", "FREQ=HOURLY;INTERVAL=x"):
+            with self.subTest(rrule=bad):
+                with self.assertRaises(m.ScheduleError):
+                    m.check_schedule(bad)
+
+    # ---- F-14：校验语义必须等于下发语义 ----
+
+    def test_duplicate_rrule_part_rejected(self):
+        """RFC 5545 §3.3.10：rule part 不得重复。
+
+        旧版用字典解析（同名 key 取最后一个）：`FREQ=DAILY;FREQ=HOURLY` 校验时
+        读到 HOURLY 判通过，下发的却是原始串——调度器若取第一个就成了 DAILY，
+        「周期固定 1 小时」被确定性绕过。
+        """
+        for bad in ("FREQ=DAILY;FREQ=HOURLY",
+                    "FREQ=HOURLY;INTERVAL=1;INTERVAL=1",
+                    "FREQ=HOURLY;INTERVAL=1;INTERVAL=2"):
+            with self.subTest(rrule=bad):
+                with self.assertRaises(m.ScheduleError):
+                    m.check_schedule(bad)
+
+    def test_rrule_output_is_canonical(self):
+        """下发必须用已验证字段重新构造的规范化串，不下发用户原始串。"""
+        self.assertEqual(m.check_schedule("FREQ=HOURLY;INTERVAL=1")["rrule"],
+                         "FREQ=HOURLY;INTERVAL=1")
+        self.assertEqual(m.check_schedule("FREQ=HOURLY")["rrule"],
+                         "FREQ=HOURLY;INTERVAL=1")
+
+    def test_lowercase_freq_accepted_and_normalised(self):
+        """RFC 5545 §2：枚举属性值不区分大小写——`freq=hourly` 不构成违规。
+
+        大小写本身不能当拒绝理由：合法输入被拒 = 校验比 RFC 还严，
+        那不是安全，是把用户的合法排程挡在门外。
+        """
+        res = m.check_schedule("freq=hourly;interval=1")
+        self.assertEqual(res["freq"], "HOURLY")
+        self.assertEqual(res["interval"], 1)
+        self.assertEqual(res["rrule"], "FREQ=HOURLY;INTERVAL=1")
+
+    def test_internal_whitespace_rejected(self):
+        """旧版 `.replace(" ", "")` 会把 `FREQ=HO URLY` 悄悄修补成合法输入。"""
+        for bad in ("FREQ=HO URLY", "FREQ=HOURLY ;INTERVAL=1", "FREQ=HOUR LY;INTERVAL=1"):
+            with self.subTest(rrule=bad):
+                with self.assertRaises(m.ScheduleError):
+                    m.check_schedule(bad)
+
+    def test_interval_strict_decimal(self):
+        """INTERVAL 必须按 RFC 十进制整数解析：`int()` 会接受 '1_0'、' 1' 这类串。"""
+        for bad in ("FREQ=HOURLY;INTERVAL=1_0", "FREQ=HOURLY;INTERVAL=0x1",
+                    "FREQ=HOURLY;INTERVAL=1.0", "FREQ=HOURLY;INTERVAL=+2",
+                    "FREQ=HOURLY;INTERVAL=-1", "FREQ=HOURLY;INTERVAL=１"):
+            with self.subTest(rrule=bad):
+                with self.assertRaises(m.ScheduleError):
+                    m.check_schedule(bad)
+
+    def test_unsupported_rule_part_rejected(self):
+        """BYxxx/UNTIL/COUNT 会改变触发语义，不得静默忽略后照样下发。"""
+        for bad in ("FREQ=HOURLY;BYHOUR=9", "FREQ=HOURLY;UNTIL=20260101T000000Z",
+                    "FREQ=HOURLY;COUNT=5"):
+            with self.subTest(rrule=bad):
+                with self.assertRaises(m.ScheduleError):
+                    m.check_schedule(bad)
+
+    def test_malformed_rule_part_rejected(self):
+        """没有 '='、空值、空 rule part 一律拒绝——旧版 `if "=" in chunk` 会整段忽略。"""
+        for bad in ("FREQ", "FREQ=", "FREQ=HOURLY;;INTERVAL=1", "FREQ=HOURLY;INTERVAL",
+                    ";FREQ=HOURLY"):
             with self.subTest(rrule=bad):
                 with self.assertRaises(m.ScheduleError):
                     m.check_schedule(bad)
