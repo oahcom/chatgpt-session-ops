@@ -144,8 +144,45 @@ class TestStateFiles(TmpBase):
             m._atomic_write(target, "x")
         self.assertFalse(os.path.exists(target + ".tmp"))
 
-    def test_atomic_write_uses_unique_tmp_names(self):
-        # 事故：固定 `.tmp` 时同进程两个线程写同一个临时文件，Windows 上 os.replace
+    def test_tmp_is_in_same_dir_and_fsync_failure_cleans_up(self):
+        """A20：tmp 必须同目录（同文件系统才原子）；fsync 失败要清 tmp 并抛出。"""
+        path = os.path.join(self.tmp, "sub", "fsync.json")
+        seen = {}
+        real_fsync = os.fsync
+
+        def boom(fd):
+            seen["called"] = True
+            raise OSError("disk says no")
+
+        os.fsync = boom
+        try:
+            with self.assertRaises(OSError):
+                m._atomic_write(path, "{}")
+        finally:
+            os.fsync = real_fsync
+        self.assertTrue(seen.get("called"), "必须真的调用过 fsync")
+        self.assertEqual([f for f in os.listdir(os.path.dirname(path)) if ".tmp" in f], [],
+                         "fsync 失败后没清 tmp")
+        self.assertFalse(os.path.exists(path), "失败不该留下目标文件")
+
+    def test_replace_failure_cleans_up_and_keeps_old_content(self):
+        path = os.path.join(self.tmp, "keep.json")
+        m._atomic_write(path, '{"v": 1}')
+        real_replace = os.replace
+
+        def boom(src, dst):
+            raise PermissionError("locked by another process")
+
+        os.replace = boom
+        try:
+            with self.assertRaises(PermissionError):
+                m._atomic_write(path, '{"v": 2}')
+        finally:
+            os.replace = real_replace
+        self.assertEqual([f for f in os.listdir(self.tmp) if ".tmp" in f], [], "失败后留了 tmp")
+        self.assertEqual(json.load(open(path, encoding="utf-8"))["v"], 1, "旧内容必须完好")
+
+    def test_atomic_write_uses_unique_tmp_names(self):        # 事故：固定 `.tmp` 时同进程两个线程写同一个临时文件，Windows 上 os.replace
         # 抛 WinError 32，线程被打死、锁留在原地 → 4 线程 ×20 次只落 60 条。
         # 真实用法是「先取 A22 锁再写」，所以这里也按锁串行，只校验 tmp 名唯一。
         path = os.path.join(self.tmp, "uniq.json")
@@ -572,7 +609,7 @@ class FakeAPI:
 
     def send(self, conv_id, text, parent_message_id, req_token, proof, timeout=420, model=None):
         self.sent.append({"conv_id": conv_id, "parent": parent_message_id, "text": text,
-                          "model": model})
+                          "model": model, "timeout": timeout})
         return self.send_status, self.sse or ""
 
     def warm_cookies(self):
@@ -688,6 +725,17 @@ class TestSendFlow(TmpBase):
         self.assertEqual(dg["message_id"], "msg-1")
         self.assertIsNone(m.reply_digest('{"mapping": {}}'))
         self.assertIsNone(m.reply_digest("not json"))
+
+    def test_timeout_is_split_by_thinking(self):
+        """A16：思考模式给 30 分钟，非思考给 7 分钟；同一条预算会误杀 19 分钟的思考回复。"""
+        cid = "11111111-2222-4333-8444-555555555555"
+        api = FakeAPI(os.path.join(self.tmp, "auth"),
+                      sse='data: {"conversation_id": "%s"}\n\ndata: [DONE]' % cid)
+        api.resolve_thinking_model = lambda _a: "gpt-6-t-mini"
+        m.send_prompt(api, None, self._prompt("x"), new_chat=True, thinking=True)
+        self.assertEqual(api.sent[-1]["timeout"], 1800)
+        m.send_prompt(api, None, self._prompt("x"), new_chat=True, thinking=False)
+        self.assertEqual(api.sent[-1]["timeout"], 420)
 
     def test_default_keeps_auto_model(self):
         """未开启思考模式时不覆写 model（保持 auto）。"""
@@ -1242,6 +1290,75 @@ class TestSlotsAndLease(TmpBase):
         os.utime(sp, (old, old))
         slot, _rid = m.acquire_slot("race", base=self.tmp, lock_timeout=1.0)
         self.assertTrue(slot and slot.endswith("slot-1.slot"), slot)
+
+    def test_corrupt_lease_needs_approval_to_release(self):
+        """B15：损坏租约只能经「独立批准标记」隔离，不能自动删、也不能凭口头放行。"""
+        path = os.path.join(self.tmp, "lease-c.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{broken")
+        approval = os.path.join(self.tmp, "approve.json")
+        ok, why = m.lease_force_release(path, approval)
+        self.assertFalse(ok)
+        self.assertEqual(why, "no_approval")
+        self.assertTrue(os.path.exists(path), "没有批准就动了租约")
+
+        with open(approval, "w", encoding="utf-8") as f:
+            json.dump({"sha256": "deadbeef"}, f)
+        ok, why = m.lease_force_release(path, approval)
+        self.assertFalse(ok)
+        self.assertEqual(why, "approval_incomplete", "缺批准人/原因/时间就是口头放行")
+
+        with open(approval, "w", encoding="utf-8") as f:
+            json.dump({"sha256": "deadbeef", "approved_at": "2026-11-19T16:00:00+08:00",
+                       "approver": "owner", "reason": "test"}, f)
+        ok, why = m.lease_force_release(path, approval)
+        self.assertFalse(ok)
+        self.assertEqual(why, "sha256_mismatch")
+        self.assertTrue(os.path.exists(path))
+
+        with open(approval, "w", encoding="utf-8") as f:
+            json.dump({"sha256": m._sha256_file(path),
+                       "approved_at": "2026-11-19T16:00:00+08:00",
+                       "approver": "owner", "reason": "holder confirmed dead"}, f)
+        ok, why = m.lease_force_release(path, approval)
+        self.assertTrue(ok, why)
+        self.assertEqual(why, "quarantined")
+        self.assertFalse(os.path.exists(path))
+        left = [f for f in os.listdir(self.tmp) if ".corrupt-" in f]
+        self.assertEqual(len(left), 1, "隔离文件必须保留原字节")
+
+    def test_process_alive_blocks_force_release(self):
+        """R3/R4：文件坏了不等于进程死了；持有者还活着就不许恢复。"""
+        path = os.path.join(self.tmp, "lease-alive.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid(),
+                       "process_start_time": m._proc_start_time(os.getpid()),
+                       "run_id": "rid"}, f)
+        approval = os.path.join(self.tmp, "approve-alive.json")
+        with open(approval, "w", encoding="utf-8") as f:
+            json.dump({"sha256": m._sha256_file(path),
+                       "approved_at": "2026-11-19T16:00:00+08:00",
+                       "approver": "owner", "reason": "looks dead"}, f)
+        ok, why = m.lease_force_release(path, approval)
+        self.assertFalse(ok)
+        self.assertEqual(why, "process_alive")
+        self.assertTrue(os.path.exists(path))
+
+    def test_corrupt_slot_is_registered(self):
+        """损坏槽位不能静默占坑：必须进 corrupt-registry.jsonl，带 sha256 便于事后核对。"""
+        d = os.path.join(self.tmp, "slots")
+        os.makedirs(d, exist_ok=True)
+        sp = os.path.join(d, "slot-1.slot")
+        with open(sp, "w", encoding="utf-8") as f:
+            f.write("{broken")
+        m.acquire_slot("race", base=self.tmp, lock_timeout=1.0)
+        reg = os.path.join(self.tmp, "corrupt-registry.jsonl")
+        self.assertTrue(os.path.exists(reg), "损坏槽位没有登记")
+        row = json.loads(open(reg, encoding="utf-8").read().splitlines()[0])
+        self.assertEqual(row["kind"], "slot")
+        self.assertEqual(row["why"], "identity_unreadable")
+        self.assertEqual(row["sha256"], m._sha256_file(sp))
+        self.assertEqual(row["size"], os.path.getsize(sp))
 
     def test_lease_valid_blocks_reclaim(self):
         ok, why = m._lease_reclaimable({

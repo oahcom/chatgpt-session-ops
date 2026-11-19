@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**九轮对外对抗审查**逐条改写（每轮裁定见 §F，第九轮把「可判定」本身当成攻击面），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 144 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**十轮对外对抗审查**逐条改写（每轮裁定见 §F，第九轮把「可判定」本身当成攻击面），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 150 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -34,7 +34,7 @@
 | 2 | 这个会话归谁 | `--owner <conv_id>` | 输出唯一账号 |
 | 3 | 配额有没有冷却 | `--rotation` | `unavailable` 为空或目标账号不在其中 |
 | 4 | 匿名要用先看设备 | `--anon-devices` | 目标设备 `jar=true` |
-| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 144 条） |
+| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 150 条） |
 
 ### A1–A4 内容主权（不可协商）
 
@@ -94,6 +94,17 @@
 **A12 实现（v1.8）**：`reply_digest(raw_body)` 从 mapping 按 `create_time` 取最新 assistant，输出 `message_id / parts各段字符数 / chars合计 / 拼接 SHA-256`；流截断补全文时打印这四项并与 `len(full)` 对账，缺 part 即判「不完整」。旧版只比「GET 比 SSE 长」——缺一个 part 但总长仍变长时会误判完整。
 
 **A22 事故数据**：4 线程 × 20 次，修前只落 59/80，修后 80/80；双进程各写 40 条 → 81 条零丢失。
+
+**A20 六项保证与对应断言（第十轮审查要求逐项核验）**：
+
+| 保证 | 断言载体 |
+|---|---|
+| tmp 与目标同文件系统 | tmp 就建在目标同目录（`path + ".tmp-…"`），用例断言落盘位置 |
+| tmp 名唯一 | `test_atomic_write_uses_unique_tmp_names`（4 线程各写一次，断言 `os.replace` 收到的 src 互不相同） |
+| flush + fsync(file) | `test_tmp_is_in_same_dir_and_fsync_failure_cleans_up`（注入 `os.fsync` 抛错，断言确实调用过且失败后清 tmp） |
+| `os.replace` 原子替换 | `test_replace_failure_cleans_up_and_keeps_old_content`（注入 `os.replace` 失败，断言旧内容完好、无 tmp 残留） |
+| fsync(dir) | 同一次 `_atomic_write` 内在 `os.replace` 后对父目录 fsync（POSIX；Windows 打不开目录时跳过） |
+| 失败清理且不得记成成功 | 上述两个注入用例都断言「失败抛异常 + 目标文件不被替换」 |
 
 **A20 二次事故（v1.8，被新回归抓出）**：文档写着「文件名唯一（禁止共用固定 `.tmp`）」，代码里却一直是 `path + ".tmp"`。同进程 4 线程并发写同一状态文件时，两个线程写同一个临时文件、`os.replace` 在 Windows 上抛 `WinError 32`，线程被打死、锁文件留在原地，后来者等 8s 超时后「跳过加锁」继续写 → **4 × 20 次只落 60 条**（断言要求 80）。修法：tmp 名改成 `<path>.tmp-<pid>-<thread ident>`。教训写进 §0：**「文档里写了」不等于「代码里是」**，这条是本次把文档当受审对象后才暴露的。
 
@@ -212,7 +223,20 @@
 
 1. **抢不到锁 = 不启动**。`_file_lock(..., strict=True)` 超时抛 `LockTimeout`，`acquire_slot` 捕获后按 `QUEUED` 返回 `(None, run_id)`。旧版超时后打印 WARN 就「跳过加锁继续跑」，6 进程抢槽实测出现过 **6 个槽位同时被占**——并发上限这种硬约束上，「WARN 不等于阻断」是致命的。
 2. **空/半截槽位 5s 内不得当死槽**。槽位是「先 `O_EXCL` 占名、再写内容」，读的人必然能读到半截 JSON；5s 内一律视作活槽。
-3. **瞬时文件禁止用 `_load_json` 读**。`_load_json` 会把「解析失败的非空文件」隔离改名（A21 对长期状态文件是对的），但用在槽位上等于**把别人刚占的槽位挪走**，文件名一空出来第二个进程立刻能占——这是超发的真正根因。瞬时文件走 `_read_ephemeral()`：读不懂就当它还在，不回收也不改名。租约同理：不可读 → 按占用处理，禁止回收。
+3. **B15-R 损坏租约恢复闸口**（第十轮审查要求，已落地）。租约读不懂就永不自动回收，会带来「永久占位」；解法不是加 TTL，而是留一条**需人批准且留痕**的通道 `lease_force_release(path, approval_path)`：
+
+| 步骤 | 落地 |
+|---|---|
+| R1 记录原哈希/大小/路径/时间 | `_record_corruption()` 先写 `corrupt-registry.jsonl`（append-only，带 sha256） |
+| R2 同一把 strict 锁 | 闸口本身只做文件操作，不进入租约临界区；真正的写入路径仍由 `lease_acquire` 的 strict 锁兜住 |
+| R3/R4 原实例身份与存活 | 能解析出 `pid` 且 `_proc_alive` 为真 → `process_alive` 拒绝（**不许凭「文件坏了」推断进程死了**） |
+| R5 B7 状态核对 | 恢复前必须人工确认无「已提交未确认」的副作用（写进恢复记录，不由脚本猜） |
+| R6 独立授权 | 批准文件必须有 `sha256 + approved_at + approver + reason`，缺一项即 `approval_incomplete` |
+| R7 隔离归档 | `os.replace` 改名为 `<lease>.corrupt-<ts>`，**保留原字节** |
+| R8 恢复后复核 | 隔离后复查原路径确已空出，否则 `quarantine_failed:path_still_present` |
+
+**为什么不能只看 PID**：原执行体可能已派生子进程，或副作用已提交但未持久化确认；因此 R5 是人工步骤，脚本只负责「不让你在没有记录的情况下悄悄放行」。回归：`test_corrupt_lease_needs_approval_to_release`、`test_process_alive_blocks_force_release`、`test_corrupt_slot_is_registered`。
+4. **瞬时文件禁止用 `_load_json` 读**。`_load_json` 会把「解析失败的非空文件」隔离改名（A21 对长期状态文件是对的），但用在槽位上等于**把别人刚占的槽位挪走**，文件名一空出来第二个进程立刻能占——这是超发的真正根因。瞬时文件走 `_read_ephemeral()`：读不懂就当它还在，不回收也不改名。租约同理：不可读 → 按占用处理，禁止回收。
 
 > **B14/B15 编号说明**：v1.0 的 B14 是联动红线（无独立判定口径），审查据此判「B14 缺失」。v1.1 保留 B14 为红线表，把审查提出的「运行实例租约」独立为 **B15**——两类约束不同（红线是跨类禁令，B15 是调度器级生命周期），不合并。
 
@@ -302,7 +326,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | automation 名称 / 排程 | 同上 + `--check-name`、`--check-schedule`、`--check-oneshot` | B1/B4/B5/B10/B11 |
 | 排程口径 | `automation_update list` 全量盘点 | B1–B5 |
 
-**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 144 条。
+**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 150 条。
 
 ---
 
@@ -335,6 +359,19 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | 7 | v1.7 | `NEEDS-REVISION`（2 项纯一致性） | B15 主条款仍写「超时释放租约」，与实现段 orphan 保留冲突；标题 v1.6 / 结尾 v1.7 |
 | 8 | v1.7 | **`PASS`** | B15 两档语义一致、版本号统一，无新矛盾 |
 | 9 | v1.8 | `NEEDS-REVISION`（6 项 P1 + 2 项 P2） | 攻击面换成「可判定」本身：证据矩阵只验证用例名存在、不验证断言覆盖（A2/A20/B5 三处确认夸大）；`--fence` 是位置索引不是交付身份；B1 缺 INTERVAL 与另两项；**B15 的 `lease_acquire/lease_reclaim` 仍用非 strict 锁，拿不到锁照样进临界区**；B5 存量归档没实现却挂了实测证据；不可读槽位「超 5s 按年龄回收」与「身份不明禁回收」自相矛盾 |
+
+| 10 | v1.8 修订 | `NEEDS-REVISION`（返修要求 4 条 + 新发现 N1–N6） | A20/B15 的 FULL 名不副实（缺故障注入与异常路径断言）；损坏槽位/租约没有统一登记；缺 B15-R 完整恢复闭环；等级元测试仍只校验字符串；`lease_acquire` 不区分 `lease_conflict` 与 `lock_timeout` |
+
+**第十轮改了什么（逐条对应）**：
+
+| 审查项 | 处置 |
+|---|---|
+| A20 FULL 名不副实 | 补 `fsync` / `os.replace` 双层故障注入用例，并把 `fsync(dir)` 真正写进 `_atomic_write`；六项保证逐项列表给出断言载体（见 A20 段） |
+| B15 FULL 名不副实 | 补 `test_lease_ops_never_run_unlocked`（四个入口超时都拒绝）、损坏登记、B15-R 闸口；心跳/释放超时断言「租约文件仍在」 |
+| 损坏文件无登记 | 新增 `_record_corruption()`，槽位/租约/恢复三个入口统一写 `corrupt-registry.jsonl`（带 sha256/大小/时间），用例断言登记内容 |
+| 缺恢复闭环 | 落 `lease_force_release()` + R1–R8 表；`process_alive` 拒绝、批准四字段缺一不可、隔离改名保留原字节 |
+| 等级元测试只校验字符串 | 保留字符串校验，同时把「六项保证 ↔ 用例」写成表格（人可核）；FULL 的语义真实性仍靠对照表，不再声称测试能自动证明 |
+| `lease_acquire` 失败原因混同 | 日志区分 `lease_conflict`（有效租约）与 `lock_timeout`（抢不到锁）；两者都拒绝启动，但审计可分辨 |
 
 **第九轮改了什么（逐条对应）**：
 
@@ -370,7 +407,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 
 **矩阵自身有回归**：`TestEvidenceMatrix` 三条断言——条款集合 = 矩阵行集合（不漏、不多、不重复）；每个 `test:`/`code:` 引用都能解析；每行至少一种证据。它的作用是让「文档漂移」变成红灯，而不是等下一次审查才被发现。
 
-**当前分布（49 条，按等级）**：**FULL 21 条**（核心判定 + 失败分支都有独立断言）；**PARTIAL 10 条**（只覆盖一半，缺的部分写在该条说明里）；**CODE_ONLY 5 条**（A7 A9 A15 A16 A18，有实现无回归）；**HUMAN 13 条**（A0 B0 B2 B3 B6 B7 B9 B13 B14 C1–C4）。**只有 FULL 才算「已机械化」**——按「有没有 test:」计数会系统性高估，这是第九轮审查的结论。
+**当前分布（49 条，按等级）**：**FULL 22 条**（核心判定 + 失败分支都有独立断言）；**PARTIAL 10 条**（只覆盖一半，缺的部分写在该条说明里）；**CODE_ONLY 4 条**（A7 A9 A15 A18，有实现无回归）；**HUMAN 13 条**（A0 B0 B2 B3 B6 B7 B9 B13 B14 C1–C4）。**只有 FULL 才算「已机械化」**——按「有没有 test:」计数会系统性高估，这是第九轮审查的结论。
 
 **已知缺口（按危害排序，写着就是为了下次被追）**：
 

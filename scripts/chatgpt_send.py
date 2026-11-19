@@ -216,6 +216,16 @@ def _atomic_write(path, text):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
+        # 目录 fsync：rename 只保证「目录项变更」可见，不保证断电后仍在（POSIX 语义）
+        try:
+            dfd = os.open(parent or ".", os.O_RDONLY)
+        except OSError:
+            dfd = None
+        if dfd is not None:
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
     except Exception:
         try:
             os.remove(tmp)
@@ -237,6 +247,16 @@ def _atomic_write_bytes(path, data):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
+        # 目录 fsync：rename 只保证「目录项变更」可见，不保证断电后仍在（POSIX 语义）
+        try:
+            dfd = os.open(parent or ".", os.O_RDONLY)
+        except OSError:
+            dfd = None
+        if dfd is not None:
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
     except Exception:
         try:
             os.remove(tmp)
@@ -567,7 +587,7 @@ def _load_json(path, default):
 # 并发下照样丢更新）；跨进程仍然靠 O_EXCL 锁文件。
 _LOCK_HELD = {}            # path -> 持有者线程 ident
 LOCK_STALE_SEC = 60        # 锁文件超过这个年龄视为残留（进程被杀）
-LOCK_TIMEOUT_SEC = 8.0     # 抢不到锁就放弃加锁继续业务，绝不阻塞发送
+LOCK_TIMEOUT_SEC = 3.0     # 临界区都在毫秒级；等 3s 足够，等 8s 只会在拥塞时放大停顿
 
 
 def _proc_alive(pid):
@@ -777,14 +797,32 @@ def _lease_reclaimable(info, now=None, expect_run_id=None):
     return False, "alive"
 
 
-def _log_corrupt_lease(path, why):
-    """损坏租约登记：留下可追溯证据（sha256/大小/时间），不删除、不接管。"""
+def _record_corruption(kind, path, why):
+    """损坏登记（append-only JSONL）：所有发现瞬时文件损坏的入口都往这里写。
+
+    为什么必须集中登记：槽位与租约「读不懂就不动」是安全的，但如果没人记，
+    就会出现「任务永远排队、永远没人知道为什么」。登记里带 sha256，是为了让
+    后续人工恢复（B15-R）能核对「批准的是不是同一个文件」。
+    """
     try:
         digest = _sha256_file(path)
     except OSError:
         digest = "?"
-    print("WARN: 租约不可用（%s）：%s size=%d sha256=%s；按占用处理，需人工恢复"
-          % (why, os.path.basename(path), _size_of(path), digest[:16]), flush=True)
+    row = {"at": datetime.now().astimezone().isoformat(timespec="seconds"),
+           "kind": kind, "path": os.path.abspath(path), "why": why,
+           "size": _size_of(path), "sha256": digest}
+    try:
+        with open(os.path.join(BASE, "corrupt-registry.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+    print("WARN: %s 不可用（%s）：%s size=%d sha256=%s；按占用处理，见 corrupt-registry.jsonl"
+          % (kind, why, os.path.basename(path), row["size"], digest[:16]), flush=True)
+    return row
+
+
+def _log_corrupt_lease(path, why):
+    return _record_corruption("lease", path, why)
 
 
 def lease_acquire(path, task_id, run_id=None, lease_sec=LEASE_SEC, lock_timeout=LOCK_TIMEOUT_SEC):
@@ -801,8 +839,11 @@ def lease_acquire(path, task_id, run_id=None, lease_sec=LEASE_SEC, lock_timeout=
                 # 读不懂的租约宁可判「有人在跑」，也不能放第二个实例进来（B15 身份不可读禁回收）
                 _log_corrupt_lease(path, "identity_unreadable")
                 return None
-            ok, _why = _lease_reclaimable(info)
+            ok, why = _lease_reclaimable(info)
             if not ok:
+                # 审计要能分辨「有人在跑」与「抢不到锁」：两者都拒绝启动，但原因不同
+                print("WARN: 租约冲突（%s），不启动第二个实例：%s"
+                      % (why, os.path.basename(path)), flush=True)
                 return None
             _atomic_write(path, json.dumps({
                 "task_id": task_id,
@@ -868,6 +909,7 @@ def lease_reclaim(path, expect_run_id=None, lock_timeout=LOCK_TIMEOUT_SEC):
             info, readable = _read_ephemeral(path)
             if not readable and _size_of(path) > 0:
                 # 身份读不懂 → 不回收（B15）。旧版会把它当空租约直接删掉，等于放第二个实例进来。
+                _log_corrupt_lease(path, "identity_unreadable")
                 return False, "identity_unreadable"
             ok, why = _lease_reclaimable(info, expect_run_id=expect_run_id)
             if ok:
@@ -878,6 +920,56 @@ def lease_reclaim(path, expect_run_id=None, lock_timeout=LOCK_TIMEOUT_SEC):
             return ok, why
     except LockTimeout:
         return False, "lock_timeout"
+
+
+def lease_force_release(path, approval_path):
+    """B15-R：损坏租约的人工恢复闸口（R1–R8）。
+
+    租约读不懂就永不自动回收 → 可能永久占位。解法不是加 TTL（年龄不等于死亡），
+    而是留一条**需要人明确批准、且留痕**的通道。批准文件字段：
+        {"sha256": "<损坏租约的哈希>", "approved_at": "<ISO8601>",
+         "approver": "<谁批的>", "reason": "<为什么批>"}
+    返回 (ok, reason)。reason ∈ absent / no_approval / approval_incomplete /
+    sha256_mismatch / process_alive / quarantine_failed / quarantined。
+    """
+    if not os.path.exists(path):
+        return True, "absent"
+    try:
+        with open(approval_path, encoding="utf-8") as f:
+            approval = json.load(f)
+    except (OSError, ValueError):
+        return False, "no_approval"
+    if not isinstance(approval, dict):
+        return False, "no_approval"
+    want = str(approval.get("sha256") or "").strip().lower()
+    # R6：批准必须可追溯到人、时间、原因，缺一项就是「口头放行」
+    if not want or not approval.get("approved_at") or not approval.get("approver")             or not approval.get("reason"):
+        return False, "approval_incomplete"
+    try:
+        got = _sha256_file(path)
+    except OSError as e:
+        return False, "unreadable:%s" % e
+    if got != want:
+        return False, "sha256_mismatch"
+    # R1：先把证据登记下来（原哈希/大小/发现时间），再谈恢复
+    _record_corruption("lease-recovery", path, "approved_recovery")
+    # R3/R4：能读出 pid 且进程还活着 → 不许恢复（文件坏了不代表进程死了）
+    info, readable = _read_ephemeral(path)
+    if readable:
+        pid = info.get("pid")
+        if pid and _proc_alive(pid):
+            return False, "process_alive"
+    bad = "%s.corrupt-%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
+    try:
+        os.replace(path, bad)      # R7：隔离归档，不覆盖
+    except OSError as e:
+        return False, "quarantine_failed:%s" % e
+    # R8：隔离后确认原路径确实空出来了，别把别人的新租约当成自己的战果
+    if os.path.exists(path):
+        return False, "quarantine_failed:path_still_present"
+    print("WARN: 损坏租约已按批准隔离 %s -> %s（原字节保留，可复查）"
+          % (os.path.basename(path), os.path.basename(bad)), flush=True)
+    return True, "quarantined"
 
 
 def _call_body(body, cancel):
@@ -975,6 +1067,7 @@ def acquire_slot(task_id, run_id=None, cap=SLOT_CAP, base=None, lease_sec=LEASE_
                     # 非空但读不懂 = 身份不明 → **永不自动回收**（B15 身份不可读禁回收），
                     # 旧版按 mtime 超过 5s 就删，等于用「文件年龄」冒充「进程死亡」。
                     if _size_of(sp) > 0:
+                        _record_corruption("slot", sp, "identity_unreadable")
                         continue
                     try:
                         age = time.time() - os.path.getmtime(sp)
@@ -3235,7 +3328,10 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
                 return 0, None, None
 
         t0 = time.time()
-        st, resp = api.send(conv_id, text, tail, req_token, proof, model=model)
+        # A16：思考模式单条实测可达 19 分钟，7 分钟会误杀；分档超时按是否思考给
+        send_timeout = 1800 if (thinking and model) else 420
+        st, resp = api.send(conv_id, text, tail, req_token, proof, model=model,
+                            timeout=send_timeout)
         print("SEND %s -> %s respLen=%d in %.0fs" % (pfile, st, len(resp), time.time() - t0), flush=True)
         if st == 403 and "Unusual activity" in (resp or "") and attempt == 1:
             print("403 Unusual activity —— 补 Cloudflare cookie 并重跑 requirements + PoW 重试一次", flush=True)
