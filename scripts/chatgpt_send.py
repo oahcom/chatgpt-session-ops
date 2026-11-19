@@ -84,6 +84,7 @@ import copy
 import gzip
 import hashlib
 import http.client
+import inspect
 import ipaddress
 import json
 import os
@@ -390,6 +391,238 @@ def _file_lock(path, timeout=LOCK_TIMEOUT_SEC):
 def _save_json(path, data):
     with _file_lock(path):
         _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2))
+
+
+# ---------- 调度槽位与租约（B8 / B15 的落地实现）----------
+SLOT_CAP = 3          # 调度器全局并发上限（日志实测 concurrency=3）
+LEASE_SEC = 60        # 默认租约秒数（B15）
+HEARTBEAT_SEC = 15    # 心跳间隔（B15）
+RUN_MAX_SEC = 3600    # 单次运行上限，超时记 TIMEOUT 并释放租约（B15）
+
+
+def _slots_dir(base=None):
+    return os.path.join(base or BASE, "slots")
+
+
+def _lease_reclaimable(info, now=None, expect_run_id=None):
+    """这份租约能否回收（B15 判定口径，纯函数便于回归）。
+
+    返回 (bool, reason)。reason 取值：
+      empty                空/损坏/无 run_id → 可回收
+      lease_valid          租约未到期，别人在跑
+      run_id_mismatch      文件里不是目标实例（不回收也不接管，调用方须 exit 1）
+      process_gone         原进程确实不在了
+      pid_reused           PID 存活但启动时间不符（被系统复用）
+      identity_unreadable  进程身份读不到 → 禁止回收
+      alive                原进程仍在且租约过期（长任务未续期）
+    """
+    now = time.time() if now is None else now
+    if not isinstance(info, dict) or not info.get("run_id"):
+        return True, "empty"
+    if expect_run_id is not None and info.get("run_id") != expect_run_id:
+        return False, "run_id_mismatch"
+    try:
+        until = float(info.get("lease_until") or 0)
+    except (TypeError, ValueError):
+        until = 0.0
+    if now < until:
+        return False, "lease_valid"
+    if not _proc_alive(info.get("pid")):
+        return True, "process_gone"
+    cur = _proc_start_time(info.get("pid"))
+    if cur is None:
+        return False, "identity_unreadable"
+    if info.get("process_start_time") not in (None, cur):
+        return True, "pid_reused"
+    return False, "alive"
+
+
+def lease_acquire(path, task_id, run_id=None, lease_sec=LEASE_SEC):
+    """领租约。成功返回 run_id；已有有效租约返回 None（调用方 exit 1，不得起第二个实例）。"""
+    run_id = run_id or uuid.uuid4().hex[:12]
+    now = time.time()
+    with _file_lock(path):
+        ok, _why = _lease_reclaimable(_load_json(path, {}))
+        if not ok:
+            return None
+        _atomic_write(path, json.dumps({
+            "task_id": task_id,
+            "run_id": run_id,
+            "pid": os.getpid(),
+            "process_start_time": _proc_start_time(os.getpid()),
+            "started_at": now,
+            "heartbeat_at": now,
+            "lease_until": now + lease_sec,
+        }, ensure_ascii=False, indent=2))
+    return run_id
+
+
+def lease_heartbeat(path, run_id, lease_sec=LEASE_SEC):
+    """续期（B15：每 15s 一次）。返回 False 说明租约已不属于自己。"""
+    with _file_lock(path):
+        info = _load_json(path, {})
+        if info.get("run_id") != run_id:
+            return False
+        now = time.time()
+        info["heartbeat_at"] = now
+        info["lease_until"] = now + lease_sec
+        _atomic_write(path, json.dumps(info, ensure_ascii=False, indent=2))
+    return True
+
+
+def lease_release(path, run_id):
+    """主动释放：只有持有者能释放。"""
+    with _file_lock(path):
+        info = _load_json(path, {})
+        if info.get("run_id") != run_id:
+            return False
+        try:
+            os.remove(path)
+        except OSError:
+            _atomic_write(path, "{}")
+    return True
+
+
+def lease_reclaim(path, expect_run_id=None):
+    """按 B15 口径回收。返回 (是否回收, reason)。"""
+    with _file_lock(path):
+        info = _load_json(path, {})
+        ok, why = _lease_reclaimable(info, expect_run_id=expect_run_id)
+        if ok:
+            try:
+                os.remove(path)
+            except OSError:
+                _atomic_write(path, "{}")
+        return ok, why
+
+
+def _call_body(body, cancel):
+    """按签名决定传不传 cancel（零参 body 照旧可用）。"""
+    try:
+        params = [p for p in inspect.signature(body).parameters.values()
+                  if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                  and p.default is p.empty]
+        if len(params) >= 1:
+            return body(cancel)
+    except (TypeError, ValueError):
+        pass
+    return body()
+
+
+def lease_run(path, task_id, body, run_id=None, lease_sec=LEASE_SEC,
+              heartbeat_sec=HEARTBEAT_SEC, max_sec=RUN_MAX_SEC, grace_sec=5):
+    """领租约 → 后台按 heartbeat_sec 续期 → 执行 body → 释放。
+
+    返回 (value, status)，status ∈ DONE / TIMEOUT / TIMEOUT_ORPHAN / LEASE_BUSY。
+
+    超时语义（B15）：
+      - 先把 cancel 置位，给执行体 grace_sec 收尾；执行体确实停了才释放租约，记 TIMEOUT。
+      - 执行体不响应取消（仍在跑）→ 记 TIMEOUT_ORPHAN 并**保留租约**：
+        这时释放租约等于允许第二个实例起来，正好造成双跑——比留下僵尸实例危险得多。
+    body 可选地接受一个参数（threading.Event），在中途检查它并尽快返回。
+    """
+    rid = lease_acquire(path, task_id, run_id=run_id, lease_sec=lease_sec)
+    if not rid:
+        return None, "LEASE_BUSY"
+    stop = threading.Event()
+
+    def _beat():
+        while not stop.wait(heartbeat_sec):
+            try:
+                lease_heartbeat(path, rid, lease_sec)
+            except Exception:
+                pass
+
+    th = threading.Thread(target=_beat, daemon=True)
+    th.start()
+    box = {}
+    cancel = threading.Event()
+
+    def _wrap():
+        try:
+            box["value"] = _call_body(body, cancel)
+        except BaseException as e:      # noqa: BLE001 - 原样回抛给调用方
+            box["error"] = e
+
+    runner = threading.Thread(target=_wrap, daemon=True)
+    runner.start()
+    runner.join(max_sec)
+    timed_out = runner.is_alive()
+    if timed_out:
+        cancel.set()
+        runner.join(grace_sec)
+    stop.set()
+    if runner.is_alive():
+        return None, "TIMEOUT_ORPHAN"   # 租约故意不释放
+    try:
+        lease_release(path, rid)        # 执行体已停：释放租约
+    except Exception:
+        pass
+    if timed_out:
+        return None, "TIMEOUT"
+    if "error" in box:
+        raise box["error"]
+    return box.get("value"), "DONE"
+
+
+def acquire_slot(task_id, run_id=None, cap=SLOT_CAP, base=None, lease_sec=LEASE_SEC):
+    """B8：原子领取全局并发槽位。
+
+    读当前 RUNNING 数 + 占槽在同一次跨进程加锁内完成，所以两个任务不可能
+    同时读到 2 再一起启动。返回 (slot_path, run_id)；满员返回 (None, run_id)，
+    调用方必须记 QUEUED，不得当已执行。
+    """
+    d = _slots_dir(base)
+    os.makedirs(d, exist_ok=True)
+    run_id = run_id or uuid.uuid4().hex[:12]
+    with _file_lock(os.path.join(d, ".slots")):
+        # 先回收死槽（进程没了 / PID 复用），再占位
+        for fn in sorted(os.listdir(d)):
+            if not fn.endswith(".slot"):
+                continue
+            sp = os.path.join(d, fn)
+            ok, _why = _lease_reclaimable(_load_json(sp, {}))
+            if ok:
+                try:
+                    os.remove(sp)
+                except OSError:
+                    pass
+        for i in range(1, int(cap) + 1):
+            sp = os.path.join(d, "slot-%d.slot" % i)
+            try:
+                fd = os.open(sp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                continue
+            now = time.time()
+            try:
+                os.write(fd, json.dumps({
+                    "task_id": task_id,
+                    "run_id": run_id,
+                    "pid": os.getpid(),
+                    "process_start_time": _proc_start_time(os.getpid()),
+                    "started_at": now,
+                    "heartbeat_at": now,
+                    "lease_until": now + lease_sec,
+                }, ensure_ascii=False, indent=2).encode("utf-8"))
+            finally:
+                os.close(fd)
+            return sp, run_id
+    return None, run_id
+
+
+def release_slot(slot_path, run_id=None):
+    """释放槽位（只有持有者能释放）。"""
+    if not slot_path or not os.path.exists(slot_path):
+        return False
+    if run_id is not None:
+        info = _load_json(slot_path, {})
+        if info.get("run_id") not in (None, run_id):
+            return False
+    try:
+        os.remove(slot_path)
+        return True
+    except OSError:
+        return False
 
 
 def _update_json(path, mutate, default):

@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import socket
+import subprocess
 import struct
 import sys
 import tempfile
@@ -1049,6 +1050,173 @@ class TestProxy(TmpBase):
         finally:
             m.check_egress, m.probe_site, m.resolve_proxy_info = real_eg, real_site, real_res
             sys.argv = real_argv
+
+
+class TestSlotsAndLease(TmpBase):
+    """B8 原子领槽 + B15 租约回收的回归（审查要求的实现证据）。"""
+
+    def _now(self):
+        return time.time()
+
+    def test_lease_valid_blocks_reclaim(self):
+        ok, why = m._lease_reclaimable({
+            "run_id": "r1", "lease_until": self._now() + 60,
+            "pid": os.getpid(), "process_start_time": m._proc_start_time(os.getpid())})
+        self.assertFalse(ok)
+        self.assertEqual(why, "lease_valid")
+
+    def test_lease_expired_process_gone(self):
+        ok, why = m._lease_reclaimable({
+            "run_id": "r1", "lease_until": self._now() - 1,
+            "pid": 999999, "process_start_time": 1})
+        self.assertTrue(ok)
+        self.assertEqual(why, "process_gone")
+
+    def test_lease_pid_reused(self):
+        real_start = m._proc_start_time(os.getpid())
+        ok, why = m._lease_reclaimable({
+            "run_id": "r1", "lease_until": self._now() - 1,
+            "pid": os.getpid(), "process_start_time": (real_start or 0) + 999})
+        self.assertTrue(ok)
+        self.assertEqual(why, "pid_reused")
+
+    def test_lease_identity_unreadable_keeps(self):
+        alive, start = m._proc_alive, m._proc_start_time
+        try:
+            m._proc_alive = lambda pid: True
+            m._proc_start_time = lambda pid: None
+            ok, why = m._lease_reclaimable({
+                "run_id": "r1", "lease_until": self._now() - 1,
+                "pid": 4242, "process_start_time": 7})
+        finally:
+            m._proc_alive, m._proc_start_time = alive, start
+        self.assertFalse(ok)
+        self.assertEqual(why, "identity_unreadable")
+
+    def test_lease_run_id_mismatch_refused(self):
+        ok, why = m._lease_reclaimable({
+            "run_id": "r1", "lease_until": self._now() - 1, "pid": 999999},
+            expect_run_id="r2")
+        self.assertFalse(ok)
+        self.assertEqual(why, "run_id_mismatch")
+
+    def test_lease_lifecycle(self):
+        p = os.path.join(self.tmp, "lease.json")
+        rid = m.lease_acquire(p, "task-A", run_id="run-A", lease_sec=1)
+        self.assertEqual(rid, "run-A")
+        self.assertIsNone(m.lease_acquire(p, "task-A"), "有效租约在，不得二次领取")
+        self.assertFalse(m.lease_heartbeat(p, "run-B"), "只有持有者能续期")
+        self.assertTrue(m.lease_heartbeat(p, "run-A"))
+        self.assertFalse(m.lease_release(p, "run-B"), "只有持有者能释放")
+        self.assertTrue(m.lease_release(p, "run-A"))
+        self.assertEqual(m.lease_acquire(p, "task-A", run_id="run-A2"), "run-A2")
+
+    def test_lease_reclaim_removes_file(self):
+        p = os.path.join(self.tmp, "lease2.json")
+        m._atomic_write(p, json.dumps({"run_id": "x", "lease_until": 1, "pid": 999999}))
+        ok, why = m.lease_reclaim(p)
+        self.assertTrue(ok)
+        self.assertEqual(why, "process_gone")
+        self.assertFalse(os.path.exists(p))
+
+    # ---- B15：心跳 / 续期 / 超时回收（时间参数按比例缩小，可重复）----
+    def test_lease_run_done(self):
+        p = os.path.join(self.tmp, "run1.json")
+        val, st = m.lease_run(p, "t", lambda: 42, lease_sec=0.5, heartbeat_sec=0.1, max_sec=5)
+        self.assertEqual((val, st), (42, "DONE"))
+        self.assertFalse(os.path.exists(p), "结束后必须释放租约")
+
+    def test_heartbeat_keeps_lease_alive(self):
+        """运行时长超过租约时，心跳必须续期（否则会被判过期而重复启动）。"""
+        p = os.path.join(self.tmp, "run2.json")
+        seen = {}
+
+        def body():
+            time.sleep(1.2)                     # 远超 lease_sec=0.4
+            info = json.load(open(p, encoding="utf-8"))
+            seen["alive"], seen["why"] = m._lease_reclaimable(info)
+            return "ok"
+
+        val, st = m.lease_run(p, "t", body, lease_sec=0.4, heartbeat_sec=0.1, max_sec=10)
+        self.assertEqual(st, "DONE")
+        self.assertFalse(seen.get("alive"), "心跳续期后租约不应可回收：%r" % (seen,))
+
+    def test_lease_run_timeout_cancels_body(self):
+        """超时后执行体必须真的停了：收到 cancel 就返回，且不再产生副作用。"""
+        p = os.path.join(self.tmp, "run3.json")
+        hits = {"stopped": False, "side_effects": 0}
+
+        def body(cancel):
+            while True:
+                if cancel.is_set():
+                    hits["stopped"] = True
+                    return "stopped"
+                hits["side_effects"] += 1     # 模拟副作用
+                time.sleep(0.02)
+
+        val, st = m.lease_run(p, "t", body, lease_sec=5, heartbeat_sec=1,
+                              max_sec=0.2, grace_sec=2)
+        self.assertEqual((val, st), (None, "TIMEOUT"))
+        self.assertTrue(hits["stopped"], "超时后必须通知执行体停止")
+        self.assertFalse(os.path.exists(p), "执行体已停 → 释放租约")
+        n = hits["side_effects"]
+        time.sleep(0.2)
+        self.assertEqual(hits["side_effects"], n, "返回后不得再有副作用")
+
+    def test_lease_run_timeout_orphan_keeps_lease(self):
+        """执行体不响应取消：保留租约，绝不放开第二个实例（双跑比僵尸更危险）。"""
+        p = os.path.join(self.tmp, "run3b.json")
+        val, st = m.lease_run(p, "t", lambda: time.sleep(1.5), lease_sec=30,
+                              heartbeat_sec=1, max_sec=0.2, grace_sec=0.1)
+        self.assertEqual((val, st), (None, "TIMEOUT_ORPHAN"))
+        self.assertTrue(os.path.exists(p), "执行体仍在跑时必须保留租约")
+        other, ost = m.lease_run(p, "t", lambda: 1, lease_sec=30)
+        self.assertEqual((other, ost), (None, "LEASE_BUSY"))
+
+    def test_lease_run_busy(self):
+        p = os.path.join(self.tmp, "run4.json")
+        rid = m.lease_acquire(p, "t", run_id="other", lease_sec=60)
+        self.assertEqual(rid, "other")
+        val, st = m.lease_run(p, "t", lambda: 1, lease_sec=60)
+        self.assertEqual((val, st), (None, "LEASE_BUSY"))
+
+    def test_run_max_defaults(self):
+        """超时上限与心跳间隔是常量，不是散落的魔法数。"""
+        self.assertEqual(m.HEARTBEAT_SEC, 15)
+        self.assertEqual(m.RUN_MAX_SEC, 3600)
+        self.assertEqual(m.LEASE_SEC, 60)
+        self.assertEqual(m.SLOT_CAP, 3)
+
+    def test_slot_cap_sequential(self):
+        base = os.path.join(self.tmp, "slots")
+        got = [m.acquire_slot("t%d" % i, base=base) for i in range(4)]
+        self.assertTrue(all(g[0] for g in got[:3]))
+        self.assertIsNone(got[3][0], "第 4 个必须满员")
+        self.assertEqual(len(set(g[0] for g in got[:3])), 3, "槽位必须互异")
+        for sp, rid in got[:3]:
+            self.assertTrue(m.release_slot(sp, rid))
+
+    def test_slot_cap_under_process_race(self):
+        """6 个进程同时抢，有效槽位任何时刻都不得超过 3（B8 的核心断言）。"""
+        base = os.path.join(self.tmp, "slots-race")
+        script = (
+            "import sys, time\n"
+            "sys.path.insert(0, %r)\n"
+            "import chatgpt_send as C\n"
+            "time.sleep(float(sys.argv[1]))\n"
+            "sp, rid = C.acquire_slot('race', base=sys.argv[2], lease_sec=300)\n"
+            "print(sp or 'FULL')\n"
+        ) % (os.path.dirname(os.path.abspath(m.__file__)),)
+        procs = [subprocess.Popen([sys.executable, "-c", script, "0.15", base],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                 for _ in range(6)]
+        outs = []
+        for p in procs:
+            out, err = p.communicate(timeout=120)
+            outs.append((out or "").strip())
+        got = [o for o in outs if o and o != "FULL"]
+        self.assertLessEqual(len(got), 3, "超发槽位：%r" % (outs,))
+        self.assertEqual(len(set(got)), len(got), "同一槽位被两个进程同时持有")
 
 
 if __name__ == "__main__":

@@ -227,7 +227,7 @@ python scripts/chatgpt_send.py --tail <conv_id>
 python -m unittest discover -s tests -v
 ```
 
-61 条，覆盖 id 校验与路径穿越、状态文件损坏隔离、原子写与 tmp 清理、锁重入/stale 回收/并发 80 次不丢更新、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性、设备身份留存与多设备回退（含凭据剔除、429 停手、归属自愈），以及用离线桩跑通的投递主流程（含 413、空提示词、非法 id、发送异常时的孤儿会话登记）；出口代理（优先级、fail-closed、http/socks 真分流、死节点探测、出口判定）。**改锁、改落盘、改 id、改设备身份、改代理前先跑一遍。**
+96 条，覆盖 id 校验与路径穿越、状态文件损坏隔离、原子写与 tmp 清理、锁重入/stale 回收/并发 80 次不丢更新、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性、设备身份留存与多设备回退（含凭据剔除、429 停手、归属自愈），以及用离线桩跑通的投递主流程（含 413、空提示词、非法 id、发送异常时的孤儿会话登记）；出口代理（优先级、fail-closed、http/socks 真分流、死节点探测、出口判定、目标站探活、WebRTC 泄漏分类）、锁持有者身份校验、B8 六进程并发抢槽、B15 租约心跳与超时释放。**改锁、改落盘、改 id、改设备身份、改代理前先跑一遍。**
 
 ## 统一出口代理（强制）
 
@@ -296,7 +296,7 @@ python scripts/chatgpt_send.py --proxy-clear                # 清掉 proxy.json 
 
 ### scripts/
 
-- `chatgpt_send.py` — 统一发送/收割器（P0）。`<conv_id> <prompt_file>` 投递既有会话；`--new <prompt_file>` 开 Owner 新会话（登录态均分，匿名兜底）；`--tail <conv_id>` 只收割；`--list/--list-all` 会话清单；`--rotation*` 轮转管理；`--owner <conv_id>` 查归属；`--anon-list/--anon-read/--anon-send/--anon-devices/--anon-relink/--anon-restore` 匿名会话对照表、按 id 续聊、设备身份留存与修复；`--proxy-show/--proxy-set/--proxy-check/--proxy-url` 统一出口的查看、写入、校验与给 shell 用的纯值输出。内含 `AnonBrowser`（匿名浏览器通道：同标签页多轮 + CDP 抓 jar + API 收割）。
+- `chatgpt_send.py` — 统一发送/收割器（P0）。`<conv_id> <prompt_file>` 投递既有会话；`--new <prompt_file>` 开 Owner 新会话（登录态均分，匿名兜底）；`--tail <conv_id>` 只收割；`--list/--list-all` 会话清单；`--rotation*` 轮转管理；`--owner <conv_id>` 查归属；`--anon-list/--anon-read/--anon-send/--anon-devices/--anon-relink/--anon-restore` 匿名会话对照表、按 id 续聊、设备身份留存与修复；`--proxy-show/--proxy-set/--proxy-check/--proxy-url` 统一出口的查看、写入、校验与给 shell 用的纯值输出。内含 `AnonBrowser`（匿名浏览器通道：同标签页多轮 + CDP 抓 jar + API 收割）、`probe_site`（A26 目标站探活）、`webrtc_probe`（A23 WebRTC 出口）、`acquire_slot/release_slot`（B8 原子领槽）、`lease_acquire/heartbeat/release/reclaim`（B15 实例租约）。
 - `continue_full.py` — 413 满员续接器（P1，依赖 browser-automation-cdp 的 cdp.py）。
 - `pow_solver.py` — PoW 解算器（FNV-1a + gAAAAAB 前缀，毫秒级），被 chatgpt_send.py 引用。
 - `extract_auth.py` — 从 Edge CDP 提取 cookies/accessToken。
@@ -320,7 +320,7 @@ python scripts/chatgpt_send.py --proxy-clear                # 清掉 proxy.json 
 
 ### tests/
 
-- `test_hardening.py` — 离线回归（61 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW、设备身份留存与多设备回退、出口代理（含本地假 http/socks 代理真分流）。
+- `test_hardening.py` — 离线回归（96 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW、设备身份留存与多设备回退、出口代理（含本地假 http/socks 代理真分流）。
 
 ## 协议细节
 

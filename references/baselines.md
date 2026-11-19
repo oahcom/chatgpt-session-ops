@@ -1,8 +1,8 @@
-# 基线与纪律（可判定版 v1.1）
+# 基线与纪律（可判定版 v1.7）
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.1（2026-11-19）。v1.0 经 ChatGPT 思考模式对外对抗审查，裁定 `NEEDS-REVISION`（A 类 11 PASS / 12 WEAK / 2 MISSING，B 类 0 PASS / 10 WEAK / 4 MISSING）。v1.1 已按审查逐条改写判定口径，**未采纳项与理由见 §F**，不静默丢弃。
+**版本**：v1.7（2026-11-19）。v1.0 起经 ChatGPT 思考模式**八轮对外对抗审查**逐条改写（每轮裁定见 §F，最终裁定 `PASS`），**未采纳项与理由见 §F**，不静默丢弃。所有判定口径都有对应代码与离线回归支撑（当前 96 条）。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -34,7 +34,7 @@
 | 2 | 这个会话归谁 | `--owner <conv_id>` | 输出唯一账号 |
 | 3 | 配额有没有冷却 | `--rotation` | `unavailable` 为空或目标账号不在其中 |
 | 4 | 匿名要用先看设备 | `--anon-devices` | 目标设备 `jar=true` |
-| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 64 条） |
+| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 96 条） |
 
 ### A1–A4 内容主权（不可协商）
 
@@ -91,7 +91,7 @@
 
 | 编号 | 基线 | 判定口径 | 违例后果 |
 |---|---|---|---|
-| **A23** | 一切出网继承统一出口（含 WebRTC） | API、CDP 浏览器、匿名浏览器、自启动浏览器、git push 全部读**同一份** `proxy.json`，禁止任一子进程回退系统直连；浏览器启动必带 `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`；`--proxy-check --browser` 同时记录 API 出口、浏览器 HTTP 出口、`webrtc.status`；任一项不通过或**未验证** → `exit 3` 且 `full_chain_verified=false`；DNS：`socks5h` 远端解析（本地不解析），`http` 代理的 DNS 路径记为 `UNVERIFIED`，不得写成已验 | 「API 走隧道、浏览器裸连」= 身份与出口不一致；WebRTC UDP 是最隐蔽的泄漏面 |
+| **A23** | 一切出网继承统一出口（含 WebRTC） | API、CDP 浏览器、匿名浏览器、自启动浏览器、git push 全部读**同一份** `proxy.json`，禁止任一子进程回退系统直连；浏览器启动必带 `--webrtc-ip-handling-policy=disable_non_proxied_udp`（**只有这个开关名有效**；旧名 `--force-webrtc-ip-handling-policy` 可作冗余附带，但**不得作为依赖**——实测被 Edge 157 忽略）；`--proxy-check --browser` 同时记录 API 出口、浏览器 HTTP 出口、`webrtc.status`；任一项不通过或**未验证** → `exit 3` 且 `full_chain_verified=false`；DNS：`socks5h` 远端解析（本地不解析），`http` 代理的 DNS 路径记为 `UNVERIFIED`，不得写成已验 | 「API 走隧道、浏览器裸连」= 身份与出口不一致；WebRTC UDP 是最隐蔽的泄漏面 |
 **A23 WebRTC 判定（实测 2026-11-19）**：浏览器里一条 `new RTCPeerConnection({iceServers:[stun:…]})` 就能从 UDP 把公网 IP 漏出去，`--proxy-server` 拦不住。**正确开关是 `--webrtc-ip-handling-policy=disable_non_proxied_udp`**；带 `force-` 前缀的旧名字（`--force-webrtc-ip-handling-policy`）被 Edge 157 忽略，实测仍漏出 `59.34.82.8` 与本机 IPv6。`webrtc_probe()` 在一次性标签页跑真实 ICE，`_classify_webrtc()` 出结论：
 
 | status | 含义 | 处置 |
@@ -156,7 +156,7 @@
 | **B1** | 周期任务固定 1 小时 | `rrule` 必须 `FREQ=HOURLY;INTERVAL=1`；禁止 `DAILY/WEEKLY/MONTHLY`；**禁止用 `INTERVAL<1` 表示高频**；同一 automation 实际触发间隔 ≥60 分钟；时区统一 `Asia/Shanghai`，缺失即禁止启用 | 天维度过久 / 语义漂移 |
 | **B2** | 到期项走每小时条件巡检 | 状态文件持久化三态 `PENDING/RUNNING/DONE`：未到点→`exit 0` 静默；到点且 `PENDING`→**原子领取**后才可执行；`RUNNING` 且租约有效→退出；`DONE`→`exit 0`；`FAILED`→按 B13；**先持久化 `DONE` 再结束**；状态文件读写失败→`exit 1` 禁止处置 | 重复处置、漏处置 |
 | **B3** | 长周期用 `validFrom/validUntil` 收窗 | 带时区 ISO 8601，窗口**左闭右开** `[from, until)`；窗口外 `exit 0` 不做业务；`until` 到点标 `EXPIRED`，不得再执行（除非新实例） | 窗外执行或永久残留 |
-| **B4** | 一次性看门狗寿命 ≤1h | `scheduledAt` 带时区；创建时 `0 < scheduledAt - now ≤ 3600s`；已过去的不得建成 ACTIVE；更远的需求改 B2；单次运行上限 3600s，超时记 `TIMEOUT` 并释放租约 | 远期单点触发 / 长期占并发槽 |
+| **B4** | 一次性看门狗寿命 ≤1h | `scheduledAt` 带时区；创建时 `0 < scheduledAt - now ≤ 3600s`；已过去的不得建成 ACTIVE；更远的需求改 B2；单次运行上限 3600s，超时先取消执行体、**确认执行体已停**才记 `TIMEOUT` 并释放租约（执行体不响应取消 → `TIMEOUT_ORPHAN` 保留租约，见 B15，不得在此处擅自释放） | 远期单点触发 / 长期占并发槽 |
 | **B5** | 过期 one-shot 一律 PAUSED | 判定 = `scheduledAt < now AND status == ACTIVE`；每小时巡检盘点全量 one-shot；置 `PAUSED` 后**重新读取确认**；失败写 `watchdog.log`（id/原状态/目标状态/错误码）；**禁止凭接口返回成功就认定已归档**；存在运行实例时先按 B9 | 过期任务重放 / 占资源 |
 
 ### B6–B9 执行可靠性
@@ -174,12 +174,26 @@
 
 | 编号 | 基线 | 判定口径 | 违例后果 |
 |---|---|---|---|
-| **B10** | 命名即契约 | 只读名称必须匹配 `^.+ .+（只读）$`（全角括号）；写入名称必须匹配 `^.+ .+ .+$`（三段）；名称解析出的类型必须与 argv 权限分类一致；无法解析或不一致 → `exit 2` 禁止启用 | 权限无法从名称交叉验证 |
+| **B10** | 命名即契约（含权限映射表） | 名称 strip 后按空白（含全角空格）**分词**：只读 = **恰好 2 段**且第 2 段以全角「（只读）」结尾；写入 = **恰好 3 段**；动作词取第 2 段（只读，**先去掉末尾全角「（只读）」再整段比对**）/ 第 3 段（写入），必须与词表中的词**整段精确相等**（不做包含/前缀匹配，`查看并删除` 不算只读）；**段数不符、动作词未分类、名称类型与 argv 权限分类不一致 → `exit 2`** 禁止启用（正则只作人眼提示，不作判定依据） | 权限无法从名称交叉验证 |
 | **B11** | 只读看门狗走 argv 白名单 | 白名单（完整 argv）：`--list`、`--tail <id>`、`--owner <id>`、`--anon-list`、`--anon-devices`、`--proxy-show`、`--rotation`、`--list-all`；禁止 `--new / --anon-send / --proxy-set` 及任何发送/修改/删除；**禁止 shell 字符串拼接绕过**；执行前解析完整 argv；**禁止前缀/正则包含匹配**（`startswith("--rotation")` 会把写操作 `--rotation-reset/-enable/-disable` 一起放行，`--anon` 会吞掉 `--anon-send`）；不匹配 `exit 2`；记录实际命令与退出码 | 白名单与巡检骨架冲突（v1.0 内部矛盾，已修） |
 | **B12** | 无事静默 | 正常巡检 stdout ≤1 行、stderr 为空；无待处置 `exit 0`；有待处置且成功 `exit 0`；业务失败 `exit 1`；参数/配置错 `exit 2`；出口不满足 `exit 3`；**异常不得被吞成 0**；诊断只写 `watchdog.log` | 异常被静默吞掉 / 持续刷屏 |
 | **B13** | 重试有固定上限 | 同 `task_id+step_id` 每自然小时最多 1 次处置；`attempt_count` 持久化跨实例共享；默认 `N=3`；每次失败记时间/退出码/摘要/副作用状态；达 3 次 → `MANUAL_REVIEW`，**禁止自动重投**；恢复需新授权记录（task/step/时间/批准人）；429 仍按 A17，不因小时重置提前重试 | 无限重投烧配额，或失败后永久停滞 |
 | **B14** | 与 A 类的联动红线 | 巡检不得并发跑多个 `--tail/--list`（A15）；无 `--owner` 结论不得 `--new`；429 只记不重投（A17）；留存型工作不得用匿名（A5/A9）；任何 automation 出网必须继承同一出口（A23） | 巡检自己把自己限速 |
-| **B15** | 运行实例必须有租约与超时回收 | 每次运行生成唯一 `run_id`；同 `task_id` 同时只允许一个有效 RUNNING；实例记 `run_id/task_id/PID/started_at/heartbeat_at/lease_until`；**每 15s 心跳**，默认租约 60s；回收必须同时校验 `PID + process_start_time + run_id`（PID 会被复用，单看 PID 存在性不够）；只有「租约过期 **且** 原实例身份确认不存在」才可回收；**身份无法确认 → 保留租约并 `exit 1`**，禁止启动第二个；单次上限 3600s，超时记 `TIMEOUT` 并释放租约；重启必须读 B7 状态，不得从第一步重做；租约冲突 `exit 1` 禁止副作用 | 僵尸实例占槽位 / 并发重复处置 |
+| **B15** | 运行实例必须有租约与超时回收 | 每次运行生成唯一 `run_id`；同 `task_id` 同时只允许一个有效 RUNNING；实例记 `run_id/task_id/PID/started_at/heartbeat_at/lease_until`；**每 15s 心跳**，默认租约 60s；回收必须同时校验 `PID + process_start_time + run_id`（PID 会被复用，单看 PID 存在性不够）；只有「租约过期 **且** 原实例身份确认不存在」才可回收；**身份无法确认 → 保留租约并 `exit 1`**，禁止启动第二个；单次上限 3600s；超时先取消执行体并给宽限，**执行体确认已停**才记 `TIMEOUT` 并释放租约，执行体不响应取消 → 记 `TIMEOUT_ORPHAN` 并**保留租约**（两档语义与实现段一致）；重启必须读 B7 状态，不得从第一步重做；租约冲突 `exit 1` 禁止副作用 | 僵尸实例占槽位 / 并发重复处置 |
+
+**B10 权限映射表（可机器解析，不是措辞约定）**：
+
+| 分词后段数 | 末段 | 动作词（唯一判定依据） | argv 权限分类 | 判定 |
+|---|---|---|---|---|
+| 2 | 以「（只读）」结尾 | 查看 / 列出 / 收割 / 校验 / 盘点 / 巡检 / 比对 / 读取 | 必须 ∈ B11 只读白名单 | 通过 |
+| 3 | 无后缀 | 投递 / 新建 / 写入 / 切换 / 重置 / 删除 / 归档 / 修复 / 设置 / 处置 / 执行 / 补采 | 可出现写命令 | 通过 |
+| 其他（1 段 / ≥4 段 / 2 段无后缀 / 3 段带后缀 / 动作词未分类） | — | — | — | `exit 2` |
+
+解析顺序：`strip()` → 按空白分词 → 段数分支 → 去后缀 → **动作词整段相等比对** → argv 权限交叉验证。矛盾一律 `exit 2`：①「（只读）」+ 写词表动词；② 无后缀 + 读词表动词；③ 只读名称的 argv 里出现白名单外命令（B11）；④ 段数不是 2 或 3。**对象信息不得含空格**（复合就写在一段里或用连字符），因为段数是判定依据。合规样例：`协调器 收敛 处置`（写入，3 段）、`到期项 处置 执行`（写入，3 段）、`配额 盘点（只读）`（只读，2 段）；反例：`每小时收敛巡检（协调器值班）`——按空白只有 1 段，必须 `exit 2`。
+
+**不要用 `^.+ .+ .+$` 这类贪婪正则代替分词**——它连四段、五段一起放行，正是本轮审查抓到的口径漏洞。
+
+**B8/B15 实现**：`acquire_slot()` / `release_slot()` 在同一把跨进程锁内完成「回收死槽 + 计数 + 占位」，返回 `(slot_path, run_id)`，满员返回 `(None, run_id)` 由调用方记 `QUEUED`；`lease_acquire/heartbeat/release/reclaim` + `_lease_reclaimable()` 覆盖 `lease_valid / process_gone / pid_reused / identity_unreadable / run_id_mismatch / alive` 六种回收判定。回归含 6 进程同时抢槽（断言有效槽位 ≤3 且互不重叠）与租约六态。超时分两档（B15 硬要求）：执行体响应 cancel 且确实停下 → `TIMEOUT` 并释放租约；**执行体不响应取消、仍在跑 → `TIMEOUT_ORPHAN` 且保留租约**（此时释放租约等于放第二个实例进来，双跑比僵尸更危险）。心跳与超时由 `lease_run()` 落地：`HEARTBEAT_SEC=15`、`LEASE_SEC=60`、`RUN_MAX_SEC=3600` 三个常量可注入，回归用**按比例缩小的秒数**（如 lease 0.4s / heartbeat 0.1s / max 0.2s）验证同一套逻辑——证明「运行超过租约时心跳确实续期、不会被判过期」以及「超 `RUN_MAX_SEC` 时，执行体已停 → `TIMEOUT` + 释放租约，执行体不停 → `TIMEOUT_ORPHAN` + 保留租约」，不需要真等 15 分钟和 1 小时。
 
 > **B14/B15 编号说明**：v1.0 的 B14 是联动红线（无独立判定口径），审查据此判「B14 缺失」。v1.1 保留 B14 为红线表，把审查提出的「运行实例租约」独立为 **B15**——两类约束不同（红线是跨类禁令，B15 是调度器级生命周期），不合并。
 
@@ -190,7 +204,7 @@
 ### C1 每小时收敛巡检（协调器值班）
 
 ```text
-rrule: FREQ=HOURLY;INTERVAL=1        名称: 每小时收敛巡检（协调器值班）
+rrule: FREQ=HOURLY;INTERVAL=1        名称: 协调器 收敛 处置
 prompt 骨架：
 1) 只读盘点：--rotation、--list-all（单进程串行）、目标仓库 open PR/Issue
 2) 若存在待处置项且本轮未处置过 → 原子领取后执行一次（每小时上限 1 次，B13）
@@ -199,7 +213,7 @@ prompt 骨架：
 5) 无待处置项 → 不输出，exit 0（B12）
 ```
 
-### C2 回复落盘看门狗（只读，寿命 ≤1h）
+### C2 回复落盘看门狗（寿命 ≤1h，名称：`协调器 回复 补采`）
 
 ```bash
 python scripts/chatgpt_send.py --owner <conv_id>   # 先确认身份（A7）
@@ -209,7 +223,7 @@ python scripts/chatgpt_send.py --tail <conv_id>    # 无内容 → exit 1，属�
 
 判定：`0` 且有文件 → 已落盘，静默；`1` → 回复未完成，**不重投**，等下个巡检点；`2`/`3` → 参数或出口问题，立即报。
 
-### C3 到期处置（远期事项，避免天维度）
+### C3 到期处置（远期事项，避免天维度；名称：`到期项 处置 执行`）
 
 ```text
 rrule: FREQ=HOURLY;INTERVAL=1
@@ -218,7 +232,7 @@ prompt：窗口外 → exit 0 静默（B3）；状态 DONE → exit 0；PENDING 
         先落副作用证据再写 DONE（B2/B7）。
 ```
 
-### C4 配额哨兵（429 零漏出）
+### C4 配额哨兵（429 零漏出；只读，名称：`配额 盘点（只读）`）
 
 ```text
 rrule: FREQ=HOURLY;INTERVAL=1
@@ -262,7 +276,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | 流解析 | 同上 + 构造 `IncompleteRead` 用例 | A28 |
 | 排程口径 | `automation_update list` 全量盘点 | B1–B5 |
 
-**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。当前 64 条。
+**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。当前 96 条。
 
 ---
 
@@ -279,8 +293,23 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | 时区统一 `Asia/Tokyo` | **改为 `Asia/Shanghai`** | 本机与用户都在 UTC+8；照抄会把所有排程错开 1 小时 |
 | A16 统一「7 分钟超时」 | **改为分档**：非思考 7min / 思考 30min | 实测思考模式单条 19 分钟仍在正常流式输出，7 分钟会误杀（A27/A16） |
 | A1 要求 SHA-256 覆盖换行符不转换 | 采纳，但注明「上游回复原文件」是唯一基准 | 若无原文件则无从校验，先落原文再提取 |
-| A23 要求校验 WebRTC 出口 | **降级为提示** | Chrome 侧无法在不改启动参数下可靠取证；硬门禁会误报 exit 3 |
+| A23 要求校验 WebRTC 出口 | **v1.1 曾降级为提示，第二轮审查驳回 → v1.2 改回硬门禁并落地探针** | 驳回成立：实测浏览器 HTTP 走代理而 WebRTC UDP 漏出真 IP `59.34.82.8`；「取证难」不是「风险不存在」。现由 `webrtc_probe()` 判定，漏即 `exit 3` |
 | B14 判为「原文缺失」 | **保留 B14 并新增 B15** | v1.0 有 B14（联动红线表），只是缺判定口径；两类约束不合并 |
 | B11 白名单增 `--rotation/--list-all` | **采纳** | 两者均为只读，是 v1.0 文档内部矛盾（配方要求用、白名单没列） |
+
+**审查轮次记录（同一会话 `6afe91c4`，全程思考模式）**：
+
+| 轮 | 受审版本 | 裁定 | 结论要点 |
+|---|---|---|---|
+| 1 | v1.0 | `NEEDS-REVISION`（A 11 PASS / 12 WEAK / 2 MISSING；B 0 / 10 / 4） | B 类缺可执行判定；A 类多处「WARN 当阻断」 |
+| 2 | v1.1 | `NEEDS-REVISION`（8 个开放项） | A22 进程身份、A23 WebRTC、B6 路径类型、B10 命名正则、A27 硬失败、A26/A18 403 分域、B8 原子领槽、B15 实例身份 |
+| 3 | v1.2 | `NEEDS-REVISION`（4 项 PARTIAL） | 抓到真矛盾：A23 正文仍把已证无效的 `--force-…` 当必需参数；B10 缺语义映射；B8/B15 缺实现与竞争回归证据 |
+| 4 | v1.3 | `NEEDS-REVISION`（2 项 PARTIAL + 2 处文档矛盾） | B10 贪婪正则放行四段以上；B15 缺心跳/超时验证；测试数 64 vs 90 不一致 |
+| 5 | v1.4 | `NEEDS-REVISION`（2 项 PARTIAL + 版本标记冲突） | 动作词未要求整段相等；超时测试未证明执行体已停；开头 v1.1 / 结尾 v1.4 混用 |
+| 6 | v1.6 | `NEEDS-REVISION`（3 项） | 配方里的 automation 名称本身违反 B10；B4「超时释放租约」与 B15 orphan 保留冲突；轮次表不全 |
+| 7 | v1.7 | `NEEDS-REVISION`（2 项纯一致性） | B15 主条款仍写「超时释放租约」，与实现段 orphan 保留冲突；标题 v1.6 / 结尾 v1.7 |
+| 8 | v1.7 | **`PASS`** | B15 两档语义一致、版本号统一，无新矛盾 |
+
+**多轮对抗审查下来最值钱的一条**：审查对 A23 的「取证难 ≠ 风险不存在」的驳回，直接换来一次真实泄漏的发现——只带 `--proxy-server` 时浏览器 HTTP 出口是 `152.175.33.8`，WebRTC 候选却是本机 `59.34.82.8` + IPv6。**防御性强的审查不是障碍，是外部审计。**
 
 **审查提出的三条易忽略语义（已并入正文）**：①「WARN 不等于阻断」→ A7/A11 改为 WARN + 非 0 退出；②「文件存在 ≠ 业务完成」→ B2/B7 要求副作用与标记绑定；③「PAUSED ≠ 已停止」→ B5/B9 区分调度状态与 run 实例状态。
