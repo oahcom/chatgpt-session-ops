@@ -12,6 +12,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -142,6 +143,35 @@ class TestStateFiles(TmpBase):
         with self.assertRaises(Exception):
             m._atomic_write(target, "x")
         self.assertFalse(os.path.exists(target + ".tmp"))
+
+    def test_atomic_write_uses_unique_tmp_names(self):
+        # 事故：固定 `.tmp` 时同进程两个线程写同一个临时文件，Windows 上 os.replace
+        # 抛 WinError 32，线程被打死、锁留在原地 → 4 线程 ×20 次只落 60 条。
+        # 真实用法是「先取 A22 锁再写」，所以这里也按锁串行，只校验 tmp 名唯一。
+        path = os.path.join(self.tmp, "uniq.json")
+        seen = []
+        real = os.replace
+
+        def spy(src, dst):
+            seen.append(src)
+            return real(src, dst)
+
+        def w(i):
+            with m._file_lock(path):
+                m._atomic_write(path, json.dumps({"i": i}))
+
+        os.replace = spy
+        try:
+            ts = [threading.Thread(target=w, args=(i,)) for i in range(4)]
+            [t.start() for t in ts]
+            [t.join() for t in ts]
+        finally:
+            os.replace = real
+        self.assertEqual(len(seen), 4)
+        self.assertEqual(len(set(seen)), len(seen), "临时文件名重复：%r" % (seen,))
+        for s in seen:
+            self.assertIn(".tmp-%d-" % os.getpid(), s)
+        self.assertEqual([f for f in os.listdir(self.tmp) if ".tmp" in f], [], "留下临时文件")
 
     def test_lock_is_reentrant(self):
         p = os.path.join(self.tmp, "x.json")
@@ -1058,6 +1088,71 @@ class TestSlotsAndLease(TmpBase):
     def _now(self):
         return time.time()
 
+    def _hold_lock(self, path):
+        """造一把「活人持有」的锁：当前 pid 存活、created_at 新鲜，因此不可回收。"""
+        lock = path + ".lock"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(lock, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"pid": os.getpid(),
+                                "process_start_time": m._proc_start_time(os.getpid()),
+                                "created_at": time.time(), "thread": 0}))
+        return lock
+
+    def test_strict_lock_raises_instead_of_skipping(self):
+        # 事故：超时后打印 WARN 并「跳过加锁继续跑」，导致 6 进程抢槽全部拿到槽位。
+        target = os.path.join(self.tmp, "slots", ".slots")
+        self._hold_lock(target)
+        with self.assertRaises(m.LockTimeout):
+            with m._file_lock(target, timeout=0.3, strict=True):
+                self.fail("严格模式下不该进入临界区")
+
+    def test_acquire_slot_fails_closed_on_lock_timeout(self):
+        self._hold_lock(os.path.join(self.tmp, "slots", ".slots"))
+        slot, _rid = m.acquire_slot("race", base=self.tmp, lock_timeout=0.3)
+        self.assertIsNone(slot)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "slots", "slot-1.slot")),
+                         "抢不到锁却占了槽位")
+
+    def test_fresh_empty_slot_file_is_not_reclaimed(self):
+        # 别人刚 os.open 还没写完时读到空 json，旧逻辑会把它当死槽删掉 → 同一槽位发两张票
+        d = os.path.join(self.tmp, "slots")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "slot-1.slot"), "w", encoding="utf-8"):
+            pass
+        slot, _rid = m.acquire_slot("race", base=self.tmp)
+        self.assertTrue(slot and slot.endswith("slot-2.slot"), slot)
+        self.assertTrue(os.path.exists(os.path.join(d, "slot-1.slot")), "活槽被误删")
+
+    def test_partial_slot_json_is_not_quarantined(self):
+        # 事故根因：读的人用 _load_json，把「别人正在写」的半截 json 当损坏隔离改名，
+        # 文件名一空出来，第二个进程就能占同一个槽位 → 同一槽位发两张票。
+        d = os.path.join(self.tmp, "slots")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "slot-1.slot"), "w", encoding="utf-8") as f:
+            f.write('{"task_id": "race", "run_id"')      # 半截
+        slot, _rid = m.acquire_slot("race", base=self.tmp)
+        self.assertTrue(slot and slot.endswith("slot-2.slot"), slot)
+        self.assertTrue(os.path.exists(os.path.join(d, "slot-1.slot")), "半截槽位被改名/删掉")
+        self.assertEqual([f for f in os.listdir(d) if ".corrupt-" in f], [])
+
+    def test_lease_reclaim_refuses_unreadable_identity(self):
+        path = os.path.join(self.tmp, "lease-unreadable.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("not json at all")
+        ok, why = m.lease_reclaim(path)
+        self.assertFalse(ok)
+        self.assertEqual(why, "identity_unreadable")
+        self.assertTrue(os.path.exists(path), "身份读不懂却把租约删了")
+
+    def test_lease_acquire_refuses_unreadable_lease(self):
+        path = os.path.join(self.tmp, "lease-busy.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("")
+        self.assertIsNotNone(m.lease_acquire(path, "t1"))   # 空文件=无租约，可领
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{broken")
+        self.assertIsNone(m.lease_acquire(path, "t2"))      # 读不懂=当有人在跑
+
     def test_lease_valid_blocks_reclaim(self):
         ok, why = m._lease_reclaimable({
             "run_id": "r1", "lease_until": self._now() + 60,
@@ -1217,6 +1312,298 @@ class TestSlotsAndLease(TmpBase):
         got = [o for o in outs if o and o != "FULL"]
         self.assertLessEqual(len(got), 3, "超发槽位：%r" % (outs,))
         self.assertEqual(len(set(got)), len(got), "同一槽位被两个进程同时持有")
+
+
+class TestCustody(TmpBase):
+    """A1/A2/A4：交付正文的字节级托管。
+
+    事故背景：正文长期靠「人眼看、手复制」，于是出现两种静默改写——用「最长代码块」
+    误取别的段落；以及提取时顺手 strip/Unicode 规范化，把 CRLF 与全角空格改掉。
+    两者都不会报错，只会让投递出去的正文与 ChatGPT 自产的正文不是同一份字节。
+    """
+
+    def _src(self, body, name="src.md"):
+        path = os.path.join(self.tmp, name)
+        with open(path, "wb") as f:
+            f.write(body)
+        return path
+
+    def test_between_extracts_exact_bytes_and_offsets(self):
+        body = (b"preamble\r\n<<<BEGIN>>>\r\nline1 \r\nline2\t\r\n<<<END>>>\r\ntrailer\r\n")
+        src = self._src(body)
+        out = os.path.join(self.tmp, "body.md")
+        res = m.extract_deliverable(src, begin="<<<BEGIN>>>", end="<<<END>>>", out=out)
+        got = open(out, "rb").read()
+        # CRLF、行尾空格、制表符都必须原样保留（A1：不得转换换行、不得规范化）
+        self.assertEqual(got, b"line1 \r\nline2\t\r\n")
+        self.assertEqual(res["bytes"], len(got))
+        self.assertEqual(res["sha256"], m._sha256_bytes(got))
+        self.assertEqual(body[res["offset_start"]:res["offset_end"]], got)
+
+    def test_only_blank_lines_are_trimmed(self):
+        src = self._src(b"<b>\n\n  \n" + "正文  ".encode() + b"\n\n</e>\n")
+        out = os.path.join(self.tmp, "o.md")
+        m.extract_deliverable(src, begin="<b>", end="</e>", out=out)
+        # 首尾空行可裁，但「正文  」的尾随空格属于正文字节，不得裁
+        self.assertEqual(open(out, "rb").read(), ("正文  " + "\n").encode())
+
+    def test_duplicate_marker_rejected(self):
+        src = self._src(b"<b>\na\n</e>\n<b>\nb\n</e>\n")
+        with self.assertRaises(m.CustodyError):
+            m.extract_deliverable(src, begin="<b>", end="</e>",
+                                  out=os.path.join(self.tmp, "x.md"))
+
+    def test_reversed_marker_rejected(self):
+        src = self._src(b"</e>\na\n<b>\n")
+        with self.assertRaises(m.CustodyError):
+            m.extract_deliverable(src, begin="<b>", end="</e>",
+                                  out=os.path.join(self.tmp, "x.md"))
+
+    def test_fence_picks_nth_not_longest(self):
+        # 最长块是第 1 个（干扰项），必须取第 2 个（A2：不按「最长」定位）
+        src = self._src(b"```\n" + b"x" * 400 + b"\n```\n```\nreal\n```\n")
+        out = os.path.join(self.tmp, "o.md")
+        res = m.extract_deliverable(src, fence=2, out=out)
+        self.assertEqual(open(out, "rb").read(), b"real\n")
+        self.assertEqual(res["locator"], "fence:2")
+
+    def test_fence_out_of_range_rejected(self):
+        src = self._src(b"```\nonly\n```\n")
+        with self.assertRaises(m.CustodyError):
+            m.extract_deliverable(src, fence=2, out=os.path.join(self.tmp, "x.md"))
+
+    def test_empty_block_rejected(self):
+        src = self._src(b"<b>\n\n   \n</e>\n")
+        with self.assertRaises(m.CustodyError):
+            m.extract_deliverable(src, begin="<b>", end="</e>",
+                                  out=os.path.join(self.tmp, "x.md"))
+
+    def test_locator_is_mandatory(self):
+        src = self._src(b"<b>\na\n</e>\n")
+        with self.assertRaises(m.CustodyError):
+            m.extract_deliverable(src, out=os.path.join(self.tmp, "x.md"))
+
+    def test_verify_copy_detects_single_byte_change(self):
+        a = self._src(b"same\n", "a.md")
+        b = self._src(b"same\n", "b.md")
+        self.assertTrue(m.verify_copy(a, b)["equal"])
+        with open(b, "wb") as f:
+            f.write(b"Same\n")           # 只差一个大小写，也算不一致
+        res = m.verify_copy(a, b)
+        self.assertFalse(res["equal"])
+        self.assertNotEqual(res["src_sha256"], res["dst_sha256"])
+
+    def _cli(self, *argv):
+        p = subprocess.run([sys.executable, SCRIPT] + list(argv),
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+        return p.returncode, (p.stdout or "")
+
+    def test_cli_exit_codes(self):
+        good = self._src(b"<b>\nreal\n</e>\n", "good.md")
+        dup = self._src(b"<b>\na\n</e>\n<b>\nb\n</e>\n", "dup.md")
+        out = os.path.join(self.tmp, "cli-body.md")
+        code, so = self._cli("--extract", good, "--between", "<b>", "</e>", "--out", out)
+        self.assertEqual(code, 0, so)
+        self.assertIn("\"result\": \"ok\"", so)
+        self.assertEqual(open(out, "rb").read(), b"real\n")
+        code, _ = self._cli("--extract", dup, "--between", "<b>", "</e>", "--out", out)
+        self.assertEqual(code, 2)         # 标记不唯一：禁止投递
+        code, _ = self._cli("--verify-copy", good, dup)
+        self.assertEqual(code, 2)         # 不一致：禁止回灌
+
+
+class TestScheduleContract(unittest.TestCase):
+    """B1/B10/B11：命名即契约、1 小时维度。
+
+    事故背景：审查两次抓到这里——先是用 `^.+ .+ .+$` 放行四段名，
+    后用 `startswith("--rotation")` 把 `--rotation-reset` 放进只读白名单。
+    两个漏洞的共同点是「人眼正则代替分词与整段比对」。
+    """
+
+    def test_readonly_name_ok(self):
+        res = m.check_automation_name("配额 盘点（只读）")
+        self.assertEqual(res["kind"], "readonly")
+        self.assertEqual(res["verb"], "盘点")
+
+    def test_write_name_ok(self):
+        for name, verb in (("到期项 处置 执行", "执行"), ("协调器 收敛 处置", "处置")):
+            with self.subTest(name=name):
+                res = m.check_automation_name(name)
+                self.assertEqual(res["kind"], "write")
+                self.assertEqual(res["verb"], verb)
+
+    def test_fullwidth_space_counts_as_separator(self):
+        # 一个全角空格 = 2 段（只读合法）；两个全角空格 = 3 段，会被判成写入并因动词不认识而拒绝
+        res = m.check_automation_name("配额\u3000盘点（只读）")
+        self.assertEqual(res["segments"], ["配额", "盘点（只读）"])
+        with self.assertRaises(m.ScheduleError):
+            m.check_automation_name("配额\u3000盘点\u3000（只读）")
+
+    def test_single_segment_rejected(self):
+        with self.assertRaises(m.ScheduleError):
+            m.check_automation_name("每小时收敛巡检（协调器值班）")
+
+    def test_four_segments_rejected(self):
+        # 贪婪正则 `^.+ .+ .+$` 会放行这个
+        with self.assertRaises(m.ScheduleError):
+            m.check_automation_name("协调器 收敛 巡检 执行")
+
+    def test_two_segments_without_suffix_rejected(self):
+        with self.assertRaises(m.ScheduleError):
+            m.check_automation_name("配额 盘点")
+
+    def test_readonly_suffix_with_write_verb_rejected(self):
+        with self.assertRaises(m.ScheduleError):
+            m.check_automation_name("会话 删除（只读）")
+
+    def test_write_name_with_readonly_verb_rejected(self):
+        # 写入名的动作词取第 3 段；把读词表动词放在第 3 段，就是「无后缀 + 读动词」的矛盾
+        with self.assertRaises(m.ScheduleError):
+            m.check_automation_name("会话 执行 盘点")
+
+    def test_verb_must_match_whole_segment(self):
+        # `查看并删除` 不是只读词表里的词，包含匹配会误放行
+        with self.assertRaises(m.ScheduleError):
+            m.check_automation_name("会话 查看并删除（只读）")
+
+    def test_readonly_argv_whitelist_is_exact(self):
+        ok = m.check_automation_name("配额 盘点（只读）", ["--rotation", "--list-all"])
+        self.assertEqual(ok["argv"], ["--rotation", "--list-all"])
+        for bad in ("--rotation-reset", "--anon-send", "--new", "--proxy-set"):
+            with self.subTest(cmd=bad):
+                with self.assertRaises(m.ScheduleError):
+                    m.check_automation_name("配额 盘点（只读）", ["--rotation", bad])
+
+    def test_write_name_may_use_write_argv(self):
+        res = m.check_automation_name("到期项 处置 执行", ["--new", "p.md"])
+        self.assertEqual(res["kind"], "write")
+
+    def test_hourly_rrule_ok(self):
+        self.assertEqual(m.check_schedule("FREQ=HOURLY;INTERVAL=1")["interval"], 1)
+        self.assertEqual(m.check_schedule("FREQ=HOURLY")["interval"], 1)
+
+    def test_non_hourly_rrule_rejected(self):
+        for bad in ("FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+                    "FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=0",
+                    "FREQ=MONTHLY;BYMONTHDAY=1;BYHOUR=9;BYMINUTE=0",
+                    "FREQ=MINUTELY;INTERVAL=5"):
+            with self.subTest(rrule=bad):
+                with self.assertRaises(m.ScheduleError):
+                    m.check_schedule(bad)
+
+    def test_interval_not_one_rejected(self):
+        for bad in ("FREQ=HOURLY;INTERVAL=0", "FREQ=HOURLY;INTERVAL=2", "FREQ=HOURLY;INTERVAL=x"):
+            with self.subTest(rrule=bad):
+                with self.assertRaises(m.ScheduleError):
+                    m.check_schedule(bad)
+
+    def test_oneshot_within_hour_ok(self):
+        from datetime import datetime, timedelta
+        at = (datetime.now().astimezone() + timedelta(minutes=30)).isoformat()
+        self.assertTrue(m.check_oneshot(at)["lifetime_ok"])
+        # Z 后缀等价于 +00:00，也要能过
+        utc = (datetime.now().astimezone() + timedelta(minutes=30)).astimezone(
+            __import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.assertTrue(m.check_oneshot(utc)["lifetime_ok"])
+
+    def test_oneshot_in_the_past_rejected(self):
+        from datetime import datetime, timedelta
+        at = (datetime.now().astimezone() - timedelta(minutes=1)).isoformat()
+        with self.assertRaises(m.ScheduleError):
+            m.check_oneshot(at)
+
+    def test_oneshot_without_timezone_rejected(self):
+        with self.assertRaises(m.ScheduleError):
+            m.check_oneshot("2026-11-19T16:00:00")
+
+    def test_oneshot_beyond_one_hour_rejected(self):
+        from datetime import datetime, timedelta
+        at = (datetime.now().astimezone() + timedelta(hours=3)).isoformat()
+        with self.assertRaises(m.ScheduleError):
+            m.check_oneshot(at)
+
+    def test_cli_check_name_and_schedule(self):
+        p = subprocess.run([sys.executable, SCRIPT, "--check-name", "配额 盘点（只读）",
+                            "--argv", "--rotation"], stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, text=True, timeout=120)
+        self.assertEqual(p.returncode, 0, p.stdout)
+        p = subprocess.run([sys.executable, SCRIPT, "--check-name", "配额 删除（只读）"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+        self.assertEqual(p.returncode, 2)
+        p = subprocess.run([sys.executable, SCRIPT, "--check-schedule", "FREQ=DAILY;BYHOUR=9"],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=120)
+        self.assertEqual(p.returncode, 2)
+
+
+class TestEvidenceMatrix(unittest.TestCase):
+    """反夸大校验：`baselines.md` 的每条判定口径都必须在矩阵里有且只有一行，
+    且引用的用例名/符号必须真实存在。
+
+    这一条测试是给「文档说可判定、代码里没有」这类漂移上闸：只要有人新增条款
+    不补证据、或删了用例却留着引用，测试立刻红。
+    """
+
+    ROOT = os.path.dirname(HERE)
+
+    def _read(self, *parts):
+        with open(os.path.join(self.ROOT, *parts), encoding="utf-8") as f:
+            return f.read()
+
+    def _clauses(self):
+        text = self._read("references", "baselines.md")
+        ids = re.findall(r"^\|\s*\*\*([A-E]\d{1,2})\*\*\s*\|", text, re.M)
+        ids += re.findall(r"^###\s+([A-E]\d{1,2})\s", text, re.M)
+        return ids
+
+    def _rows(self):
+        rows = {}
+        for line in self._read("references", "evidence-matrix.md").splitlines():
+            m = re.match(r"^\|\s*([A-E]\d{1,2})\s*\|(.*)$", line)
+            if m:
+                rows.setdefault(m.group(1), []).append(m.group(2))
+        return rows
+
+    def test_every_clause_has_exactly_one_row(self):
+        clauses, rows = self._clauses(), self._rows()
+        self.assertTrue(clauses, "没解析到任何条款，解析规则失效")
+        missing = sorted(set(clauses) - set(rows))
+        extra = sorted(set(rows) - set(clauses))
+        dup = sorted(c for c, v in rows.items() if len(v) > 1)
+        self.assertEqual(missing, [], "这些条款在证据矩阵里没有对应行")
+        self.assertEqual(extra, [], "证据矩阵里有 baselines.md 不存在的条款")
+        self.assertEqual(dup, [], "同一术语出现多行（重复计数）")
+
+    def test_citations_resolve(self):
+        tests_src = open(os.path.join(HERE, "test_hardening.py"), encoding="utf-8").read()
+        test_names = set(re.findall(r"def (test_\w+)\s*\(", tests_src))
+        scripts = ""
+        for fn in os.listdir(os.path.join(self.ROOT, "scripts")):
+            if fn.endswith(".py"):
+                scripts += open(os.path.join(self.ROOT, "scripts", fn), encoding="utf-8").read()
+        symbols = set(re.findall(r"^\s*(?:def|class)\s+([A-Za-z_]\w*)", scripts, re.M))
+        symbols |= set(re.findall(r"^([A-Z][A-Z0-9_]*)\s*=", scripts, re.M))
+        for clause, cells in self._rows().items():
+            for tok in re.findall(r"(test|code|live|human):([^\s|`]+)", " ".join(cells)):
+                kind, value = tok
+                with self.subTest(clause=clause, kind=kind, value=value):
+                    if kind == "test":
+                        self.assertIn(value, test_names, "%s 引用了不存在的用例 %s" % (clause, value))
+                    elif kind == "code":
+                        self.assertIn(value.split(".")[-1], symbols,
+                                      "%s 引用了不存在的符号 %s" % (clause, value))
+                    elif kind == "live":
+                        self.assertRegex(value, r"^\d{4}-\d{2}-\d{2}$")
+                        self.assertLessEqual(value, time.strftime("%Y-%m-%d"),
+                                             "%s 的实测日期在未来" % clause)
+                    else:
+                        self.assertTrue(value.strip(), "%s 的人判理由为空" % clause)
+
+    def test_no_row_is_evidence_free(self):
+        for clause, cells in self._rows().items():
+            joined = " ".join(cells)
+            with self.subTest(clause=clause):
+                self.assertRegex(joined, r"(test|code|live|human):",
+                                 "%s 没有任何证据标注" % clause)
 
 
 if __name__ == "__main__":

@@ -189,7 +189,7 @@ python scripts/chatgpt_send.py --tail <conv_id>
 5. **匿名纪律**：匿名只做限速兜底与一次性短任务；**需要留存、归档、跨机续接的会话必须用 acct1/acct2**。匿名会话丢设备 cookie 即永久失联，且从不进历史。
 6. **落盘约定**：`prompts/`（编号前缀 NN-topic.md）、`replies/`（reply-<conv_id8>-<topic>.md 全文不截断）、`conv-api/`（GET 缓存）、`newchat-map.json`、`sessions-registry.json`、`send-queue-log.md`。
 7. **禁止**：自撰/改写自产提示词；**自行做逻辑规划/实现方案/补全设计**（一切逻辑规划实现必须由 ChatGPT 主导，方案不完整回问 ChatGPT 补全）；POST 不带 conversation_id 发进既有任务会话；并发抢 GET 配额；未查 open PR 就开同主题实现；删除任何会话产物。
-8. **定时任务粒度（用户明示强制 2026-11-19）**：**所有定时任务一律按 1 小时维度排程，禁止天维度（天维度过久）**。落地口径：循环任务用每小时（间隔 ≤1h）；到期处置/远期复核不得挂天级 one-shot，改为**每小时条件巡检**（提示词内置"未到点→静默退出；已到点且未处置→执行；已处置→静默退出"门控）；一次性看门狗/闹钟 ≤1h。违规排程（DAILY、数日后 one-shot）一律改小时维度。**本条为管理基线**（管理所有 AI 代理的 WorkBuddy automation 排程）：创建/修改任何 automation 前先读本条；过期 one-shot 一律 PAUSED 归档，不得留 ACTIVE 尸体；跨天/跨周的到期项用每小时条件巡检 + validFrom/validUntil 收窗，避免无效空转。完整条款见 `references/baselines.md` 的 **B1–B14**（含并发上限 3、`unknown_interrupted` 幂等续跑、只读看门狗零写副作用、无事静默）。
+8. **定时任务粒度（用户明示强制 2026-11-19）**：**所有定时任务一律按 1 小时维度排程，禁止天维度（天维度过久）**。落地口径：循环任务用每小时（间隔 ≤1h）；到期处置/远期复核不得挂天级 one-shot，改为**每小时条件巡检**（提示词内置"未到点→静默退出；已到点且未处置→执行；已处置→静默退出"门控）；一次性看门狗/闹钟 ≤1h。违规排程（DAILY、数日后 one-shot）一律改小时维度。**本条为管理基线**（管理所有 AI 代理的 WorkBuddy automation 排程）：创建/修改任何 automation 前先读本条；过期 one-shot 一律 PAUSED 归档，不得留 ACTIVE 尸体；跨天/跨周的到期项用每小时条件巡检 + validFrom/validUntil 收窗，避免无效空转。完整条款见 `references/baselines.md` 的 **B1–B15**（含并发上限 3、`unknown_interrupted` 幂等续跑、只读看门狗零写副作用、无事静默）。
 
 ## 健壮性加固（2026-11-19 第三轮）
 
@@ -227,7 +227,23 @@ python scripts/chatgpt_send.py --tail <conv_id>
 python -m unittest discover -s tests -v
 ```
 
-96 条，覆盖 id 校验与路径穿越、状态文件损坏隔离、原子写与 tmp 清理、锁重入/stale 回收/并发 80 次不丢更新、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性、设备身份留存与多设备回退（含凭据剔除、429 停手、归属自愈），以及用离线桩跑通的投递主流程（含 413、空提示词、非法 id、发送异常时的孤儿会话登记）；出口代理（优先级、fail-closed、http/socks 真分流、死节点探测、出口判定、目标站探活、WebRTC 泄漏分类）、锁持有者身份校验、B8 六进程并发抢槽、B15 租约心跳与超时释放。**改锁、改落盘、改 id、改设备身份、改代理前先跑一遍。**
+135 条，覆盖 id 校验与路径穿越、状态文件损坏隔离、原子写（tmp 名唯一，防同进程多线程互踩）与并发 80 次不丢更新、锁重入/stale 回收/持有者身份、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性、设备身份留存与多设备回退（含凭据剔除、429 停手、归属自愈），以及用离线桩跑通的投递主流程（含 413、空提示词、非法 id、发送异常时的孤儿会话登记）；出口代理（优先级、fail-closed、http/socks 真分流、死节点探测、出口判定、目标站探活、WebRTC 泄漏分类）；B8 六进程并发抢槽（抢不到锁即 QUEUED、半截槽位不回收）、B15 租约心跳与超时两档；交付正文托管（`--extract` 字节级、CRLF 不改、标记不唯一退 2、`--verify-copy` 单字节差异即拒）；调度口径（`--check-name` 12 条命名契约、`--check-schedule` 1 小时维度、`--check-oneshot` 一次性窗口）；证据矩阵自校验（条款与证据一一对应，引用不存在的用例即红）。**改锁、改落盘、改 id、改设备身份、改代理、改基线条款前先跑一遍。**
+
+### 交付正文与排程口径的机器闸口（v1.8）
+
+```bash
+# 交付正文：按显式定位器取唯一块，字节级落盘；标记不唯一/顺序反/块为空 → exit 2
+python scripts/chatgpt_send.py --extract <src.md> --between "<<<BEGIN>>>" "<<<END>>>" --out body.md
+python scripts/chatgpt_send.py --extract <src.md> --fence 2      # 第 2 个围栏块（不按「最长」取）
+python scripts/chatgpt_send.py --verify-copy body.md backfill.md  # 回灌前比对，不一致 exit 2
+
+# 排程口径：建 automation 之前先过一遍，别用正则自己判
+python scripts/chatgpt_send.py --check-name "配额 盘点（只读）" --argv "--rotation"
+python scripts/chatgpt_send.py --check-schedule "FREQ=HOURLY;INTERVAL=1"
+python scripts/chatgpt_send.py --check-oneshot 2026-11-19T16:00:00+08:00
+```
+
+三个 `--check-*` 都是纯本地、不触网：命名按空白（含全角空格）分词判段数、动作词整段比对、只读名 argv 必须在白名单内；排程只认 `FREQ=HOURLY;INTERVAL=1`；一次性窗口必须带时区且落在未来 1 小时内。**任何一条不成立都 `exit 2`，不允许「先建了再说」。**
 
 ## 统一出口代理（强制）
 
@@ -296,7 +312,7 @@ python scripts/chatgpt_send.py --proxy-clear                # 清掉 proxy.json 
 
 ### scripts/
 
-- `chatgpt_send.py` — 统一发送/收割器（P0）。`<conv_id> <prompt_file>` 投递既有会话；`--new <prompt_file>` 开 Owner 新会话（登录态均分，匿名兜底）；`--tail <conv_id>` 只收割；`--list/--list-all` 会话清单；`--rotation*` 轮转管理；`--owner <conv_id>` 查归属；`--anon-list/--anon-read/--anon-send/--anon-devices/--anon-relink/--anon-restore` 匿名会话对照表、按 id 续聊、设备身份留存与修复；`--proxy-show/--proxy-set/--proxy-check/--proxy-url` 统一出口的查看、写入、校验与给 shell 用的纯值输出。内含 `AnonBrowser`（匿名浏览器通道：同标签页多轮 + CDP 抓 jar + API 收割）、`probe_site`（A26 目标站探活）、`webrtc_probe`（A23 WebRTC 出口）、`acquire_slot/release_slot`（B8 原子领槽）、`lease_acquire/heartbeat/release/reclaim`（B15 实例租约）。
+- `chatgpt_send.py` — 统一发送/收割器（P0）。`--extract/--verify-copy` 交付正文字节级托管（A1/A2/A4）；`--check-name/--check-schedule/--check-oneshot` 命名与排程口径（B1/B4/B10/B11）；`<conv_id> <prompt_file>` 投递既有会话；`--new <prompt_file>` 开 Owner 新会话（登录态均分，匿名兜底）；`--tail <conv_id>` 只收割；`--list/--list-all` 会话清单；`--rotation*` 轮转管理；`--owner <conv_id>` 查归属；`--anon-list/--anon-read/--anon-send/--anon-devices/--anon-relink/--anon-restore` 匿名会话对照表、按 id 续聊、设备身份留存与修复；`--proxy-show/--proxy-set/--proxy-check/--proxy-url` 统一出口的查看、写入、校验与给 shell 用的纯值输出。内含 `AnonBrowser`（匿名浏览器通道：同标签页多轮 + CDP 抓 jar + API 收割）、`probe_site`（A26 目标站探活）、`webrtc_probe`（A23 WebRTC 出口）、`acquire_slot/release_slot`（B8 原子领槽）、`lease_acquire/heartbeat/release/reclaim`（B15 实例租约）。
 - `continue_full.py` — 413 满员续接器（P1，依赖 browser-automation-cdp 的 cdp.py）。
 - `pow_solver.py` — PoW 解算器（FNV-1a + gAAAAAB 前缀，毫秒级），被 chatgpt_send.py 引用。
 - `extract_auth.py` — 从 Edge CDP 提取 cookies/accessToken。
@@ -315,12 +331,13 @@ python scripts/chatgpt_send.py --proxy-clear                # 清掉 proxy.json 
 
 ### references/
 
-- `baselines.md` — **A/B 类基线（可判定版）**：每条带判定口径与违例后果，附 C 类现成配方（每小时巡检、落盘看门狗、到期处置、配额哨兵）、D 类事故→条款映射、E 类变更纪律。**开工前扫 A0/B0 清单，排程前读 B1–B14，改代码前读对应条款。**
+- `baselines.md` — **A/B 类基线（可判定版 v1.8，49 条）**：每条带判定口径与违例后果，附 C 类现成配方（每小时巡检、落盘看门狗、到期处置、配额哨兵）、D 类事故→条款映射、E 类变更纪律、G 类证据矩阵说明。**开工前扫 A0/B0 清单，排程前读 B1–B15，改代码前读对应条款。**
+- `evidence-matrix.md` — **逐条对账「这条基线由什么证明」**：`test:` 用例名 / `code:` 符号 / `live:` 实测日期 / `human:` 人判理由，四类分开标注；32 条有离线用例、4 条只有代码、13 条纯人判，缺口按危害排序列在文末。改基线必须同步这张表——`TestEvidenceMatrix` 会校验引用是否真实存在。
 - `api-protocol.md` — 实测协议细节：端点、PoW 算法、POST 请求体全字段、SSE 解析、mapping tail 计算、状态码处置、限速纪律。改脚本前先读。
 
 ### tests/
 
-- `test_hardening.py` — 离线回归（96 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW、设备身份留存与多设备回退、出口代理（含本地假 http/socks 代理真分流）。
+- `test_hardening.py` — 离线回归（135 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW、设备身份留存与多设备回退、出口代理（含本地假 http/socks 代理真分流）。
 
 ## 协议细节
 

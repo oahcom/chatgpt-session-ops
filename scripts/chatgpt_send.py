@@ -22,6 +22,26 @@
     python chatgpt_send.py --proxy-show                # 当前出口代理来自哪里
     python chatgpt_send.py --proxy-set <url>           # 写入 proxy.json（http/https/socks5/socks5h）
     python chatgpt_send.py --proxy-check [--browser]   # 量出口 IP：API 侧 + 浏览器侧是否一致
+    python chatgpt_send.py --extract <src> --between <起> <止> [--out <p>]  # 取唯一交付块（字节级）
+    python chatgpt_send.py --extract <src> --fence <n> [--out <p>]         # 取第 n 个围栏块
+    python chatgpt_send.py --verify-copy <a> <b>       # 回灌前比对两份文件是否字节一致
+    python chatgpt_send.py --check-name "<名称>" [--argv "<命令串>"]  # B10/B11 命名与权限
+    python chatgpt_send.py --check-schedule "FREQ=HOURLY;INTERVAL=1"  # B1 排程口径
+    python chatgpt_send.py --check-oneshot 2026-11-19T16:00:00+08:00  # B4/B5 一次性窗口
+
+交付正文托管（A1/A2/A4 的机器判定，纯本地不触网）：
+    定位器必须显式给：--between 两行标记（strip 后整行相等，各恰好 1 处）或 --fence 第 n 块。
+    脚本不猜「最长块」、不做 Unicode 规范化、不转 CRLF；只允许裁掉首尾空行。
+    输出 JSON 带 src_sha256 / sha256 / offset_start / offset_end，正文另存为独立文件。
+    标记不唯一、顺序反、块为空、文件缺失 → exit 2，禁止投递。
+    回灌前跑 --verify-copy：两份不一致 → exit 2（A4），禁止用摘要替代原文。
+
+调度口径校验（B1/B10/B11 的机器判定，纯本地）：
+    --check-name 把名称按空白分词（全角空格等价）：只读恰好 2 段且以「（只读）」结尾，
+    写入恰好 3 段；动作词必须与词表整段相等（不做包含/前缀匹配）；只读名称的 argv
+    必须全部落在白名单内。任一条不成立 → exit 2。
+    --check-schedule 只接受 FREQ=HOURLY 且 INTERVAL=1；天维度、INTERVAL≠1 一律 exit 2。
+    这两个开关就是 automation 创建/巡检前的闸口，别再用正则自己判。
 
 出口代理（统一）：
     API、匿名浏览器、自启动浏览器共用同一个出口，解析顺序
@@ -89,6 +109,7 @@ import ipaddress
 import json
 import os
 import re
+import shlex
 import socket
 import ssl
 import struct
@@ -179,11 +200,16 @@ def _harden_perms(path):
 
 
 def _atomic_write(path, text):
-    """tmp → fsync → replace。状态 json 与匿名归档都只有这一份副本，写半截就全丢。"""
+    """tmp → fsync → replace。状态 json 与匿名归档都只有这一份副本，写半截就全丢。
+
+    tmp 名必须**唯一**（pid + 线程）：固定 `.tmp` 时，同进程两个线程会写同一个临时文件，
+    Windows 上 os.replace 直接 WinError 32（另一个程序正在使用此文件），线程被打死、
+    锁留在原地，后面的人等 8s 超时后「跳过加锁」继续写——实测 4 线程 ×20 次只落 60 条。
+    """
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    tmp = path + ".tmp"
+    tmp = "%s.tmp-%d-%d" % (path, os.getpid(), threading.get_ident())
     try:
         with open(tmp, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
@@ -197,6 +223,280 @@ def _atomic_write(path, text):
             pass
         raise
     _harden_perms(path)
+
+
+def _atomic_write_bytes(path, data):
+    """二进制原子写。用于交付正文字节级落盘——不能经过文本层，否则 CRLF 会被改写。"""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = "%s.tmp-%d-%d" % (path, os.getpid(), threading.get_ident())
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    _harden_perms(path)
+
+
+# ---------- 交付正文托管（A1/A2/A4 的机器判定） ----------
+# 这三条的旧状态是「只在文档里写口径」，等于人判。人判在无人值守链路上必然漂移：
+# 只要有人图省事用「最长代码块」或「首尾 strip 后重排」，正文就换了一个字节而没人知道。
+# 所以这里把三件事做成可执行的：按显式定位器取唯一块、字节级落盘、回灌前比对 SHA-256。
+class CustodyError(Exception):
+    """提取/校验不成立。调用方必须 exit 2，禁止把半成品当正文投递。"""
+
+
+def _sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _lines_with_offsets(raw):
+    """按 \\n 切行并保留每行起始字节偏移。只认 \\n，避免 splitlines 把 \\x0b 等也当换行。"""
+    out, pos = [], 0
+    while pos < len(raw):
+        nl = raw.find(b"\n", pos)
+        end = len(raw) if nl < 0 else nl + 1
+        out.append((pos, raw[pos:end]))
+        pos = end
+    return out
+
+
+def _trim_blank_lines(blob):
+    """只裁掉首尾「整行只有空白」的行（A1 唯一允许的改动），其余字节一个不动。
+
+    注意保留最后一行自身的换行：那是行终止符，不是多余空白。
+    """
+    rows = _lines_with_offsets(blob)
+    keep = [i for i, (_, ln) in enumerate(rows) if ln.strip()]
+    if not keep:
+        return b""
+    start = rows[keep[0]][0]
+    last_off, last_ln = rows[keep[-1]]
+    return blob[start:last_off + len(last_ln)]
+
+
+def extract_deliverable(src, begin=None, end=None, fence=None, out=None):
+    """取出唯一交付块并以字节级落盘。
+
+    定位器必须由调用方显式指定，脚本不做猜测：
+      - ``between``：两行标记（strip 后整行相等），各必须恰好出现 1 次；
+      - ``fence``：第 n 个围栏块（``` 或 ~~~，1 起）。
+    这也正是 A2 的要求——按约定定位，不按「最长」定位。
+    """
+    if not os.path.isfile(src):
+        raise CustodyError("源文件不存在：%s" % src)
+    raw = open(src, "rb").read()
+    if not raw:
+        raise CustodyError("源文件为空：%s" % src)
+    lines = _lines_with_offsets(raw)
+    locator = ""
+    if begin is not None and end is not None:
+        b, e = begin.encode("utf-8"), end.encode("utf-8")
+        bi = [i for i, (_, ln) in enumerate(lines) if ln.strip() == b]
+        ei = [i for i, (_, ln) in enumerate(lines) if ln.strip() == e]
+        if len(bi) != 1 or len(ei) != 1:
+            raise CustodyError("标记不唯一：begin=%d 处、end=%d 处（各须恰好 1 处）"
+                               % (len(bi), len(ei)))
+        if bi[0] >= ei[0]:
+            raise CustodyError("标记顺序错：begin 在第 %d 行，end 在第 %d 行" % (bi[0] + 1, ei[0] + 1))
+        start = lines[bi[0]][0] + len(lines[bi[0]][1])
+        stop = lines[ei[0]][0]
+        locator = "between:%s..%s" % (begin, end)
+    elif fence is not None:
+        try:
+            n = int(fence)
+        except (TypeError, ValueError):
+            raise CustodyError("--fence 需要正整数：%r" % (fence,))
+        if n < 1:
+            raise CustodyError("--fence 从 1 开始：%r" % (fence,))
+        spans, opened = [], None
+        for off, ln in lines:
+            s = ln.lstrip()
+            if s.startswith(b"```") or s.startswith(b"~~~"):
+                if opened is None:
+                    opened = off + len(ln)
+                else:
+                    spans.append((opened, off))
+                    opened = None
+        if len(spans) < n:
+            raise CustodyError("围栏块不足：要求第 %d 个，实际 %d 个" % (n, len(spans)))
+        start, stop = spans[n - 1]
+        locator = "fence:%d" % n
+    else:
+        raise CustodyError("必须显式指定定位器：--between <起> <止> 或 --fence <n>")
+    body = _trim_blank_lines(raw[start:stop])
+    if not body.strip():
+        raise CustodyError("交付块为空（定位器 %s 命中空块）" % locator)
+    out = out or (src + ".body")
+    _atomic_write_bytes(out, body)
+    return {"result": "ok", "locator": locator, "src": os.path.abspath(src),
+            "src_sha256": _sha256_bytes(raw), "src_bytes": len(raw),
+            "body": os.path.abspath(out), "bytes": len(body),
+            "offset_start": start, "offset_end": stop,
+            "sha256": _sha256_bytes(body)}
+
+
+def verify_copy(src, dst):
+    """回灌前比对：两份文件必须字节一致（A1/A4）。不一致即禁止回灌。"""
+    for p in (src, dst):
+        if not os.path.isfile(p):
+            raise CustodyError("文件不存在：%s" % p)
+    a, b = _sha256_file(src), _sha256_file(dst)
+    return {"result": "ok" if a == b else "mismatch", "src": os.path.abspath(src),
+            "dst": os.path.abspath(dst), "src_sha256": a, "dst_sha256": b,
+            "src_bytes": os.path.getsize(src), "dst_bytes": os.path.getsize(dst),
+            "equal": a == b}
+
+
+# ---------- 调度口径校验（B1/B10/B11 的机器判定） ----------
+# 这三条原先只有「文档口径 + 人眼正则」，而人眼正则恰好是审查反复抓到的漏洞：
+# `^.+ .+ .+$` 连四段都放行；`startswith("--rotation")` 会把 --rotation-reset 一起放行。
+# 这里把词表与段数规则写成代码，自动化在创建/巡检前跑一次即可判定。
+READONLY_SUFFIX = "（只读）"
+READONLY_VERBS = ("查看", "列出", "收割", "校验", "盘点", "巡检", "比对", "读取")
+WRITE_VERBS = ("投递", "新建", "写入", "切换", "重置", "删除", "归档", "修复",
+               "设置", "处置", "执行", "补采")
+READONLY_ARGV = ("--list", "--tail", "--owner", "--anon-list", "--anon-devices",
+                 "--proxy-show", "--rotation", "--list-all")
+
+
+class ScheduleError(Exception):
+    """命名/排程口径不成立。调用方必须 exit 2，禁止启用该 automation。"""
+
+
+def split_name(name):
+    """按空白分词，全角空格与半角一视同仁（B10 的段数判定依据）。"""
+    return [p for p in str(name or "").replace("\u3000", " ").split() if p]
+
+
+def check_automation_name(name, argv=None):
+    """B10/B11：只读恰好 2 段且带「（只读）」后缀；写入恰好 3 段；动作词整段相等。"""
+    segs = split_name(name)
+    if len(segs) == 2 and segs[1].endswith(READONLY_SUFFIX):
+        kind = "readonly"
+        verb = segs[1][:-len(READONLY_SUFFIX)]
+        if verb not in READONLY_VERBS:
+            raise ScheduleError("只读名称的动作词不在读词表：%r（允许：%s）"
+                                % (verb, "、".join(READONLY_VERBS)))
+    elif len(segs) == 3:
+        kind = "write"
+        verb = segs[2]
+        if verb not in WRITE_VERBS:
+            raise ScheduleError("写入名称的动作词不在写词表：%r（允许：%s）"
+                                % (verb, "、".join(WRITE_VERBS)))
+    elif len(segs) == 2:
+        raise ScheduleError("2 段但第 2 段缺少「%s」后缀：%r（只读要后缀，写入要 3 段）"
+                            % (READONLY_SUFFIX, segs[1]))
+    else:
+        raise ScheduleError("段数 %d 不合法：只读恰好 2 段、写入恰好 3 段（对象名里不许有空格）"
+                            % len(segs))
+    cmds = [c for c in (argv or []) if c]
+    if kind == "readonly":
+        bad = [c for c in cmds if c not in READONLY_ARGV]
+        if bad:
+            raise ScheduleError("只读名称出现白名单外命令：%s（白名单：%s）"
+                                % (", ".join(bad), " ".join(READONLY_ARGV)))
+    return {"result": "ok", "name": name, "segments": segs, "kind": kind,
+            "verb": verb, "argv": cmds}
+
+
+def check_schedule(rrule):
+    """B1：周期任务固定 1 小时。天维度、INTERVAL≠1（含用 0 表示高频）一律拒绝。"""
+    raw = str(rrule or "").strip()
+    if not raw:
+        raise ScheduleError("rrule 为空")
+    norm = raw.upper().replace(" ", "")
+    parts = {}
+    for chunk in norm.split(";"):
+        if "=" in chunk:
+            k, v = chunk.split("=", 1)
+            parts[k] = v
+    freq = parts.get("FREQ")
+    if freq != "HOURLY":
+        raise ScheduleError("FREQ 必须 HOURLY（周期固定 1 小时），收到 %r" % (freq or "缺失"))
+    iv = parts.get("INTERVAL")
+    if iv is not None:
+        try:
+            n = int(iv)
+        except ValueError:
+            raise ScheduleError("INTERVAL 不是整数：%r" % iv)
+        if n != 1:
+            raise ScheduleError("INTERVAL 必须为 1：%d 会变成 %s 小时一次，"
+                                "高频也不能用 INTERVAL<1 表示" % (n, n))
+    return {"result": "ok", "rrule": raw, "freq": "HOURLY", "interval": 1}
+
+
+def check_oneshot(scheduled_at, now=None):
+    """B4/B5：一次性任务必须带时区、必须落在未来 1 小时内。
+
+    事故：盘点出 4 个早已过点却仍 ACTIVE 的 one-shot，没人负责归档。
+    所以「建之前」就把已过去与过远的两头堵住，而不是等事后巡检。
+    """
+    raw = str(scheduled_at or "").strip()
+    if not raw:
+        raise ScheduleError("scheduledAt 为空")
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        raise ScheduleError("scheduledAt 不是 ISO 8601：%r" % raw)
+    if dt.tzinfo is None:
+        raise ScheduleError("scheduledAt 缺时区偏移（必须形如 2026-11-19T16:00:00+08:00）：%r" % raw)
+    base = now or datetime.now(dt.tzinfo)
+    delta = (dt - base).total_seconds()
+    if delta <= 0:
+        raise ScheduleError("scheduledAt 已过去（%s）：不得建成 ACTIVE，先按 B5 归档" % raw)
+    if delta > 3600:
+        raise ScheduleError("scheduledAt 距今 %.0f 分钟 > 60 分钟：改走每小时条件巡检（B2）"
+                            % (delta / 60.0))
+    return {"result": "ok", "scheduled_at": raw, "seconds_from_now": int(delta),
+            "lifetime_ok": True}
+
+
+def _size_of(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def _read_ephemeral(path):
+    """读瞬时状态文件（槽位/租约），返回 (info, readable)，**绝不改文件**。
+
+    为什么不用 `_load_json`：它会把「解析失败的非空文件」隔离改名。槽位与租约是
+    「先 O_EXCL 占名、再写内容」的，读的人完全可能读到半截 JSON；一旦被隔离，
+    文件名就空出来了，第二个进程立刻能占同一个槽位——实测表现就是同一个槽位
+    发给两个进程（并发超发）。瞬时文件的正确姿态是：读不懂就当它还在，不回收。
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return {}, False
+    if size == 0:
+        return {}, False
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}, False
+    if not isinstance(data, dict):
+        return {}, False
+    return data, True
 
 
 def _load_json(path, default):
@@ -334,8 +634,12 @@ def _lock_holder_stale(lock):
     return info.get("process_start_time") not in (None, cur)
 
 
+class LockTimeout(RuntimeError):
+    """抢锁超时。strict 模式下必须抛出，绝不「跳过加锁继续跑」。"""
+
+
 @contextlib.contextmanager
-def _file_lock(path, timeout=LOCK_TIMEOUT_SEC):
+def _file_lock(path, timeout=LOCK_TIMEOUT_SEC, strict=False):
     me = threading.get_ident()
     if _LOCK_HELD.get(path) == me:  # 同线程重入：直接放行（避免自锁）
         yield
@@ -366,10 +670,14 @@ def _file_lock(path, timeout=LOCK_TIMEOUT_SEC):
             except OSError:
                 pass
             if time.time() >= end:
+                if strict:
+                    raise LockTimeout("锁等待超时（%s）" % os.path.basename(path))
                 print("WARN: 状态文件锁等待超时，跳过加锁（%s）" % os.path.basename(path), flush=True)
                 break
             time.sleep(0.1)
         except OSError as e:
+            if strict:
+                raise LockTimeout("加锁失败（%s）：%s" % (os.path.basename(path), e))
             print("WARN: 状态文件加锁失败（%s）：%s" % (os.path.basename(path), e), flush=True)
             break
     _LOCK_HELD[path] = me
@@ -442,7 +750,12 @@ def lease_acquire(path, task_id, run_id=None, lease_sec=LEASE_SEC):
     run_id = run_id or uuid.uuid4().hex[:12]
     now = time.time()
     with _file_lock(path):
-        ok, _why = _lease_reclaimable(_load_json(path, {}))
+        info, readable = _read_ephemeral(path)
+        if not readable and _size_of(path) > 0:
+            # 读不懂的租约宁可判「有人在跑」，也不能放第二个实例进来（B15 身份不可读禁回收）
+            print("WARN: 租约文件不可读，按占用处理：%s" % os.path.basename(path), flush=True)
+            return None
+        ok, _why = _lease_reclaimable(info)
         if not ok:
             return None
         _atomic_write(path, json.dumps({
@@ -460,7 +773,7 @@ def lease_acquire(path, task_id, run_id=None, lease_sec=LEASE_SEC):
 def lease_heartbeat(path, run_id, lease_sec=LEASE_SEC):
     """续期（B15：每 15s 一次）。返回 False 说明租约已不属于自己。"""
     with _file_lock(path):
-        info = _load_json(path, {})
+        info, _readable = _read_ephemeral(path)
         if info.get("run_id") != run_id:
             return False
         now = time.time()
@@ -473,7 +786,7 @@ def lease_heartbeat(path, run_id, lease_sec=LEASE_SEC):
 def lease_release(path, run_id):
     """主动释放：只有持有者能释放。"""
     with _file_lock(path):
-        info = _load_json(path, {})
+        info, _readable = _read_ephemeral(path)
         if info.get("run_id") != run_id:
             return False
         try:
@@ -486,7 +799,10 @@ def lease_release(path, run_id):
 def lease_reclaim(path, expect_run_id=None):
     """按 B15 口径回收。返回 (是否回收, reason)。"""
     with _file_lock(path):
-        info = _load_json(path, {})
+        info, readable = _read_ephemeral(path)
+        if not readable and _size_of(path) > 0:
+            # 身份读不懂 → 不回收（B15）。旧版会把它当空租约直接删掉，等于放第二个实例进来。
+            return False, "identity_unreadable"
         ok, why = _lease_reclaimable(info, expect_run_id=expect_run_id)
         if ok:
             try:
@@ -565,7 +881,8 @@ def lease_run(path, task_id, body, run_id=None, lease_sec=LEASE_SEC,
     return box.get("value"), "DONE"
 
 
-def acquire_slot(task_id, run_id=None, cap=SLOT_CAP, base=None, lease_sec=LEASE_SEC):
+def acquire_slot(task_id, run_id=None, cap=SLOT_CAP, base=None, lease_sec=LEASE_SEC,
+                 lock_timeout=LOCK_TIMEOUT_SEC):
     """B8：原子领取全局并发槽位。
 
     读当前 RUNNING 数 + 占槽在同一次跨进程加锁内完成，所以两个任务不可能
@@ -575,38 +892,62 @@ def acquire_slot(task_id, run_id=None, cap=SLOT_CAP, base=None, lease_sec=LEASE_
     d = _slots_dir(base)
     os.makedirs(d, exist_ok=True)
     run_id = run_id or uuid.uuid4().hex[:12]
-    with _file_lock(os.path.join(d, ".slots")):
-        # 先回收死槽（进程没了 / PID 复用），再占位
-        for fn in sorted(os.listdir(d)):
-            if not fn.endswith(".slot"):
-                continue
-            sp = os.path.join(d, fn)
-            ok, _why = _lease_reclaimable(_load_json(sp, {}))
-            if ok:
+    try:
+        # strict=True：抢不到锁就**不启动**（fail-closed）。旧版超时后跳过加锁继续跑，
+        # 6 进程抢槽实测出现 6 个槽位全被占——「WARN 不等于阻断」在并发上限上是致命的。
+        with _file_lock(os.path.join(d, ".slots"), timeout=lock_timeout, strict=True):
+            # 先回收死槽（进程没了 / PID 复用），再占位
+            for fn in sorted(os.listdir(d)):
+                if not fn.endswith(".slot"):
+                    continue
+                sp = os.path.join(d, fn)
+                info, readable = _read_ephemeral(sp)
+                if not readable:
+                    # 空文件/半截 JSON：可能是别人刚占位还没写完。
+                    # 5s 内一律当活槽；超过 5s 仍是空壳才当死槽回收。
+                    try:
+                        age = time.time() - os.path.getmtime(sp)
+                    except OSError:
+                        age = 0.0
+                    if age <= 5:
+                        continue
+                    ok = True
+                else:
+                    ok, why = _lease_reclaimable(info)
+                    if ok and why == "empty":
+                        try:
+                            age = time.time() - os.path.getmtime(sp)
+                        except OSError:
+                            age = 0.0
+                        ok = age > 5
+                if ok:
+                    try:
+                        os.remove(sp)
+                    except OSError:
+                        pass
+            for i in range(1, int(cap) + 1):
+                sp = os.path.join(d, "slot-%d.slot" % i)
                 try:
-                    os.remove(sp)
-                except OSError:
-                    pass
-        for i in range(1, int(cap) + 1):
-            sp = os.path.join(d, "slot-%d.slot" % i)
-            try:
-                fd = os.open(sp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
-                continue
-            now = time.time()
-            try:
-                os.write(fd, json.dumps({
-                    "task_id": task_id,
-                    "run_id": run_id,
-                    "pid": os.getpid(),
-                    "process_start_time": _proc_start_time(os.getpid()),
-                    "started_at": now,
-                    "heartbeat_at": now,
-                    "lease_until": now + lease_sec,
-                }, ensure_ascii=False, indent=2).encode("utf-8"))
-            finally:
-                os.close(fd)
-            return sp, run_id
+                    fd = os.open(sp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                except FileExistsError:
+                    continue
+                now = time.time()
+                try:
+                    os.write(fd, json.dumps({
+                        "task_id": task_id,
+                        "run_id": run_id,
+                        "pid": os.getpid(),
+                        "process_start_time": _proc_start_time(os.getpid()),
+                        "started_at": now,
+                        "heartbeat_at": now,
+                        "lease_until": now + lease_sec,
+                    }, ensure_ascii=False, indent=2).encode("utf-8"))
+                finally:
+                    os.close(fd)
+                return sp, run_id
+    except LockTimeout as e:
+        print("WARN: 抢不到槽位锁，本轮按 QUEUED 处理（不启动）：%s" % e, flush=True)
+        return None, run_id
     return None, run_id
 
 
@@ -615,7 +956,7 @@ def release_slot(slot_path, run_id=None):
     if not slot_path or not os.path.exists(slot_path):
         return False
     if run_id is not None:
-        info = _load_json(slot_path, {})
+        info, _readable = _read_ephemeral(slot_path)
         if info.get("run_id") not in (None, run_id):
             return False
     try:
@@ -3044,7 +3385,110 @@ def main():
         if not args:
             print(__doc__)
             return 1
+    # ---- 交付正文托管（纯本地，不触网；A1/A2/A4）----
+    if args and args[0] == "--extract":
+        rest, begin, end, fence, out, positional = args[1:], None, None, None, None, []
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a == "--between":
+                if i + 2 >= len(rest):
+                    print(json.dumps({"result": "error", "error": "--between 需要两个标记行"},
+                                     ensure_ascii=False))
+                    return 2
+                begin, end = rest[i + 1], rest[i + 2]
+                i += 3
+            elif a == "--fence":
+                if i + 1 >= len(rest):
+                    print(json.dumps({"result": "error", "error": "--fence 需要一个序号"},
+                                     ensure_ascii=False))
+                    return 2
+                fence = rest[i + 1]
+                i += 2
+            elif a == "--out":
+                if i + 1 >= len(rest):
+                    print(json.dumps({"result": "error", "error": "--out 需要一个路径"},
+                                     ensure_ascii=False))
+                    return 2
+                out = rest[i + 1]
+                i += 2
+            else:
+                positional.append(a)
+                i += 1
+        if len(positional) != 1:
+            print(json.dumps({"result": "error",
+                              "error": "--extract 需要且只需要一个源文件（收到 %d 个）" % len(positional)},
+                             ensure_ascii=False))
+            return 2
+        try:
+            print(json.dumps(extract_deliverable(positional[0], begin=begin, end=end,
+                                                 fence=fence, out=out),
+                             ensure_ascii=False, indent=2))
+            return 0
+        except CustodyError as e:
+            print(json.dumps({"result": "error", "error": str(e)}, ensure_ascii=False))
+            return 2
+        except OSError as e:
+            print(json.dumps({"result": "error", "error": "io: %s" % e}, ensure_ascii=False))
+            return 2
+    if args and args[0] == "--verify-copy":
+        if len(args) != 3:
+            print(json.dumps({"result": "error", "error": "--verify-copy 需要两个文件路径"},
+                             ensure_ascii=False))
+            return 2
+        try:
+            res = verify_copy(args[1], args[2])
+        except CustodyError as e:
+            print(json.dumps({"result": "error", "error": str(e)}, ensure_ascii=False))
+            return 2
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        # 不一致即禁止回灌（A4）：退 2 而不是 1，这是「参数/前置不成立」不是业务失败
+        return 0 if res["equal"] else 2
+    # ---- 调度口径校验（纯本地；B1/B10/B11）----
+    if args and args[0] == "--check-name":
+        if len(args) < 2:
+            print(json.dumps({"result": "error", "error": "--check-name 需要 automation 名称"},
+                             ensure_ascii=False))
+            return 2
+        name, rest = args[1], args[2:]
+        argv = None
+        if "--argv" in rest:
+            i = rest.index("--argv")
+            if i + 1 >= len(rest):
+                print(json.dumps({"result": "error", "error": "--argv 需要命令串"},
+                                 ensure_ascii=False))
+                return 2
+            argv = shlex.split(rest[i + 1])
+        try:
+            print(json.dumps(check_automation_name(name, argv), ensure_ascii=False, indent=2))
+            return 0
+        except ScheduleError as e:
+            print(json.dumps({"result": "error", "error": str(e)}, ensure_ascii=False))
+            return 2
+    if args and args[0] == "--check-schedule":
+        if len(args) < 2:
+            print(json.dumps({"result": "error", "error": "--check-schedule 需要 rrule"},
+                             ensure_ascii=False))
+            return 2
+        try:
+            print(json.dumps(check_schedule(args[1]), ensure_ascii=False, indent=2))
+            return 0
+        except ScheduleError as e:
+            print(json.dumps({"result": "error", "error": str(e)}, ensure_ascii=False))
+            return 2
+    if args and args[0] == "--check-oneshot":
+        if len(args) < 2:
+            print(json.dumps({"result": "error", "error": "--check-oneshot 需要 scheduledAt"},
+                             ensure_ascii=False))
+            return 2
+        try:
+            print(json.dumps(check_oneshot(args[1]), ensure_ascii=False, indent=2))
+            return 0
+        except ScheduleError as e:
+            print(json.dumps({"result": "error", "error": str(e)}, ensure_ascii=False))
+            return 2
     # ---- 出口代理（API / 浏览器 / 自启动共用同一个出口）----
+
     if args and args[0] == "--proxy-url":
         # 给 shell 用：只输出 URL（解析不到就空行 + exit 1），便于 git 等外部动作对齐出口
         url = resolve_proxy()
