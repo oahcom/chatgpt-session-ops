@@ -175,7 +175,7 @@ python scripts/chatgpt_send.py --tail <conv_id>
 python -m unittest discover -s tests -v
 ```
 
-29 条，覆盖 id 校验与路径穿越、状态文件损坏隔离、原子写与 tmp 清理、锁重入/stale 回收/并发 80 次不丢更新、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性。**改锁、改落盘、改 id 处理前先跑一遍。**
+35 条，覆盖 id 校验与路径穿越、状态文件损坏隔离、原子写与 tmp 清理、锁重入/stale 回收/并发 80 次不丢更新、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性，以及用离线桩跑通的投递主流程（含 413、空提示词、非法 id）。**改锁、改落盘、改 id 处理前先跑一遍。**
 
 ## 故障速查
 
@@ -226,7 +226,7 @@ python -m unittest discover -s tests -v
 
 ### tests/
 
-- `test_hardening.py` — 离线回归（29 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW。
+- `test_hardening.py` — 离线回归（35 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW。
 
 ## 协议细节
 

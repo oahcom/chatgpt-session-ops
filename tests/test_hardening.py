@@ -308,5 +308,107 @@ class TestMisc(TmpBase):
         self.assertTrue(solve("", "0"))
 
 
+# ---------------------------------------------------------------- 投递流程（离线桩）
+class FakeAPI:
+    """只实现 send_prompt 用到的那几个方法，用来在没有网络/凭据时跑通主流程。"""
+
+    is_anon = False
+    account = "acct1"
+
+    def __init__(self, base_dir, send_status=200, sse=None):
+        self.base_dir = base_dir
+        self.send_status = send_status
+        self.sse = sse
+        self.sent = []
+        self.last_headers = {}
+
+    def live_tail(self, conv_id, tries=2):
+        return "parent-msg-1", '{"mapping": {}}'
+
+    def cached_tail(self, conv_id):
+        return None
+
+    def requirements(self):
+        return "req-token", "proof-token"
+
+    def send(self, conv_id, text, parent_message_id, req_token, proof, timeout=420):
+        self.sent.append({"conv_id": conv_id, "parent": parent_message_id, "text": text})
+        return self.send_status, self.sse or ""
+
+    def warm_cookies(self):
+        return False
+
+    def extract_reply_sse(self, raw):
+        return m.ChatGPTAPI.extract_reply_sse(raw)
+
+    def harvest_mapping(self, raw):
+        return m.ChatGPTAPI.harvest_mapping(raw)
+
+    def save_reply(self, conv_id, pfile, text):
+        return m.ChatGPTAPI.save_reply(self, conv_id, pfile, text)
+
+    def quota(self):
+        return {}
+
+
+class TestSendFlow(TmpBase):
+    def _prompt(self, body):
+        p = os.path.join(self.tmp, "prompt.md")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(body)
+        return p
+
+    def _sse(self, conv_id, reply):
+        return "\n".join([
+            'data: {"conversation_id": "%s", "message": {"author": {"role": "assistant"},'
+            ' "content": {"parts": ["%s"]}}}' % (conv_id, reply),
+            "data: [DONE]",
+        ])
+
+    def test_happy_path_keeps_conversation_id(self):
+        cid = "11111111-2222-4333-8444-555555555555"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "hello"))
+        prompt = self._prompt("# 注释行会被去掉\n真正的正文\n")
+        status, path, conv = m.send_prompt(api, cid, prompt)
+        self.assertEqual(status, 200)
+        self.assertEqual(conv, cid, "必须认回原会话，不能静默落新会话")
+        self.assertEqual(api.sent[0]["conv_id"], cid)
+        self.assertEqual(api.sent[0]["text"], "真正的正文")
+        self.assertIn("hello", _read(path))
+
+    def test_new_chat_has_no_parent(self):
+        cid = "11111111-2222-4333-8444-555555555555"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "owner ruling"))
+        status, _p, conv = m.send_prompt(api, None, self._prompt("x"), new_chat=True)
+        self.assertEqual(status, 200)
+        self.assertEqual(conv, cid, "新会话必须从 SSE 里认出 id")
+        self.assertIsNone(api.sent[0]["parent"], "新会话不该带 parent_message_id")
+
+    def test_413_is_reported_not_swallowed(self):
+        api = FakeAPI(os.path.join(self.tmp, "auth"), send_status=413,
+                      sse='{"detail": "conversation_too_large"}')
+        status, path, conv = m.send_prompt(api, "11111111-2222-4333-8444-555555555555", self._prompt("x"))
+        self.assertEqual(status, 413)
+        self.assertIsNone(path)
+
+    def test_missing_prompt_file_is_a_clean_error(self):
+        api = FakeAPI(os.path.join(self.tmp, "auth"))
+        with self.assertRaises(RuntimeError):
+            m.send_prompt(api, None, os.path.join(self.tmp, "nope.md"), new_chat=True)
+
+    def test_empty_or_comment_only_prompt_is_rejected(self):
+        api = FakeAPI(os.path.join(self.tmp, "auth"))
+        for body in ("", "   \n", "# 只有注释\n# 还是注释\n"):
+            with self.subTest(body=body):
+                with self.assertRaises(RuntimeError):
+                    m.send_prompt(api, None, self._prompt(body), new_chat=True)
+
+    def test_invalid_conv_id_rejected_before_network(self):
+        api = FakeAPI(os.path.join(self.tmp, "auth"))
+        with self.assertRaises(ValueError):
+            m.send_prompt(api, "../../evil", self._prompt("x"))
+        self.assertEqual(api.sent, [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

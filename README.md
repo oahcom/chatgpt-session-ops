@@ -175,7 +175,7 @@ python scripts/chatgpt_send.py --anon-read <conv_id>       # 读全文并归档�
 | `CHATGPT_ANON_IDLE_SEC` | 900 | 匿名等待生成结束的预算 |
 
 ```bash
-python -m unittest discover -s tests -v      # 29 条，零依赖
+python -m unittest discover -s tests -v      # 35 条，零依赖
 ```
 
 ---
@@ -231,7 +231,7 @@ scripts/continue_full.py    413 满员续接
 scripts/pow_solver.py       PoW 解算器
 scripts/extract_auth.py     从 Edge CDP 提取凭据
 scripts/accounts/README.md  凭据目录结构（不含任何真实凭据）
-tests/test_hardening.py     离线回归测试（id 校验、损坏隔离、原子写、锁并发、兜底判定）
+tests/test_hardening.py     离线回归（id 校验、损坏隔离、原子写、锁并发、兜底判定、投递主流程）
 tools/sync.sh               从本机技能目录同步 + 提交前敏感信息拦截
 ```
 
