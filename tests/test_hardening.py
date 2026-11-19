@@ -397,6 +397,101 @@ class TestStateFiles(TmpBase):
         self.assertEqual(why, "identity_unconfirmed")
         self.assertTrue(os.path.exists(path))
 
+    def test_lock_pid_field_falsy_not_reclaimed_by_mtime(self):
+        """F-04：pid 字段存在但假值（0/空串/None）= 新格式损坏，不得借 mtime 逃生。"""
+        for bad in (0, "", None):
+            lock = os.path.join(self.tmp, "f04-%s.lock" % bad)
+            with open(lock, "w", encoding="utf-8") as f:
+                json.dump({"pid": bad, "process_start_time": 7,
+                           "created_at": time.time() - 999}, f)
+            old = time.time() - (m.LOCK_STALE_SEC + 30)
+            os.utime(lock, (old, old))   # mtime 很老，旧逻辑会直接判 stale
+            self.assertFalse(m._lock_holder_stale(lock),
+                             "假值 pid=%r 不得按 mtime 判 stale" % (bad,))
+            self.assertFalse(m._try_reclaim_stale(lock))
+            self.assertTrue(os.path.exists(lock), "假值 pid 锁被误删")
+
+    def test_lock_pid_field_garbage_not_reclaimed(self):
+        """F-04：pid 字段不可解析（字符串垃圾）→ UNKNOWN，不回收。"""
+        lock = os.path.join(self.tmp, "f04-g.lock")
+        with open(lock, "w", encoding="utf-8") as f:
+            json.dump({"pid": "not-a-pid", "process_start_time": 7,
+                       "created_at": time.time() - 999}, f)
+        old = time.time() - (m.LOCK_STALE_SEC + 30)
+        os.utime(lock, (old, old))
+        self.assertFalse(m._lock_holder_stale(lock))
+        self.assertTrue(os.path.exists(lock))
+
+    def test_lock_no_pid_field_uses_mtime(self):
+        """老格式（无 pid 字段）仍走 mtime 判据——F-04 只堵「字段在但值坏」。"""
+        lock = os.path.join(self.tmp, "f04-legacy.lock")
+        with open(lock, "w", encoding="utf-8") as f:
+            json.dump({"created_at": 1}, f)   # 有内容但无 pid 字段
+        old = time.time() - (m.LOCK_STALE_SEC + 30)
+        os.utime(lock, (old, old))
+        self.assertTrue(m._lock_holder_stale(lock), "老格式应按 mtime 判 stale")
+
+    def test_force_release_missing_pid_needs_identity_evidence(self):
+        """F-05：可读租约但 pid 缺失——不得用 if pid 短路跳过身份确认。"""
+        path = os.path.join(self.tmp, "lease-f05.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"run_id": "rid"}, f)   # 可读但无 pid
+        approval = os.path.join(self.tmp, "approve-f05.json")
+        with open(approval, "w", encoding="utf-8") as f:
+            json.dump({"sha256": m._sha256_file(path),
+                       "approved_at": "2026-11-19T16:00:00+08:00",
+                       "approver": "owner", "reason": "looks dead"}, f)
+        ok, why = m.lease_force_release(path, approval)
+        self.assertFalse(ok, "无 pid 的可读租约必须先要独立确认依据")
+        self.assertEqual(why, "identity_unconfirmed")
+        self.assertTrue(os.path.exists(path))
+        # 带独立确认依据后按正常闸口放行
+        with open(approval, "w", encoding="utf-8") as f:
+            json.dump({"sha256": m._sha256_file(path),
+                       "approved_at": "2026-11-19T16:00:00+08:00",
+                       "approver": "owner", "reason": "looks dead",
+                       "identity_evidence": "ps snapshot 2026-11-19"}, f)
+        ok, why = m.lease_force_release(path, approval)
+        self.assertTrue(ok)
+        self.assertEqual(why, "quarantined")
+
+    def test_force_release_pid_zero_needs_identity_evidence(self):
+        """F-05：pid=0 假值同款——不得绕过身份确认。"""
+        path = os.path.join(self.tmp, "lease-f05b.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"pid": 0, "run_id": "rid"}, f)
+        approval = os.path.join(self.tmp, "approve-f05b.json")
+        with open(approval, "w", encoding="utf-8") as f:
+            json.dump({"sha256": m._sha256_file(path),
+                       "approved_at": "2026-11-19T16:00:00+08:00",
+                       "approver": "owner", "reason": "looks dead"}, f)
+        ok, why = m.lease_force_release(path, approval)
+        self.assertFalse(ok)
+        self.assertEqual(why, "identity_unconfirmed")
+
+    @unittest.skipIf(os.name != "nt", "Windows-only ctypes 原型")
+    def test_win_k32_declares_handle_prototypes(self):
+        """F-06：OpenProcess restype 必须是 HANDLE（指针宽度），否则 64 位截断句柄。"""
+        import ctypes
+        from ctypes import wintypes
+        k32 = m._win_k32()
+        self.assertIs(k32.OpenProcess.restype, wintypes.HANDLE,
+                      "restype 必须 HANDLE，c_int 会在 64 位截断")
+        self.assertIs(k32.GetExitCodeProcess.restype, wintypes.BOOL)
+        self.assertIs(k32.CloseHandle.restype, wintypes.BOOL)
+        self.assertIs(k32.GetProcessTimes.restype, wintypes.BOOL)
+        # 真实句柄往返：拿当前进程、查退出码、拿启动时间、关闭——任何一步截断即炸
+        h = k32.OpenProcess(0x1000, False, os.getpid())
+        self.assertTrue(h)
+        try:
+            code = wintypes.DWORD()
+            self.assertTrue(k32.GetExitCodeProcess(h, ctypes.byref(code)))
+            self.assertEqual(code.value, 259)   # STILL_ACTIVE
+        finally:
+            self.assertTrue(k32.CloseHandle(h))
+        self.assertIsNotNone(m._proc_start_time(os.getpid()),
+                             "启动时间读取失败多半是句柄截断")
+
     def test_reclaim_removes_only_stale_lock(self):
         """确认已死的残留锁：回收成功，且只删这一份。"""
         p = os.path.join(self.tmp, "rc1.json")

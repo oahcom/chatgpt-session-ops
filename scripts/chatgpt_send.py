@@ -611,6 +611,32 @@ PROC_ALIVE = "ALIVE"      # 确认进程存活
 PROC_UNKNOWN = "UNKNOWN"  # 无权限 / 查询失败 / 身份无法确认
 
 
+def _win_k32():
+    """带显式原型声明的 kernel32 句柄（F-06）。
+
+    ctypes 默认 restype 是 c_int（32 位），而 Windows HANDLE 是指针宽度——
+    64 位下 OpenProcess 返回的句柄会被截断，后续 GetExitCodeProcess /
+    CloseHandle / GetProcessTimes 全部拿到坏句柄：查询失败 → 被折叠成
+    「进程不存在」→ 活锁被误删。必须显式声明 HANDLE/BOOL/DWORD 原型。
+    """
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    k32.GetExitCodeProcess.restype = wintypes.BOOL
+    k32.GetProcessTimes.argtypes = [wintypes.HANDLE,
+                                    ctypes.POINTER(wintypes.FILETIME),
+                                    ctypes.POINTER(wintypes.FILETIME),
+                                    ctypes.POINTER(wintypes.FILETIME),
+                                    ctypes.POINTER(wintypes.FILETIME)]
+    k32.GetProcessTimes.restype = wintypes.BOOL
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    k32.CloseHandle.restype = wintypes.BOOL
+    return k32
+
+
 def _win_open_error_to_state(err):
     """OpenProcess 失败原因分桶（F-03）：明确不存在 → DEAD，其余 → UNKNOWN。
 
@@ -644,7 +670,7 @@ def _proc_state(pid):
     try:
         if os.name == "nt":
             import ctypes
-            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32 = _win_k32()                      # F-06：显式 HANDLE 原型，防 64 位截断
             h = k32.OpenProcess(0x1000, False, pid)   # PROCESS_QUERY_LIMITED_INFORMATION
             if not h:
                 return _win_open_error_to_state(ctypes.get_last_error())
@@ -679,7 +705,7 @@ def _proc_start_time(pid):
         if os.name == "nt":
             import ctypes
             from ctypes import wintypes
-            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32 = _win_k32()                      # F-06：同款显式原型
             h = k32.OpenProcess(0x1000, False, pid)
             if not h:
                 return None
@@ -700,12 +726,15 @@ def _lock_holder_stale(lock):
     """锁能否回收：租约过期 + 原持有者确认不在（或 PID 已被复用）。
 
     判定顺序（A22）：
-      1. 读不到锁内容（老格式/损坏）→ 退化为 mtime 判据，兼容旧行为；
+      1. 无 pid **字段**（老格式/损坏）→ 退化为 mtime 判据，兼容旧行为；
+         pid 字段**存在但假值/非法**（0/None/空串/不可解析）→ 身份损坏，
+         按 UNKNOWN 处理，**不回收**（F-04：假值 pid 不得借 mtime 逃生）；
       2. 租约未过期 → 不可回收；
-      3. 原 PID 不存活 → 可回收；
-      4. 存活但启动时间读不到 → **不可回收**（宁可等超时，也不误删活锁）；
-      5. 存活但启动时间与记录不一致 → PID 被复用，可回收；
-      6. 否则不可回收。
+      3. 原 PID 确认不存在（DEAD）→ 可回收；
+      4. UNKNOWN（无权限/查询失败）→ **不可回收**（F-03：查不到 ≠ 死了）；
+      5. 存活但启动时间读不到 → **不可回收**（宁可等超时，也不误删活锁）；
+      6. 存活但启动时间与记录不一致 → PID 被复用，可回收；
+      7. 否则不可回收。
     """
     try:
         with open(lock, "r", encoding="utf-8") as f:
@@ -714,12 +743,13 @@ def _lock_holder_stale(lock):
             info = {}
     except Exception:
         info = {}
-    pid = info.get("pid")
-    if not pid:
+    if "pid" not in info:
+        # 老格式（无 pid 字段）才允许 mtime 判据；字段在但值坏 = 新格式损坏
         try:
             return time.time() - os.path.getmtime(lock) > LOCK_STALE_SEC
         except OSError:
             return False
+    pid = info.get("pid")
     try:
         created = float(info.get("created_at") or 0)
     except (TypeError, ValueError):
@@ -1137,18 +1167,19 @@ def _force_release_locked(path, approval_path):
     if got != want:
         return False, "sha256_mismatch"
     # R3/R4：能读出 pid 且进程还活着 → 不许恢复（文件坏了不代表进程死了）。
-    # F-03：三态判定——UNKNOWN（无权限查询）不是死亡证据，走 identity_unconfirmed
-    # 同款口径（必须有独立确认依据），绝不因「查不到」放行。
+    # F-03/F-05：三态判定对可读租约**无条件执行**——pid 缺失/假值同样落入
+    # UNKNOWN（_proc_state 对 None/0/不可解析都返回 UNKNOWN），不得用 if pid
+    # 隐式短路：那会让身份不完整的可读租约只凭 approval 就跳过证据要求。
+    # UNKNOWN 不是死亡证据，走 identity_unconfirmed 同款口径（必须有独立确认依据），
+    # 绝不因「查不到」放行。
     info, readable = _read_ephemeral(path)
     if readable:
-        pid = info.get("pid")
-        if pid:
-            state = _proc_state(pid)
-            if state == PROC_ALIVE:
-                return False, "process_alive"
-            if state == PROC_UNKNOWN:
-                if not str(approval.get("identity_evidence") or "").strip():
-                    return False, "identity_unconfirmed"
+        state = _proc_state(info.get("pid"))
+        if state == PROC_ALIVE:
+            return False, "process_alive"
+        if state == PROC_UNKNOWN:
+            if not str(approval.get("identity_evidence") or "").strip():
+                return False, "identity_unconfirmed"
     else:
         # 身份读不出来 ≠ 原实例已死。必须由批准人给出独立确认依据（例如进程表快照、
         # 子进程检查、B7 状态核对结果），否则拒绝——不能让「批准」替「证据」。
