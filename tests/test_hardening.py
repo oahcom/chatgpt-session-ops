@@ -1479,6 +1479,218 @@ class TestSlotsAndLease(TmpBase):
         self.assertEqual(why, "audit_registration_failed")
         self.assertTrue(os.path.exists(path))
 
+    def test_force_release_reason_is_stable_enum(self):
+        """F-01：reason 必须是稳定枚举，不许把异常文本拼进去。
+
+        事故：`"quarantine_failed:%s" % e`、`"unreadable:%s" % e` 让调用方无法用
+        等值比较分流，而且换个环境错误消息一变，判定就跟着变——对外契约被实现细节污染。
+        这里把所有拒绝路径跑一遍，断言每个返回值都在 FORCE_RELEASE_REASONS 内且不含 ':'。
+        """
+        seen = []
+
+        def broken_path(tag):
+            p = os.path.join(self.tmp, "lease-%s.json" % tag)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("{broken")
+            return p
+
+        def approve(tag, payload):
+            a = os.path.join(self.tmp, "appr-%s.json" % tag)
+            with open(a, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            return a
+
+        def full(sha, **extra):
+            d = {"sha256": sha, "approved_at": "2026-11-19T16:00:00+08:00",
+                 "approver": "owner", "reason": "test"}
+            d.update(extra)
+            return d
+
+        def check(tag, path, approval):
+            ok, why = m.lease_force_release(path, approval)
+            seen.append(why)
+            self.assertIn(why, m.FORCE_RELEASE_REASONS, "%s 返回了枚举外的 reason" % tag)
+            self.assertNotIn(":", why, "%s 把异常文本拼进了 reason" % tag)
+            return ok, why
+
+        # absent
+        self.assertEqual(check("absent", os.path.join(self.tmp, "none.json"),
+                               os.path.join(self.tmp, "none-appr.json"))[1], "absent")
+        # no_approval：批准文件不存在
+        p = broken_path("noappr")
+        self.assertEqual(check("noappr", p, os.path.join(self.tmp, "ghost.json"))[1],
+                         "no_approval")
+        # approval_incomplete：只有 sha256，没有批准人/时间/原因
+        p = broken_path("partial")
+        self.assertEqual(check("partial", p,
+                               approve("partial", {"sha256": "deadbeef"}))[1],
+                         "approval_incomplete")
+        # sha256_mismatch
+        p = broken_path("wrong")
+        self.assertEqual(check("wrong", p, approve("wrong", full("0" * 64)))[1],
+                         "sha256_mismatch")
+        # identity_unconfirmed：读不出 pid 且没有独立依据
+        p = broken_path("noid")
+        self.assertEqual(check("noid", p, approve("noid", full(m._sha256_file(p))))[1],
+                         "identity_unconfirmed")
+        # process_alive：持有者还活着，哪怕批准齐全也不许恢复
+        p = os.path.join(self.tmp, "lease-alive.json")
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid(),
+                       "process_start_time": m._proc_start_time(os.getpid()),
+                       "run_id": "rid"}, f)
+        self.assertEqual(check("alive", p,
+                               approve("alive", full(m._sha256_file(p))))[1],
+                         "process_alive")
+        # lock_timeout：抢不到锁（批准内容无关，锁先挡住）
+        p = broken_path("lock")
+        held = self._hold_lock(p)
+        try:
+            self.assertEqual(check("lock", p, approve("lock", full("x")))[1],
+                             "lock_timeout")
+        finally:
+            os.remove(held)
+        self.assertIn("absent", seen)
+        self.assertIn("no_approval", seen)
+        self.assertIn("approval_incomplete", seen)
+        self.assertIn("sha256_mismatch", seen)
+        self.assertIn("identity_unconfirmed", seen)
+        self.assertIn("process_alive", seen)
+        self.assertIn("lock_timeout", seen)
+
+    def test_force_release_unreadable_hash_is_stable(self):
+        """F-01：哈希读不出来时返回 "unreadable"（稳定值），细节只进日志。"""
+        path = os.path.join(self.tmp, "lease-unreadable.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{broken")
+        approval = os.path.join(self.tmp, "approve-unreadable.json")
+        with open(approval, "w", encoding="utf-8") as f:
+            json.dump({"sha256": "deadbeef",
+                       "approved_at": "2026-11-19T16:00:00+08:00",
+                       "approver": "owner", "reason": "test"}, f)
+        real = m._sha256_file
+
+        def boom(_p):
+            raise OSError("模拟读失败 WinError 32")
+        try:
+            m._sha256_file = boom
+            ok, why = m.lease_force_release(path, approval)
+        finally:
+            m._sha256_file = real
+        self.assertFalse(ok)
+        self.assertEqual(why, "unreadable")
+        self.assertTrue(os.path.exists(path), "哈希读不出来时不许动租约")
+
+    def test_quarantine_failure_is_stable(self):
+        """F-01：隔离改名失败返回 "quarantine_failed"（不带异常文本），租约保持原样。"""
+        path = os.path.join(self.tmp, "lease-qfail.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{broken")
+        approval = os.path.join(self.tmp, "approve-qfail.json")
+        with open(approval, "w", encoding="utf-8") as f:
+            json.dump({"sha256": m._sha256_file(path),
+                       "approved_at": "2026-11-19T16:00:00+08:00",
+                       "approver": "owner", "reason": "dead",
+                       "identity_evidence": "ps snapshot"}, f)
+        real = m.os.replace
+
+        def boom(src, dst):
+            raise OSError("模拟改名失败 WinError 5")
+        try:
+            m.os.replace = boom
+            ok, why = m.lease_force_release(path, approval)
+        finally:
+            m.os.replace = real
+        self.assertFalse(ok)
+        self.assertEqual(why, "quarantine_failed")
+        self.assertTrue(os.path.exists(path), "改名失败却动了租约")
+        reg = os.path.join(self.tmp, "corrupt-registry.jsonl")
+        rows = [json.loads(l) for l in
+                open(reg, encoding="utf-8").read().splitlines() if l.strip()]
+        kinds = [r["kind"] for r in rows]
+        self.assertIn("lease-recovery", kinds)
+        self.assertEqual(kinds[-1], "lease-recovery-failed",
+                         "批准了但没隔离成，必须补一条失败行，不能只留 approved_recovery")
+        self.assertEqual(rows[-1]["why"], "quarantine_failed")
+
+    def test_quarantine_failed_row_write_failure_is_survivable(self):
+        """隔离失败的补记行自己写不进去时：仍返回 quarantine_failed，租约原样留着。
+
+        第十四轮审查残余风险 3：`_record_corruption("lease-recovery-failed", ...)` 自身
+        失败的行为没被证明过。这里让第一次登记成功、第二次返回 None（模拟磁盘写失败），
+        断言不抛异常、返回值仍是稳定枚举、原文件没被搬走。
+        """
+        path = os.path.join(self.tmp, "lease-rows.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{broken")
+        approval = os.path.join(self.tmp, "approve-rows.json")
+        with open(approval, "w", encoding="utf-8") as f:
+            json.dump({"sha256": m._sha256_file(path),
+                       "approved_at": "2026-11-19T16:00:00+08:00",
+                       "approver": "owner", "reason": "dead",
+                       "identity_evidence": "ps snapshot"}, f)
+        real_record, real_replace = m._record_corruption, m.os.replace
+        calls = []
+
+        def record_once(kind, p, why):
+            calls.append(kind)
+            if len(calls) == 1:
+                return real_record(kind, p, why)
+            return None          # 第二次（失败行）写不进去
+
+        def boom(src, dst):
+            raise OSError("模拟改名失败 WinError 5")
+        try:
+            m._record_corruption = record_once
+            m.os.replace = boom
+            ok, why = m.lease_force_release(path, approval)
+        finally:
+            m._record_corruption, m.os.replace = real_record, real_replace
+        self.assertFalse(ok)
+        self.assertEqual(why, "quarantine_failed")
+        self.assertEqual(calls, ["lease-recovery", "lease-recovery-failed"])
+        self.assertTrue(os.path.exists(path), "补记行写失败不该把租约搞丢")
+
+    def test_rejected_recovery_leaves_no_audit_row_for_hash_and_identity(self):
+        """被 sha256/身份依据拒绝的恢复，同样不许留下「已批准恢复」的假记录。"""
+        cases = []
+
+        def broken(path):
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("{broken")
+
+        # (1) 哈希不匹配
+        p1 = os.path.join(self.tmp, "lease-h1.json")
+        broken(p1)
+        a1 = os.path.join(self.tmp, "a-h1.json")
+        with open(a1, "w", encoding="utf-8") as f:
+            json.dump({"sha256": "0" * 64,
+                       "approved_at": "2026-11-19T16:00:00+08:00",
+                       "approver": "owner", "reason": "test",
+                       "identity_evidence": "snapshot"}, f)
+        cases.append((p1, a1, "sha256_mismatch"))
+
+        # (2) 身份读不出来且没有独立依据
+        p2 = os.path.join(self.tmp, "lease-h2.json")
+        broken(p2)
+        a2 = os.path.join(self.tmp, "a-h2.json")
+        with open(a2, "w", encoding="utf-8") as f:
+            json.dump({"sha256": m._sha256_file(p2),
+                       "approved_at": "2026-11-19T16:00:00+08:00",
+                       "approver": "owner", "reason": "assume dead"}, f)
+        cases.append((p2, a2, "identity_unconfirmed"))
+
+        for p, a, want in cases:
+            ok, why = m.lease_force_release(p, a)
+            self.assertFalse(ok, want)
+            self.assertEqual(why, want)
+            self.assertTrue(os.path.exists(p), "%s：被拒绝却动了租约" % want)
+        reg = os.path.join(self.tmp, "corrupt-registry.jsonl")
+        if os.path.exists(reg):
+            kinds = [json.loads(l)["kind"]
+                     for l in open(reg, encoding="utf-8").read().splitlines() if l.strip()]
+            self.assertNotIn("lease-recovery", kinds, "被拒绝的恢复留下了批准记录")
+
     def test_heartbeat_and_release_timeout_keep_lease_bytes(self):
         """B15：抢不到锁时，心跳/释放都必须什么都不做——文件与字节都不许变。"""
         path = os.path.join(self.tmp, "lease-keep.json")

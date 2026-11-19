@@ -925,6 +925,24 @@ def lease_reclaim(path, expect_run_id=None, lock_timeout=LOCK_TIMEOUT_SEC):
         return False, "lock_timeout"
 
 
+FORCE_RELEASE_REASONS = (
+    "absent", "no_approval", "approval_incomplete", "unreadable",
+    "sha256_mismatch", "process_alive", "identity_unconfirmed",
+    "audit_registration_failed", "quarantine_failed", "lock_timeout",
+    "quarantined",
+)
+
+
+def _diag(what, path, detail):
+    """诊断细节只进日志，绝不拼进返回值。
+
+    为什么：reason 是给机器做等值比较的**稳定枚举**。一旦写成
+    "quarantine_failed:WinError 32"，调用方既没法用 `== "quarantine_failed"` 分流，
+    也把内部异常文本泄进了对外契约——换个 Python 版本错误消息变了，判定就跟着变。
+    """
+    print("WARN: %s（%s）：%s" % (what, os.path.basename(path), detail), flush=True)
+
+
 def lease_force_release(path, approval_path):
     """B15-R：损坏租约的人工恢复闸口（R1–R8）。
 
@@ -932,10 +950,11 @@ def lease_force_release(path, approval_path):
     而是留一条**需要人明确批准、且留痕**的通道。批准文件字段：
         {"sha256": "<损坏租约的哈希>", "approved_at": "<ISO8601>",
          "approver": "<谁批的>", "reason": "<为什么批>"}
-    返回 (ok, reason)。reason 枚举：
-        absent / no_approval / approval_incomplete / sha256_mismatch / process_alive /
-        identity_unconfirmed / audit_registration_failed / quarantine_failed /
-        lock_timeout / quarantined
+    返回 (ok, reason)。reason 只能是 FORCE_RELEASE_REASONS 之一（稳定枚举，
+    不含异常文本；细节走 _diag 落日志）：
+        absent / no_approval / approval_incomplete / unreadable / sha256_mismatch /
+        process_alive / identity_unconfirmed / audit_registration_failed /
+        quarantine_failed / lock_timeout / quarantined
     """
     if not os.path.exists(path):
         return True, "absent"
@@ -957,12 +976,14 @@ def _force_release_locked(path, approval_path):
         return False, "no_approval"
     want = str(approval.get("sha256") or "").strip().lower()
     # R6：批准必须可追溯到人、时间、原因，缺一项就是「口头放行」
-    if not want or not approval.get("approved_at") or not approval.get("approver")             or not approval.get("reason"):
+    if (not want or not approval.get("approved_at")
+            or not approval.get("approver") or not approval.get("reason")):
         return False, "approval_incomplete"
     try:
         got = _sha256_file(path)
     except OSError as e:
-        return False, "unreadable:%s" % e
+        _diag("租约存在但读不出哈希，无法核对批准的是不是同一个文件", path, e)
+        return False, "unreadable"
     if got != want:
         return False, "sha256_mismatch"
     # R3/R4：能读出 pid 且进程还活着 → 不许恢复（文件坏了不代表进程死了）
@@ -984,10 +1005,16 @@ def _force_release_locked(path, approval_path):
     try:
         os.replace(path, bad)      # R7：隔离归档，不覆盖
     except OSError as e:
-        return False, "quarantine_failed:%s" % e
+        _diag("租约隔离改名失败，原文件仍在", path, e)
+        # 登记行已经写成「已批准恢复」，但隔离没成——必须补一条失败行，否则审计上
+        # 只看到 approved_recovery、看不到恢复其实没落地，等于谎报一次已完成的恢复。
+        _record_corruption("lease-recovery-failed", path, "quarantine_failed")
+        return False, "quarantine_failed"
     # R8：隔离后确认原路径确实空出来了，别把别人的新租约当成自己的战果
     if os.path.exists(path):
-        return False, "quarantine_failed:path_still_present"
+        _diag("隔离改名返回成功但原路径仍存在", path, path)
+        _record_corruption("lease-recovery-failed", path, "path_still_present")
+        return False, "quarantine_failed"
     print("WARN: 损坏租约已按批准隔离 %s -> %s（原字节保留，可复查）"
           % (os.path.basename(path), os.path.basename(bad)), flush=True)
     return True, "quarantined"

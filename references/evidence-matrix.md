@@ -13,7 +13,7 @@
 
 **矩阵自身受回归保护**：`tests/test_hardening.py::TestEvidenceMatrix` 会校验「条款集合 = 矩阵行集合」「每个 `test:`/`code:` 引用都能解析」「每条至少一种证据」。也就是说，新增条款而不补证据行、或引用了不存在的用例，测试会直接红。
 
-> 最后更新：2026-11-19（v1.8）。当前回归 151 条，全绿。
+> 最后更新：2026-11-19（v1.8）。当前回归 163 条，全绿（1 条 POSIX-only skip）。
 
 ---
 
@@ -70,7 +70,7 @@
 | B12 | **PARTIAL** | 测试+代码+人判 | `test:test_cli_exit_codes` `test:test_proxy_check_requires_site_ok` `code:main` `human:exit 0/1/2/3 的语义分散在各分支，只能逐分支看；无事静默靠 stdout 行数人眼确认` | 0/1/2/3 各有用例，但不是集中式断言 |
 | B13 | **HUMAN** | 人判 | `human:attempt_count 与 MANUAL_REVIEW 在各任务状态文件里，无共享库` | 已知缺口 |
 | B14 | **HUMAN** | 人判 | `human:红线本身不含新判定，约束由 B8/A15/A17/A5/A23 各自实现` | 交叉引用型条款 |
-| B15 | **PARTIAL** | 测试+代码 | `test:test_lease_valid_blocks_reclaim` `test:test_lease_expired_process_gone` `test:test_lease_pid_reused` `test:test_heartbeat_keeps_lease_alive` `test:test_lease_run_timeout_cancels_body` `test:test_lease_run_timeout_orphan_keeps_lease` `test:test_lease_ops_never_run_unlocked` `test:test_corrupt_lease_needs_approval_to_release` `test:test_process_alive_blocks_force_release` `test:test_force_release_refuses_without_lock` `test:test_heartbeat_and_release_timeout_keep_lease_bytes` `test:test_force_release_needs_identity_evidence_when_unreadable` `test:test_force_release_blocks_when_audit_registration_fails` `test:test_rejected_recovery_leaves_no_fake_audit_row` `test:test_corrupt_slot_is_registered` `code:lease_run` `code:lease_force_release` | 心跳续期 + 超时两档（TIMEOUT / TIMEOUT_ORPHAN） `human:PID 复用/派生子进程/检测时序无法穷举；跨进程竞态只能抽样` |
+| B15 | **PARTIAL** | 测试+代码 | `test:test_lease_valid_blocks_reclaim` `test:test_lease_expired_process_gone` `test:test_lease_pid_reused` `test:test_heartbeat_keeps_lease_alive` `test:test_lease_run_timeout_cancels_body` `test:test_lease_run_timeout_orphan_keeps_lease` `test:test_lease_ops_never_run_unlocked` `test:test_corrupt_lease_needs_approval_to_release` `test:test_process_alive_blocks_force_release` `test:test_force_release_refuses_without_lock` `test:test_heartbeat_and_release_timeout_keep_lease_bytes` `test:test_force_release_needs_identity_evidence_when_unreadable` `test:test_force_release_blocks_when_audit_registration_fails` `test:test_rejected_recovery_leaves_no_fake_audit_row` `test:test_force_release_reason_is_stable_enum` `test:test_force_release_unreadable_hash_is_stable` `test:test_quarantine_failure_is_stable` `test:test_quarantine_failed_row_write_failure_is_survivable` `test:test_rejected_recovery_leaves_no_audit_row_for_hash_and_identity` `test:test_corrupt_slot_is_registered` `code:lease_run` `code:lease_force_release` `code:FORCE_RELEASE_REASONS` | 心跳续期 + 超时两档（TIMEOUT / TIMEOUT_ORPHAN） `human:PID 复用/派生子进程/检测时序无法穷举；跨进程竞态只能抽样` |
 
 ## C. 配方
 

@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**十轮对外对抗审查**逐条改写（每轮裁定见 §F，第九轮把「可判定」本身当成攻击面），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 158 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**十四轮对外对抗审查**逐条改写（每轮裁定见 §F；**第十四轮 `PASS`**，第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 163 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -238,9 +238,11 @@
 | R5 B7 状态核对 | 恢复前必须人工确认无「已提交未确认」的副作用（写进恢复记录，不由脚本猜） |
 | R6 独立授权 | 批准文件必须有 `sha256 + approved_at + approver + reason`，缺一项即 `approval_incomplete` |
 | R7 隔离归档 | `os.replace` 改名为 `<lease>.corrupt-<ts>`，**保留原字节** |
-| R8 恢复后复核 | 隔离后复查原路径确已空出，否则 `quarantine_failed:path_still_present` |
+| R8 恢复后复核 | 隔离后复查原路径确已空出，否则 `quarantine_failed`（并补一条 `lease-recovery-failed / path_still_present` 审计行） |
 
-**为什么不能只看 PID**：原执行体可能已派生子进程，或副作用已提交但未持久化确认；因此 R5 是人工步骤，脚本只负责「不让你在没有记录的情况下悄悄放行」。回归：`test_corrupt_lease_needs_approval_to_release`、`test_process_alive_blocks_force_release`、`test_corrupt_slot_is_registered`。
+**返回值是稳定枚举，不是错误消息**（第十三轮审查 F-01）：`reason` 只能是 `FORCE_RELEASE_REASONS` 之一——`absent / no_approval / approval_incomplete / unreadable / sha256_mismatch / process_alive / identity_unconfirmed / audit_registration_failed / quarantine_failed / lock_timeout / quarantined`。**禁止把异常文本拼进 reason**（原实现写过 `unreadable:%s`、`quarantine_failed:%s`、`quarantine_failed:path_still_present`）：调用方没法用等值比较分流，且换个 Python 版本错误消息一变、判定跟着变，等于把实现细节泄进对外契约。异常细节走 `_diag()` 打 WARN 日志。批准通过但隔离失败时，另补一条 `lease-recovery-failed` 行——否则审计上只看到 `approved_recovery`，看不到恢复其实没落地，等于谎报一次已完成的恢复。
+
+**为什么不能只看 PID**：原执行体可能已派生子进程，或副作用已提交但未持久化确认；因此 R5 是人工步骤，脚本只负责「不让你在没有记录的情况下悄悄放行」。回归：`test_corrupt_lease_needs_approval_to_release`、`test_process_alive_blocks_force_release`、`test_corrupt_slot_is_registered`、`test_force_release_reason_is_stable_enum`、`test_force_release_unreadable_hash_is_stable`、`test_quarantine_failure_is_stable`、`test_rejected_recovery_leaves_no_audit_row_for_hash_and_identity`。
 4. **瞬时文件禁止用 `_load_json` 读**。`_load_json` 会把「解析失败的非空文件」隔离改名（A21 对长期状态文件是对的），但用在槽位上等于**把别人刚占的槽位挪走**，文件名一空出来第二个进程立刻能占——这是超发的真正根因。瞬时文件走 `_read_ephemeral()`：读不懂就当它还在，不回收也不改名。租约同理：不可读 → 按占用处理，禁止回收。
 
 > **B14/B15 编号说明**：v1.0 的 B14 是联动红线（无独立判定口径），审查据此判「B14 缺失」。v1.1 保留 B14 为红线表，把审查提出的「运行实例租约」独立为 **B15**——两类约束不同（红线是跨类禁令，B15 是调度器级生命周期），不合并。
@@ -374,6 +376,14 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | 12 | v1.8 修订 | `NEEDS-REVISION`（1 项实现级：审计登记顺序） | 八项返修全部核销，A20/B15 的 PARTIAL 声明被判「成立」；唯一实现缺陷是**先登记恢复、再做存活/身份检查**，被拒绝时留下假「已批准」记录 |
 
 **第十二轮改了什么**：`lease_force_release` 把登记移到「哈希 → 存活 → 身份证据」全部通过之后；返回值枚举补全（`identity_unconfirmed` / `audit_registration_failed` / `lock_timeout` / `quarantine_failed`）；新增 `test_rejected_recovery_leaves_no_fake_audit_row` 断言被拒绝时 registry 里没有 `lease-recovery` 行。
+
+| 13 | v1.8 修订 | `NEEDS-REVISION`（F-01 唯一实现级：返回值枚举不一致） | 假恢复登记缺陷**核销**（「`process_alive` 与 `identity_unconfirmed` 两种拒绝路径均发生在审计登记之前……原先指出的先登记后检查缺陷已经修复」）；只剩 reason 里拼异常文本（`unreadable:%s` / `quarantine_failed:%s` / `quarantine_failed:path_still_present`），与文档枚举不符 |
+
+**第十三轮改了什么**：① `reason` 收敛为 `FORCE_RELEASE_REASONS` 稳定枚举，三条拼异常文本的返回全部改成 `unreadable` / `quarantine_failed`，细节改由 `_diag()` 打 WARN；② 批准通过但隔离失败时补一条 `lease-recovery-failed` 审计行，避免 registry 里只剩 `approved_recovery`、看起来像恢复已落地；③ 新增四条用例把「枚举稳定性」本身变成闸口：`test_force_release_reason_is_stable_enum`（七类拒绝路径逐一断言 `reason ∈ 枚举` 且不含 `:`）、`test_force_release_unreadable_hash_is_stable`、`test_quarantine_failure_is_stable`、`test_rejected_recovery_leaves_no_audit_row_for_hash_and_identity`。
+
+| 14 | v1.8 修订 | **`PASS`** | F-01 核销；无新实现级缺陷；三条残余风险（PID 复用/派生进程/检测时序不可穷举、哈希校验与隔离之间的跨进程竞态、补记行自身写失败未被证明）均属已披露的 PARTIAL 边界 |
+
+**第十四轮之后补的一条**：审查把「`_record_corruption("lease-recovery-failed")` 自己失败会怎样」列为残余风险 3，虽不构成裁定理由，但这是能离线证明的，于是补 `test_quarantine_failed_row_write_failure_is_survivable`（第一次登记成功、第二次返回 `None`，断言不抛异常、仍返回 `quarantine_failed`、租约原样在）。**属于 PASS 后的加证，不改变任何条款口径**，故不重开一轮审查。
 
 **第十轮改了什么（逐条对应）**：
 
