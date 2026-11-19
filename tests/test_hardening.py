@@ -618,7 +618,9 @@ class TestSendFlow(TmpBase):
 
     def test_thinking_uses_thinking_slug(self):
         """CHATGPT_THINKING 开启时必须把 -t- 思考模型传进 POST body。"""
-        api = FakeAPI(os.path.join(self.tmp, "auth"))
+        cid = "11111111-2222-4333-8444-555555555555"
+        api = FakeAPI(os.path.join(self.tmp, "auth"),
+                      sse='data: {"conversation_id": "%s"}\n\ndata: [DONE]' % cid)
         api.resolve_thinking_model = lambda _a: "gpt-6-t-mini"
         old = os.environ.get("CHATGPT_THINKING")
         os.environ["CHATGPT_THINKING"] = "1"
@@ -652,9 +654,46 @@ class TestSendFlow(TmpBase):
         with open(path, encoding="utf-8") as f:
             self.assertIn("FULL-ANSWER-END", f.read())
 
+    def test_missing_conversation_id_is_failure_not_silent_success(self):
+        """A11：200 但解析不出 id → 判失败；禁止回落原 id 继续落盘，也禁止重投。"""
+        cid = "11111111-2222-4333-8444-555555555555"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse="data: {\"v\": 1}\n\ndata: [DONE]")
+        status, path, conv = m.send_prompt(api, cid, self._prompt("x"), thinking=False)
+        self.assertEqual(status, 1, "解析不出 id 必须判失败")
+        self.assertIsNone(path, "没有落点证据就不许落盘")
+        self.assertEqual(len(api.sent), 1, "不得换身份重投")
+
+    def test_invalid_conversation_id_is_rejected(self):
+        """A11：解析出的 id 不合规（如路径穿越串）→ 判失败，不得回落原 id。"""
+        cid = "11111111-2222-4333-8444-555555555555"
+        api = FakeAPI(os.path.join(self.tmp, "auth"),
+                      sse='data: {"conversation_id": "../../evil"}\n\ndata: [DONE]')
+        status, path, _conv = m.send_prompt(api, cid, self._prompt("x"), thinking=False)
+        self.assertEqual(status, 1)
+        self.assertIsNone(path)
+        self.assertEqual(len(api.sent), 1)
+
+    def test_reply_digest_reports_parts_and_sha(self):
+        """A12：GET 全文要按 part 数 + 拼接 SHA-256 对账，不能只看「变长了」。"""
+        raw = json.dumps({"mapping": {
+            "u": {"message": {"author": {"role": "user"},
+                              "content": {"parts": ["ask"]}, "create_time": 1}},
+            "a": {"message": {"id": "msg-1", "author": {"role": "assistant"},
+                              "content": {"parts": ["abc", "defgh"]}, "create_time": 5}},
+        }})
+        dg = m.reply_digest(raw)
+        self.assertEqual(dg["parts"], [3, 5])
+        self.assertEqual(dg["chars"], 8)
+        self.assertEqual(dg["sha256"], __import__("hashlib").sha256(b"abcdefgh").hexdigest())
+        self.assertEqual(dg["message_id"], "msg-1")
+        self.assertIsNone(m.reply_digest('{"mapping": {}}'))
+        self.assertIsNone(m.reply_digest("not json"))
+
     def test_default_keeps_auto_model(self):
         """未开启思考模式时不覆写 model（保持 auto）。"""
-        api = FakeAPI(os.path.join(self.tmp, "auth"))
+        cid = "11111111-2222-4333-8444-555555555555"
+        api = FakeAPI(os.path.join(self.tmp, "auth"),
+                      sse='data: {"conversation_id": "%s"}\n\ndata: [DONE]' % cid)
         status, _p, _c = m.send_prompt(api, None, self._prompt("x"), new_chat=True)
         self.assertEqual(status, 200)
         self.assertIsNone(api.sent[-1]["model"])
@@ -1309,7 +1348,9 @@ class TestSlotsAndLease(TmpBase):
         for p in procs:
             out, err = p.communicate(timeout=120)
             outs.append((out or "").strip())
-        got = [o for o in outs if o and o != "FULL"]
+        # 子进程可能先打印 WARN 再打印结果：只认最后一行，且必须是槽位路径
+        got = [o.strip().splitlines()[-1] for o in outs
+               if o and o.strip().splitlines() and o.strip().splitlines()[-1].endswith(".slot")]
         self.assertLessEqual(len(got), 3, "超发槽位：%r" % (outs,))
         self.assertEqual(len(set(got)), len(got), "同一槽位被两个进程同时持有")
 

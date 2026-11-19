@@ -499,6 +499,38 @@ def _read_ephemeral(path):
     return data, True
 
 
+def reply_digest(raw_body):
+    """A12：把一条 assistant 消息的 parts 统计出来，用于核对「GET 全文是否完整」。
+
+    返回 {message_id, parts, chars, sha256}；没有可用消息返回 None。
+    为什么要有它：流被截断时 SSE 可能是半截，GET 回来的 mapping 也可能缺 part，
+    只看「长度变长了」会把缺 part 的回复当完整——必须按 part 数与拼接 SHA-256 对账。
+    """
+    try:
+        data = json.loads(raw_body)
+    except Exception:
+        return None
+    best = None
+    for node_id, node in (data.get("mapping") or {}).items():
+        msg = (node or {}).get("message") or {}
+        if (msg.get("author") or {}).get("role") != "assistant":
+            continue
+        parts = [p for p in ((msg.get("content") or {}).get("parts") or []) if isinstance(p, str)]
+        if not parts or not "".join(parts).strip():
+            continue
+        key = (msg.get("create_time") or 0, msg.get("id") or node_id)
+        if best is None or key > best[0]:
+            best = (key, msg, parts)
+    if best is None:
+        return None
+    _key, msg, parts = best
+    joined = "".join(parts).encode("utf-8")
+    return {"message_id": msg.get("id") or "",
+            "parts": [len(p) for p in parts],
+            "chars": sum(len(p) for p in parts),
+            "sha256": hashlib.sha256(joined).hexdigest()}
+
+
 def _load_json(path, default):
     """读状态 json。文件损坏时隔离为 .corrupt-<ts> 并告警，而不是静默返回空。
 
@@ -3182,30 +3214,38 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
 
     # 校验 conversation_id：防静默落新会话事故
     # 三级兜底：SSE 逐行解析 → 整包 JSON → 精确正则（流被截断时仍能捞出 id）
-    real_conv = conv_id
+    parsed = None
     for line in resp.splitlines():
         if line.startswith("data:"):
             try:
                 obj = json.loads(line[5:].strip())
                 cid = obj.get("conversation_id")
                 if cid:
-                    real_conv = cid
+                    parsed = cid
                     break
             except Exception:
                 pass
-    if not (conv_id or real_conv):
+    if not parsed:
         try:
-            real_conv = json.loads(resp).get("conversation_id") or real_conv
+            parsed = json.loads(resp).get("conversation_id")
         except Exception:
             pass
-    if not real_conv:
+    if not parsed:
         m = re.search(r'"conversation_id"\s*:\s*"([0-9a-fA-F-]{36})"', resp or "")
         if m:
-            real_conv = m.group(1)
-            print("conversation_id 由正则兜底解析得到：%s" % real_conv, flush=True)
-    if real_conv and not _ID_RE.match(real_conv):
-        print("WARN: 解析出的 conversation_id 不合规（%r），按原 id 处理" % (real_conv,), flush=True)
-        real_conv = conv_id or ""
+            parsed = m.group(1)
+            print("conversation_id 由正则兜底解析得到：%s" % parsed, flush=True)
+    # A11 硬要求：解析不出唯一且合规的 id 就判失败，禁止「WARN 一下接着走」或换身份重投。
+    # 旧版在 id 不合规时回落到传入的 conv_id 继续落盘，等于把「没认回会话」粉饰成成功。
+    if not parsed:
+        print("FAIL: 200 但解析不出 conversation_id（无法证明落点会话）；按 A11 判失败，不重投",
+              flush=True)
+        return 1, None, None
+    if not _ID_RE.match(parsed):
+        print("FAIL: 解析出的 conversation_id 不合规（%r）；按 A11 判失败，不重投、不落盘"
+              % (parsed,), flush=True)
+        return 1, None, None
+    real_conv = parsed
     if conv_id and real_conv != conv_id:
         print("WARN: 落入了不同会话! target=%s real=%s" % (conv_id, real_conv), flush=True)
 
@@ -3218,6 +3258,15 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
                              timeout=120)
         if gst == 200:
             full = api.harvest_mapping(gbody)
+            digest = reply_digest(gbody)
+            if digest:
+                # A12：按 part 统计对账，不只看「长度变长了」
+                print("GET 全文核对：message=%s parts=%s chars=%d sha256=%s"
+                      % ((digest["message_id"] or "?")[:12], digest["parts"],
+                         digest["chars"], digest["sha256"][:12]), flush=True)
+                if digest["chars"] != len(full):
+                    print("WARN: parts 合计 %d 字符 ≠ 拼接 %d 字符（可能缺 part），按不完整处理"
+                          % (digest["chars"], len(full)), flush=True)
         if len(full) > len(reply or ""):
             print("补全文：SSE %d 字符 → GET %d 字符" % (len(reply or ""), len(full)), flush=True)
             reply = full

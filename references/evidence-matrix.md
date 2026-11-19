@@ -13,7 +13,7 @@
 
 **矩阵自身受回归保护**：`tests/test_hardening.py::TestEvidenceMatrix` 会校验「条款集合 = 矩阵行集合」「每个 `test:`/`code:` 引用都能解析」「每条至少一种证据」。也就是说，新增条款而不补证据行、或引用了不存在的用例，测试会直接红。
 
-> 最后更新：2026-11-19（v1.8）。当前回归 135 条，全绿。
+> 最后更新：2026-11-19（v1.8）。当前回归 138 条，全绿。
 
 ---
 
@@ -32,8 +32,8 @@
 | A8 | 测试+代码 | `test:test_device_summary_counts_bound_sessions` `test:test_jar_is_persisted_and_header_is_readable` `code:list_device_ids` `code:device_summary` | 设备快照双文件（txt + json）同时存在才算 known |
 | A9 | 代码+人判 | `code:_attach` `code:find_tab` `human:targetId+oai-did+conv_id 三要素校验在 UI 通道内，离线只能验标签页选择` | 可写窗口身份绑定靠真机验证 |
 | A10 | 测试+代码 | `test:test_happy_path_keeps_conversation_id` `code:send_prompt` | 发送后 SSE 首包 id 必须与目标一致 |
-| A11 | 测试+代码 | `test:test_extract_reply_sse_takes_last_assistant` `test:test_happy_path_keeps_conversation_id` `code:create_chat_rotating` | 200 后不再换身份；id 解析不出即停 |
-| A12 | 测试+代码 | `test:test_tail_from_mapping_picks_newest` `code:tail_from_mapping` `code:harvest_mapping` | 按原始顺序取 parts，用 SHA-256 与 chars 同口径比对 |
+| A11 | 测试+代码 | `test:test_missing_conversation_id_is_failure_not_silent_success` `test:test_invalid_conversation_id_is_rejected` `test:test_happy_path_keeps_conversation_id` `code:create_chat_rotating` | 200 后不再换身份；解不出 id 或 id 不合规 → 返回 1、不落盘、不重投 |
+| A12 | 测试+代码 | `test:test_reply_digest_reports_parts_and_sha` `test:test_tail_from_mapping_picks_newest` `code:reply_digest` `code:tail_from_mapping` | 截断补全文时按 part 数 + 拼接 SHA-256 对账，不只看「变长了」 |
 | A13 | 测试+代码 | `test:test_full_text_is_kept` `test:test_optional_truncation_is_labelled` `code:save_reply` | 默认全文；截断必须写进文件头 |
 | A14 | 测试+代码 | `test:test_jar_is_persisted_and_header_is_readable` `test:test_auth_cookies_are_never_written_to_disk` `code:save_device_cookie` | 发前落身份，auth cookie 永不落盘 |
 | A15 | 测试+代码 | `test:test_lock_is_reentrant` `test:test_concurrent_updates_do_not_lose_writes` `code:_file_lock` | 账号级串行靠同一把状态锁 |
