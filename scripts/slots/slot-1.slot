@@ -1,9 +1,0 @@
-{
-  "task_id": "../../evil",
-  "run_id": "a37ea8375d71",
-  "pid": 17620,
-  "process_start_time": 134395941489842190,
-  "started_at": 1795120549.3737102,
-  "heartbeat_at": 1795120549.3737102,
-  "lease_until": 1795120609.3737102
-}

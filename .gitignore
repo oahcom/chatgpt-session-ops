@@ -32,6 +32,9 @@ quarantine/
 pending-claims.jsonl
 conv-api/
 *.lock
+# B8 槽位 / B15 租约是运行态（测试也会在 BASE 下生成），绝不入库
+slots/
+lease-*.json
 # 出口代理配置可能带账号密码（socks5h://user:pass@host），绝不入库
 proxy.json
 
