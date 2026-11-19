@@ -735,6 +735,52 @@ class TestRotation(TmpBase):
         self.assertEqual(plan[-1], "acct1")
         self.assertEqual(len(plan), len(m.ROTATION_PRIMARY))
 
+    # ---- F-33：429 限流时换账号 / 走匿名（用户裁定） ----
+    def _run_new(self, account, status, conv=None):
+        """跑 `--account <account> --new p.md`，返回 (rc, 是否走到轮转兜底, 输出)。"""
+        real_api, real_send = m.ChatGPTAPI, m.send_prompt
+        real_rot, real_argv = m.create_chat_rotating, sys.argv
+        hit = {"rotate": False}
+
+        class _Api(object):
+            account = "x"
+            is_anon = False
+
+        m.ChatGPTAPI = lambda account=None: _Api()
+        m.send_prompt = lambda *a, **k: (status, None, conv)
+        m.create_chat_rotating = lambda *a, **k: hit.update(rotate=True) or 0
+        sys.argv = ["chatgpt_send.py", "--account", account, "--new", "p.md"]
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = m.main()
+        finally:
+            m.ChatGPTAPI, m.send_prompt = real_api, real_send
+            m.create_chat_rotating, sys.argv = real_rot, real_argv
+        return rc, hit["rotate"], buf.getvalue()
+
+    def test_explicit_account_429_escalates_to_rotation(self):
+        """显式指定 acct1 却 429：必须换账号（换不动则匿名），不能原地失败。"""
+        rc, rotated, out = self._run_new("acct1", 429)
+        self.assertTrue(rotated, "429 未进入轮转兜底：用户裁定要求换账号/走匿名\n%s" % out)
+        self.assertEqual(rc, 0)
+        # 该账号要被记进冷却，否则轮转计划会先把它自己再试一遍
+        st = m.load_rotation()
+        self.assertIn("acct1", st["unavailable"])
+        self.assertIn("429", st["unavailable"]["acct1"]["reason"])
+
+    def test_explicit_account_401_does_not_escalate(self):
+        """401 = 凭据失效，换账号/匿名都治不了，不得掩盖成「换个身份试试」。"""
+        rc, rotated, out = self._run_new("acct1", 401)
+        self.assertFalse(rotated, "401 不该触发轮转\n%s" % out)
+        self.assertEqual(rc, 1)
+
+    def test_explicit_nologin_429_does_not_recurse(self):
+        """显式 nologin 已 429：再兜底还是匿名，不能自己调自己。"""
+        rc, rotated, out = self._run_new("nologin", 429)
+        self.assertFalse(rotated, "nologin 429 触发匿名兜底 = 无限自递归\n%s" % out)
+        self.assertEqual(rc, 1)
+
 
 # ---------------------------------------------------------------- 落盘
 class TestReplySave(TmpBase):
@@ -3359,6 +3405,68 @@ class TestSlotsAndLease(TmpBase):
         self.assertTrue(ok)
         self.assertEqual(why, "process_gone")
         self.assertFalse(os.path.exists(p))
+
+    # ---- F-32：磁盘写失败时租约 API 必须降级，不得让 OSError 逃逸 ----
+    def _disk_full(self):
+        """模拟磁盘满：_atomic_write 与 os.remove 都失败。"""
+        def boom(*a, **k):
+            raise OSError(28, "No space left on device")
+        return boom
+
+    def test_lease_heartbeat_write_failure_returns_false(self):
+        """文档承诺返回 bool。OSError 穿出去 = 心跳线程静默死亡、租约悄悄过期。"""
+        p = os.path.join(self.tmp, "lease-f32a.json")
+        m._atomic_write(p, json.dumps({"run_id": "r1", "pid": os.getpid(),
+                                       "lease_until": time.time() + 999}))
+        real = m._atomic_write
+        m._atomic_write = self._disk_full()
+        try:
+            self.assertFalse(m.lease_heartbeat(p, "r1"))
+        finally:
+            m._atomic_write = real
+
+    def test_lease_release_write_failure_returns_false(self):
+        """释放失败按「租约仍在」处理：宁可留僵尸等人工闸口，也不谎报已释放。"""
+        p = os.path.join(self.tmp, "lease-f32b.json")
+        m._atomic_write(p, json.dumps({"run_id": "r1", "pid": os.getpid(),
+                                       "lease_until": time.time() + 999}))
+        real_w, real_rm = m._atomic_write, m.os.remove
+        m._atomic_write = self._disk_full()
+        m.os.remove = self._disk_full()
+        try:
+            self.assertFalse(m.lease_release(p, "r1"))
+        finally:
+            m._atomic_write, m.os.remove = real_w, real_rm
+
+    def test_lease_reclaim_write_failure_returns_stable_reason(self):
+        """回收是自动化巡检入口：写失败必须落成枚举 (False,'write_failed')，
+        而不是抛异常把整轮巡检崩掉。租约必须过期，否则走不到写分支。"""
+        p = os.path.join(self.tmp, "lease-f32c.json")
+        m._atomic_write(p, json.dumps({"run_id": "r2", "pid": 999999,
+                                       "lease_until": time.time() - 10,
+                                       "process_start_time": 1.0}))
+        real_w, real_rm = m._atomic_write, m.os.remove
+        m._atomic_write = self._disk_full()
+        m.os.remove = self._disk_full()
+        try:
+            ok, why = m.lease_reclaim(p)
+        finally:
+            m._atomic_write, m.os.remove = real_w, real_rm
+        self.assertFalse(ok)
+        self.assertEqual(why, "write_failed")
+        self.assertTrue(os.path.exists(p), "写失败却把租约弄丢了")
+        self.assertIn("write_failed", (m.lease_reclaim.__doc__ or "") + why,
+                      "reason 必须是稳定枚举，不得混入异常文本")
+
+    def test_lease_acquire_write_failure_returns_none(self):
+        """没写成 = 没拿到租约。返回 None 让调用方按冲突退出，绝不带病继续跑。"""
+        p = os.path.join(self.tmp, "lease-f32d.json")
+        real = m._atomic_write
+        m._atomic_write = self._disk_full()
+        try:
+            self.assertIsNone(m.lease_acquire(p, "task-x"))
+        finally:
+            m._atomic_write = real
 
     # ---- B15：心跳 / 续期 / 超时回收（时间参数按比例缩小，可重复）----
     def test_lease_run_done(self):

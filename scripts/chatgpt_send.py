@@ -1646,15 +1646,29 @@ def lease_acquire(path, task_id, run_id=None, lease_sec=LEASE_SEC, lock_timeout=
     except LockTimeout:
         print("WARN: 租约锁等待超时 → 按 B15 判冲突（调用方 exit 1），不启动第二个实例", flush=True)
         return None
+    except OSError as e:
+        # F-32：写租约失败 → 没拿到租约。返回 None 让调用方按 LEASE_BUSY 退出，
+        # 绝不带着「以为领到了」的状态继续跑（那会绕过 B15 的单实例保证）。
+        _diag("写租约失败，不启动（按冲突处理）", path, e)
+        return None
     return run_id
 
 
 def lease_heartbeat(path, run_id, lease_sec=LEASE_SEC, lock_timeout=LOCK_TIMEOUT_SEC):
-    """续期（B15：每 15s 一次）。返回 False 说明租约已不属于自己（或抢不到锁）。"""
+    """续期（B15：每 15s 一次）。返回 False 说明租约已不属于自己（或抢不到锁）。
+
+    F-32：文档承诺「返回 bool」，所以**任何**失败都必须落成 False——
+    旧版只 catch LockTimeout，`_atomic_write` 的 OSError（磁盘满/权限/只读盘）
+    会直接穿出去。心跳线程里若没包 try 就是线程静默死亡（租约悄悄过期）；
+    包了 try 也只是把异常吞掉，调用方仍拿不到「本次续期失败」这个信息。
+    """
     try:
         return _lease_heartbeat_locked(path, run_id, lease_sec, lock_timeout)
     except LockTimeout:
         print("WARN: 心跳抢不到租约锁，本次续期失败（按不属于自己处理）", flush=True)
+        return False
+    except OSError as e:
+        _diag("心跳写入失败，本次续期失败（租约可能因此过期）", path, e)
         return False
 
 
@@ -1671,11 +1685,19 @@ def _lease_heartbeat_locked(path, run_id, lease_sec, lock_timeout):
 
 
 def lease_release(path, run_id, lock_timeout=LOCK_TIMEOUT_SEC):
-    """主动释放：只有持有者能释放。抢不到锁 → 不释放（返回 False，让调用方记 orphan）。"""
+    """主动释放：只有持有者能释放。抢不到锁 → 不释放（返回 False，让调用方记 orphan）。
+
+    F-32：同 `lease_heartbeat`——承诺返回 bool，OSError 不得逃逸。
+    释放失败按「租约仍在」处理（调用方记 TIMEOUT_ORPHAN），这是保守方向：
+    宁可留僵尸租约等人工闸口，也不谎报已释放。
+    """
     try:
         return _lease_release_locked(path, run_id, lock_timeout)
     except LockTimeout:
         print("WARN: 释放租约抢不到锁，保留租约（按 TIMEOUT_ORPHAN 处理）", flush=True)
+        return False
+    except OSError as e:
+        _diag("释放租约失败，保留租约（按 TIMEOUT_ORPHAN 处理）", path, e)
         return False
 
 
@@ -1692,7 +1714,12 @@ def _lease_release_locked(path, run_id, lock_timeout):
 
 
 def lease_reclaim(path, expect_run_id=None, lock_timeout=LOCK_TIMEOUT_SEC):
-    """按 B15 口径回收。返回 (是否回收, reason)。抢不到锁 → 不回收（lock_timeout）。"""
+    """按 B15 口径回收。返回 (是否回收, reason)。抢不到锁 → 不回收（lock_timeout）。
+
+    F-32：承诺返回 (bool, 稳定枚举)，OSError 不得逃逸——回收是**自动化巡检**
+    的入口，异常穿出去会让巡检脚本崩掉整轮，而不是跳过这一个租约继续看下一个。
+    写入失败时返回 (False, "write_failed")：明确「没回收成」，不是「回收了但没写」。
+    """
     try:
         with _file_lock(path, timeout=lock_timeout, strict=True):
             info, readable = _read_ephemeral(path)
@@ -1709,6 +1736,9 @@ def lease_reclaim(path, expect_run_id=None, lock_timeout=LOCK_TIMEOUT_SEC):
             return ok, why
     except LockTimeout:
         return False, "lock_timeout"
+    except OSError as e:
+        _diag("回收租约失败，保留租约", path, e)
+        return False, "write_failed"
 
 
 FORCE_RELEASE_REASONS = (
@@ -5162,6 +5192,16 @@ def main():
             if status == 200 and conv:
                 record_conv(conv, account, args[1])
                 print("NEW_CONV %s account=%s" % (conv, account), flush=True)
+            if status == 429 and account in ROTATION_PRIMARY:
+                # 429 限流 → 换账号，换不动就匿名（用户裁定）。显式指定身份只约束
+                # 「用谁起」，不该约束「限速后还能干什么」：429 还没建成会话，
+                # 重试不会重复建会话、不会多花配额。
+                print("WARN: %s 返回 429 —— 换另一个登录态，都限速则走匿名通道" % account,
+                      flush=True)
+                def mark(s):
+                    mark_unavailable(s, account, "HTTP 429 限速冷却", COOLDOWN_429)
+                mutate_rotation(mark)
+                return create_chat_rotating(args[1], thinking=True if thinking_flag else None)
             return 0 if status == 200 else 1
         # 默认：acct1/acct2 均分轮转，双 429 才匿名兜底
         return create_chat_rotating(args[1], thinking=True if thinking_flag else None)
@@ -5212,6 +5252,12 @@ def main():
         return 1
     if status == 200:
         record_conv(conv_id, account, args[1])
+    elif status == 429:
+        # 既有会话不能换身份：会话归属固定（换账号 404，匿名更读不到）。
+        # 这里只报「怎么解」——换账号/匿名只对 --new 有效，别让人以为能重投。
+        print("FAIL: 429 限速，但会话 %s 归属 %s —— 换账号或匿名都读不到这条会话。"
+              "按返回体时限退避后重试，或用 --new 开新会话（429 会自动换账号/走匿名）"
+              % (conv_id[:8], account), flush=True)
     elif getattr(conv, "mismatch", False):
         # F-13：落点不一致 → 业务失败，且必须把两个 id 都带出来（目标 vs 实际落点）
         print(json.dumps({

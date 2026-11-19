@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**三十七轮对外对抗审查**逐条改写（第三十三～三十七轮为收敛后终检自检，其余为对外会话裁定；每轮裁定见 §F；**第二十五轮 `PASS`——锁子系统全文最终确认·收敛**，第二十二轮 `PASS`（F-10 残留定向复审），**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至二十三轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08）、锁元数据写入失败进临界区（F-09）、损坏启动时间误判 pid_reused（F-10）、归档覆盖（F-11）、超长 pid 串 int() 异常逃逸（F-07 残留）、**收割/对账解析器畸形 JSON 崩溃（F-12，41 处）**、**落点不一致只 WARN 导致会话身份与回复归属分裂（F-13）**、**RRULE 校验语义 ≠ 下发语义（F-14）**、**解析边界与证据保全缺口（F-15～F-19）**、**落点正则绕过与回复完整性 fail-open（F-13/F-16 残留 + F-23～F-25）**、**浮点精度与首尾换行边界（F-12c/F-22 残留 + N-01/N-02）**、**对账器跨角色畸形漏检（D-01）**——前 11 组已在第二十五轮核销，**F-12～F-25 + D-01 全部核销，三十二轮对抗审查收敛**），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 283 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**三十八轮对外对抗审查**逐条改写（第三十三～三十八轮为收敛后终检自检，其余为对外会话裁定；每轮裁定见 §F；**第二十五轮 `PASS`——锁子系统全文最终确认·收敛**，第二十二轮 `PASS`（F-10 残留定向复审），**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至二十三轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08）、锁元数据写入失败进临界区（F-09）、损坏启动时间误判 pid_reused（F-10）、归档覆盖（F-11）、超长 pid 串 int() 异常逃逸（F-07 残留）、**收割/对账解析器畸形 JSON 崩溃（F-12，41 处）**、**落点不一致只 WARN 导致会话身份与回复归属分裂（F-13）**、**RRULE 校验语义 ≠ 下发语义（F-14）**、**解析边界与证据保全缺口（F-15～F-19）**、**落点正则绕过与回复完整性 fail-open（F-13/F-16 残留 + F-23～F-25）**、**浮点精度与首尾换行边界（F-12c/F-22 残留 + N-01/N-02）**、**对账器跨角色畸形漏检（D-01）**——前 11 组已在第二十五轮核销，**F-12～F-25 + D-01 全部核销，三十二轮对抗审查收敛**），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 290 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -34,7 +34,7 @@
 | 2 | 这个会话归谁 | `--owner <conv_id>` | 输出唯一账号 |
 | 3 | 配额有没有冷却 | `--rotation` | `unavailable` 为空或目标账号不在其中 |
 | 4 | 匿名要用先看设备 | `--anon-devices` | 目标设备 `jar=true` |
-| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 283 条） |
+| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 290 条） |
 
 ### A1–A4 内容主权（不可协商）
 
@@ -224,6 +224,16 @@
 
 **B8/B15 实现**：`acquire_slot()` / `release_slot()` 在同一把跨进程锁内完成「回收死槽 + 计数 + 占位」，返回 `(slot_path, run_id)`，满员返回 `(None, run_id)` 由调用方记 `QUEUED`；`lease_acquire/heartbeat/release/reclaim` + `_lease_reclaimable()` 覆盖 `lease_valid / process_gone / pid_reused / identity_unreadable / run_id_mismatch / alive` 六种回收判定。回归含 6 进程同时抢槽（断言有效槽位 ≤3 且互不重叠）与租约六态。超时分两档（B15 硬要求）：执行体响应 cancel 且确实停下 → `TIMEOUT` 并释放租约；**执行体不响应取消、仍在跑 → `TIMEOUT_ORPHAN` 且保留租约**（此时释放租约等于放第二个实例进来，双跑比僵尸更危险）。心跳与超时由 `lease_run()` 落地：`HEARTBEAT_SEC=15`、`LEASE_SEC=60`、`RUN_MAX_SEC=3600` 三个常量可注入，回归用**按比例缩小的秒数**（如 lease 0.4s / heartbeat 0.1s / max 0.2s）验证同一套逻辑——证明「运行超过租约时心跳确实续期、不会被判过期」以及「超 `RUN_MAX_SEC` 时，执行体已停 → `TIMEOUT` + 释放租约，执行体不停 → `TIMEOUT_ORPHAN` + 保留租约」，不需要真等 15 分钟和 1 小时。
 
+**租约 API 的返回值是契约，磁盘失败不得破约（F-32，第三十八轮）**：四个对外函数承诺确定结局，`OSError`（磁盘满 WinError 112 / 只读盘 / 权限）必须落成承诺值，诊断细节走 `_diag()` 只进日志：
+
+| 函数 | 承诺 | 磁盘失败时 | 为什么是这一侧 |
+|---|---|---|---|
+| `lease_acquire` | `run_id` 或 `None` | `None` | 没写成 = 没拿到租约。带病继续跑会绕过 B15 单实例保证 |
+| `lease_heartbeat` | `bool` | `False` | 线程里没人接异常 → 线程静默死亡、租约悄悄过期 |
+| `lease_release` | `bool` | `False` | 保守侧：宁可留僵尸等人工闸口，也不谎报已释放（调用方记 `TIMEOUT_ORPHAN`） |
+| `lease_reclaim` | `(bool, 稳定枚举)` | `(False, "write_failed")` | 自动化巡检入口：抛异常会崩掉整轮，而不是跳过这一份继续看下一份 |
+
+
 **B8 六条补充口径（v1.8，由真实超发事故倒推）**：
 
 1. **抢不到锁 = 不启动**。`_file_lock(..., strict=True)` 超时抛 `LockTimeout`，`acquire_slot` 捕获后按 `QUEUED` 返回 `(None, run_id)`。旧版超时后打印 WARN 就「跳过加锁继续跑」，6 进程抢槽实测出现过 **6 个槽位同时被占**——并发上限这种硬约束上，「WARN 不等于阻断」是致命的。
@@ -335,7 +345,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | automation 名称 / 排程 | 同上 + `--check-name`、`--check-schedule`、`--check-oneshot` | B1/B4/B5/B10/B11 |
 | 排程口径 | `automation_update list` 全量盘点 | B1–B5 |
 
-**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 283 条。
+**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 290 条。
 
 ---
 
@@ -468,10 +478,15 @@ X=2` 会被当成单个合法 VALUE 放行；改为 `([^;
 | 37 | v1.8 修订 | **`PASS`（收敛后终检自检：F-31）** | 前三轮修完「不可信输入 → 确定性结局」在校验器与锁判定上的漏网后，本轮用**结构化 fuzz**（4000 组随机 JSON 形状：嵌套 dict/list/超大整数/NaN/±inf/bytes/None/int）打四个解析器。抓出 **F-31**：同一份不可信输入两种待遇——`reply_digest`/`harvest_mapping_checked` 走 `json.loads` 的 `except Exception`，任意类型降级成 None；而 `_scan_sse`/`_sse_conv_ids` 直接 `(raw_text or "").splitlines()`，收到 **bytes** 抛 `TypeError: startswith first arg must be bytes or a tuple of bytes, not str`、收到 int/float/bool/object 抛 `AttributeError: ... has no attribute 'splitlines'`。当前 HTTP 层统一 `.decode("utf-8","replace")` 后再传入，故**不可达**；但上层一旦改流式/二进制读取即变成可复现崩溃。修复：抽 `code:_as_text`（str 原样；bytes/bytearray 解码；其余空串），两处解析器共用。补 3 条回归（280→283）。|
 
 **第三十七轮改了什么（收敛后终检自检，非新会话裁定）**：**F-31**——① 新增 `_as_text(value)`：`str` 原样返回；`bytes`/`bytearray` 按 `utf-8`/`replace` 解码（HTTP 体的天然形态）；其余类型一律空串。与 `_as_dict`/`_as_seq`/`_as_float` 同族——「没有可解析内容」是保守结论（不完整），不是猜测。② `_scan_sse` 与 `_sse_conv_ids` 的 `(raw_text or "").splitlines()` 全部改为 `_as_text(raw_text).splitlines()`。③ 探针实测：`None`/`123`/`1.5`/`True`/`[]`/`{}`/`object()` 全部降级为 `("", False, ...)` 与 `(None, [])`，无异常；`bytes` 形态与 `str` 形态解析结果**逐字节等价**（`_sse_conv_ids` 取到同一 id、`_scan_sse` 取到同一正文与 `saw_done`）。④ 补 3 条回归：`test_sse_parsers_accept_non_str_without_raising`、`test_sse_parsers_decode_bytes`、`test_lock_judgement_rejects_non_path`；反证已做——回退两处调用点后前者报 `TypeError`/`AttributeError`、后者报 `TypeError`，精确复现旧行为。**F-31b（同轮附带）**：结构化 fuzz 打 `_lock_holder_stale` 时暴露 `open(True)` ≡ `open(1)`（把 stdout 当文件读，实测挂住）与 `open(10**400)` 抛 `OverflowError`（既非 OSError 也非 ValueError），`_lock_holder_stale` 与 `_try_reclaim_stale` 入口补路径类型守卫，非路径一律返回 False（保守，不动锁）。**自检裁定：F-31/F-31b 关闭；当前不可达（HTTP 层已解码、调用方恒传路径），属健壮性与一致性缺陷（同一不可信输入两种待遇，违反 F-12 已确立口径），修复面仅限两个 SSE 解析器的入口类型收敛与锁判定入口守卫，未改动解析逻辑、落点判定、`[DONE]` 终点语义与 stale 判定顺序；回归 283 全绿（1 条 POSIX-only skip）。**
+| 38 | v1.8 修订 | **`PASS`（收敛后终检自检：F-32 + F-33）** | 本轮两靶：① 锁子系统**磁盘失败面**——`lease_heartbeat`/`lease_release`/`lease_reclaim`/`lease_acquire` 文档承诺 `bool` / `(bool, 稳定枚举)` / `run_id|None`，实际只 catch `LockTimeout`，`_atomic_write`/`os.remove` 的 `OSError`（磁盘满 WinError 112 / 只读盘 / 权限）直接穿出去。心跳线程里没包 `try` 就是**线程静默死亡、租约悄悄过期**（B15 的单实例保证失效），包了 `try` 也只是吞异常、调用方拿不到「本次续期失败」。`lease_reclaim` 更重：它是**自动化巡检入口**，异常穿出去会崩掉整轮巡检，而不是跳过这一份租约继续看下一份。② 429 处置**身份侧**——用户裁定「429 限流换账号或者直接用匿名渠道」，此前只对 `--new` 隐式轮转成立；**显式 `--account acct1 --new` 遇 429 直接 exit 1**（明明另一个账号可用），既有会话遇 429 也只报一句 `resp:` 不解释为什么换号无用。修复：租约四函数各补 `except OSError` 分支（`False` / `False` / `(False,"write_failed")` / `None`），诊断细节走 `_diag` 落日志不入返回值；`--new` 显式主身份 429 → 记入冷却后转轮转（换另一个登录态，都 429 则匿名）；既有会话 429 → 明确告知「会话归属固定，换号/匿名都读不到，只能按服务端时限退避或 `--new`」。补 7 条回归（283→290）。|
+
+
+
+**第三十八轮改了什么（收敛后终检自检，非新会话裁定）**：**F-32 + F-33**——① **F-32**：`lease_heartbeat`/`lease_release`/`lease_reclaim`/`lease_acquire` 各补 `except OSError` 分支，分别返回 `False` / `False` / `(False, "write_failed")` / `None`；诊断细节一律走 `_diag(what, path, detail)` 落 WARN 日志，**不进返回值**——reason 是给机器做等值比较的稳定枚举，混入 `WinError 112` 文本后换个 Python 版本判定就变。语义方向均取保守侧：续期失败 = 本次没续上（租约可能因此过期）；释放失败 = 租约仍在（调用方记 `TIMEOUT_ORPHAN`，宁可留僵尸等人工闸口也不谎报已释放）；回收写失败 = `write_failed`（「没回收成」，不是「回收了但没写」）；领租约写失败 = `None`（没写成就是没拿到，绝不带病跑，否则绕过 B15 单实例保证）。② **F-33**（依用户裁定「429 限流换账号或者直接用匿名渠道」）：`--new` 显式主身份（`acct1`/`acct2`）遇 429 时，先把该身份记入 429 冷却（`COOLDOWN_429`），再转 `create_chat_rotating` —— 换另一个登录态，两者都 429 才启用匿名兜底。判据：429 时**会话尚未建成**，重试不会重复建会话、不会多花配额，所以显式指定身份只约束「用谁起」，不约束「限速后还能干什么」。401/403 不转（凭据失效要重新提取、风控短冷却自愈，换身份只会掩盖病因）；显式 `nologin` 已 429 也不转（再兜底还是匿名 = 无限自递归）。既有会话遇 429 只输出解释：会话归属固定，换号 404、匿名更读不到，只能按服务端时限退避或 `--new`。③ 探针实测（`_atomic_write`/`os.remove` 双失败）：四函数分别返回 `False`/`False`/`(False,'write_failed')`/`None`，无异常逃逸；正常路径 `acquire→heartbeat→reclaim(未过期)→release→reclaim(空)` 结果与修复前逐项一致。④ 补 7 条回归：`test_lease_heartbeat_write_failure_returns_false`、`test_lease_release_write_failure_returns_false`、`test_lease_reclaim_write_failure_returns_stable_reason`、`test_lease_acquire_write_failure_returns_none`、`test_explicit_account_429_escalates_to_rotation`、`test_explicit_account_401_does_not_escalate`、`test_explicit_nologin_429_does_not_recurse`；反证已做——回退四处 `except OSError` 后四条租约用例全 ERROR（`OSError` 逃逸），回退 429 转轮转后 `test_explicit_account_429_escalates_to_rotation` 报 `AssertionError: False is not true : 429 未进入轮转兜底`，均精确复现旧行为。**自检裁定：F-32/F-33 关闭；F-32 属「文档承诺 vs 实现」不一致（承诺确定性结局，实际让 OSError 逃逸），修复面限于四个对外函数的异常出口，未改动锁的两层互斥结构、`_atomic_write` 的原子性与 stale/回收判定顺序；F-33 属能力缺口（用户裁定要求的行为在显式身份路径上不存在），修复面限于 `main()` 的 `--new` 分支与既有会话的失败说明，未改动轮转计划、游标推进规则与匿名兜底放行条件。回归 290 全绿（1 条 POSIX-only skip）。**
 
 **第三十一轮改了什么（依新会话裁定）**：**D-01**——`reply_digest` 将 `_split_parts(parts)` 与 `if malformed: return None` 移到 `author.get("role") != "assistant"` 判断**之前**（时间戳校验之后），确保**所有角色**的非法 part 都让完整性证明器整体不可用；assistant 的结构化 part 与「无文本」判断仍保留在角色判断之后，用户合法多模态 part 照常放行。补 1 条回归（268→269），三对照实测：user 非法 part→None、user 合法结构化 part→摘要成立、assistant 非法 part→None。
 
-**收敛声明（第 32 轮，第 33～37 轮终检后仍成立）**：经三十二轮对抗审查，三个子系统全部收敛——①**锁/进程身份**：第 25 轮全文最终确认 PASS（逐函数 12 项 + 逐组合 7 组），第 36 轮补修 F-30（状态文件超大数值的 `OverflowError` 不得穿出锁判定，统一走 `_as_float`）；②**定时任务契约**：第 31 轮增量收敛（CR/LF 首尾绕过、内部空白、重复 rule part、非法/超长 INTERVAL、大小写不敏感、规范化下发、缺省语义全部覆盖，无新绕过路径），第 35 轮补修 `check_oneshot` 的 F-28（`now` 异常不得逃逸 TypeError）与 F-29（回显规范化，原串只留 audit 字段）；③**回复完整性/收割链路**：第 32 轮增量收敛（D-01 关闭，F-12～F-25 + D-01 全部核销），第 33 轮收敛后终检自检补修 F-26（digest/full 拼接口径统一）、第 34 轮补修 F-27（选节点口径对齐）、第 37 轮补修 F-31（SSE 解析器入口类型收敛，`_as_text`；锁判定入口路径守卫，F-31b）——均未推翻前述收敛结论。回归 **283 条全绿**（1 条 POSIX-only skip，含 PASS 后加证 1 条：`test_digest_none_never_leaves_harvest_complete` 钉住降级对称性）。收敛后不再开启新一轮对抗审查；新增功能或改动这三个子系统的实现时需重新走对抗审查。
+**收敛声明（第 32 轮，第 33～38 轮终检后仍成立）**：经三十二轮对抗审查，三个子系统全部收敛——①**锁/进程身份**：第 25 轮全文最终确认 PASS（逐函数 12 项 + 逐组合 7 组），第 36 轮补修 F-30（状态文件超大数值的 `OverflowError` 不得穿出锁判定，统一走 `_as_float`），第 38 轮补修 F-32（租约四函数的 `OSError` 出口必须落成文档承诺的返回值，诊断只进日志）；②**定时任务契约**：第 31 轮增量收敛（CR/LF 首尾绕过、内部空白、重复 rule part、非法/超长 INTERVAL、大小写不敏感、规范化下发、缺省语义全部覆盖，无新绕过路径），第 35 轮补修 `check_oneshot` 的 F-28（`now` 异常不得逃逸 TypeError）与 F-29（回显规范化，原串只留 audit 字段）；③**回复完整性/收割链路**：第 32 轮增量收敛（D-01 关闭，F-12～F-25 + D-01 全部核销），第 33 轮收敛后终检自检补修 F-26（digest/full 拼接口径统一）、第 34 轮补修 F-27（选节点口径对齐）、第 37 轮补修 F-31（SSE 解析器入口类型收敛，`_as_text`；锁判定入口路径守卫，F-31b）——均未推翻前述收敛结论。第 38 轮的 F-33 是**用户裁定带来的能力补齐**（429 换账号/匿名），不属对抗审查发现，不影响收敛结论。回归 **290 条全绿**（1 条 POSIX-only skip，含 PASS 后加证 1 条：`test_digest_none_never_leaves_harvest_complete` 钉住降级对称性）。收敛后不再开启新一轮对抗审查；新增功能或改动这三个子系统的实现时需重新走对抗审查。
 
 **第十四轮之后补的一条**：审查把「`_record_corruption("lease-recovery-failed")` 自己失败会怎样」列为残余风险 3，虽不构成裁定理由，但这是能离线证明的，于是补 `test_quarantine_failed_row_write_failure_is_survivable`（第一次登记成功、第二次返回 `None`，断言不抛异常、仍返回 `quarantine_failed`、租约原样在）。**属于 PASS 后的加证，不改变任何条款口径**，故不重开一轮审查。
 
