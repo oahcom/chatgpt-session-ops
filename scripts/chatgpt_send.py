@@ -686,6 +686,29 @@ def _as_text(value):
     return ""
 
 
+def _as_int(value, default=0):
+    """把不可信状态文件里的整数字段收敛成 int，**永不抛异常**（F-34）。
+
+    F-07 口径：绝不借 `int()` 把非法折叠成合法——`int(True) == 1`、
+    `int(3.5) == 3`，会让「不是下标/计数的东西」悄悄变成下标/计数。
+    只认两种形态：
+      - int 且不是 bool（True 不是 1）；
+      - 纯十进制数字串（"42" 可以，" 42"/"4.2"/"0x2a" 不行；超长串在
+        3.11+ 会让 int() 抛 ValueError，一并降级成 default）。
+    float/bool/None/其余类型一律 default——「没有这个值」是保守结论。
+    """
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value and all(c in "0123456789" for c in value):
+        try:
+            return int(value)
+        except (ValueError, OverflowError):
+            return default
+    return default
+
+
 def _as_ctime(value):
     """规范化 create_time，返回 (ok, number)。
 
@@ -1042,13 +1065,20 @@ def _load_json(path, default):
 
     静默返回空最危险的地方在于：下一次 _save_json 会把原来的内容永久覆盖掉
     （conv-accounts 最多 500 条归属记录会一次性清空）。
+    「损坏」含两种（F-34）：语法坏（JSONDecodeError）与**顶层类型坏**（合法
+    JSON 但不是预期形状，如手改成 `[]`/`"x"`）。两者同等隔离重建——否则
+    同一份不可信输入两种待遇：conv_owner 对非 dict 有守卫，record_conv 没有。
     """
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        if type(data) is not type(default):
+            raise ValueError("顶层类型不符：期望 %s，实际 %s"
+                             % (type(default).__name__, type(data).__name__))
+        return data
     except FileNotFoundError:
         return copy.deepcopy(default)
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, ValueError) as e:   # JSONDecodeError 是 ValueError 子类
         try:
             size = os.path.getsize(path)
         except OSError:
@@ -1139,24 +1169,13 @@ def _parse_pid(pid):
 
     为什么不能用 int()：int(999999.9) == 999999、int(True) == 1——把非法身份
     折叠成合法 pid 再去查死活，等于替伪造数据开了一条回收通道（租约里写
-    999999.9，查的是 999999 死不死，两回事）。只认：
+    999999.9，查的是 999999 死不死，两回事）。收敛统一走 _as_int（F-34）：
       - int 且不是 bool（True 不是 pid 1）；
       - 纯十进制数字串（"4242" 可以，" 4242"/"42.2"/"0x10" 不行）。
     float、bool、None、垃圾串一律 None → 调用方走 UNKNOWN。
     """
-    if isinstance(pid, bool):
-        return None
-    if isinstance(pid, int):
-        return pid if pid > 0 else None
-    if isinstance(pid, str) and pid and all(c in "0123456789" for c in pid):
-        try:
-            v = int(pid)
-        except (ValueError, OverflowError):
-            # Python 3.11+ 对 int() 的十进制字符串有最大位数限制，超长串抛 ValueError。
-            # 异常不得穿过 _parse_pid 逃逸到 _proc_state（那会绕过 UNKNOWN 返回）。
-            return None
-        return v if v > 0 else None
-    return None
+    v = _as_int(pid, None)
+    return v if (v is not None and v > 0) else None
 
 
 def _proc_state(pid):
@@ -2040,20 +2059,44 @@ def _update_json(path, mutate, default, timeout=LOCK_TIMEOUT_SEC, retries=3):
 
 
 def _normalize_rotation(st):
-    order = [a for a in st.get("order") or ROTATION_ORDER if a in ROTATION_ORDER]
+    """把轮转状态收敛成合法形状，**永不抛异常**（F-34）。
+
+    状态文件是不可信输入：语法坏由 _load_json 隔离，但「合法 JSON、字段类型坏」
+    （cursor="abc" / created="x" / order=5）会原样穿进来。旧版直接
+    `int(st.get("cursor") or 0)`、`st["created"].setdefault(...)`——ValueError /
+    OverflowError / TypeError / AttributeError 一路穿出 load_rotation，调用方
+    拿到的不是「可用状态」而是崩溃。且 `int(3.5)==3`、`int(True)==1` 违反 F-07
+    「不许把非法折叠成合法」。
+    现在逐字段收敛：形状不符就当「没有这个值」，绝不抛异常。
+    """
+    if not isinstance(st, dict):
+        st = {}
+    order = [a for a in _as_seq(st.get("order")) if a in ROTATION_ORDER]
     for a in ROTATION_ORDER:  # 保证三身份齐全且顺序稳定
         if a not in order:
             order.append(a)
     st["order"] = order
-    # 游标只在登录态身份之间推进（匿名是兜底，不参与均分）
-    st["cursor"] = int(st.get("cursor") or 0) % len(ROTATION_PRIMARY)
-    st.setdefault("created", {a: 0 for a in order})
-    st.setdefault("failures", {a: 0 for a in order})
-    st.setdefault("unavailable", {})
-    st.setdefault("fallback_uses", 0)
+    # 游标只在登录态身份之间推进（匿名是兜底，不参与均分）；
+    # _as_int 不折叠 bool/float，垃圾游标归零而不是猜一个下标
+    st["cursor"] = _as_int(st.get("cursor"), 0) % len(ROTATION_PRIMARY)
+    created, failures = _as_dict(st.get("created")), _as_dict(st.get("failures"))
     for a in order:
-        st["created"].setdefault(a, 0)
-        st["failures"].setdefault(a, 0)
+        created[a] = _as_int(created.get(a), 0)
+        failures[a] = _as_int(failures.get(a), 0)
+    st["created"], st["failures"] = created, failures
+    # unavailable：每项必须是 dict，数值字段走 _as_float（is_unavailable/
+    # purge_expired/mark_unavailable 都按这个形状读写）
+    clean = {}
+    for k, v in _as_dict(st.get("unavailable")).items():
+        info = _as_dict(v)
+        clean[k] = {
+            "reason": _as_text(info.get("reason")),
+            "at": _as_text(info.get("at")),
+            "epoch": _as_float(info.get("epoch"), 0.0),
+            "ttl": _as_float(info.get("ttl"), UNAVAILABLE_TTL),
+        }
+    st["unavailable"] = clean
+    st["fallback_uses"] = _as_int(st.get("fallback_uses"), 0)
     return st
 
 
@@ -2088,14 +2131,16 @@ def save_rotation(st):
 
 
 def mark_unavailable(st, account, reason, ttl=None):
-    st.setdefault("unavailable", {})[account] = {
-        "reason": reason, "at": _now(), "epoch": time.time(),
-        "ttl": UNAVAILABLE_TTL if ttl is None else ttl,
+    unav = _as_dict(st.get("unavailable"))
+    unav[account] = {
+        "reason": _as_text(reason), "at": _now(), "epoch": time.time(),
+        "ttl": UNAVAILABLE_TTL if ttl is None else _as_float(ttl, UNAVAILABLE_TTL),
     }
+    st["unavailable"] = unav
 
 
 def is_unavailable(st, account):
-    info = (st.get("unavailable") or {}).get(account)
+    info = _as_dict(_as_dict(st.get("unavailable")).get(account))
     if not info:
         return False
     ttl = _as_float(info.get("ttl"), UNAVAILABLE_TTL)          # F-30
@@ -2105,20 +2150,25 @@ def is_unavailable(st, account):
 def purge_expired(st):
     """清掉过期的不可用标记（is_unavailable 只读，不再隐式改状态）。"""
     changed = False
-    for a in list(st.get("unavailable") or {}):
-        info = st["unavailable"][a] or {}
+    unav = _as_dict(st.get("unavailable"))
+    for a in list(unav):
+        info = _as_dict(unav.get(a))
         ttl = _as_float(info.get("ttl"), UNAVAILABLE_TTL)      # F-30
         if time.time() - _as_float(info.get("epoch"), 0.0) > ttl:
-            st["unavailable"].pop(a, None)
+            unav.pop(a, None)
             changed = True
+    if changed:
+        st["unavailable"] = unav
     return changed
 
 
 def rotation_plan(st):
     """登录取证身份（acct1/acct2）从游标起顺次尝试；不可用的排到末尾（避免死锁）。
     匿名态不进入该计划——它只在两者都 429 时由 anon_fallback_ready() 决定是否兜底。"""
+    st = _as_dict(st)
+    cur = _as_int(st.get("cursor"), 0)                          # F-34
     n = len(ROTATION_PRIMARY)
-    seq = [ROTATION_PRIMARY[(st["cursor"] + i) % n] for i in range(n)]
+    seq = [ROTATION_PRIMARY[(cur + i) % n] for i in range(n)]
     return [a for a in seq if not is_unavailable(st, a)] + [a for a in seq if is_unavailable(st, a)]
 
 
@@ -2134,8 +2184,8 @@ def anon_fallback_block_reason(st, outcomes):
         return "没有任何登录态尝试结果，不启用兜底"
     if not all("429" in str(v) for v in outcomes.values()):
         return "登录态并非全部 429（401=凭据失效、403=风控，都不该用匿名顶）"
-    info = (st.get("unavailable") or {}).get("nologin") or {}
-    if "manually disabled" in (info.get("reason") or ""):
+    info = _as_dict(_as_dict(st.get("unavailable")).get("nologin"))
+    if "manually disabled" in _as_text(info.get("reason")):
         return "nologin 已被手动禁用（--rotation-enable nologin 解封）"
     if is_unavailable(st, "nologin"):
         ttl = _as_float(info.get("ttl"), UNAVAILABLE_TTL)      # F-30
@@ -2158,7 +2208,8 @@ def record_conv(conv_id, account, prompt_file):
     def mutate(data):
         data[conv_id] = {"account": account, "prompt": prompt_file, "ts": _now()}
         if len(data) > 500:  # 只保留最近 500 条
-            for k in sorted(data, key=lambda x: (data[x] or {}).get("ts") or "")[:len(data) - 500]:
+            # F-34：条目值可能是损坏的非 dict（手改/旧版写坏），排序键必须收敛
+            for k in sorted(data, key=lambda x: _as_dict(data[x]).get("ts") or "")[:len(data) - 500]:
                 data.pop(k, None)
 
     try:
@@ -2175,8 +2226,18 @@ def conv_owner(conv_id):
 
 # ---------- 匿名会话 id 对照表（服务端不给历史，skill 侧自己留存） ----------
 def load_anon_sessions():
-    data = _load_json(ANON_SESSIONS_FILE, {})
-    data.setdefault("sessions", {})
+    """读匿名会话表并收敛形状（F-34）：sessions 必须是 dict[str, dict]。
+
+    「合法 JSON、字段类型坏」（sessions="x"、条目="notadict"）不得让
+    .setdefault/.get 变成 AttributeError——形状不符的条目就当没有这一层。
+    """
+    data = _as_dict(_load_json(ANON_SESSIONS_FILE, {}))
+    sessions = {}
+    for cid, s in _as_dict(data.get("sessions")).items():
+        info = _as_dict(s)
+        if info:
+            sessions[cid] = info
+    data["sessions"] = sessions
     return data
 
 
@@ -2200,8 +2261,8 @@ def record_anon_session(conv_id, tab=None, prompt="", reply="", device=""):
     out = {}
 
     def mutate(data):
-        data.setdefault("sessions", {})
-        s = data["sessions"].setdefault(conv_id, {"created": _now()})
+        sessions = _as_dict(data.get("sessions"))
+        s = _as_dict(sessions.get(conv_id))
         s.setdefault("created", _now())
         s["updated"] = _now()
         if tab:
@@ -2214,6 +2275,8 @@ def record_anon_session(conv_id, tab=None, prompt="", reply="", device=""):
         if device:
             s["device"] = device
         s["status"] = "live" if tab else s.get("status", "archived")
+        sessions[conv_id] = s
+        data["sessions"] = sessions
         out.update(s)
 
     try:
@@ -2224,18 +2287,21 @@ def record_anon_session(conv_id, tab=None, prompt="", reply="", device=""):
 
 
 def anon_session(conv_id):
-    return (load_anon_sessions().get("sessions") or {}).get(conv_id)
+    info = _as_dict(_as_dict(load_anon_sessions().get("sessions")).get(conv_id))
+    return info or None
 
 
 def mark_anon_archived(conv_id, reason=""):
     def mutate(data):
-        data.setdefault("sessions", {})
-        s = (data.get("sessions") or {}).get(conv_id)
+        sessions = _as_dict(data.get("sessions"))
+        s = _as_dict(sessions.get(conv_id))
         if not s:
             return False
         s["status"] = "archived"
         s["archived_reason"] = reason
         s["updated"] = _now()
+        sessions[conv_id] = s
+        data["sessions"] = sessions
 
     try:
         _update_json(ANON_SESSIONS_FILE, mutate, {"sessions": {}})
@@ -4704,7 +4770,7 @@ def create_chat_rotating(prompt_file, thinking=None):
     outcomes, attempts, skipped = {}, [], {}
     for name in ROTATION_PRIMARY:
         if is_unavailable(st, name):
-            reason = (st["unavailable"].get(name) or {}).get("reason", "unavailable")
+            reason = _as_dict(_as_dict(st.get("unavailable")).get(name)).get("reason", "unavailable")
             skipped[name] = reason
             outcomes[name] = "SKIP:" + reason
     plan = [a for a in rotation_plan(st) if a not in skipped]

@@ -132,6 +132,27 @@ class TestStateFiles(TmpBase):
         self.assertEqual(m._load_json(p, {"k": 1}), {"k": 1})
         self.assertFalse([n for n in os.listdir(self.tmp) if ".corrupt-" in n])
 
+    def test_top_level_type_mismatch_is_quarantined(self):
+        """F-34：合法 JSON 但顶层不是预期形状（手改成 []）＝损坏，与语法坏同罪。"""
+        p = os.path.join(self.tmp, "shape.json")
+        m._atomic_write(p, "[1, 2, 3]")
+        got = m._load_json(p, {})
+        self.assertEqual(got, {}, "顶层类型不符必须回落默认值，不得把 list 当 dict 返回")
+        bads = [n for n in os.listdir(self.tmp) if n.startswith("shape.json.corrupt-")]
+        self.assertEqual(len(bads), 1, "类型坏也要隔离，否则下一次写会静默覆盖旧内容")
+
+    def test_anon_sessions_shape_pollution_never_escapes(self):
+        """F-34：sessions/条目/顶层形状坏时，读写 API 全部确定性结局。"""
+        cid = "44444444-5555-4666-7777-888888888888"
+        for blob in ({"sessions": "x"}, {"sessions": {cid: "notadict"}}, [1, 2]):
+            with self.subTest(blob=blob):
+                m._atomic_write(m.ANON_SESSIONS_FILE, json.dumps(blob))
+                self.assertIsInstance(m.load_anon_sessions().get("sessions"), dict)
+                self.assertIsNone(m.anon_session(cid), "坏条目不算会话")
+                m.record_anon_session(cid, tab="t1")
+                m.mark_anon_archived(cid, reason="r")
+                self.assertEqual(m.anon_session(cid).get("status"), "archived")
+
     def test_atomic_write_leaves_no_tmp(self):
         p = os.path.join(self.tmp, "sub", "a.json")
         m._atomic_write(p, '{"a": 1}')
@@ -734,6 +755,53 @@ class TestRotation(TmpBase):
         plan = m.rotation_plan(st)
         self.assertEqual(plan[-1], "acct1")
         self.assertEqual(len(plan), len(m.ROTATION_PRIMARY))
+
+    # ---- F-34：状态文件形状/类型畸形 → 确定性结局 ----
+    def test_normalize_converges_polluted_shapes(self):
+        for blob in ({"cursor": "abc"}, {"cursor": float("inf")}, {"cursor": [1]},
+                     {"order": 5}, {"order": {}}, {"created": "x"}, {"created": []},
+                     {"failures": 5}, {"unavailable": "x"}, {"unavailable": [1]},
+                     {"fallback_uses": "5"}, [1, 2], "top-level-str"):
+            with self.subTest(blob=blob):
+                st = m._normalize_rotation(blob)
+                self.assertIsInstance(st["cursor"], int)
+                self.assertLess(st["cursor"], len(m.ROTATION_PRIMARY))
+                self.assertEqual(set(st["order"]), set(m.ROTATION_ORDER))
+                for a in m.ROTATION_ORDER:
+                    self.assertIsInstance(st["created"][a], int)
+                    self.assertIsInstance(st["failures"][a], int)
+                self.assertIsInstance(st["unavailable"], dict)
+                self.assertIsInstance(st["fallback_uses"], int)
+
+    def test_normalize_does_not_fold_bool_or_float_cursor(self):
+        """F-07 口径：int(True)==1、int(3.5)==3 都是把非法折叠成合法下标。"""
+        self.assertEqual(m._normalize_rotation({"cursor": True})["cursor"], 0)
+        self.assertEqual(m._normalize_rotation({"cursor": 3.5})["cursor"], 0)
+        self.assertEqual(m._normalize_rotation({"cursor": "3.5"})["cursor"], 0)
+        self.assertEqual(m._normalize_rotation({"cursor": "7"})["cursor"],
+                         7 % len(m.ROTATION_PRIMARY), "纯数字串是合法整数，要保住计数")
+
+    def test_rotation_helpers_total_on_polluted_unavailable(self):
+        for blob in ({"unavailable": "x"}, {"unavailable": {"acct1": "str"}},
+                     {"unavailable": {"acct1": []}}, {"unavailable": 7}):
+            with self.subTest(blob=blob):
+                st = json.loads(json.dumps(blob))   # 深拷贝，避免用例间互相污染
+                self.assertFalse(m.is_unavailable(st, "acct1"))
+                self.assertIn(m.purge_expired(st), (True, False))
+                m.mark_unavailable(st, "acct1", "r")
+                self.assertEqual(len(m.rotation_plan(st)), len(m.ROTATION_PRIMARY))
+                reason = m.anon_fallback_block_reason(st, {"acct1": 429, "acct2": 429})
+                self.assertTrue(reason is None or isinstance(reason, str),
+                                "结局必须是 None（放行）或人话，不得抛异常")
+
+    def test_polluted_counters_increment_without_typeerror(self):
+        st = {"fallback_uses": "5", "failures": {"acct1": "2"}, "created": {"acct1": "x"}}
+        m._normalize_rotation(st)
+        st["fallback_uses"] = st.get("fallback_uses", 0) + 1
+        st["failures"]["acct1"] = st["failures"].get("acct1", 0) + 1
+        self.assertEqual(st["fallback_uses"], 6, "纯数字串保住计数再自增")
+        self.assertEqual(st["failures"]["acct1"], 3)
+        self.assertEqual(st["created"]["acct1"], 0, "非法计数归零，不折叠出假计数")
 
     # ---- F-33：429 限流时换账号 / 走匿名（用户裁定） ----
     def _run_new(self, account, status, conv=None):
