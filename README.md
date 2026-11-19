@@ -196,6 +196,8 @@ scripts/chatgpt_send.py     统一投递 / 收割 / 轮转 / 匿名通道（1600
 scripts/continue_full.py    413 满员续接
 scripts/pow_solver.py       PoW 解算器
 scripts/extract_auth.py     从 Edge CDP 提取凭据
+scripts/accounts/README.md  凭据目录结构（不含任何真实凭据）
+tools/sync.sh               从本机技能目录同步 + 提交前敏感信息拦截
 ```
 
 改脚本前先读 `references/api-protocol.md`，源码里的血泪注释（`conversation_id` 必填、勿提前关连接等）都对应一次真实故障。

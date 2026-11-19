@@ -199,3 +199,7 @@ python scripts/chatgpt_send.py --tail <conv_id>
 ## 协议细节
 
 PoW 算法、POST 请求体全字段、SSE 解析、mapping tail 计算等实现级细节见 `references/api-protocol.md`。脚本内部有注释标注血泪条款（conversation_id 必填、勿提前关连接等），修改前先读。
+
+## 代码仓库
+
+代码与协议文档已仓库化：<https://github.com/oahcom/chatgpt-session-ops>（公开）。仓库只含代码与文档，凭据、`replies/`、状态 json 全部由 `.gitignore` 排除；同步时只拷 `SKILL.md`、`references/`、`scripts/*.py`，勿带本机运行态。

@@ -54,6 +54,8 @@ def build_fingerprint(browser_facts: dict = None) -> list:
     ua = b.get("ua", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                      "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36 Edg/157.0.4341.60")
     script_src = b.get("script_src", "/cdn/assets/async/7078.691a92af09.js")
+    # 注意：这里的 UUID 是前端 build id（/c/<build-id>/_next/），不是会话 id，
+    # 也不属于任何账号；页面在时由调用方从 script_src 覆盖。
     build = b.get("build", "/c/6afcc453-295c-83e8-8e24-3a089ff20e22/_next/")
     hw = b.get("hw", 16)
     now_ms = time.time() * 1000
