@@ -663,7 +663,12 @@ def _parse_pid(pid):
     if isinstance(pid, int):
         return pid if pid > 0 else None
     if isinstance(pid, str) and pid and all(c in "0123456789" for c in pid):
-        v = int(pid)
+        try:
+            v = int(pid)
+        except (ValueError, OverflowError):
+            # Python 3.11+ 对 int() 的十进制字符串有最大位数限制，超长串抛 ValueError。
+            # 异常不得穿过 _parse_pid 逃逸到 _proc_state（那会绕过 UNKNOWN 返回）。
+            return None
         return v if v > 0 else None
     return None
 

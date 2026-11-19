@@ -508,6 +508,27 @@ class TestStateFiles(TmpBase):
         self.assertEqual(m._parse_pid(4242), 4242, "合法正整数照常收")
         self.assertEqual(m._parse_pid("4242"), 4242, "纯数字串照常收")
 
+    def test_parse_pid_overflow_string_returns_none(self):
+        """F-07 残留（第二十三轮）：超长十进制串 int() 抛 ValueError/OverflowError 不得逃逸。"""
+        huge = "9" * 5000   # Python 3.11+ int() 十进制串有位数限制
+        self.assertIsNone(m._parse_pid(huge), "超长数字串必须返回 None，不得抛异常")
+        # _proc_state 同样不得炸
+        self.assertEqual(m._proc_state(huge), m.PROC_UNKNOWN,
+                         "超长 pid 串查进程状态必须 UNKNOWN，不得异常穿透")
+        # _lock_holder_stale 不回收
+        lock = os.path.join(self.tmp, "f07-overflow.lock")
+        with open(lock, "w", encoding="utf-8") as f:
+            json.dump({"pid": huge, "process_start_time": 7,
+                       "created_at": time.time() - 999}, f)
+        self.assertFalse(m._lock_holder_stale(lock),
+                         "超长 pid 串的锁不得被回收")
+        # _lease_reclaimable 返回 identity_unreadable
+        info = {"run_id": "r1", "pid": huge,
+                "lease_until": 0, "process_start_time": 7}
+        ok, why = m._lease_reclaimable(info, now=time.time())
+        self.assertFalse(ok)
+        self.assertEqual(why, "identity_unreadable")
+
     def test_proc_state_rejects_float_and_bool_pid(self):
         """F-07：float/bool pid 必须 UNKNOWN，不得借 int() 折叠后查到 DEAD。"""
         self.assertEqual(m._proc_state(999999.9), m.PROC_UNKNOWN,
