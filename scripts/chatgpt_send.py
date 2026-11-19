@@ -519,26 +519,202 @@ def _read_ephemeral(path):
     return data, True
 
 
+def _as_dict(obj):
+    """把任意值收敛成 dict；不是 dict 一律返回空 dict（F-12）。
+
+    为什么需要：解析网络响应时，「JSON 解析成功」不等于「形状符合预期」。
+    服务端返回 `null`、数组、或字段类型变了，下一行 `.get()` 就是 AttributeError。
+    这些解析器本来都写了 `except Exception: return None` 来优雅降级「解析失败」，
+    但对「解析成功、形状不符」漏了守卫——同一份不可信输入两种待遇。
+    统一用本函数收敛，形状不符就当「没有这一层」，绝不抛异常。
+    """
+    return obj if isinstance(obj, dict) else {}
+
+
+def _as_seq(obj):
+    """把任意值收敛成 list；不是 list/tuple 一律返回空 list（F-12）。"""
+    return list(obj) if isinstance(obj, (list, tuple)) else []
+
+
+def _as_ctime(value):
+    """规范化 create_time，返回 (ok, float)。
+
+    ok=False 表示这个时间值**不可用**（类型不是数字、或是 bool）——记录无效，
+    不得靠它参与排序，否则「顺序」就是编出来的。
+    缺失（None）返回 (True, 0.0)：记录本身没坏，只是没有时间戳，视为最旧，
+    内容照收，不影响「取最新」的选择。
+    """
+    if value is None:
+        return True, 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False, 0.0
+    return True, float(value)
+
+
+def _scan_sse(raw_text):
+    """扫描 SSE 文本，返回 (text, complete, detail)。
+
+    降级姿态（第二十六轮审查口径）：坏事件只跳过、继续处理后续事件，
+    但**必须被记录**——否则「部分流」会被当成完整回复落盘。
+
+    complete = 没出现畸形事件 且 流以 [DONE] 正常收尾。
+    detail 说明差在哪（坏事件数 / 是否见到 [DONE]）。
+    """
+    last = ""
+    bad = 0
+    saw_done = False
+    for line in (raw_text or "").splitlines():
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            saw_done = True
+            continue
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            bad += 1
+            continue
+        if not isinstance(obj, dict):
+            bad += 1
+            continue
+        msg = obj.get("message")
+        if msg is None:
+            continue                     # 事件里没有 message（如 conversation_id）——正常
+        if not isinstance(msg, dict):
+            bad += 1
+            continue
+        content = msg.get("content")
+        if content is None:
+            parts = []
+        elif isinstance(content, dict):
+            parts = content.get("parts")
+            if parts is None:
+                parts = []
+            elif not isinstance(parts, list):
+                bad += 1
+                continue
+        else:
+            bad += 1
+            continue
+        author = msg.get("author")
+        role = author.get("role") if isinstance(author, dict) else None
+        txt = "".join(p for p in parts if isinstance(p, str))
+        if role == "assistant" and txt.strip():
+            last = txt
+    detail = "坏事件 %d 个、%s" % (bad, "见到 [DONE]" if saw_done else "未见 [DONE]")
+    return last, (bad == 0 and saw_done), detail
+
+
+def _scan_mapping(raw_body):
+    """扫描会话 mapping，返回 (rows, complete)。
+
+    rows = [(ctime, role, text), ...] 按时间升序。complete=False 表示 body 里有
+    畸形节点或不可用的时间戳——采到的是「尽力而为」，**不得当作完整 mapping**
+    （第二十六轮审查口径：跳过坏 node ≠ 证明 mapping 完整）。
+    """
+    try:
+        data = json.loads(raw_body)
+    except Exception:
+        return [], False
+    if not isinstance(data, dict):
+        return [], False
+    mapping = data.get("mapping")
+    if not isinstance(mapping, dict):
+        return [], False
+    complete = True
+    rows = []
+    for node in mapping.values():
+        if not isinstance(node, dict):
+            complete = False
+            continue
+        m = node.get("message")
+        if m is None:
+            continue                     # 非消息节点（根节点等）——正常
+        if not isinstance(m, dict):
+            complete = False
+            continue
+        author = m.get("author")
+        if not isinstance(author, dict):
+            complete = False
+            continue
+        content = m.get("content")
+        if content is None:
+            parts = []
+        elif isinstance(content, dict):
+            parts = content.get("parts")
+            if parts is None:
+                parts = []
+            elif not isinstance(parts, list):
+                complete = False
+                continue
+        else:
+            complete = False
+            continue
+        ok, ct = _as_ctime(m.get("create_time"))
+        if not ok:
+            complete = False             # 时间戳不可用 → 顺序不可信
+        role = author.get("role")
+        text = "".join(p for p in parts if isinstance(p, str)).strip()
+        if role in ("user", "assistant") and text:
+            rows.append((ct, role, text))
+    rows.sort(key=lambda x: x[0])
+    return rows, complete
+
+
 def reply_digest(raw_body):
     """A12：把一条 assistant 消息的 parts 统计出来，用于核对「GET 全文是否完整」。
 
-    返回 {message_id, parts, chars, sha256}；没有可用消息返回 None。
+    返回 {message_id, parts, chars, sha256}；**核不了就返回 None**。
     为什么要有它：流被截断时 SSE 可能是半截，GET 回来的 mapping 也可能缺 part，
     只看「长度变长了」会把缺 part 的回复当完整——必须按 part 数与拼接 SHA-256 对账。
+
+    降级姿态（第二十六轮审查口径）：这是**完整性证明器**，不是内容提取器。
+    只要 body 里有一处畸形（mapping/node/message/author/content/parts 形状不对、
+    或时间戳不可用），就**整体判定不可用 → None**；绝不能跳过坏 node 后拿剩余
+    part 算一个「看起来正常」的摘要——那正好把缺失的 part 藏进一个可信的外观里。
     """
     try:
         data = json.loads(raw_body)
     except Exception:
         return None
+    if not isinstance(data, dict):
+        return None            # F-12：解析成功但不是 dict → 核不了
+    mapping = data.get("mapping")
+    if not isinstance(mapping, dict):
+        return None
     best = None
-    for node_id, node in (data.get("mapping") or {}).items():
-        msg = (node or {}).get("message") or {}
-        if (msg.get("author") or {}).get("role") != "assistant":
+    for node_id, node in mapping.items():
+        if not isinstance(node, dict):
+            return None        # 有一个坏 node → 整体不可用（不得跳过）
+        msg = node.get("message")
+        if msg is None:
+            continue            # 非消息节点（根节点等）——正常，不影响完整性
+        if not isinstance(msg, dict):
+            return None
+        author = msg.get("author")
+        if not isinstance(author, dict):
+            return None
+        content = msg.get("content")
+        if content is None:
+            parts = []
+        elif isinstance(content, dict):
+            parts = content.get("parts")
+            if parts is None:
+                parts = []
+            elif not isinstance(parts, list):
+                return None
+        else:
+            return None
+        ok, ct = _as_ctime(msg.get("create_time"))
+        if not ok:
+            return None        # 时间戳不可用 → 顺序不可信，核不了
+        if author.get("role") != "assistant":
             continue
-        parts = [p for p in ((msg.get("content") or {}).get("parts") or []) if isinstance(p, str)]
+        parts = [p for p in parts if isinstance(p, str)]
         if not parts or not "".join(parts).strip():
             continue
-        key = (msg.get("create_time") or 0, msg.get("id") or node_id)
+        key = (ct, str(msg.get("id") or node_id))
         if best is None or key > best[0]:
             best = (key, msg, parts)
     if best is None:
@@ -1647,8 +1823,9 @@ def record_conv(conv_id, account, prompt_file):
 
 
 def conv_owner(conv_id):
-    info = _load_json(CONV_MAP_FILE, {}).get(conv_id)
-    return (info or {}).get("account")
+    # F-12：_load_json 成功但文件内容不是 dict（手改成 [] 等）时不得直接 .get
+    info = _as_dict(_as_dict(_load_json(CONV_MAP_FILE, {})).get(conv_id))
+    return info.get("account")
 
 
 # ---------- 匿名会话 id 对照表（服务端不给历史，skill 侧自己留存） ----------
@@ -2707,17 +2884,34 @@ class ChatGPTAPI:
     # ---------- tail ----------
     @staticmethod
     def tail_from_mapping(raw_body):
+        """取最新消息的 node id（作 parent_message_id）。
+
+        降级姿态（第二十六轮审查口径）：这是**尾部确认**，不是内容提取。
+        mapping 有任何畸形（node/message 形状不对、时间戳不可用）就整体返回
+        None——不能把「不完整 mapping 里最新的那条」当成**已确认的真实尾部**
+        去续接对话，否则续接的父节点可能是错的。
+        """
         try:
             data = json.loads(raw_body)
         except Exception:
             return None
-        mapping = data.get("mapping") or {}
-        best_id, best_t = None, 0
+        if not isinstance(data, dict):
+            return None
+        mapping = data.get("mapping")
+        if not isinstance(mapping, dict):
+            return None
+        best_id, best_t = None, 0.0
         for nid, node in mapping.items():
+            if not isinstance(node, dict):
+                return None
             m = node.get("message")
-            if not m:
-                continue
-            t = m.get("create_time") or 0
+            if m is None:
+                continue                     # 非消息节点——正常
+            if not isinstance(m, dict):
+                return None
+            ok, t = _as_ctime(m.get("create_time"))
+            if not ok:
+                return None                 # 时间不可用 → 尾部不可信
             if t > best_t:
                 best_t, best_id = t, nid
         return best_id
@@ -2764,7 +2958,12 @@ class ChatGPTAPI:
                 payload = json.loads(body)
             except json.JSONDecodeError:
                 return conversations, status, "invalid JSON in conversation list"
-            items = payload if isinstance(payload, list) else payload.get("items", payload.get("conversations", []))
+            if isinstance(payload, list):
+                items = payload
+            elif isinstance(payload, dict):
+                items = payload.get("items", payload.get("conversations", []))
+            else:
+                return conversations, status, "unrecognized conversation list response"
             if not isinstance(items, list):
                 return conversations, status, "unrecognized conversation list response"
             fresh = 0
@@ -2797,7 +2996,11 @@ class ChatGPTAPI:
         except json.JSONDecodeError:
             print("WARN: chat-requirements 返回非 JSON：%r" % (body[:200],), flush=True)
             return None, None
-        p = d.get("proofofwork") or {}
+        if not isinstance(d, dict):
+            # F-12：形状不对（null/数组）→ 拿不到 token 就按拿不到处理
+            print("WARN: chat-requirements 返回的不是对象：%r" % (body[:200],), flush=True)
+            return None, None
+        p = _as_dict(d.get("proofofwork"))
         return d.get("token"), solve(p.get("seed", ""), p.get("difficulty", "0"))
 
     # ---------- send ----------
@@ -2849,13 +3052,16 @@ class ChatGPTAPI:
                 d = json.loads(body)
             except Exception:
                 return cache.setdefault(key, "auto")
-            models = d.get("models") or []
-            default = d.get("default_model_slug") or "auto"
+            if not isinstance(d, dict):
+                return cache.setdefault(key, "auto")   # F-12：形状不对 → 回退 auto
+            models = [_as_dict(m) for m in _as_seq(d.get("models"))]
+            default = d.get("default_model_slug")
+            default = default if isinstance(default, str) else "auto"
             by_slug = {m.get("slug"): m for m in models}
             if "-t-" in default:
                 chosen = default
             else:
-                want_title = (by_slug.get(default) or {}).get("title")
+                want_title = _as_dict(by_slug.get(default)).get("title")
                 for m in models:
                     slug = m.get("slug") or ""
                     if "-t-" in slug and want_title and m.get("title") == want_title:
@@ -2864,7 +3070,10 @@ class ChatGPTAPI:
                 if not chosen:
                     for m in models:
                         slug = m.get("slug") or ""
-                        if "-t-" in slug and (m.get("max_tokens") or 0) > 100000:
+                        mt = m.get("max_tokens")
+                        if not isinstance(mt, (int, float)) or isinstance(mt, bool):
+                            continue
+                        if "-t-" in slug and mt > 100000:
                             chosen = slug
                             break
         chosen = chosen or "auto"
@@ -2875,64 +3084,42 @@ class ChatGPTAPI:
     # ---------- harvest ----------
     @staticmethod
     def extract_reply_sse(raw_text):
-        last = ""
-        for line in raw_text.splitlines():
-            if not line.startswith("data:"):
-                continue
-            payload = line[5:].strip()
-            if payload == "[DONE]":
-                continue
-            try:
-                obj = json.loads(payload)
-            except Exception:
-                continue
-            msg = obj.get("message") or {}
-            parts = (msg.get("content") or {}).get("parts") or []
-            txt = "".join(p for p in parts if isinstance(p, str))
-            if (msg.get("author") or {}).get("role") == "assistant" and txt.strip():
-                last = txt
-        return last
+        return _scan_sse(raw_text)[0]
+
+    @staticmethod
+    def extract_reply_sse_checked(raw_text):
+        """返回 (text, complete, detail)。
+
+        complete=False 表示「这是部分流」：出现过畸形事件，或流没有以 [DONE]
+        收尾。坏事件只跳过、不影响后续事件，但**必须被记下来**——否则部分流
+        会被当成完整回复落盘（第二十六轮审查口径）。
+        """
+        return _scan_sse(raw_text)
 
     @staticmethod
     def harvest_mapping(raw_body):
-        try:
-            data = json.loads(raw_body)
-        except Exception:
-            return ""
-        msgs = []
-        for node in (data.get("mapping") or {}).values():
-            m = node.get("message")
-            if not m:
-                continue
-            role = (m.get("author") or {}).get("role")
-            text = "".join(p for p in ((m.get("content") or {}).get("parts") or []) if isinstance(p, str)).strip()
-            if role in ("user", "assistant") and text:
-                msgs.append((m.get("create_time") or 0, role, text))
-        msgs.sort(key=lambda x: x[0])
-        for _, role, text in reversed(msgs):
+        return _scan_mapping(raw_body)[0]
+
+    @staticmethod
+    def harvest_mapping_checked(raw_body):
+        """返回 (text, complete)。complete=False = mapping 有畸形，采到的是尽力而为。"""
+        rows, complete = _scan_mapping(raw_body)
+        for _, role, text in reversed(rows):
             if role == "assistant":
-                return text
-        return ""
+                return text, complete
+        return "", complete
 
     @staticmethod
     def harvest_transcript(raw_body):
         """按时间顺序返回整段对话 [(role, text), ...]，用于匿名会话留存。"""
-        try:
-            data = json.loads(raw_body)
-        except Exception:
-            return []
-        rows = []
-        for node in (data.get("mapping") or {}).values():
-            m = node.get("message")
-            if not m:
-                continue
-            role = (m.get("author") or {}).get("role")
-            text = "".join(p for p in ((m.get("content") or {}).get("parts") or [])
-                           if isinstance(p, str)).strip()
-            if role in ("user", "assistant") and text:
-                rows.append((m.get("create_time") or 0, role, text))
-        rows.sort(key=lambda x: x[0])
+        rows, _complete = _scan_mapping(raw_body)
         return [(role, text) for _, role, text in rows]
+
+    @staticmethod
+    def harvest_transcript_checked(raw_body):
+        """返回 (rows, complete)。complete=False = 留存不完整，必须能识别。"""
+        rows, complete = _scan_mapping(raw_body)
+        return [(role, text) for _, role, text in rows], complete
 
     def save_reply(self, conv_id, pfile, text):
         """落盘回复全文。默认不截断（旧版静默只留末尾 2 万字，等于丢结论）。
@@ -3545,7 +3732,7 @@ def read_anon(api, conv_id, save=True, devices=None):
     if used and used != recorded:
         print("anon-read: 设备归属已修正 %s -> %s（原记录缺失或设备已换）"
               % ((recorded or "-")[:8], used[:8]), flush=True)
-    transcript = api.harvest_transcript(body)
+    transcript, t_complete = api.harvest_transcript_checked(body)
     last = ""
     for role, text in reversed(transcript):
         if role == "assistant":
@@ -3556,6 +3743,12 @@ def read_anon(api, conv_id, save=True, devices=None):
         # 先写 tmp 再 replace —— 崩在半路也不能留个截断的归档（那是唯一副本）。
         path = anon_archive_path(conv_id)
         chunks = ["# 匿名会话 %s（%s）\n\n" % (conv_id, _now())]
+        if not t_complete:
+            # 留存不完整必须能被识别：mapping 有畸形节点/时间戳不可用，
+            # 归档头部明确标注，不得让「尽力而为」的留存冒充完整对话
+            # （第二十六轮审查口径）。
+            chunks.append("> ⚠️ 留存不完整：服务端返回的 mapping 有畸形节点或不可用时间戳，"
+                          "以下内容为尽力而为的抢救结果，不保证完整。\n\n")
         for role, text in transcript:
             chunks.append("## %s\n\n%s\n\n" % (role, text))
         _atomic_write(path, "".join(chunks))
@@ -3637,7 +3830,9 @@ def send_anon(api, conv_id, prompt_file, text):
     reply = ""
     st, body = api.req("GET", API_BASE + "/backend-api/conversation/" + cid, timeout=90)
     if st == 200:
-        reply = api.harvest_mapping(body)
+        reply, acomplete, adetail = api.harvest_mapping_checked(body)
+        if reply and not acomplete:
+            print("WARN: 匿名会话 mapping 收割不完整（%s）——按尽力而为处理" % adetail, flush=True)
     if not reply:
         reply = dom_reply
     path = api.save_reply(cid, os.path.basename(prompt_file), reply)
@@ -3781,7 +3976,14 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
     if conv_id and real_conv != conv_id:
         print("WARN: 落入了不同会话! target=%s real=%s" % (conv_id, real_conv), flush=True)
 
-    reply = api.extract_reply_sse(resp) or api.harvest_mapping(resp)
+    reply, sse_complete, sse_detail = api.extract_reply_sse_checked(resp)
+    if not reply:
+        reply, map_complete = api.harvest_mapping_checked(resp)
+        if reply and not map_complete:
+            print("WARN: mapping 收割不完整——本次回复按「尽力而为」处理", flush=True)
+    elif not sse_complete:
+        # 部分流不得冒充完整回复：明确记下来，内容照收（第二十六轮审查口径）
+        print("WARN: SSE 流不完整（%s）——本次回复按「部分流」处理" % sse_detail, flush=True)
     if getattr(api, "last_truncated", False) and (conv_id or real_conv):
         # 流被截断：SSE 里的回复可能只到一半。用 GET 拉 mapping 取全文，
         # 避免把半截内容当定稿落盘（归档是唯一副本）。
@@ -3789,16 +3991,28 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
         gst, gbody = api.req("GET", API_BASE + "/backend-api/conversation/" + (conv_id or real_conv),
                              timeout=120)
         if gst == 200:
-            full = api.harvest_mapping(gbody)
-            digest = reply_digest(gbody)
+            full, gcomplete = api.harvest_mapping_checked(gbody)
+            if not gcomplete:
+                print("WARN: GET 回来的 mapping 不完整——按尽力而为处理", flush=True)
+            # A12：按 part 统计对账，不只看「长度变长了」。
+            # 对账器是**辅助核验**，绝不能成为归档的前置硬依赖——它崩了/核不了，
+            # 也必须继续 save_reply（否则唯一副本反而丢了）。
+            try:
+                digest = reply_digest(gbody)
+            except Exception as e:
+                digest = None
+                print("WARN: 全文对账器异常（%s: %s）——跳过对账，继续归档"
+                      % (type(e).__name__, e), flush=True)
             if digest:
-                # A12：按 part 统计对账，不只看「长度变长了」
                 print("GET 全文核对：message=%s parts=%s chars=%d sha256=%s"
                       % ((digest["message_id"] or "?")[:12], digest["parts"],
                          digest["chars"], digest["sha256"][:12]), flush=True)
                 if digest["chars"] != len(full):
                     print("WARN: parts 合计 %d 字符 ≠ 拼接 %d 字符（可能缺 part），按不完整处理"
                           % (digest["chars"], len(full)), flush=True)
+            else:
+                print("WARN: GET 全文无法对账（mapping 畸形）——按尽力而为处理，继续归档",
+                      flush=True)
         if len(full) > len(reply or ""):
             print("补全文：SSE %d 字符 → GET %d 字符" % (len(reply or ""), len(full)), flush=True)
             reply = full

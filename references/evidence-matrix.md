@@ -13,7 +13,7 @@
 
 **矩阵自身受回归保护**：`tests/test_hardening.py::TestEvidenceMatrix` 会校验「条款集合 = 矩阵行集合」「每个 `test:`/`code:` 引用都能解析」「每条至少一种证据」。也就是说，新增条款而不补证据行、或引用了不存在的用例，测试会直接红。
 
-> 最后更新：2026-11-19（v1.8）。当前回归 206 条，全绿（1 条 POSIX-only skip）。
+> 最后更新：2026-11-19（v1.8）。当前回归 218 条，全绿（1 条 POSIX-only skip）。
 
 ---
 
@@ -28,13 +28,13 @@
 | A4 | **FULL** | 测试+代码 | `test:test_verify_copy_detects_single_byte_change` `test:test_cli_exit_codes` `code:verify_copy` | 大小写差一个字节即判不一致并退 2 |
 | A5 | **FULL** | 测试+代码 | `test:test_fallback_requires_all_login_429` `test:test_rotation_plan_puts_unavailable_last` `code:rotation_plan` `code:anon_fallback_block_reason` | 两账号都 429 才允许匿名；匿名计数不推主游标 |
 | A6 | **FULL** | 测试+代码 | `test:test_fallback_requires_all_login_429` `test:test_fallback_blocked_when_disabled_by_env` `code:anon_fallback_block_reason` | 兜底判定只读 429 / nologin 冷却两个输入 |
-| A7 | **CODE_ONLY** | 代码+实测+人判 | `code:conv_owner` `live:2026-11-19` `human:显式账号与登记冲突退 2 的分支只走了代码路径，没有独立回归` | 已知缺口：本条缺一条「冲突即退 2」的用例 |
+| A7 | **PARTIAL** | 测试+代码+实测+人判 | `test:test_conv_owner_tolerates_non_dict_state_file` `code:conv_owner` `live:2026-11-19` `human:显式账号与登记冲突退 2 的分支只走了代码路径，没有独立回归` | 会话归属登记；归属文件内容不是 dict 时不得抛异常（F-12）。已知缺口：本条仍缺一条「冲突即退 2」的用例 |
 | A8 | **PARTIAL** | 测试+代码 | `test:test_device_summary_counts_bound_sessions` `test:test_jar_is_persisted_and_header_is_readable` `code:list_device_ids` `code:device_summary` | 设备快照双文件（txt + json）同时存在才算 known ；`human:设备快照与浏览器上下文的绑定只能真机验证` |
 | A9 | **CODE_ONLY** | 代码+人判 | `code:_attach` `code:find_tab` `human:targetId+oai-did+conv_id 三要素校验在 UI 通道内，离线只能验标签页选择` | 可写窗口身份绑定靠真机验证 |
 | A10 | **PARTIAL** | 测试+代码 | `test:test_happy_path_keeps_conversation_id` `code:send_prompt` | 发送后 SSE 首包 id 必须与目标一致 ；`human:落点一致性只在正常 SSE 下验证，异常流交给 A11` |
 | A11 | **FULL** | 测试+代码 | `test:test_missing_conversation_id_is_failure_not_silent_success` `test:test_invalid_conversation_id_is_rejected` `test:test_happy_path_keeps_conversation_id` `code:create_chat_rotating` | 200 后不再换身份；解不出 id 或 id 不合规 → 返回 1、不落盘、不重投 |
-| A12 | **PARTIAL** | 测试+代码 | `test:test_reply_digest_reports_parts_and_sha` `test:test_tail_from_mapping_picks_newest` `code:reply_digest` `code:tail_from_mapping` | 截断补全文时按 part 数 + 拼接 SHA-256 对账，不只看「变长了」 ；`human:只能对账 GET 结果自身，证明不了服务端没丢 part` |
-| A13 | **PARTIAL** | 测试+代码 | `test:test_full_text_is_kept` `test:test_optional_truncation_is_labelled` `code:save_reply` | 默认全文；截断必须写进文件头 ；`human:截断阈值由调用方设，没有默认上限可断言` |
+| A12 | **PARTIAL** | 测试+代码 | `test:test_reply_digest_reports_parts_and_sha` `test:test_tail_from_mapping_picks_newest` `test:test_malformed_bodies_never_raise` `test:test_malformed_sse_never_raises` `test:test_reply_digest_malformed_returns_none` `test:test_shape_helper_contract` `test:test_mapping_checked_reports_incomplete` `test:test_mapping_checked_complete_when_clean` `test:test_sse_checked_reports_bad_events_and_done` `test:test_tail_from_mapping_returns_none_when_malformed` `code:reply_digest` `code:tail_from_mapping` `code:_scan_mapping` `code:_scan_sse` `code:_as_dict` | 截断补全文时按 part 数 + 拼接 SHA-256 对账，不只看「变长了」；对账器是**完整性证明器**——任何畸形整体判不可用，不许跳过坏 node 拿剩余 part 算摘要（F-12） ；`human:只能对账 GET 结果自身，证明不了服务端没丢 part` |
+| A13 | **PARTIAL** | 测试+代码 | `test:test_full_text_is_kept` `test:test_optional_truncation_is_labelled` `test:test_malformed_sse_skipped_but_good_line_kept` `test:test_archiving_not_blocked_by_digest_failure` `code:save_reply` | 默认全文；截断必须写进文件头；**辅助对账器不得成为归档的前置硬依赖**——对账失败/崩溃也必须继续落盘（F-12） `human:截断阈值由调用方设，没有默认上限可断言` |
 | A14 | **PARTIAL** | 测试+代码 | `test:test_jar_is_persisted_and_header_is_readable` `test:test_auth_cookies_are_never_written_to_disk` `code:save_device_cookie` | 发前落身份，auth cookie 永不落盘 ；`human:CDP 取 jar 的真机路径无法离线复现` |
 | A15 | **CODE_ONLY** | 代码+人判 | `code:_file_lock` `human:账号级串行是调用点约定（同一账号不并发起两个 GET），离线只能验锁本身，验不了「谁在调用」` | 已知缺口：缺一个「同账号并发调用被拒」的用例 |
 | A16 | **FULL** | 测试+代码 | `test:test_timeout_is_split_by_thinking` `code:send_prompt` | 思考 1800s / 非思考 420s 两档都有断言（同一预算会误杀 19 分钟的思考回复） |
@@ -99,12 +99,12 @@
 | 等级 | 条数 | 条款 |
 |---|---|---|
 | FULL | 20 | A1 A3 A4 A5 A6 A11 A16 A19 A21 A22 A23 A24 A25 A26 A27 A28 B4 B8 B10 B11 |
-| PARTIAL | 12 | A2 A8 A10 A12 A13 A14 A17 A20 B1 B5 B12 B15 |
-| CODE_ONLY | 4 | A7 A9 A15 A18 |
+| PARTIAL | 13 | A2 A7 A8 A10 A12 A13 A14 A17 A20 B1 B5 B12 B15 |
+| CODE_ONLY | 3 | A9 A15 A18 |
 | HUMAN | 13 | A0 B0 B2 B3 B6 B7 B9 B13 B14 C1 C2 C3 C4 |
 | 合计 | 49 | — |
 
-**结论**：49 条里 **20 条（41%）真正机械化**，12 条半机械化，4 条只有代码，13 条人判。任何「全都可以机器判定」的说法都是夸大。
+**结论**：49 条里 **20 条（41%）真正机械化**，13 条半机械化，3 条只有代码，13 条人判。任何「全都可以机器判定」的说法都是夸大。
 
 **已知缺口（按危害排序，不许糊过去）**：
 

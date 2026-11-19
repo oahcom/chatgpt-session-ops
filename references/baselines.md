@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**二十五轮对外对抗审查**逐条改写（每轮裁定见 §F；**第二十五轮 `PASS`——全文最终确认·收敛**，第二十二轮 `PASS`（F-10 残留定向复审），**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至二十三轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08）、锁元数据写入失败进临界区（F-09）、损坏启动时间误判 pid_reused（F-10）、归档覆盖（F-11）、超长 pid 串 int() 异常逃逸（F-07 残留），全部已修复并在第二十五轮全文复审核销），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 206 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**二十六轮对外对抗审查**逐条改写（每轮裁定见 §F；**第二十五轮 `PASS`——锁子系统全文最终确认·收敛**，第二十二轮 `PASS`（F-10 残留定向复审），**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至二十三轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08）、锁元数据写入失败进临界区（F-09）、损坏启动时间误判 pid_reused（F-10）、归档覆盖（F-11）、超长 pid 串 int() 异常逃逸（F-07 残留）、**收割/对账解析器畸形 JSON 崩溃（F-12，41 处）**——前 11 组已在第二十五轮核销，F-12 已修待复审），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 218 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -34,7 +34,7 @@
 | 2 | 这个会话归谁 | `--owner <conv_id>` | 输出唯一账号 |
 | 3 | 配额有没有冷却 | `--rotation` | `unavailable` 为空或目标账号不在其中 |
 | 4 | 匿名要用先看设备 | `--anon-devices` | 目标设备 `jar=true` |
-| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 206 条） |
+| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 218 条） |
 
 ### A1–A4 内容主权（不可协商）
 
@@ -335,7 +335,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | automation 名称 / 排程 | 同上 + `--check-name`、`--check-schedule`、`--check-oneshot` | B1/B4/B5/B10/B11 |
 | 排程口径 | `automation_update list` 全量盘点 | B1–B5 |
 
-**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 206 条。
+**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 218 条。
 
 ---
 
@@ -411,7 +411,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 
 | 21 | v1.8 修订 | `NEEDS-REVISION`（F-10 残留） | F-09/F-11/F-08补 均判「修复到位」；`_write_all`/`_rename_no_overwrite` 核心正确（但 `_rename_no_overwrite` POSIX 路径非原子重命名——硬链接+删源两步，docstring 措辞需修正）。**F-10 残留**：`_parse_start_time` 只拒 NaN 未拒 ±inf 和负数，`float("inf")`/`-1` 等能通过验证后 `!= cur` 触发 pid_reused 回收 |
 
-**第二十一轮改了什么**：① `_parse_start_time` 补拒 ±inf（`float("inf")`/`float("-inf")`）与负数（int/float 均查 `< 0`）；② `_rename_no_overwrite` docstring 改为「目标不覆盖的归档移动」并注明 POSIX 两步非原子；③ 测试集扩充 ±inf/-1/-0.5 至三处（`_parse_start_time` 契约 + `_lock_holder_stale` 侧 + `_lease_reclaimable` 侧），206 条不变（用例集扩参不加新 ID）。
+**第二十一轮改了什么**：① `_parse_start_time` 补拒 ±inf（`float("inf")`/`float("-inf")`）与负数（int/float 均查 `< 0`）；② `_rename_no_overwrite` docstring 改为「目标不覆盖的归档移动」并注明 POSIX 两步非原子；③ 测试集扩充 ±inf/-1/-0.5 至三处（`_parse_start_time` 契约 + `_lock_holder_stale` 侧 + `_lease_reclaimable` 侧），218 条不变（用例集扩参不加新 ID）。
 
 | 22 | v1.8 修订 | **`PASS`** | F-10 完全闭环（None/bool/str/NaN/±inf/负数全覆盖，bool 先于 int 排除顺序正确）；`_rename_no_overwrite` docstring 措辞修正可接受（POSIX 两步非原子的描述准确）。无新确定性实现级缺陷。残余风险 2 条：①POSIX 归档硬链接成功后、删源前崩溃可能留下双路径（不丢数据不覆盖归档，需人工/恢复逻辑识别）；②历史空锁/无 pid 锁的 mtime 兼容回收不具备身份级证明（退化恢复机制） |
 
@@ -423,6 +423,12 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 
 | 24 | v1.8 修订 | **`PASS`** | F-07 完全闭环：`int()` 异常被捕获返回 None，异常传播链闭合，四路回归覆盖充分（解析/进程状态/锁回收/租约回收均验超长 pid 不抛不误删）。无新缺陷 |
 | 25 | v1.8 修订 | **`PASS`** | **全文最终确认·收敛轮**。逐函数（12 项）全部通过；逐组合（F-02×F-03 / F-03×F-07 / F-07×F-08 / F-08×F-09 / F-03×F-10 / F-02×F-11 / 强制恢复链）全部无漏洞。残余风险描述准确。**F-09/F-10/F-11 与 F-07 在最终代码中均已核销**。无新确定性实现级缺陷 |
+
+**第二十五轮说明**：定向复审（仅 F-10 残留 + docstring），非全文裁定。第二十轮「全文最终确认」曾抓出 F-09/F-10/F-11，修复后需全文确认才能收敛。
+
+| 26 | v1.8 修订 | `NEEDS-REVISION`（F-12） | **换靶到回复完整性/收割链路（A10/A12/A13/A14）**——前二十五轮火力全在锁子系统，这批条款从未做过实现级对抗审查。判 F-12 成立：`reply_digest`/`harvest_mapping`/`harvest_transcript`/`tail_from_mapping`/`extract_reply_sse` 对「JSON 合法但形状不符」的响应体抛未捕获异常（探针实测 41 处）；`reply_digest` 的异常确实阻断 `save_reply`（归档唯一副本丢失）；`extract_reply_sse` 在主收割路径 7/7 全崩。**并给出差异化降级要求**：①`reply_digest` 是完整性证明器——任何畸形**整体判不可用**，不得跳过坏 node 拿剩余 part 算摘要；②收割类必须**暴露不完整状态**；③`tail_from_mapping` 是尾部确认——畸形即整体 None；④SSE 须**记录坏事件数与是否 [DONE] 收尾**，不得把部分流冒充完整回复；⑤**辅助对账器不得成为归档的前置硬依赖**。第 3 项（全文件枚举同类位置）未完成——审查方把「通读全文」理解为去读 GitHub 仓库 `oahcom/AiMemoryBrainArchitecture`，该仓库 main 无此文件 |
+
+**第二十六轮改了什么**：① 新增 `_as_dict`/`_as_seq`/`_as_ctime` 三个形状收敛工具（`_as_ctime` 返回 `(ok, float)`，`ok=False` 表示时间值不可用、记录无效不得参与排序）；② 新增 `_scan_sse`（返回 text/complete/detail，记坏事件数与 [DONE]）与 `_scan_mapping`（返回 rows/complete，坏 node 跳过但**必须标记不完整**）两个扫描层；③ `reply_digest` 改**严格整体判定**：任何畸形（mapping/node/message/author/content/parts 形状不对或时间戳不可用）一律返回 None；④ `tail_from_mapping` 改**严格尾部确认**：任何畸形整体返回 None；⑤ 新增 `extract_reply_sse_checked`/`harvest_mapping_checked`/`harvest_transcript_checked` 三个带完整度信号的伴随接口（旧接口保留为薄包装，调用方不受影响）；⑥ `send_prompt` 用带完整度的接口，**坏流/不完整 mapping 明确打 WARN**；⑦ `reply_digest` 调用包 try/except 且**对账失败也继续 `save_reply`**——辅助对账器不再是归档的前置硬依赖；⑧ 匿名留存（`read_anon`）在归档头部写入「留存不完整」标注；⑨ `requirements`（PoW 关键路径）/ 模型清单 / 对话列表 / `conv_owner` 补形状守卫；⑩ 补 12 条回归（206→218）。
 
 **第十四轮之后补的一条**：审查把「`_record_corruption("lease-recovery-failed")` 自己失败会怎样」列为残余风险 3，虽不构成裁定理由，但这是能离线证明的，于是补 `test_quarantine_failed_row_write_failure_is_survivable`（第一次登记成功、第二次返回 `None`，断言不抛异常、仍返回 `quarantine_failed`、租约原样在）。**属于 PASS 后的加证，不改变任何条款口径**，故不重开一轮审查。
 
@@ -477,7 +483,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 
 **矩阵自身有回归**：`TestEvidenceMatrix` 三条断言——条款集合 = 矩阵行集合（不漏、不多、不重复）；每个 `test:`/`code:` 引用都能解析；每行至少一种证据。它的作用是让「文档漂移」变成红灯，而不是等下一次审查才被发现。
 
-**当前分布（49 条，按等级）**：**FULL 20 条**（核心判定 + 失败分支都有独立断言）；**PARTIAL 12 条**（含 A20/B15：跨平台持久化与进程身份无法离线穷举，见矩阵）；**CODE_ONLY 4 条**（A7 A9 A15 A18，有实现无回归）；**HUMAN 13 条**（A0 B0 B2 B3 B6 B7 B9 B13 B14 C1–C4）。**只有 FULL 才算「已机械化」**——按「有没有 test:」计数会系统性高估，这是第九轮审查的结论。
+**当前分布（49 条，按等级）**：**FULL 20 条**（核心判定 + 失败分支都有独立断言）；**PARTIAL 13 条**（含 A7/A20/B15：跨平台持久化与进程身份无法离线穷举，见矩阵）；**CODE_ONLY 3 条**（A9 A15 A18，有实现无回归）；**HUMAN 13 条**（A0 B0 B2 B3 B6 B7 B9 B13 B14 C1–C4）。**只有 FULL 才算「已机械化」**——按「有没有 test:」计数会系统性高估，这是第九轮审查的结论。
 
 **已知缺口（按危害排序，写着就是为了下次被追）**：
 

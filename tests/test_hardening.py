@@ -941,6 +941,9 @@ class FakeAnonAPI:
     def harvest_transcript(self, raw):
         return [("user", "q"), ("assistant", "a")]
 
+    def harvest_transcript_checked(self, raw):
+        return [("user", "q"), ("assistant", "a")], True
+
     def _device_id(self):
         return m.device_id_from_cookie(self.cookie)
 
@@ -1065,8 +1068,14 @@ class FakeAPI:
     def extract_reply_sse(self, raw):
         return m.ChatGPTAPI.extract_reply_sse(raw)
 
+    def extract_reply_sse_checked(self, raw):
+        return m.ChatGPTAPI.extract_reply_sse_checked(raw)
+
     def harvest_mapping(self, raw):
         return m.ChatGPTAPI.harvest_mapping(raw)
+
+    def harvest_mapping_checked(self, raw):
+        return m.ChatGPTAPI.harvest_mapping_checked(raw)
 
     def save_reply(self, conv_id, pfile, text):
         return m.ChatGPTAPI.save_reply(self, conv_id, pfile, text)
@@ -1737,6 +1746,237 @@ class TestProxy(TmpBase):
         finally:
             m.check_egress, m.probe_site, m.resolve_proxy_info = real_eg, real_site, real_res
             sys.argv = real_argv
+
+
+class TestMalformedResponse(TmpBase):
+    """F-12：解析器对「JSON 合法但形状不符」的响应体必须优雅降级，绝不抛异常。
+
+    事故场景：reply_digest 崩在截断回复的恢复路径上 → save_reply 永不执行 →
+    归档（唯一副本）彻底丢失。解析失败降级是这些函数既有的策略，形状不符
+    必须同等对待。
+    """
+
+    BAD_BODIES = [
+        ("顶层是数组", "[]"),
+        ("顶层是 null", "null"),
+        ("顶层是数字", "123"),
+        ("顶层是字符串", '"x"'),
+        ("mapping 是列表", json.dumps({"mapping": []})),
+        ("mapping 是字符串", json.dumps({"mapping": "x"})),
+        ("node 是字符串", json.dumps({"mapping": {"n1": "notadict"}})),
+        ("author 是字符串",
+         json.dumps({"mapping": {"n1": {"message": {"author": "root",
+                                                    "content": {"parts": ["x"]}}}}})),
+        ("content 是字符串",
+         json.dumps({"mapping": {"n1": {"message": {"author": {"role": "assistant"},
+                                                    "content": "text"}}}})),
+        ("create_time 类型混",
+         json.dumps({"mapping": {
+             "a": {"message": {"author": {"role": "assistant"},
+                                "content": {"parts": ["x"]},
+                                "create_time": "9", "id": "z"}},
+             "b": {"message": {"author": {"role": "assistant"},
+                                "content": {"parts": ["y"]},
+                                "create_time": 5, "id": "a"}}}})),
+    ]
+
+    BAD_SSE = [
+        ("data 是数字", "data: 123"),
+        ("data 是数组", "data: []"),
+        ("data 是字符串", 'data: "x"'),
+        ("data 是 null", "data: null"),
+        ("message 是字符串", 'data: {"message": "s"}'),
+        ("content 是字符串",
+         'data: {"message": {"author": {"role": "assistant"}, "content": "t"}}'),
+        ("author 是字符串",
+         'data: {"message": {"author": "root", "content": {"parts": ["x"]}}}'),
+    ]
+
+    CONV = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+
+    def test_malformed_bodies_never_raise(self):
+        """所有解析器 × 所有畸形形状：不得抛任何异常。"""
+        parsers = [("reply_digest", m.reply_digest),
+                   ("harvest_mapping", m.ChatGPTAPI.harvest_mapping),
+                   ("harvest_transcript", m.ChatGPTAPI.harvest_transcript),
+                   ("tail_from_mapping", m.ChatGPTAPI.tail_from_mapping)]
+        for pname, fn in parsers:
+            for bname, body in self.BAD_BODIES:
+                with self.subTest(parser=pname, body=bname):
+                    try:
+                        fn(body)
+                    except Exception as e:
+                        self.fail("%s 遇到 %s 抛 %s: %s" % (pname, bname, type(e).__name__, e))
+
+    def test_malformed_sse_never_raises(self):
+        """SSE 收割：畸形 data 行跳过即可，不得让整次收割崩掉。"""
+        for bname, line in self.BAD_SSE:
+            with self.subTest(line=bname):
+                try:
+                    m.ChatGPTAPI.extract_reply_sse(line)
+                except Exception as e:
+                    self.fail("extract_reply_sse 遇到 %s 抛 %s: %s"
+                              % (bname, type(e).__name__, e))
+
+    def test_malformed_sse_skipped_but_good_line_kept(self):
+        """坏行跳过后，好行仍要收得到（降级不能变成「全丢」）。"""
+        raw = ("data: 123\n"
+               "data: {\"message\": \"s\"}\n"
+               "data: {\"message\": {\"author\": {\"role\": \"assistant\"}, "
+               "\"content\": {\"parts\": [\"真正的回复\"]}}}\n")
+        self.assertEqual(m.ChatGPTAPI.extract_reply_sse(raw), "真正的回复")
+
+    def test_reply_digest_malformed_returns_none(self):
+        """对账器遇到畸形体：一律返回 None（核不了），不得抛异常。
+
+        第二十六轮审查口径：对账器是**完整性证明器**，不是内容提取器——
+        跳过一个坏 node 后拿剩余 part 算摘要，等于把缺失的 part 藏进一个
+        「看起来正常」的摘要里。因此任何畸形都整体判不可用。
+        """
+        for bname, body in self.BAD_BODIES:
+            with self.subTest(body=bname):
+                self.assertIsNone(m.reply_digest(body),
+                                  "畸形体 %r 必须整体判不可用" % (bname,))
+
+    def test_shape_helper_contract(self):
+        """_as_dict / _as_seq / _as_ctime 直接契约。"""
+        self.assertEqual(m._as_dict({"a": 1}), {"a": 1})
+        for bad in (None, [], "x", 1, 1.5, True):
+            self.assertEqual(m._as_dict(bad), {}, "_as_dict(%r) 应返回 {}" % (bad,))
+        self.assertEqual(m._as_seq([1, 2]), [1, 2])
+        for bad in (None, {}, "x", 1):
+            self.assertEqual(m._as_seq(bad), [], "_as_seq(%r) 应返回 []" % (bad,))
+        # _as_ctime 返回 (ok, float)：ok=False = 时间值不可用，记录无效
+        self.assertEqual(m._as_ctime(5), (True, 5.0))
+        self.assertEqual(m._as_ctime(5.5), (True, 5.5))
+        self.assertEqual(m._as_ctime(None), (True, 0.0))       # 缺失 = 最旧，内容照收
+        self.assertEqual(m._as_ctime("9"), (False, 0.0))       # 类型不对 = 不可用
+        self.assertEqual(m._as_ctime(True), (False, 0.0))      # bool 不算时间戳
+
+    def test_conv_owner_tolerates_non_dict_state_file(self):
+        """会话归属文件内容不是 dict 时：不得抛异常（返回 None）。"""
+        path = os.path.join(self.tmp, "conv-accounts.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("[]")
+        real = m.CONV_MAP_FILE
+        try:
+            m.CONV_MAP_FILE = path
+            self.assertIsNone(m.conv_owner("whatever"))
+        finally:
+            m.CONV_MAP_FILE = real
+
+    # ---- 第二十六轮审查口径：跳过坏 node ≠ 证明完整 ----
+    def test_mapping_checked_reports_incomplete(self):
+        """收割必须能识别「不完整」——坏 node 不能被静默当成完整 mapping。"""
+        for bname, body in self.BAD_BODIES:
+            with self.subTest(body=bname):
+                _text, complete = m.ChatGPTAPI.harvest_mapping_checked(body)
+                self.assertFalse(complete, "畸形体 %r 必须标记为不完整" % (bname,))
+
+    def test_transcript_checked_reports_incomplete(self):
+        """匿名留存也必须能识别不完整（否则「尽力而为」冒充完整对话）。"""
+        for bname, body in self.BAD_BODIES:
+            with self.subTest(body=bname):
+                _rows, complete = m.ChatGPTAPI.harvest_transcript_checked(body)
+                self.assertFalse(complete, "畸形体 %r 必须标记为不完整" % (bname,))
+
+    def test_mapping_checked_complete_when_clean(self):
+        """干净的 mapping：complete=True（不能把降级做成永远报警）。"""
+        body = json.dumps({"mapping": {
+            "a": {"message": {"author": {"role": "user"},
+                               "content": {"parts": ["q"]},
+                               "create_time": 1.0}},
+            "b": {"message": {"author": {"role": "assistant"},
+                               "content": {"parts": ["a"]},
+                               "create_time": 2.0}},
+        }})
+        text, complete = m.ChatGPTAPI.harvest_mapping_checked(body)
+        self.assertTrue(complete)
+        self.assertEqual(text, "a")
+
+    def test_sse_checked_reports_bad_events_and_done(self):
+        """SSE 必须记录坏事件数与是否 [DONE] 收尾——部分流不得冒充完整回复。"""
+        clean = ('data: {"message": {"author": {"role": "assistant"}, '
+                 '"content": {"parts": ["ok"]}}}\ndata: [DONE]\n')
+        text, complete, detail = m.ChatGPTAPI.extract_reply_sse_checked(clean)
+        self.assertEqual(text, "ok")
+        self.assertTrue(complete, "干净流应判完整")
+        self.assertIn("[DONE]", detail)
+
+        bad = 'data: 123\ndata: [DONE]\n'
+        text, complete, detail = m.ChatGPTAPI.extract_reply_sse_checked(bad)
+        self.assertFalse(complete, "含坏事件必须判不完整")
+        self.assertIn("坏事件 1", detail)
+
+        no_done = ('data: {"message": {"author": {"role": "assistant"}, '
+                   '"content": {"parts": ["ok"]}}}\n')
+        text, complete, detail = m.ChatGPTAPI.extract_reply_sse_checked(no_done)
+        self.assertEqual(text, "ok", "内容照收")
+        self.assertFalse(complete, "未见 [DONE] 必须判不完整")
+        self.assertIn("未见 [DONE]", detail)
+
+    def test_tail_from_mapping_returns_none_when_malformed(self):
+        """尾部确认：mapping 有畸形就整体返回 None——不把不完整的尾部当真实尾部。"""
+        for bname, body in self.BAD_BODIES:
+            with self.subTest(body=bname):
+                self.assertIsNone(m.ChatGPTAPI.tail_from_mapping(body),
+                                  "畸形体 %r 的尾部不可确认" % (bname,))
+
+    def test_archiving_not_blocked_by_digest_failure(self):
+        """辅助对账器不得成为归档的前置硬依赖：对账失败/崩溃都仍要落盘。
+
+        事故场景：对账器抛异常 → 控制流跳出 send_prompt → save_reply 永不执行
+        → 归档（唯一副本）彻底丢失。
+        """
+        path = os.path.join(self.tmp, "f12-block.json")
+        saved = []
+        CONV = self.CONV
+
+        class Stub:
+            is_anon = False
+            account = "acct1"
+            last_truncated = True
+            last_status = 200
+            last_body = ""
+
+            def live_tail(self, conv_id, tries=2):
+                return ("p1", "{}")
+
+            def cached_tail(self, conv_id):
+                return "p1"
+
+            def resolve_thinking_model(self, api):
+                return "auto"
+
+            def requirements(self):
+                return "tok", "proof"
+
+            def send(self, conv_id, text, tail, req_token, proof, model=None, timeout=420):
+                sse = ('data: {"conversation_id": "%s"}\n'
+                       'data: {"message": {"author": {"role": "assistant"}, '
+                       '"content": {"parts": ["半截回复"]}}}\n' % CONV)
+                return 200, sse
+
+            def req(self, method, url, body=None, timeout=60):
+                return 200, "null"          # 畸形 GET body → 对账器核不了
+
+            def extract_reply_sse_checked(self, raw):
+                return m.ChatGPTAPI.extract_reply_sse_checked(raw)
+
+            def harvest_mapping_checked(self, raw):
+                return m.ChatGPTAPI.harvest_mapping_checked(raw)
+
+            def save_reply(self, conv_id, pfile, text):
+                saved.append((conv_id, text))
+                return "<path>"
+
+        prompt = os.path.join(self.tmp, "p12.md")
+        with open(prompt, "w", encoding="utf-8") as f:
+            f.write("提示词\n")
+        st, _p, conv = m.send_prompt(Stub(), CONV, prompt)
+        self.assertEqual(st, 200)
+        self.assertTrue(saved, "对账器核不了也必须落盘——归档是唯一副本")
+        self.assertEqual(saved[0][0], CONV)
 
 
 class TestSlotsAndLease(TmpBase):
