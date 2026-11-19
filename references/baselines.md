@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**十八轮对外对抗审查**逐条改写（每轮裁定见 §F；**第十四轮 `PASS`**，第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至十八轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08），均已修复待复审），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 192 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**十九轮对外对抗审查**逐条改写（每轮裁定见 §F；**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至十八轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08），均已在第十九轮核销），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 192 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -400,6 +400,10 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | 18 | v1.8 修订 | `NEEDS-REVISION`（F-07 / F-08 两项） | F-04/05/06 被判「主要修复均已落地」；但抓出两个新绕过点：**F-07** `_proc_state` 用 `int(pid)` 折叠非法输入（`int(999999.9)==999999`、`int(True)==1`），非法 pid 会被折成合法 pid 查死活，可能借截断触发回收；**F-08** `_lock_holder_stale` 把「JSON 损坏/读取失败/顶层非字典」与「老格式无 pid 字段」合并进同一条 mtime 兼容路径，损坏数据借老格式逃生 |
 
 **第十八轮改了什么**：① **F-07**：新增 `_parse_pid()` 严格解析（只认正整数 int 且拒 bool、纯十进制数字串；float/bool/带空白串/0x 串/0/负数一律 None），`_proc_state` 与 `_proc_start_time` 共用，float/bool pid 一律 UNKNOWN。② **F-08**：`_lock_holder_stale` 读取段重写——OSError（读失败）/ ValueError（JSON 损坏）/ 顶层非字典 → 保守不回收；只有「成功解析的字典且无 pid 字段」与「空文件（老格式锁的字面形态）」走 mtime 兼容。③ 补六条回归（186→192）：`test_parse_pid_rejects_lossy_coercion`（12 个折叠通道逐一断言 None）/ `test_proc_state_rejects_float_and_bool_pid` / `test_lock_float_pid_not_reclaimed`（事故复现：999999.9 截断成 999999 判 DEAD 误删）/ `test_lock_corrupt_json_not_reclaimed_by_mtime` / `test_lock_non_dict_json_not_reclaimed` / `test_lock_unreadable_not_reclaimed`（路径是目录 = 读失败）。
+
+| 19 | v1.8 修订 | **`PASS`** | F-07/F-08 均判「已修复」；空文件 mtime 兼容取舍被明确接受（「区分解析失败与历史格式本身没有身份内容……我接受这个取舍」，但要求措辞上不得与新格式三态身份验证等同）；无新确定性实现级缺陷。残余风险 2 条：①历史空锁/无 pid 锁的 mtime 兼容回收不具备身份级证明（退化恢复机制）；②进程状态查询与回收之间存在不可完全消除的系统级时序窗口。裁定范围限已展示路径（`_try_reclaim_stale`/`_lease_reclaimable`/`lease_force_release` 未全文展示），最终收敛以全文复审为准 |
+
+**第十九轮遗留的口径修正（PASS 后按审查要求改措辞，不重开审查）**：空文件/无 pid 字段老格式锁的 mtime 兼容回收是**历史格式的退化恢复机制**，不具备与新格式三态身份验证（`_proc_state` DEAD/ALIVE/UNKNOWN）同等的保证——文档各处不得把两者等同描述。
 
 **第十四轮之后补的一条**：审查把「`_record_corruption("lease-recovery-failed")` 自己失败会怎样」列为残余风险 3，虽不构成裁定理由，但这是能离线证明的，于是补 `test_quarantine_failed_row_write_failure_is_survivable`（第一次登记成功、第二次返回 `None`，断言不抛异常、仍返回 `quarantine_failed`、租约原样在）。**属于 PASS 后的加证，不改变任何条款口径**，故不重开一轮审查。
 
