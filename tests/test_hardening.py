@@ -1219,5 +1219,194 @@ class TestSlotsAndLease(TmpBase):
         self.assertEqual(len(set(got)), len(got), "同一槽位被两个进程同时持有")
 
 
+class TestFileLockFailClosed(TmpBase):
+    """P1-01: _file_lock fail-closed 语义回归——锁获取失败绝不进临界区。"""
+
+    def _load(self):
+        return load_module()
+
+    def test_normal_acquire_and_release(self):
+        """T01: 正常获取锁→进入临界区→释放后锁文件清除。"""
+        m = self._load()
+        p = os.path.join(self.tmp, "state.json")
+        entered = False
+        with m._file_lock(p):
+            entered = True
+            lockfile = p + ".lock"
+            self.assertTrue(os.path.exists(lockfile), "持锁期间锁文件应存在")
+        self.assertTrue(entered)
+        self.assertFalse(os.path.exists(p + ".lock"), "释放后锁文件应清除")
+        self.assertNotIn(p, m._LOCK_HELD, "释放后 _LOCK_HELD 应清除")
+
+    def test_timeout_raises_and_skips_critical_section(self):
+        """T03: 锁被占用且等待超时→TimeoutError→不进临界区→不写状态。"""
+        m = self._load()
+        p = os.path.join(self.tmp, "state.json")
+        state_file = p
+        # 先由另一个线程持锁
+        hold_event = threading.Event()
+        release_event = threading.Event()
+
+        def holder():
+            with m._file_lock(p):
+                hold_event.set()
+                release_event.wait(timeout=10)
+
+        t = threading.Thread(target=holder)
+        t.start()
+        self.assertTrue(hold_event.wait(timeout=5), "持锁线程应已进入临界区")
+
+        # 当前线程尝试获取锁，应超时失败
+        entered = False
+        with self.assertRaises(TimeoutError):
+            with m._file_lock(p, timeout=0.3):
+                entered = True
+                # 如果进来就写状态文件——绝不能发生
+                with open(state_file, "w") as f:
+                    f.write("CORRUPTED")
+
+        self.assertFalse(entered, "超时后绝不应进入临界区")
+        self.assertFalse(os.path.exists(state_file), "失败方不应写入状态文件")
+
+        release_event.set()
+        t.join(timeout=5)
+
+    def test_oserror_raises_and_skips_critical_section(self):
+        """T04: OSError 路径→明确异常→不进临界区。"""
+        m = self._load()
+        p = os.path.join(self.tmp, "state.json")
+        # 模拟 os.open 抛 OSError
+        orig_open = os.open
+        def failing_open(*args, **kwargs):
+            raise OSError(28, "No space left on device")
+        os.open = failing_open
+        try:
+            entered = False
+            with self.assertRaises(OSError):
+                with m._file_lock(p):
+                    entered = True
+            self.assertFalse(entered, "OSError 后绝不应进入临界区")
+        finally:
+            os.open = orig_open
+
+    def test_lock_not_registered_when_acquisition_fails(self):
+        """失败方不得在 _LOCK_HELD 中登记持锁。"""
+        m = self._load()
+        p = os.path.join(self.tmp, "state.json")
+        hold_event = threading.Event()
+        release_event = threading.Event()
+
+        def holder():
+            with m._file_lock(p):
+                hold_event.set()
+                release_event.wait(timeout=10)
+
+        t = threading.Thread(target=holder)
+        t.start()
+        self.assertTrue(hold_event.wait(timeout=5))
+
+        failed_ident = threading.get_ident()
+        with self.assertRaises(TimeoutError):
+            with m._file_lock(p, timeout=0.3):
+                pass
+
+        # 此时 holder 仍持锁，_LOCK_HELD[p] 应是 holder 的 ident，不是失败方的
+        holder_ident = m._LOCK_HELD.get(p)
+        self.assertNotEqual(holder_ident, failed_ident,
+                            "失败方不应出现在 _LOCK_HELD")
+        release_event.set()
+        t.join(timeout=5)
+        # holder 释放后应清除
+        self.assertNotIn(p, m._LOCK_HELD, "释放后应清除 _LOCK_HELD")
+
+    def test_thread_contention_only_holder_enters(self):
+        """T05: 多线程竞争——同一时刻只有持锁方在临界区内。"""
+        m = self._load()
+        p = os.path.join(self.tmp, "state.json")
+        max_concurrent = 0
+        current = 0
+        lock = threading.Lock()
+        errors = []
+        entered_count = [0]
+
+        def worker(idx):
+            nonlocal max_concurrent, current
+            try:
+                with m._file_lock(p, timeout=5):
+                    with lock:
+                        current += 1
+                        entered_count[0] += 1
+                        max_concurrent = max(max_concurrent, current)
+                    time.sleep(0.05)
+                    with lock:
+                        current -= 1
+            except (TimeoutError, OSError) as e:
+                errors.append((idx, str(e)))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        self.assertEqual(max_concurrent, 1,
+                         "临界区内同时存在 %d 个执行者——锁失效!" % max_concurrent)
+        self.assertGreater(entered_count[0], 0, "至少应有 1 个线程成功进入")
+        # 失败的线程不应写入状态
+        self.assertFalse(os.path.exists(p + ".lock"), "锁应已全部释放")
+
+    def test_process_contention_no_unlocked_write(self):
+        """T06: 多进程竞争——失败进程不写状态文件。"""
+        m = self._load()
+        p = os.path.join(self.tmp, "state.json")
+        with open(p, "w") as f:
+            json.dump({"value": "original"}, f)
+
+        script = (
+            "import sys, os, json, time\n"
+            "sys.path.insert(0, %r)\n"
+            "import chatgpt_send as C\n"
+            "p = sys.argv[1]\n"
+            "try:\n"
+            "    with C._file_lock(p, timeout=float(sys.argv[2])):\n"
+            "        time.sleep(float(sys.argv[3]))\n"
+            "        d = json.load(open(p))\n"
+            "        d['value'] = 'MODIFIED_BY_PID_' + str(os.getpid())\n"
+            "        json.dump(d, open(p, 'w'))\n"
+            "        print('ENTERED')\n"
+            "except (TimeoutError, OSError, RuntimeError) as e:\n"
+            "    print('REJECTED: ' + str(e))\n"
+        ) % (os.path.dirname(os.path.abspath(m.__file__)),)
+
+        # 进程 1 持锁 3 秒
+        proc1 = subprocess.Popen(
+            [sys.executable, "-c", script, p, "5", "3"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(1.0)  # 确保进程 1 已拿到锁并写入锁文件
+
+        # 进程 2 竞争，短超时
+        proc2 = subprocess.Popen(
+            [sys.executable, "-c", script, p, "0.5", "0.1"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        out1, _ = proc1.communicate(timeout=30)
+        out2, _ = proc2.communicate(timeout=30)
+
+        self.assertIn("ENTERED", out1, "进程 1 应成功进入: %r" % out1)
+        self.assertIn("REJECTED", out2, "进程 2 应被拒绝: %r" % out2)
+        # 验证状态文件只被进程 1 修改
+        final = json.load(open(p))
+        self.assertIn("MODIFIED_BY_PID_", final["value"], "进程 1 应已写入")
+
+    def test_reentrant_same_thread_no_self_lock(self):
+        """T07: 同线程合法重入不自锁。"""
+        m = self._load()
+        p = os.path.join(self.tmp, "state.json")
+        with m._file_lock(p):
+            with m._file_lock(p):  # 重入——不能死锁
+                pass  # 内层正常退出
+        self.assertNotIn(p, m._LOCK_HELD, "全部退出后应清除登记")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
