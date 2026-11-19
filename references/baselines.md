@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**九轮对外对抗审查**逐条改写（每轮裁定见 §F，第九轮把「可判定」本身当成攻击面），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 139 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**九轮对外对抗审查**逐条改写（每轮裁定见 §F，第九轮把「可判定」本身当成攻击面），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 144 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -34,7 +34,7 @@
 | 2 | 这个会话归谁 | `--owner <conv_id>` | 输出唯一账号 |
 | 3 | 配额有没有冷却 | `--rotation` | `unavailable` 为空或目标账号不在其中 |
 | 4 | 匿名要用先看设备 | `--anon-devices` | 目标设备 `jar=true` |
-| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 139 条） |
+| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 144 条） |
 
 ### A1–A4 内容主权（不可协商）
 
@@ -45,9 +45,11 @@
 | **A3** | Owner 裁决必须投给**全新**会话 | `--new` 且请求体**不含** `conversation_id` 字段 | 自己给自己判分 |
 | **A4** | 裁决结论原文回灌 | 回灌源 = 已存的原始裁决文件；回灌正文与约定交付范围**字节一致**；记录源文件 SHA-256、起止字节偏移、回灌文件 SHA-256；不一致 → `exit 2` 禁止回灌；禁止转成摘要 | 执行边界与 AMENDMENTS 丢失 |
 
+**A1 的空白口径（唯一解，别的都算篡改）**：删掉**围栏外首尾整行空白**；首尾**非空行**的全部原始字节（**含它自己的行终止符**）保留；内部所有字节原样。这条不写死就会出现「裁掉最后换行算不算改正文」的争论——现在的答案是：**不裁，保留**，因为行终止符属于原文。回归 `test_byte_exact_matrix` 用 LF / CRLF / 多空行 / 尾随空格四种输入断言精确字节。
+
 **A1/A2/A4 实现口径（v1.8 落地，此前是纯人判）**：`--extract <src> --between <起> <止>` 或 `--fence <n>` 取**唯一**交付块，`--out` 字节级落盘（`_atomic_write_bytes`），输出 `src_sha256 / sha256 / offset_start / offset_end`；标记数 ≠ 1、顺序反、块为空、定位器缺失 → `exit 2`。回灌前 `--verify-copy <a> <b>` 比对两份文件，SHA-256 不等即 `exit 2`。**不做 Unicode 规范化、不转 CRLF、只裁首尾空行**——这三件事一旦做进代码，正文就与原稿不是同一份字节，而失败是静默的。回归：`TestCustody`（10 条）。
 
-**`--fence` 的边界（别把它当成「随便取一块」）**：`--fence n` 里的 n **必须来自上游约定**（例如上游明说「第 2 个代码块是交付」），属于「约定定位」；**禁止用「哪块最长/哪块最像」反推 n**——那正是 A2 要防的猜。两个定位器都在 `exit 2` 上硬失败，宁可停下来问，也不许「取到一块看着像的就投」。
+**`--fence` 已降级为非合规辅助（第九轮审查结论）**：n 是**位置**，不是交付身份；即使调用方显式给出，也证明不了「这一块就是上游批准的那块」。因此 **A2 的合规路径只有 `--between`**（唯一标记行 = 交付标识）。`--fence` 保留给「上游明说第 n 块」的辅助场景，但**不得单独作为 A2 的证据**，用完仍须 `--verify-copy` 对齐。两个定位器都在 `exit 2` 上硬失败：宁可停下来问，也不许「取到一块看着像的就投」。
 
 ### A5–A9 通道与身份
 
@@ -202,7 +204,7 @@
 
 **B10/B11 实现（v1.8）**：`--check-name "<名称>" [--argv "<命令串>"]` 把上面两张表落成代码——分词判段数、动作词与词表**整段相等**比对、只读名的 argv 必须全部命中 `READONLY_ARGV`；任一条不成立 `exit 2`。别再自己写正则：`startswith("--rotation")` 会放行 `--rotation-reset`，`查看并删除` 会被包含匹配当成只读。回归 `TestScheduleContract`（19 条）覆盖四段名、全角空格、`（只读）+ 写动词`、白名单四个越权命令。
 
-**B1/B4/B5 实现（v1.8）**：`--check-schedule "FREQ=HOURLY;INTERVAL=1"` 只认 HOURLY + INTERVAL=1（天维度、`INTERVAL=0` 表示高频、`INTERVAL=2` 一律 `exit 2`）；`--check-oneshot <ISO8601>` 要求带时区、距今 `0 < Δ ≤ 3600s`——已过点（本该按 B5 归档）和超过 1 小时（本该走 B2 条件巡检）两头都在建之前堵住。
+**B1/B4/B5 实现（v1.8）**：`--check-schedule "FREQ=HOURLY;INTERVAL=1"` 只认 HOURLY：`INTERVAL` **缺省按 RFC 语义等价 1，允许**；显式给出则必须为 1（`INTERVAL=0` 表示高频、`INTERVAL=2` 一律 `exit 2`），天维度直接 `exit 2`。**只验 rrule 本身**——「实际触发间隔 ≥60 分钟」与「时区 Asia/Shanghai」两项依赖调度器观测与参数，仍属人判（B1 等级 FULL 指 rrule 这一半）；`--check-oneshot <ISO8601>` 要求带时区、距今 `0 < Δ ≤ 3600s`——已过点（本该按 B5 归档）和超过 1 小时（本该走 B2 条件巡检）两头都在建之前堵住。
 
 **B8/B15 实现**：`acquire_slot()` / `release_slot()` 在同一把跨进程锁内完成「回收死槽 + 计数 + 占位」，返回 `(slot_path, run_id)`，满员返回 `(None, run_id)` 由调用方记 `QUEUED`；`lease_acquire/heartbeat/release/reclaim` + `_lease_reclaimable()` 覆盖 `lease_valid / process_gone / pid_reused / identity_unreadable / run_id_mismatch / alive` 六种回收判定。回归含 6 进程同时抢槽（断言有效槽位 ≤3 且互不重叠）与租约六态。超时分两档（B15 硬要求）：执行体响应 cancel 且确实停下 → `TIMEOUT` 并释放租约；**执行体不响应取消、仍在跑 → `TIMEOUT_ORPHAN` 且保留租约**（此时释放租约等于放第二个实例进来，双跑比僵尸更危险）。心跳与超时由 `lease_run()` 落地：`HEARTBEAT_SEC=15`、`LEASE_SEC=60`、`RUN_MAX_SEC=3600` 三个常量可注入，回归用**按比例缩小的秒数**（如 lease 0.4s / heartbeat 0.1s / max 0.2s）验证同一套逻辑——证明「运行超过租约时心跳确实续期、不会被判过期」以及「超 `RUN_MAX_SEC` 时，执行体已停 → `TIMEOUT` + 释放租约，执行体不停 → `TIMEOUT_ORPHAN` + 保留租约」，不需要真等 15 分钟和 1 小时。
 
@@ -281,6 +283,8 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | **4 线程 ×20 次只落 60 条（v1.8 抓出）** | **A20** | 文档写「tmp 名唯一」，代码用固定 `.tmp`；`os.replace` WinError 32 打死线程 |
 | **6 进程抢槽出现 6 个槽位（v1.8 抓出）** | **B8** | 锁超时后「跳过加锁继续跑」；半截槽位被当损坏隔离改名，文件名空出即被二次占用 |
 | **租约文件不可读被当空租约删除** | **B15** | 读不懂的身份按「空」处理 → 放第二个实例进来；正确姿态是禁止回收 |
+| **租约操作抢不到锁照样进临界区** | **B15** | `lease_acquire/lease_reclaim` 用非 strict 锁，超时后无锁写租约 = 自毁互斥；槽位那条修了、租约这条漏了——同一类错误要按「所有临界区」排查，不能只修报出来的那个 |
+| **不可读槽位「超 5s」被当死槽删除** | **B8/B15** | 文件年龄不是进程死亡证据；只有 size=0（占名未写）才允许按时间回收 |
 
 ---
 
@@ -298,7 +302,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | automation 名称 / 排程 | 同上 + `--check-name`、`--check-schedule`、`--check-oneshot` | B1/B4/B5/B10/B11 |
 | 排程口径 | `automation_update list` 全量盘点 | B1–B5 |
 
-**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 139 条。
+**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 144 条。
 
 ---
 
@@ -330,6 +334,20 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | 6 | v1.6 | `NEEDS-REVISION`（3 项） | 配方里的 automation 名称本身违反 B10；B4「超时释放租约」与 B15 orphan 保留冲突；轮次表不全 |
 | 7 | v1.7 | `NEEDS-REVISION`（2 项纯一致性） | B15 主条款仍写「超时释放租约」，与实现段 orphan 保留冲突；标题 v1.6 / 结尾 v1.7 |
 | 8 | v1.7 | **`PASS`** | B15 两档语义一致、版本号统一，无新矛盾 |
+| 9 | v1.8 | `NEEDS-REVISION`（6 项 P1 + 2 项 P2） | 攻击面换成「可判定」本身：证据矩阵只验证用例名存在、不验证断言覆盖（A2/A20/B5 三处确认夸大）；`--fence` 是位置索引不是交付身份；B1 缺 INTERVAL 与另两项；**B15 的 `lease_acquire/lease_reclaim` 仍用非 strict 锁，拿不到锁照样进临界区**；B5 存量归档没实现却挂了实测证据；不可读槽位「超 5s 按年龄回收」与「身份不明禁回收」自相矛盾 |
+
+**第九轮改了什么（逐条对应）**：
+
+| 审查项 | 处置 |
+|---|---|
+| 证据只验名字不验断言 | 矩阵**加等级列** `FULL/PARTIAL/CODE_ONLY/HUMAN`，并加 `test_levels_are_consistent_with_evidence`：FULL 必须有用例、CODE_ONLY 不许有 test:、PARTIAL 必须写清缺哪一半。按等级统计：FULL 21 / PARTIAL 10 / CODE_ONLY 5 / HUMAN 13 |
+| A2 的 `--fence` | **降级为非合规辅助**，A2 合规路径只剩 `--between`；矩阵 A2 改 PARTIAL 并写明理由（未直接删功能，因为「上游按序号指定」确有其事） |
+| A20 证据不符 | 补 `test_atomic_write_uses_unique_tmp_names`（4 线程各写一次断言 tmp 名互不相同）与并发不丢更新的 4×20 用例，A20 升 FULL |
+| B1 严宽不一 | 文档改为「INTERVAL 缺省按 RFC 等价 1，允许；显式必须=1」；并声明实际间隔与时区仍是人判，B1 降 PARTIAL |
+| B15 无锁进临界区 | `lease_acquire/lease_reclaim/lease_heartbeat/lease_release` 全部 `strict=True`，`LockTimeout` 分别转成「冲突不启动」与「不回收（lock_timeout）」；新增 `test_lease_ops_never_run_unlocked` |
+| B5 证据夸大 | 拆成两件事：创建前预防（机器）+ 存量归档（人工），B5 降 PARTIAL |
+| 不可读槽位按年龄回收 | 改为**只有 size=0 且超 5s 才回收**；非空但读不懂 → 永不自动回收；新增 `test_unreadable_nonempty_slot_is_never_auto_reclaimed` 与 `test_empty_slot_older_than_ttl_is_reclaimed` |
+| 未来日期 | 矩阵补日期口径：`live:` 按本机 UTC+8 记，校验取 `time.strftime` 本地日期，不按 UTC 折算 |
 
 **多轮对抗审查下来最值钱的一条**：审查对 A23 的「取证难 ≠ 风险不存在」的驳回，直接换来一次真实泄漏的发现——只带 `--proxy-server` 时浏览器 HTTP 出口是 `152.175.33.8`，WebRTC 候选却是本机 `59.34.82.8` + IPv6。**防御性强的审查不是障碍，是外部审计。**
 
@@ -352,7 +370,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 
 **矩阵自身有回归**：`TestEvidenceMatrix` 三条断言——条款集合 = 矩阵行集合（不漏、不多、不重复）；每个 `test:`/`code:` 引用都能解析；每行至少一种证据。它的作用是让「文档漂移」变成红灯，而不是等下一次审查才被发现。
 
-**当前分布（49 条）**：32 条有离线用例兜底（占 65%）；4 条只有代码没有回归（A7 A9 A16 A18）；13 条纯人判（A0 B0 B2 B3 B6 B7 B9 B13 B14 C1–C4）。**三档必须分开说**，不能笼统宣称「都已机械化」。
+**当前分布（49 条，按等级）**：**FULL 21 条**（核心判定 + 失败分支都有独立断言）；**PARTIAL 10 条**（只覆盖一半，缺的部分写在该条说明里）；**CODE_ONLY 5 条**（A7 A9 A15 A16 A18，有实现无回归）；**HUMAN 13 条**（A0 B0 B2 B3 B6 B7 B9 B13 B14 C1–C4）。**只有 FULL 才算「已机械化」**——按「有没有 test:」计数会系统性高估，这是第九轮审查的结论。
 
 **已知缺口（按危害排序，写着就是为了下次被追）**：
 

@@ -777,34 +777,59 @@ def _lease_reclaimable(info, now=None, expect_run_id=None):
     return False, "alive"
 
 
-def lease_acquire(path, task_id, run_id=None, lease_sec=LEASE_SEC):
-    """领租约。成功返回 run_id；已有有效租约返回 None（调用方 exit 1，不得起第二个实例）。"""
+def _log_corrupt_lease(path, why):
+    """损坏租约登记：留下可追溯证据（sha256/大小/时间），不删除、不接管。"""
+    try:
+        digest = _sha256_file(path)
+    except OSError:
+        digest = "?"
+    print("WARN: 租约不可用（%s）：%s size=%d sha256=%s；按占用处理，需人工恢复"
+          % (why, os.path.basename(path), _size_of(path), digest[:16]), flush=True)
+
+
+def lease_acquire(path, task_id, run_id=None, lease_sec=LEASE_SEC, lock_timeout=LOCK_TIMEOUT_SEC):
+    """领租约。成功返回 run_id；已有有效租约返回 None（调用方 exit 1，不得起第二个实例）。
+
+    strict 锁：抢不到锁就按「租约冲突」处理（B15），绝不无锁进临界区。
+    """
     run_id = run_id or uuid.uuid4().hex[:12]
     now = time.time()
-    with _file_lock(path):
-        info, readable = _read_ephemeral(path)
-        if not readable and _size_of(path) > 0:
-            # 读不懂的租约宁可判「有人在跑」，也不能放第二个实例进来（B15 身份不可读禁回收）
-            print("WARN: 租约文件不可读，按占用处理：%s" % os.path.basename(path), flush=True)
-            return None
-        ok, _why = _lease_reclaimable(info)
-        if not ok:
-            return None
-        _atomic_write(path, json.dumps({
-            "task_id": task_id,
-            "run_id": run_id,
-            "pid": os.getpid(),
-            "process_start_time": _proc_start_time(os.getpid()),
-            "started_at": now,
-            "heartbeat_at": now,
-            "lease_until": now + lease_sec,
-        }, ensure_ascii=False, indent=2))
+    try:
+        with _file_lock(path, timeout=lock_timeout, strict=True):
+            info, readable = _read_ephemeral(path)
+            if not readable and _size_of(path) > 0:
+                # 读不懂的租约宁可判「有人在跑」，也不能放第二个实例进来（B15 身份不可读禁回收）
+                _log_corrupt_lease(path, "identity_unreadable")
+                return None
+            ok, _why = _lease_reclaimable(info)
+            if not ok:
+                return None
+            _atomic_write(path, json.dumps({
+                "task_id": task_id,
+                "run_id": run_id,
+                "pid": os.getpid(),
+                "process_start_time": _proc_start_time(os.getpid()),
+                "started_at": now,
+                "heartbeat_at": now,
+                "lease_until": now + lease_sec,
+            }, ensure_ascii=False, indent=2))
+    except LockTimeout:
+        print("WARN: 租约锁等待超时 → 按 B15 判冲突（调用方 exit 1），不启动第二个实例", flush=True)
+        return None
     return run_id
 
 
-def lease_heartbeat(path, run_id, lease_sec=LEASE_SEC):
-    """续期（B15：每 15s 一次）。返回 False 说明租约已不属于自己。"""
-    with _file_lock(path):
+def lease_heartbeat(path, run_id, lease_sec=LEASE_SEC, lock_timeout=LOCK_TIMEOUT_SEC):
+    """续期（B15：每 15s 一次）。返回 False 说明租约已不属于自己（或抢不到锁）。"""
+    try:
+        return _lease_heartbeat_locked(path, run_id, lease_sec, lock_timeout)
+    except LockTimeout:
+        print("WARN: 心跳抢不到租约锁，本次续期失败（按不属于自己处理）", flush=True)
+        return False
+
+
+def _lease_heartbeat_locked(path, run_id, lease_sec, lock_timeout):
+    with _file_lock(path, timeout=lock_timeout, strict=True):
         info, _readable = _read_ephemeral(path)
         if info.get("run_id") != run_id:
             return False
@@ -815,9 +840,17 @@ def lease_heartbeat(path, run_id, lease_sec=LEASE_SEC):
     return True
 
 
-def lease_release(path, run_id):
-    """主动释放：只有持有者能释放。"""
-    with _file_lock(path):
+def lease_release(path, run_id, lock_timeout=LOCK_TIMEOUT_SEC):
+    """主动释放：只有持有者能释放。抢不到锁 → 不释放（返回 False，让调用方记 orphan）。"""
+    try:
+        return _lease_release_locked(path, run_id, lock_timeout)
+    except LockTimeout:
+        print("WARN: 释放租约抢不到锁，保留租约（按 TIMEOUT_ORPHAN 处理）", flush=True)
+        return False
+
+
+def _lease_release_locked(path, run_id, lock_timeout):
+    with _file_lock(path, timeout=lock_timeout, strict=True):
         info, _readable = _read_ephemeral(path)
         if info.get("run_id") != run_id:
             return False
@@ -828,20 +861,23 @@ def lease_release(path, run_id):
     return True
 
 
-def lease_reclaim(path, expect_run_id=None):
-    """按 B15 口径回收。返回 (是否回收, reason)。"""
-    with _file_lock(path):
-        info, readable = _read_ephemeral(path)
-        if not readable and _size_of(path) > 0:
-            # 身份读不懂 → 不回收（B15）。旧版会把它当空租约直接删掉，等于放第二个实例进来。
-            return False, "identity_unreadable"
-        ok, why = _lease_reclaimable(info, expect_run_id=expect_run_id)
-        if ok:
-            try:
-                os.remove(path)
-            except OSError:
-                _atomic_write(path, "{}")
-        return ok, why
+def lease_reclaim(path, expect_run_id=None, lock_timeout=LOCK_TIMEOUT_SEC):
+    """按 B15 口径回收。返回 (是否回收, reason)。抢不到锁 → 不回收（lock_timeout）。"""
+    try:
+        with _file_lock(path, timeout=lock_timeout, strict=True):
+            info, readable = _read_ephemeral(path)
+            if not readable and _size_of(path) > 0:
+                # 身份读不懂 → 不回收（B15）。旧版会把它当空租约直接删掉，等于放第二个实例进来。
+                return False, "identity_unreadable"
+            ok, why = _lease_reclaimable(info, expect_run_id=expect_run_id)
+            if ok:
+                try:
+                    os.remove(path)
+                except OSError:
+                    _atomic_write(path, "{}")
+            return ok, why
+    except LockTimeout:
+        return False, "lock_timeout"
 
 
 def _call_body(body, cancel):
@@ -935,8 +971,11 @@ def acquire_slot(task_id, run_id=None, cap=SLOT_CAP, base=None, lease_sec=LEASE_
                 sp = os.path.join(d, fn)
                 info, readable = _read_ephemeral(sp)
                 if not readable:
-                    # 空文件/半截 JSON：可能是别人刚占位还没写完。
-                    # 5s 内一律当活槽；超过 5s 仍是空壳才当死槽回收。
+                    # 空文件（size=0）才是「占名未写」的中间态：超 5s 仍空 → 创建者已死，可回收。
+                    # 非空但读不懂 = 身份不明 → **永不自动回收**（B15 身份不可读禁回收），
+                    # 旧版按 mtime 超过 5s 就删，等于用「文件年龄」冒充「进程死亡」。
+                    if _size_of(sp) > 0:
+                        continue
                     try:
                         age = time.time() - os.path.getmtime(sp)
                     except OSError:

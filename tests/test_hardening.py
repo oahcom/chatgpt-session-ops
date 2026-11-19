@@ -1209,6 +1209,40 @@ class TestSlotsAndLease(TmpBase):
             f.write("{broken")
         self.assertIsNone(m.lease_acquire(path, "t2"))      # 读不懂=当有人在跑
 
+    def test_lease_ops_never_run_unlocked(self):
+        """B15：租约类操作抢不到锁必须拒绝，不允许「无锁进临界区」。"""
+        path = os.path.join(self.tmp, "lease.json")
+        self._hold_lock(path)
+        self.assertIsNone(m.lease_acquire(path, "t1", lock_timeout=0.3))
+        ok, why = m.lease_reclaim(path, lock_timeout=0.3)
+        self.assertFalse(ok)
+        self.assertEqual(why, "lock_timeout")
+        self.assertFalse(m.lease_heartbeat(path, "rid", lock_timeout=0.3))
+        self.assertFalse(m.lease_release(path, "rid", lock_timeout=0.3))
+
+    def test_unreadable_nonempty_slot_is_never_auto_reclaimed(self):
+        """身份不明 ≠ 死槽。旧版「非空但读不懂 + 超过 5s」就删，等于拿文件年龄冒充进程死亡。"""
+        d = os.path.join(self.tmp, "slots")
+        os.makedirs(d, exist_ok=True)
+        sp = os.path.join(d, "slot-1.slot")
+        with open(sp, "w", encoding="utf-8") as f:
+            f.write("{broken json")
+        old = time.time() - 3600
+        os.utime(sp, (old, old))
+        slot, _rid = m.acquire_slot("race", base=self.tmp, lock_timeout=1.0)
+        self.assertTrue(slot and slot.endswith("slot-2.slot"), slot)
+        self.assertTrue(os.path.exists(sp), "身份不明的槽位被自动删除了")
+
+    def test_empty_slot_older_than_ttl_is_reclaimed(self):
+        d = os.path.join(self.tmp, "slots")
+        os.makedirs(d, exist_ok=True)
+        sp = os.path.join(d, "slot-1.slot")
+        open(sp, "w", encoding="utf-8").close()
+        old = time.time() - 3600
+        os.utime(sp, (old, old))
+        slot, _rid = m.acquire_slot("race", base=self.tmp, lock_timeout=1.0)
+        self.assertTrue(slot and slot.endswith("slot-1.slot"), slot)
+
     def test_lease_valid_blocks_reclaim(self):
         ok, why = m._lease_reclaimable({
             "run_id": "r1", "lease_until": self._now() + 60,
@@ -1404,6 +1438,26 @@ class TestCustody(TmpBase):
         m.extract_deliverable(src, begin="<b>", end="</e>", out=out)
         # 首尾空行可裁，但「正文  」的尾随空格属于正文字节，不得裁
         self.assertEqual(open(out, "rb").read(), ("正文  " + "\n").encode())
+
+    def test_byte_exact_matrix(self):
+        """A1 唯一口径：删首尾整行空白；首尾非空行的全部原始字节（含行终止符）保留。
+
+        四种边界各断言精确字节：LF、CRLF、末行无换行、尾随空格 + 多空行。
+        """
+        cases = [
+            (b"<b>\nabc\n</e>\n", b"abc\n"),
+            (b"<b>\r\nabc\r\n</e>\r\n", b"abc\r\n"),
+            (b"<b>\nabc\n\n\n</e>", b"abc\n"),
+            (b"<b>\n\n  \nabc  \n \n\n</e>\n", b"abc  \n"),
+        ]
+        for raw, want in cases:
+            with self.subTest(raw=raw):
+                src = self._src(raw, "case.md")
+                out = os.path.join(self.tmp, "case.out")
+                m.extract_deliverable(src, begin="<b>", end="</e>", out=out)
+                got = open(out, "rb").read()
+                self.assertEqual(got, want)
+                self.assertEqual(got.hex(), want.hex())
 
     def test_duplicate_marker_rejected(self):
         src = self._src(b"<b>\na\n</e>\n<b>\nb\n</e>\n")
@@ -1655,6 +1709,33 @@ class TestEvidenceMatrix(unittest.TestCase):
                                              "%s 的实测日期在未来" % clause)
                     else:
                         self.assertTrue(value.strip(), "%s 的人判理由为空" % clause)
+
+    def test_levels_are_consistent_with_evidence(self):
+        """等级不是标签，得和证据类型对得上：FULL 必须有 test:，CODE_ONLY 不许有 test:。
+
+        第九轮审查抓到的正是「有 test: 就算兜底」的高估；等级列必须能反过来约束证据。
+        """
+        allowed = {"FULL", "PARTIAL", "CODE_ONLY", "HUMAN"}
+        for clause, cells in self._rows().items():
+            joined = " ".join(cells)
+            m = re.search(r"\*\*([A-Z_]+)\*\*", joined)
+            with self.subTest(clause=clause):
+                self.assertIsNotNone(m, "%s 缺少等级" % clause)
+                level = m.group(1)
+                self.assertIn(level, allowed)
+                has_test = "test:" in joined
+                has_code = "code:" in joined
+                has_human = "human:" in joined
+                if level == "FULL":
+                    self.assertTrue(has_test, "FULL 必须有用例")
+                elif level == "PARTIAL":
+                    self.assertTrue(has_test or has_code, "PARTIAL 至少要有用例或符号")
+                    self.assertTrue(has_human, "PARTIAL 必须写清缺哪一半")
+                elif level == "CODE_ONLY":
+                    self.assertTrue(has_code, "CODE_ONLY 必须有符号")
+                    self.assertFalse(has_test, "CODE_ONLY 不该引用用例")
+                else:
+                    self.assertTrue(has_human, "HUMAN 必须给理由")
 
     def test_no_row_is_evidence_free(self):
         for clause, cells in self._rows().items():
