@@ -1398,6 +1398,25 @@ class TestFileLockFailClosed(TmpBase):
         final = json.load(open(p))
         self.assertIn("MODIFIED_BY_PID_", final["value"], "进程 1 应已写入")
 
+    def test_metadata_write_failure_raises_and_cleans_up(self):
+        """元数据写入 OSError → 清理锁文件并 fail-closed，不进临界区。"""
+        m = self._load()
+        p = os.path.join(self.tmp, "state.json")
+        orig_write = os.write
+        def failing_write(*args, **kwargs):
+            raise OSError(28, "No space left on device")
+        os.write = failing_write
+        try:
+            entered = False
+            with self.assertRaises(OSError):
+                with m._file_lock(p):
+                    entered = True
+            self.assertFalse(entered, "元数据写入失败后不应进入临界区")
+            self.assertFalse(os.path.exists(p + ".lock"), "锁文件应被清理")
+            self.assertNotIn(p, m._LOCK_HELD, "不应登记持锁")
+        finally:
+            os.write = orig_write
+
     def test_reentrant_same_thread_no_self_lock(self):
         """T07: 同线程合法重入不自锁。"""
         m = self._load()

@@ -356,8 +356,18 @@ def _file_lock(path, timeout=LOCK_TIMEOUT_SEC):
                     "thread": me,
                     "path": os.path.basename(path),
                 }).encode("utf-8"))
-            except OSError:
-                pass
+            except OSError as e:
+                # 元数据写失败→锁无法被正确识别持有者→清理并 fail-closed
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    os.remove(lock)
+                except OSError:
+                    pass
+                raise OSError("锁持有者元数据写入失败（%s）：%s ——fail-closed"
+                              % (os.path.basename(path), e)) from e
             break
         except FileExistsError:
             try:
@@ -631,13 +641,20 @@ def release_slot(slot_path, run_id=None):
 
 
 def _update_json(path, mutate, default):
-    """锁内读-改-写，杜绝并发丢更新。mutate(data) 就地修改，返回 False 表示无需落盘。"""
-    with _file_lock(path):
-        data = _load_json(path, default)
-        if mutate(data) is False:
-            return data
-        _save_json(path, data)
-        return data
+    """锁内读-改-写，杜绝并发丢更新。mutate(data) 就地修改，返回 False 表示无需落盘。
+    锁超时由调用方重试（fail-closed 不放行未持锁者，但业务语义要求写入不丢失）。"""
+    for attempt in range(8):
+        try:
+            with _file_lock(path, timeout=LOCK_TIMEOUT_SEC * 2):
+                data = _load_json(path, default)
+                if mutate(data) is False:
+                    return data
+                _save_json(path, data)
+                return data
+        except TimeoutError:
+            if attempt == 7:
+                raise
+            time.sleep(0.02 * (attempt + 1))  # 退避后重试
 
 
 def _normalize_rotation(st):
