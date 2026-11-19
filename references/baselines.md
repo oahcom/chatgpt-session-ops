@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**二十三轮对外对抗审查**逐条改写（每轮裁定见 §F；**第二十二轮 `PASS`**（定向复审 F-10 残留+docstring），**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至二十三轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08）、锁元数据写入失败进临界区（F-09）、损坏启动时间误判 pid_reused（F-10）、归档覆盖（F-11）、超长 pid 串 int() 异常逃逸（F-07 残留），全部已修复），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 206 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**二十五轮对外对抗审查**逐条改写（每轮裁定见 §F；**第二十五轮 `PASS`——全文最终确认·收敛**，第二十二轮 `PASS`（F-10 残留定向复审），**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至二十三轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08）、锁元数据写入失败进临界区（F-09）、损坏启动时间误判 pid_reused（F-10）、归档覆盖（F-11）、超长 pid 串 int() 异常逃逸（F-07 残留），全部已修复并在第二十五轮全文复审核销），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 206 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -420,6 +420,9 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | 23 | v1.8 修订 | `NEEDS-REVISION`（F-07 残留） | 全文最终确认轮。F-02～F-11 组合审查全部通过、残余风险描述准确；但抓出 **F-07 残留**：`_parse_pid` 对超长十进制串（Python 3.11+ int() 位数限制）`int()` 抛 ValueError，异常从 `_parse_pid` 穿透 `_proc_state`（`_proc_state` 在 `try` 之前调用 `_parse_pid`），违反「非法 pid 一律 UNKNOWN」契约 |
 
 **第二十三轮改了什么**：`_parse_pid` 数字串分支 `int(pid)` 包 `try/except (ValueError, OverflowError)` → `None`；补一条回归 `test_parse_pid_overflow_string_returns_none`（5000 位 `"9"*5000`，四路断言：`_parse_pid` None / `_proc_state` UNKNOWN / `_lock_holder_stale` 不回收 / `_lease_reclaimable` identity_unreadable），205→206。
+
+| 24 | v1.8 修订 | **`PASS`** | F-07 完全闭环：`int()` 异常被捕获返回 None，异常传播链闭合，四路回归覆盖充分（解析/进程状态/锁回收/租约回收均验超长 pid 不抛不误删）。无新缺陷 |
+| 25 | v1.8 修订 | **`PASS`** | **全文最终确认·收敛轮**。逐函数（12 项）全部通过；逐组合（F-02×F-03 / F-03×F-07 / F-07×F-08 / F-08×F-09 / F-03×F-10 / F-02×F-11 / 强制恢复链）全部无漏洞。残余风险描述准确。**F-09/F-10/F-11 与 F-07 在最终代码中均已核销**。无新确定性实现级缺陷 |
 
 **第十四轮之后补的一条**：审查把「`_record_corruption("lease-recovery-failed")` 自己失败会怎样」列为残余风险 3，虽不构成裁定理由，但这是能离线证明的，于是补 `test_quarantine_failed_row_write_failure_is_survivable`（第一次登记成功、第二次返回 `None`，断言不抛异常、仍返回 `quarantine_failed`、租约原样在）。**属于 PASS 后的加证，不改变任何条款口径**，故不重开一轮审查。
 
