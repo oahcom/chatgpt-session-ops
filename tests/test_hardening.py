@@ -492,6 +492,72 @@ class TestStateFiles(TmpBase):
         self.assertIsNotNone(m._proc_start_time(os.getpid()),
                              "启动时间读取失败多半是句柄截断")
 
+    def test_parse_pid_rejects_lossy_coercion(self):
+        """F-07：int() 折叠通道全部封死——999999.9 不是 999999，True 不是 1。"""
+        self.assertIsNone(m._parse_pid(999999.9), "float 截断会把非法 pid 变合法")
+        self.assertIsNone(m._parse_pid(True), "bool 是 int 子类，int(True)==1")
+        self.assertIsNone(m._parse_pid(False))
+        self.assertIsNone(m._parse_pid(123.0), "整数值 float 也不收")
+        self.assertIsNone(m._parse_pid(" 4242"), "带空白的串不是规范 pid")
+        self.assertIsNone(m._parse_pid("42.2"))
+        self.assertIsNone(m._parse_pid("0x10"))
+        self.assertIsNone(m._parse_pid(""))
+        self.assertIsNone(m._parse_pid(None))
+        self.assertIsNone(m._parse_pid(-5))
+        self.assertIsNone(m._parse_pid(0))
+        self.assertEqual(m._parse_pid(4242), 4242, "合法正整数照常收")
+        self.assertEqual(m._parse_pid("4242"), 4242, "纯数字串照常收")
+
+    def test_proc_state_rejects_float_and_bool_pid(self):
+        """F-07：float/bool pid 必须 UNKNOWN，不得借 int() 折叠后查到 DEAD。"""
+        self.assertEqual(m._proc_state(999999.9), m.PROC_UNKNOWN,
+                         "int(999999.9)==999999 不存在会误判 DEAD")
+        self.assertEqual(m._proc_state(True), m.PROC_UNKNOWN,
+                         "int(True)==1 多半是活进程，会误判 ALIVE 放行另一侧")
+        self.assertEqual(m._proc_state(False), m.PROC_UNKNOWN)
+
+    def test_lock_float_pid_not_reclaimed(self):
+        """F-07 事故复现：pid=999999.9 的锁，旧逻辑截断成 999999 判 DEAD 后误删。"""
+        lock = os.path.join(self.tmp, "f07.lock")
+        with open(lock, "w", encoding="utf-8") as f:
+            json.dump({"pid": 999999.9, "process_start_time": 7,
+                       "created_at": time.time() - 999}, f)
+        old = time.time() - (m.LOCK_STALE_SEC + 30)
+        os.utime(lock, (old, old))
+        self.assertFalse(m._lock_holder_stale(lock),
+                         "float pid 不得被截断成整数后判死")
+        self.assertTrue(os.path.exists(lock))
+
+    def test_lock_corrupt_json_not_reclaimed_by_mtime(self):
+        """F-08：非空损坏内容不是老格式，mtime 过期也不得借兼容路径回收。"""
+        lock = os.path.join(self.tmp, "f08a.lock")
+        with open(lock, "w", encoding="utf-8") as f:
+            f.write("{broken")
+        old = time.time() - (m.LOCK_STALE_SEC + 30)
+        os.utime(lock, (old, old))
+        self.assertFalse(m._lock_holder_stale(lock),
+                         "损坏 JSON 不是「无 pid 字段」，不得走 mtime")
+        self.assertFalse(m._try_reclaim_stale(lock))
+        self.assertTrue(os.path.exists(lock))
+
+    def test_lock_non_dict_json_not_reclaimed(self):
+        """F-08：可解析但顶层不是字典（数组/标量）同样保守不回收。"""
+        for raw in ("[1, 2]", "42", '"str"'):
+            lock = os.path.join(self.tmp, "f08b-%s.lock" % abs(hash(raw)))
+            with open(lock, "w", encoding="utf-8") as f:
+                f.write(raw)
+            old = time.time() - (m.LOCK_STALE_SEC + 30)
+            os.utime(lock, (old, old))
+            self.assertFalse(m._lock_holder_stale(lock),
+                             "非字典内容 %r 不得回收" % raw)
+
+    def test_lock_unreadable_not_reclaimed(self):
+        """F-08：读取失败（路径是目录）≠ 旧格式，保守不回收。"""
+        lock = os.path.join(self.tmp, "f08c.lock")
+        os.makedirs(lock, exist_ok=True)   # open() 读目录必失败
+        self.assertFalse(m._lock_holder_stale(lock),
+                         "读不出来不得当老格式判 stale")
+
     def test_reclaim_removes_only_stale_lock(self):
         """确认已死的残留锁：回收成功，且只删这一份。"""
         p = os.path.join(self.tmp, "rc1.json")

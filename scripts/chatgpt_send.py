@@ -648,6 +648,26 @@ def _win_open_error_to_state(err):
     return PROC_UNKNOWN
 
 
+def _parse_pid(pid):
+    """严格解析 pid（F-07）：只认「正整数语义」的输入，其余一律 None。
+
+    为什么不能用 int()：int(999999.9) == 999999、int(True) == 1——把非法身份
+    折叠成合法 pid 再去查死活，等于替伪造数据开了一条回收通道（租约里写
+    999999.9，查的是 999999 死不死，两回事）。只认：
+      - int 且不是 bool（True 不是 pid 1）；
+      - 纯十进制数字串（"4242" 可以，" 4242"/"42.2"/"0x10" 不行）。
+    float、bool、None、垃圾串一律 None → 调用方走 UNKNOWN。
+    """
+    if isinstance(pid, bool):
+        return None
+    if isinstance(pid, int):
+        return pid if pid > 0 else None
+    if isinstance(pid, str) and pid and all(c in "0123456789" for c in pid):
+        v = int(pid)
+        return v if v > 0 else None
+    return None
+
+
 def _proc_state(pid):
     """进程存活三态判定（F-03）：DEAD / ALIVE / UNKNOWN。
 
@@ -659,14 +679,12 @@ def _proc_state(pid):
     返回值语义：
       DEAD    —— 系统明确说进程不存在（ESRCH / ERROR_INVALID_PARAMETER 等）；
       ALIVE   —— 系统确认进程存活（后续还要比对启动时间防 PID 复用）；
-      UNKNOWN —— 无权限（EPERM / ERROR_ACCESS_DENIED）、查询失败、pid 不可解析。
+      UNKNOWN —— 无权限（EPERM / ERROR_ACCESS_DENIED）、查询失败、pid 非法
+                 （F-07：bool/float/垃圾串不得借 int() 折叠成合法 pid）。
     """
-    try:
-        pid = int(pid)
-    except (TypeError, ValueError):
+    pid = _parse_pid(pid)
+    if pid is None:
         return PROC_UNKNOWN   # 身份不可解析 ≠ 死亡
-    if pid <= 0:
-        return PROC_UNKNOWN
     try:
         if os.name == "nt":
             import ctypes
@@ -697,9 +715,8 @@ def _proc_start_time(pid):
 
     读不到返回 None —— 调用方必须把 None 当「身份不可确认」，禁止据此回收锁。
     """
-    try:
-        pid = int(pid)
-    except (TypeError, ValueError):
+    pid = _parse_pid(pid)   # F-07：同款严格解析，不给 int() 折叠留通道
+    if pid is None:
         return None
     try:
         if os.name == "nt":
@@ -726,9 +743,14 @@ def _lock_holder_stale(lock):
     """锁能否回收：租约过期 + 原持有者确认不在（或 PID 已被复用）。
 
     判定顺序（A22）：
-      1. 无 pid **字段**（老格式/损坏）→ 退化为 mtime 判据，兼容旧行为；
-         pid 字段**存在但假值/非法**（0/None/空串/不可解析）→ 身份损坏，
-         按 UNKNOWN 处理，**不回收**（F-04：假值 pid 不得借 mtime 逃生）；
+      0. 读取失败（OSError）→ **不可回收**（F-08：权限/瞬时读错误 ≠ 旧格式）；
+         非空但 JSON 解析失败 / 顶层不是字典 → **不可回收**（F-08：损坏内容
+         不得借 mtime 兼容路径逃生）；
+         空文件/纯空白 → 老格式锁的字面形态（旧实现 O_EXCL 建锁后不写身份），
+         走 mtime 判据（LOCK_STALE_SEC 内视为正在写身份的新锁）；
+      1. 成功解析的字典里没有 pid **字段**（真·老格式）→ 退化为 mtime 判据；
+         pid 字段**存在但假值/非法**（0/None/空串/float/bool/垃圾串）→ 身份损坏，
+         按 UNKNOWN 处理，**不回收**（F-04/F-07：假值 pid 不得借 mtime 逃生）；
       2. 租约未过期 → 不可回收；
       3. 原 PID 确认不存在（DEAD）→ 可回收；
       4. UNKNOWN（无权限/查询失败）→ **不可回收**（F-03：查不到 ≠ 死了）；
@@ -738,13 +760,23 @@ def _lock_holder_stale(lock):
     """
     try:
         with open(lock, "r", encoding="utf-8") as f:
-            info = json.load(f)
-        if not isinstance(info, dict):
-            info = {}
-    except Exception:
-        info = {}
+            raw = f.read()
+    except OSError:
+        return False            # F-08：读不出内容，保守不回收
+    if not raw.strip():
+        # 老格式锁的字面形态：空文件（旧实现建锁后不写身份）。超龄才算残留。
+        try:
+            return time.time() - os.path.getmtime(lock) > LOCK_STALE_SEC
+        except OSError:
+            return False
+    try:
+        info = json.loads(raw)
+    except ValueError:
+        return False            # F-08：非空损坏内容 = 新格式损坏，保守不回收
+    if not isinstance(info, dict):
+        return False            # F-08：非字典内容保守不回收
     if "pid" not in info:
-        # 老格式（无 pid 字段）才允许 mtime 判据；字段在但值坏 = 新格式损坏
+        # 字典但无 pid 字段（老格式）→ mtime 判据
         try:
             return time.time() - os.path.getmtime(lock) > LOCK_STALE_SEC
         except OSError:

@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**十七轮对外对抗审查**逐条改写（每轮裁定见 §F；**第十四轮 `PASS`**，第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至十七轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 三处绕过（F-04/05/06），均已修复待复审），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 186 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**十八轮对外对抗审查**逐条改写（每轮裁定见 §F；**第十四轮 `PASS`**，第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至十八轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08），均已修复待复审），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 192 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -34,7 +34,7 @@
 | 2 | 这个会话归谁 | `--owner <conv_id>` | 输出唯一账号 |
 | 3 | 配额有没有冷却 | `--rotation` | `unavailable` 为空或目标账号不在其中 |
 | 4 | 匿名要用先看设备 | `--anon-devices` | 目标设备 `jar=true` |
-| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 186 条） |
+| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 192 条） |
 
 ### A1–A4 内容主权（不可协商）
 
@@ -335,7 +335,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | automation 名称 / 排程 | 同上 + `--check-name`、`--check-schedule`、`--check-oneshot` | B1/B4/B5/B10/B11 |
 | 排程口径 | `automation_update list` 全量盘点 | B1–B5 |
 
-**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 186 条。
+**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 192 条。
 
 ---
 
@@ -396,6 +396,10 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | 17 | v1.8 修订 | `NEEDS-REVISION`（F-04 / F-05 / F-06 三项） | F-03 三态核心判「基本修好」；但抓出三个绕过点：**F-04** 假值 pid（0/None/空串/垃圾串）被当旧格式退化 mtime 判据，可借 mtime 误删；**F-05** `lease_force_release` 用 `if pid` 短路，pid 缺失/假值时跳过状态判定与 `identity_evidence` 检查，身份不完整的可读租约只凭 approval 就能进强制释放；**F-06** ctypes 未声明 `OpenProcess` restype=HANDLE，64 位下句柄被 c_int 截断，后续查询全失败并被折叠成「进程不存在」 |
 
 **第十七轮改了什么**：① **F-04**：`_lock_holder_stale` 改为只认「无 pid **字段**」为老格式（mtime 判据），字段存在但值假/不可解析一律走 `_proc_state` → UNKNOWN → 不回收；② **F-05**：`lease_force_release` 对可读租约**无条件**三态判定（`_proc_state(info.get("pid"))` 对 None/0/垃圾天然返回 UNKNOWN），UNKNOWN 无 `identity_evidence` 即拒，不再有 `if pid` 隐式短路；③ **F-06**：新增 `_win_k32()` 集中声明 ctypes 原型（`OpenProcess.restype = HANDLE`、`GetExitCodeProcess`/`GetProcessTimes`/`CloseHandle` 的 argtypes/restype），`_proc_state` 与 `_proc_start_time` 共用；补 `test_win_k32_declares_handle_prototypes`（断言 restype + 真实句柄往返：开当前进程→查退出码 STILL_ACTIVE→关句柄→读启动时间）。④ 补六条回归（180→186）：`test_lock_pid_field_falsy_not_reclaimed_by_mtime` / `test_lock_pid_field_garbage_not_reclaimed` / `test_lock_no_pid_field_uses_mtime`（老格式兼容保留）/ `test_force_release_missing_pid_needs_identity_evidence`（含带 identity_evidence 放行的正路径）/ `test_force_release_pid_zero_needs_identity_evidence` / `test_win_k32_declares_handle_prototypes`。
+
+| 18 | v1.8 修订 | `NEEDS-REVISION`（F-07 / F-08 两项） | F-04/05/06 被判「主要修复均已落地」；但抓出两个新绕过点：**F-07** `_proc_state` 用 `int(pid)` 折叠非法输入（`int(999999.9)==999999`、`int(True)==1`），非法 pid 会被折成合法 pid 查死活，可能借截断触发回收；**F-08** `_lock_holder_stale` 把「JSON 损坏/读取失败/顶层非字典」与「老格式无 pid 字段」合并进同一条 mtime 兼容路径，损坏数据借老格式逃生 |
+
+**第十八轮改了什么**：① **F-07**：新增 `_parse_pid()` 严格解析（只认正整数 int 且拒 bool、纯十进制数字串；float/bool/带空白串/0x 串/0/负数一律 None），`_proc_state` 与 `_proc_start_time` 共用，float/bool pid 一律 UNKNOWN。② **F-08**：`_lock_holder_stale` 读取段重写——OSError（读失败）/ ValueError（JSON 损坏）/ 顶层非字典 → 保守不回收；只有「成功解析的字典且无 pid 字段」与「空文件（老格式锁的字面形态）」走 mtime 兼容。③ 补六条回归（186→192）：`test_parse_pid_rejects_lossy_coercion`（12 个折叠通道逐一断言 None）/ `test_proc_state_rejects_float_and_bool_pid` / `test_lock_float_pid_not_reclaimed`（事故复现：999999.9 截断成 999999 判 DEAD 误删）/ `test_lock_corrupt_json_not_reclaimed_by_mtime` / `test_lock_non_dict_json_not_reclaimed` / `test_lock_unreadable_not_reclaimed`（路径是目录 = 读失败）。
 
 **第十四轮之后补的一条**：审查把「`_record_corruption("lease-recovery-failed")` 自己失败会怎样」列为残余风险 3，虽不构成裁定理由，但这是能离线证明的，于是补 `test_quarantine_failed_row_write_failure_is_survivable`（第一次登记成功、第二次返回 `None`，断言不抛异常、仍返回 `quarantine_failed`、租约原样在）。**属于 PASS 后的加证，不改变任何条款口径**，故不重开一轮审查。
 
