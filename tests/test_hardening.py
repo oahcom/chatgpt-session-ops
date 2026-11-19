@@ -326,6 +326,119 @@ class TestStateFiles(TmpBase):
             lk.release()
         self.assertEqual(m._load_json(p, {})["n"], 0, "超时后不该写入")
 
+    def test_file_lock_defaults_to_strict(self):
+        """默认必须 fail-closed：业务代码不显式写 strict=False 就拿不到宽松路径（误用边界）。"""
+        import inspect
+        sig = inspect.signature(m._file_lock)
+        self.assertIs(sig.parameters["strict"].default, True,
+                      "_file_lock 默认应为 strict=True")
+
+    def test_reclaim_removes_only_stale_lock(self):
+        """确认已死的残留锁：回收成功，且只删这一份。"""
+        p = os.path.join(self.tmp, "rc1.json")
+        lock = p + ".lock"
+        with open(lock, "w", encoding="utf-8") as f:
+            json.dump({"pid": 999999, "process_start_time": 1,
+                       "created_at": time.time() - 999}, f)
+        self.assertTrue(m._try_reclaim_stale(lock))
+        self.assertFalse(os.path.exists(lock), "stale 锁应被删除")
+        self.assertTrue(os.path.exists(lock + ".reclaim"),
+                        "守卫文件是内核锁载体，必须常驻")
+
+    def test_reclaim_does_not_delete_fresh_lock(self):
+        """F-02 本质：迟到的回收者不得删掉「先删后建」的新锁（活锁）。"""
+        p = os.path.join(self.tmp, "rc2.json")
+        lock = p + ".lock"
+        with m._file_lock(p):
+            # 进程 A 持有新锁（活锁）。进程 B 按旧判定（stale）来回收——
+            # 守卫内重新判定必须看到活锁，拒绝删除。
+            self.assertFalse(m._try_reclaim_stale(lock),
+                             "活锁绝不能被回收")
+            self.assertTrue(os.path.exists(lock), "新锁必须原样存活")
+        self.assertFalse(os.path.exists(lock), "退出后正常清理")
+
+    def test_reclaim_race_two_threads_never_double_enter(self):
+        """两线程同时抢一份 stale 锁：恰好一个回收成功，临界区绝不重叠。"""
+        p = os.path.join(self.tmp, "rc3.json")
+        lock = p + ".lock"
+        with open(lock, "w", encoding="utf-8") as f:
+            json.dump({"pid": 999999, "process_start_time": 1,
+                       "created_at": time.time() - 999}, f)
+        events = []
+        ev_lock = threading.Lock()
+
+        def worker():
+            with m._file_lock(p, timeout=15, strict=True):
+                with ev_lock:
+                    events.append(("ENTER", time.time()))
+                time.sleep(0.05)
+                with ev_lock:
+                    events.append(("LEAVE", time.time()))
+
+        ts = [threading.Thread(target=worker) for _ in range(2)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        self.assertEqual(len(events), 4, "两线程都应进过临界区")
+        events.sort(key=lambda e: e[1])
+        self.assertEqual([e[0] for e in events], ["ENTER", "LEAVE", "ENTER", "LEAVE"],
+                         "临界区必须严格串行，绝不重叠")
+        self.assertFalse(os.path.exists(lock))
+
+    def test_reclaim_race_multi_process_mutual_exclusion(self):
+        """真多进程竞争（审查 F-02 要求）：两进程同时回收同一份 stale 锁，
+        全程最多一个进程在临界区内，且先取得新锁后另一进程不得删掉它。"""
+        p = os.path.join(self.tmp, "rc4.json")
+        lock = p + ".lock"
+        log = os.path.join(self.tmp, "rc4.log")
+        with open(lock, "w", encoding="utf-8") as f:
+            json.dump({"pid": 999999, "process_start_time": 1,
+                       "created_at": time.time() - 999}, f)
+        worker = os.path.join(self.tmp, "rc4_worker.py")
+        with open(worker, "w", encoding="utf-8") as f:
+            f.write(
+                "import os, sys, time, importlib.util\n"
+                "spec = importlib.util.spec_from_file_location('cgs', sys.argv[1])\n"
+                "m = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(m)\n"
+                "path, log, n = sys.argv[2], sys.argv[3], int(sys.argv[4])\n"
+                "for i in range(n):\n"
+                "    with m._file_lock(path, timeout=15, strict=True):\n"
+                "        open(log, 'a', encoding='utf-8').write('ENTER %s %f\\n' % (os.getpid(), time.time()))\n"
+                "        time.sleep(0.05)\n"
+                "        open(log, 'a', encoding='utf-8').write('LEAVE %s %f\\n' % (os.getpid(), time.time()))\n"
+            )
+        procs = []
+        err_logs = []
+        for i in range(2):
+            ef = open(os.path.join(self.tmp, "rc4_err%d.log" % i), "wb")
+            err_logs.append(ef)
+            procs.append(subprocess.Popen(
+                [sys.executable, worker, os.path.abspath(SCRIPT), p, log, "2"],
+                stdout=subprocess.DEVNULL, stderr=ef))
+        for ef in err_logs:
+            ef.close()
+        errs = ""
+        for i, pr in enumerate(procs):
+            rc = pr.wait(timeout=60)
+            if rc != 0:
+                with open(os.path.join(self.tmp, "rc4_err%d.log" % i), "rb") as f:
+                    errs += f.read().decode("utf-8", "replace")[-800:]
+            self.assertEqual(rc, 0, "worker 不应异常退出：%s" % errs)
+        with open(log, encoding="utf-8") as f:
+            ev = [ln.split() for ln in f if ln.strip()]
+        self.assertEqual(len(ev), 8, "2 进程 × 2 次 = 8 条事件（丢了更新就是互斥破了）")
+        ev.sort(key=lambda e: float(e[2]))
+        depth = 0
+        for kind, _pid, _ts in ev:
+            if kind == "ENTER":
+                depth += 1
+                self.assertLessEqual(depth, 1, "同一时刻最多一个进程在临界区内")
+            else:
+                depth -= 1
+                self.assertGreaterEqual(depth, 0, "LEAVE 不得多于 ENTER")
+        self.assertEqual(depth, 0)
+        self.assertFalse(os.path.exists(lock))
+
 
 # ---------------------------------------------------------------- 轮转
 class TestRotation(TmpBase):

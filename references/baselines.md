@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**十四轮对外对抗审查**逐条改写（每轮裁定见 §F；**第十四轮 `PASS`**，第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 171 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**十五轮对外对抗审查**逐条改写（每轮裁定见 §F；**第十四轮 `PASS`**，第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五轮抓出 stale 锁回收 TOCTOU（F-02），已修复待复审），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 176 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -34,7 +34,7 @@
 | 2 | 这个会话归谁 | `--owner <conv_id>` | 输出唯一账号 |
 | 3 | 配额有没有冷却 | `--rotation` | `unavailable` 为空或目标账号不在其中 |
 | 4 | 匿名要用先看设备 | `--anon-devices` | 目标设备 `jar=true` |
-| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 171 条） |
+| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 176 条） |
 
 ### A1–A4 内容主权（不可协商）
 
@@ -224,12 +224,13 @@
 
 **B8/B15 实现**：`acquire_slot()` / `release_slot()` 在同一把跨进程锁内完成「回收死槽 + 计数 + 占位」，返回 `(slot_path, run_id)`，满员返回 `(None, run_id)` 由调用方记 `QUEUED`；`lease_acquire/heartbeat/release/reclaim` + `_lease_reclaimable()` 覆盖 `lease_valid / process_gone / pid_reused / identity_unreadable / run_id_mismatch / alive` 六种回收判定。回归含 6 进程同时抢槽（断言有效槽位 ≤3 且互不重叠）与租约六态。超时分两档（B15 硬要求）：执行体响应 cancel 且确实停下 → `TIMEOUT` 并释放租约；**执行体不响应取消、仍在跑 → `TIMEOUT_ORPHAN` 且保留租约**（此时释放租约等于放第二个实例进来，双跑比僵尸更危险）。心跳与超时由 `lease_run()` 落地：`HEARTBEAT_SEC=15`、`LEASE_SEC=60`、`RUN_MAX_SEC=3600` 三个常量可注入，回归用**按比例缩小的秒数**（如 lease 0.4s / heartbeat 0.1s / max 0.2s）验证同一套逻辑——证明「运行超过租约时心跳确实续期、不会被判过期」以及「超 `RUN_MAX_SEC` 时，执行体已停 → `TIMEOUT` + 释放租约，执行体不停 → `TIMEOUT_ORPHAN` + 保留租约」，不需要真等 15 分钟和 1 小时。
 
-**B8 五条补充口径（v1.8，由真实超发事故倒推）**：
+**B8 六条补充口径（v1.8，由真实超发事故倒推）**：
 
 1. **抢不到锁 = 不启动**。`_file_lock(..., strict=True)` 超时抛 `LockTimeout`，`acquire_slot` 捕获后按 `QUEUED` 返回 `(None, run_id)`。旧版超时后打印 WARN 就「跳过加锁继续跑」，6 进程抢槽实测出现过 **6 个槽位同时被占**——并发上限这种硬约束上，「WARN 不等于阻断」是致命的。
 2. **空/半截槽位 5s 内不得当死槽**。槽位是「先 `O_EXCL` 占名、再写内容」，读的人必然能读到半截 JSON；5s 内一律视作活槽。
 3. **同进程多线程互斥用 `threading.Lock`，文件锁只管跨进程**（v1.8 补）。纯文件锁（`O_EXCL` + fsync + `os.remove`）在 Windows 上高竞争下极慢：4 线程 × 20 次读-改-写能把 strict 3s 超时全部吃满（实测死锁级挂起）。解法是加一层 per-path `threading.Lock`（`_thread_lock_for`），同进程线程先拿线程锁再拿文件锁；线程锁零 I/O、O(1)，天然不会因磁盘排队。文件锁仍保留，兜跨进程场景。`_update_json` 的落盘直接用 `_atomic_write`（不再嵌套 `_save_json` 的 `_file_lock`），消除嵌套锁开销。回归：`test_thread_lock_serialises_same_process`（同路径返回同一把锁且互斥）、`test_strict_update_raises_locktimeout_not_silent`、`test_strict_save_raises_locktimeout_not_silent`（strict 超时抛 `LockTimeout` 不静默写）。
-4. **B15-R 损坏租约恢复闸口**（第十轮审查要求，已落地）。租约读不懂就永不自动回收，会带来「永久占位」；解法不是加 TTL，而是留一条**需人批准且留痕**的通道 `lease_force_release(path, approval_path)`：
+4. **stale 锁回收的「判定」与「删除」必须原子化**（v1.8 补，第十五轮审查 F-02）。旧实现「`_lock_holder_stale()` 判定 → `os.remove()`」两步之间存在 TOCTOU：两个进程同时判定同一份残留锁可回收，先删后建的**新锁**会被迟到者按旧判定删掉，跨进程互斥失效（审查原话：「O_EXCL 只能保证创建时互斥，不能自动保证 stale 锁回收过程安全」）。修法：回收动作（守卫内**重新判定** + 删除）收进**内核文件锁守卫**（`_kernel_lock`：Windows `msvcrt.locking` / POSIX `fcntl.flock`，`_try_reclaim_stale`）——内核锁在持有进程死亡时自动释放，天然没有 stale 问题，避免了「回收互斥自身又需要 stale 回收」的递归坑。守卫内重新判定是关键：迟到的回收者此刻看到的是活锁（`_lock_holder_stale` 为假），拒绝删除。守卫文件（`<lock>.reclaim`）**永不删除**（内核锁载体，删了重建会各锁一个 inode）。同时把 `_file_lock` 默认翻成 `strict=True`，业务代码不显式写 `strict=False` 就拿不到宽松路径（误用边界，审查第 2 点要求）。回归：`test_reclaim_removes_only_stale_lock`、`test_reclaim_does_not_delete_fresh_lock`、`test_reclaim_race_two_threads_never_double_enter`、`test_reclaim_race_multi_process_mutual_exclusion`（**真两进程**同时回收同一份 stale 锁，断言临界区绝不重叠且事件数不丢）、`test_file_lock_defaults_to_strict`。
+5. **B15-R 损坏租约恢复闸口**（第十轮审查要求，已落地）。租约读不懂就永不自动回收，会带来「永久占位」；解法不是加 TTL，而是留一条**需人批准且留痕**的通道 `lease_force_release(path, approval_path)`：
 
 | 步骤 | 落地 |
 |---|---|
@@ -334,7 +335,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | automation 名称 / 排程 | 同上 + `--check-name`、`--check-schedule`、`--check-oneshot` | B1/B4/B5/B10/B11 |
 | 排程口径 | `automation_update list` 全量盘点 | B1–B5 |
 
-**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 171 条。
+**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 176 条。
 
 ---
 
@@ -383,6 +384,10 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 **第十三轮改了什么**：① `reason` 收敛为 `FORCE_RELEASE_REASONS` 稳定枚举，三条拼异常文本的返回全部改成 `unreadable` / `quarantine_failed`，细节改由 `_diag()` 打 WARN；② 批准通过但隔离失败时补一条 `lease-recovery-failed` 审计行，避免 registry 里只剩 `approved_recovery`、看起来像恢复已落地；③ 新增四条用例把「枚举稳定性」本身变成闸口：`test_force_release_reason_is_stable_enum`（七类拒绝路径逐一断言 `reason ∈ 枚举` 且不含 `:`）、`test_force_release_unreadable_hash_is_stable`、`test_quarantine_failure_is_stable`、`test_rejected_recovery_leaves_no_audit_row_for_hash_and_identity`。
 
 | 14 | v1.8 修订 | **`PASS`** | F-01 核销；无新实现级缺陷；三条残余风险（PID 复用/派生进程/检测时序不可穷举、哈希校验与隔离之间的跨进程竞态、补记行自身写失败未被证明）均属已披露的 PARTIAL 边界 |
+
+| 15 | v1.8 修订 | `NEEDS-REVISION`（F-02 唯一实现级：stale 锁回收 TOCTOU） | 第十四轮 PASS 后按「继续挖 flaky」动作抓到并发丢更新真 bug（4 线程×20 次只落 45/10，伴随「跳过加锁」WARN）；修复过程分两层（两层锁 + fail-closed）提交审查，审查认可两层锁设计方向，但抓到 stale 回收竞态：「判定 stale → `os.remove()`」两步间另一进程可能已删旧建新，迟到者把**新锁**删掉 = 跨进程互斥失效；另要求补真多进程竞争测试、约束非 strict 误用 |
+
+**第十五轮改了什么**：① stale 回收改为「内核文件锁守卫内**重新判定** + 删除」（`_try_reclaim_stale` + `_kernel_lock`：msvcrt.locking/fcntl.flock，进程死亡自动释放，无递归 stale 问题）；迟到的回收者守卫内看到活锁即拒绝删除；守卫文件永不删除。② `_file_lock` 默认翻 `strict=True`（误用边界）。③ 补五条回归：`test_reclaim_removes_only_stale_lock` / `test_reclaim_does_not_delete_fresh_lock` / `test_reclaim_race_two_threads_never_double_enter` / `test_reclaim_race_multi_process_mutual_exclusion`（**真两进程**竞争，断言临界区绝不重叠、事件数不丢）/ `test_file_lock_defaults_to_strict`。
 
 **第十四轮之后补的一条**：审查把「`_record_corruption("lease-recovery-failed")` 自己失败会怎样」列为残余风险 3，虽不构成裁定理由，但这是能离线证明的，于是补 `test_quarantine_failed_row_write_failure_is_survivable`（第一次登记成功、第二次返回 `None`，断言不抛异常、仍返回 `quarantine_failed`、租约原样在）。**属于 PASS 后的加证，不改变任何条款口径**，故不重开一轮审查。
 

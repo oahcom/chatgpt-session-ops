@@ -13,7 +13,7 @@
 
 **矩阵自身受回归保护**：`tests/test_hardening.py::TestEvidenceMatrix` 会校验「条款集合 = 矩阵行集合」「每个 `test:`/`code:` 引用都能解析」「每条至少一种证据」。也就是说，新增条款而不补证据行、或引用了不存在的用例，测试会直接红。
 
-> 最后更新：2026-11-19（v1.8）。当前回归 171 条，全绿（1 条 POSIX-only skip）。
+> 最后更新：2026-11-19（v1.8）。当前回归 176 条，全绿（1 条 POSIX-only skip）。
 
 ---
 
@@ -63,7 +63,7 @@
 | B5 | **PARTIAL** | 测试+代码+实测+人判 | `test:test_oneshot_in_the_past_rejected` `code:check_oneshot` `live:2026-11-19` `human:存量 ACTIVE 的发现与 PAUSED 归档靠接口盘点，本地只实现「创建前预防」` | 两件事必须分开说：预防已机器化，**存量归档仍是人工**（本次盘出 4 个，已归档） |
 | B6 | **HUMAN** | 人判 | `human:路径类型校验写在 prompt 的 preflight 段，没有本地实现` | 已知缺口 |
 | B7 | **HUMAN** | 人判 | `human:step_id/attempt_count 状态机由各任务自己的状态文件落地，无共享实现` | 已知缺口 |
-| B8 | **FULL** | 测试+代码 | `test:test_slot_cap_sequential` `test:test_slot_cap_under_process_race` `test:test_acquire_slot_fails_closed_on_lock_timeout` `test:test_fresh_empty_slot_file_is_not_reclaimed` `test:test_concurrent_updates_do_not_lose_writes` `test:test_thread_lock_serialises_same_process` `test:test_strict_update_raises_locktimeout_not_silent` `test:test_strict_save_raises_locktimeout_not_silent` `code:acquire_slot` `code:release_slot` `code:_thread_lock_for` `code:_file_lock` | 抢不到锁即 QUEUED，空槽 5s 内不当死槽；同进程线程互斥 + 跨进程文件锁两层；strict 超时抛 LockTimeout 不静默跳过 |
+| B8 | **FULL** | 测试+代码 | `test:test_slot_cap_sequential` `test:test_slot_cap_under_process_race` `test:test_acquire_slot_fails_closed_on_lock_timeout` `test:test_fresh_empty_slot_file_is_not_reclaimed` `test:test_concurrent_updates_do_not_lose_writes` `test:test_thread_lock_serialises_same_process` `test:test_strict_update_raises_locktimeout_not_silent` `test:test_strict_save_raises_locktimeout_not_silent` `test:test_file_lock_defaults_to_strict` `test:test_reclaim_removes_only_stale_lock` `test:test_reclaim_does_not_delete_fresh_lock` `test:test_reclaim_race_two_threads_never_double_enter` `test:test_reclaim_race_multi_process_mutual_exclusion` `code:acquire_slot` `code:release_slot` `code:_thread_lock_for` `code:_file_lock` `code:_try_reclaim_stale` `code:_kernel_lock` | 抢不到锁即 QUEUED，空槽 5s 内不当死槽；同进程线程互斥 + 跨进程文件锁两层；strict 超时抛 LockTimeout 不静默跳过；stale 回收判定+删除同处内核锁守卫内（F-02），默认 strict=True 堵误用 |
 | B9 | **HUMAN** | 人判 | `human:PAUSED→等实例结束→删除的顺序只在操作时执行，无脚本` | 已知缺口 |
 | B10 | **FULL** | 测试+代码 | `test:test_readonly_name_ok` `test:test_write_name_ok` `test:test_four_segments_rejected` `test:test_verb_must_match_whole_segment` `test:test_readonly_suffix_with_write_verb_rejected` `code:check_automation_name` | 分词判段，动作词整段相等 |
 | B11 | **FULL** | 测试+代码 | `test:test_readonly_argv_whitelist_is_exact` `code:READONLY_ARGV` | `--rotation-reset` 不再被前缀匹配放行 |

@@ -706,8 +706,85 @@ class LockTimeout(RuntimeError):
     """抢锁超时。strict 模式下必须抛出，绝不「跳过加锁继续跑」。"""
 
 
+def _kernel_lock(fd, timeout):
+    """内核文件锁（Windows: msvcrt.locking / POSIX: fcntl.flock）。
+
+    为什么需要它（F-02）：stale 锁回收的「判定」与「删除」若不互斥，两个进程
+    同时判定可回收 → 先删后建的新锁会被迟到者按旧判定删掉，跨进程互斥失效。
+    回收互斥不能再用 O_EXCL 锁文件（其自身的 stale 回收就是同一个坑，递归无解），
+    而内核锁在持有进程死亡时自动释放——天然没有 stale 问题。
+    """
+    end = time.time() + timeout
+    while True:
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if time.time() >= end:
+                return False
+            time.sleep(0.01)
+
+
+def _kernel_unlock(fd):
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+def _try_reclaim_stale(lock):
+    """回收确认已死的残留锁。判定与删除必须同处内核锁守卫内（F-02）。
+
+    守卫文件（lock + '.reclaim'）**永不删除**：它是内核锁的载体，删了重建会
+    让两个进程各锁一个 inode，互斥悄悄失效。空文件常驻无害。
+    拿不到守卫（或平台不支持内核锁）→ 不回收，宁可等超时也不冒险删活锁。
+    """
+    guard = lock + ".reclaim"
+    try:
+        fd = os.open(guard, os.O_CREAT | os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        if not _kernel_lock(fd, timeout=min(LOCK_TIMEOUT_SEC, 1.0)):
+            return False
+        try:
+            # 守卫内重新判定：迟到的回收者此刻看到的是「先删后建」的新锁（活锁），
+            # 判定为不可回收 —— 这正是 F-02 的修复点，绝不能按守卫外的旧判定删。
+            if not _lock_holder_stale(lock):
+                return False
+            try:
+                os.remove(lock)
+            except OSError:
+                return False
+            return True
+        finally:
+            _kernel_unlock(fd)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 @contextlib.contextmanager
-def _file_lock(path, timeout=LOCK_TIMEOUT_SEC, strict=False):
+def _file_lock(path, timeout=LOCK_TIMEOUT_SEC, strict=True):
+    """默认 strict=True（fail-closed）：超时抛 LockTimeout，绝不「跳过加锁继续跑」。
+
+    strict=False 仅限测试基建的宽松探测路径；业务代码误用请在评审里拦下——
+    宽松模式超时后无锁进临界区，等价于裸奔（事故库 A22 / F-02 反复证明过）。
+    """
     me = threading.get_ident()
     if _LOCK_HELD.get(path) == me:  # 同线程重入：直接放行（避免自锁）
         yield
@@ -741,12 +818,11 @@ def _file_lock(path, timeout=LOCK_TIMEOUT_SEC, strict=False):
                     pass
                 break
             except FileExistsError:
-                try:
-                    if _lock_holder_stale(lock):
-                        os.remove(lock)  # 干掉残留锁（已确认持有者不在）
-                        continue
-                except OSError:
-                    pass
+                # F-02：判定与删除必须同处内核锁守卫内。旧代码「_lock_holder_stale()
+                # 判定 → os.remove()」两步间，另一进程可能已删旧建新；迟到者会把
+                # **新锁**按旧判定删掉，跨进程互斥失效。
+                if _try_reclaim_stale(lock):
+                    continue
                 if time.time() >= end:
                     if strict:
                         raise LockTimeout("文件锁等待超时（%s）" % os.path.basename(path))
