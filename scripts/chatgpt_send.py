@@ -2373,8 +2373,15 @@ def normalize_proxy(url):
     scheme = u.split("://", 1)[0].lower()
     if scheme not in PROXY_SCHEMES:
         raise ValueError("不支持的代理类型 %r（只支持 http/https/socks5/socks5h）" % scheme)
-    if not urllib.parse.urlsplit(u).hostname:
+    parts = urllib.parse.urlsplit(u)
+    if not parts.hostname:
         raise ValueError("代理地址缺少主机名：%r" % url)
+    # F-35：端口在这里就要验——否则坏端口（99999 / notaport）一路潜到
+    # _parse_socks_proxy 的 u.port 才炸，错误出处变成 urllib 内部而非配置非法。
+    try:
+        parts.port
+    except ValueError:
+        raise ValueError("代理端口非法：%r（须为 0-65535 的整数）" % url)
     return u
 
 
@@ -2387,10 +2394,14 @@ def load_proxy_config():
 
 
 def _tcp_alive(host, port, timeout=0.4):
+    """探测 TCP 端口通不通；任何不可信输入一律 False（F-35，永不抛异常）。"""
+    p = _as_int(port, None)
+    if p is None or not (0 < p < 65536):
+        return False
     try:
-        with socket.create_connection((host, int(port)), timeout):
+        with socket.create_connection((host, p), timeout):
             return True
-    except (OSError, ValueError):
+    except OSError:
         return False
 
 
@@ -2462,9 +2473,8 @@ def resolve_proxy_info(refresh=False):
         ports = cfg.get("autodetect_ports") or PROXY_AUTODETECT_PORTS
         probe = cfg.get("autodetect_probe", True)
         for p in ports:
-            try:
-                p = int(p)
-            except (TypeError, ValueError):
+            p = _as_int(p, None)   # F-35：int(inf) 的 OverflowError 不得穿出；True 不折叠成 1
+            if p is None or not (0 < p < 65536):
                 continue
             if not _tcp_alive("127.0.0.1", p):
                 continue

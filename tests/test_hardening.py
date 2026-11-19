@@ -1522,6 +1522,33 @@ class TestProxy(TmpBase):
             with self.assertRaises(ValueError):
                 m.normalize_proxy(bad)
 
+    # ---- F-35：代理端口字段收敛 ----
+    def test_normalize_proxy_rejects_illegal_port(self):
+        """坏端口（超范围/非数字）＝配置非法，与坏 scheme 同待遇；
+        不得一路潜到 _parse_socks_proxy 的 u.port 才炸（错误出处变成 urllib 内部）。"""
+        for bad in ("socks5://127.0.0.1:99999", "socks5h://127.0.0.1:notaport",
+                    "http://127.0.0.1:70000"):
+            with self.subTest(url=bad):
+                with self.assertRaises(ValueError) as cm:
+                    m.normalize_proxy(bad)
+                self.assertIn("端口", str(cm.exception))
+        self.assertEqual(m.normalize_proxy("socks5://127.0.0.1:1080"),
+                         "socks5://127.0.0.1:1080")
+
+    def test_tcp_alive_never_raises_on_junk_port(self):
+        """_tcp_alive 契约 = 返回 bool；int() 的 TypeError/OverflowError 不得穿出。"""
+        for port in ([1], None, float("inf"), {"a": 1}, True, "abc", 0, -1, 65536, 10**400):
+            with self.subTest(port=port):
+                self.assertIs(m._tcp_alive("127.0.0.1", port, timeout=0.1), False)
+
+    def test_autodetect_ports_pollution_never_escapes(self):
+        """proxy.json 的 autodetect_ports 是不可信状态：畸形项跳过，不得崩整轮解析。"""
+        for ports in ([float("inf")], ["abc"], [True], [None], [{"p": 1}], ["65536"], [0]):
+            with self.subTest(ports=ports):
+                self._cfg(autodetect=True, autodetect_ports=ports)
+                info = m.resolve_proxy_info(refresh=True)
+                self.assertEqual(info["url"], "", "畸形端口不得被探测成出口")
+
     def test_env_beats_file(self):
         self._cfg(url="socks5h://file:1080")
         os.environ["CHATGPT_PROXY"] = "http://env:8080"
