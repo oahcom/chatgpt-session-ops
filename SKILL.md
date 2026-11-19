@@ -88,7 +88,8 @@ python scripts/chatgpt_send.py --anon-restore <device>           # 把留存身�
 - 用临时 profile 启动调试浏览器：`python scripts/start_chrome.py --temp --port 9333`（在 browser-automation-cdp 技能目录下；脚本在 CDP 未就绪时会自动拉起）
 - 脚本经 CDP 在未登录页面建会话（落点 `https://chatgpt.com/uc/<id>`），再用页面 cookie 走 `GET /backend-anon/conversation/<id>` 收割
 - 两个隐坑：窗口未显示时页面 `visibilityState=hidden`，应用会挂起发送 → 脚本已启用 `Emulation.setFocusEmulationEnabled`；无头模式会被 Cloudflare「请稍候」挡住 → 必须用有头浏览器
-- 端口用 `CHATGPT_ANON_CDP_PORT` 覆盖（默认 9333）；device cookie 落盘 `scripts/accounts/nologin/device-cookie.txt` 与分档快照 `accounts/nologin/devices/<oai-did>.txt`（扫掉 `devices/` 就永久失去那些设备上的历史匿名会话）
+- 端口用 `CHATGPT_ANON_CDP_PORT` 覆盖（默认 9333）；device cookie 落盘 `scripts/accounts/nologin/device-cookie.txt` 与分档快照 `accounts/nologin/devices/<oai-did>.{txt,json}`（扫掉 `devices/` 就永久失去那些设备上的历史匿名会话）
+- `start_chrome.py --temp` 的 profile 其实是**固定目录** `%TEMP%/cdp-browser-temp`：重启浏览器但不清目录时 `oai-did` 不变，设备身份通常能延续；只有清目录/换机才真的换设备。这也说明本地设备快照才是可靠兜底
 
 **凭据不全的身份会在 POST 时 403**：acct2 的 cookies.json 只有 `session-token` + `oai-did`（2 条），GET 全部正常但 POST 判 `Unusual activity`——缺 `__cf_bm`/`_cfuvid`/`__cflb`。脚本在首次 403 时自动 `warm_cookies()`（访问首页接收 Set-Cookie 并回写 cookies.json）再重试一次，实测可自愈。
 
