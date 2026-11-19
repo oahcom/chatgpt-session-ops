@@ -1226,6 +1226,39 @@ class TestSendFlow(TmpBase):
         self.assertEqual(dg["sha256"], hashlib.sha256(full.encode("utf-8")).hexdigest(),
                          "同 ct 时摘要仍须与落盘全文一致（F-27）")
 
+    def test_digest_none_never_leaves_harvest_complete(self):
+        """加证（PASS 后加固）：对账器判不可用的 body，harvest 不得以 complete=True 放行。
+
+        这不是新条款——F-24 门禁本就要求 digest 参与放行；这里把「两边对畸形输入的
+        判定对称」这个不变量钉住，防止未来改动让 digest 返回 None 而 harvest 却报
+        complete=True（那样 send_prompt 会把 digest_ok=False 当不完整处理，行为仍
+        保守，但两侧语义分裂本身是隐患）。固定用例覆盖：非法 part / assistant 结构化
+        part / 畸形 create_time。
+        """
+        import hashlib
+        bodies = [
+            # 非法 part（non-string 且非结构化）
+            json.dumps({"mapping": {"n": {"message": {
+                "id": "m", "author": {"role": "assistant"},
+                "content": {"parts": ["ok", 123]}, "create_time": 1}}}}),
+            # assistant 含合法结构化 part（多模态）——文本只是投影
+            json.dumps({"mapping": {"n": {"message": {
+                "id": "m", "author": {"role": "assistant"},
+                "content": {"parts": [{"content_type": "image/png"}]}, "create_time": 1}}}}),
+            # 不可用时间戳
+            json.dumps({"mapping": {"n": {"message": {
+                "id": "m", "author": {"role": "assistant"},
+                "content": {"parts": ["ok"]}, "create_time": "bad"}}}}),
+        ]
+        for body in bodies:
+            with self.subTest(body=body[:60]):
+                dg = m.reply_digest(body)
+                full, complete = m.ChatGPTAPI.harvest_mapping_checked(body)
+                self.assertIsNone(dg, "这些畸形输入对账器必须判不可用")
+                self.assertFalse(complete,
+                                 "对账器判不可用时，harvest 不得报 complete=True 完整放行"
+                                 "（可尽力收割部分文本，但须标记不完整）")
+
     def test_timeout_is_split_by_thinking(self):
         """A16：思考模式给 30 分钟，非思考给 7 分钟；同一条预算会误杀 19 分钟的思考回复。"""
         cid = "11111111-2222-4333-8444-555555555555"
