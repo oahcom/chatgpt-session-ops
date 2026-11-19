@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**十轮对外对抗审查**逐条改写（每轮裁定见 §F，第九轮把「可判定」本身当成攻击面），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 157 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**十轮对外对抗审查**逐条改写（每轮裁定见 §F，第九轮把「可判定」本身当成攻击面），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 158 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -34,7 +34,7 @@
 | 2 | 这个会话归谁 | `--owner <conv_id>` | 输出唯一账号 |
 | 3 | 配额有没有冷却 | `--rotation` | `unavailable` 为空或目标账号不在其中 |
 | 4 | 匿名要用先看设备 | `--anon-devices` | 目标设备 `jar=true` |
-| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 157 条） |
+| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 158 条） |
 
 ### A1–A4 内容主权（不可协商）
 
@@ -232,7 +232,7 @@
 
 | 步骤 | 落地 |
 |---|---|
-| R1 记录原哈希/大小/路径/时间 | `_record_corruption()` 先写 `corrupt-registry.jsonl`（append-only，带 sha256） |
+| R1 记录原哈希/大小/路径/时间 | `_record_corruption()` 写 `corrupt-registry.jsonl`（append-only，带 sha256）。**顺序在 R3/R4/R6 之后**：前置检查没过就登记，会留下「已批准恢复」的假记录 |
 | R2 同一把 strict 锁 | 闸口本身只做文件操作，不进入租约临界区；真正的写入路径仍由 `lease_acquire` 的 strict 锁兜住 |
 | R3/R4 原实例身份与存活 | 能解析出 `pid` 且 `_proc_alive` 为真 → `process_alive` 拒绝（**不许凭「文件坏了」推断进程死了**） |
 | R5 B7 状态核对 | 恢复前必须人工确认无「已提交未确认」的副作用（写进恢复记录，不由脚本猜） |
@@ -331,7 +331,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | automation 名称 / 排程 | 同上 + `--check-name`、`--check-schedule`、`--check-oneshot` | B1/B4/B5/B10/B11 |
 | 排程口径 | `automation_update list` 全量盘点 | B1–B5 |
 
-**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 157 条。
+**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 158 条。
 
 ---
 
@@ -370,6 +370,10 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | 11 | v1.8 修订 | `NEEDS-REVISION`（A20/B15 仍判 PARTIAL；R2 锁未实现；登记失败未阻断） | 只认贴出来的断言，不认矩阵里的用例名；TOCTOU、审计失败、身份不可读三点均属实现未闭环 |
 
 **第十一轮改了什么**：见下方第十轮表格末尾 7 行（A20/B15 降级、审计阻断、R2 加锁、身份证据、超时保留字节、同目录与目录 fsync 断言）。
+
+| 12 | v1.8 修订 | `NEEDS-REVISION`（1 项实现级：审计登记顺序） | 八项返修全部核销，A20/B15 的 PARTIAL 声明被判「成立」；唯一实现缺陷是**先登记恢复、再做存活/身份检查**，被拒绝时留下假「已批准」记录 |
+
+**第十二轮改了什么**：`lease_force_release` 把登记移到「哈希 → 存活 → 身份证据」全部通过之后；返回值枚举补全（`identity_unconfirmed` / `audit_registration_failed` / `lock_timeout` / `quarantine_failed`）；新增 `test_rejected_recovery_leaves_no_fake_audit_row` 断言被拒绝时 registry 里没有 `lease-recovery` 行。
 
 **第十轮改了什么（逐条对应）**：
 

@@ -1437,6 +1437,27 @@ class TestSlotsAndLease(TmpBase):
         self.assertEqual(why, "identity_unconfirmed")
         self.assertTrue(os.path.exists(path))
 
+    def test_rejected_recovery_leaves_no_fake_audit_row(self):
+        """被拒绝的恢复不许留下「已批准恢复」记录——先登记后检查等于谎报一次恢复。"""
+        path = os.path.join(self.tmp, "lease-nofake.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid(),
+                       "process_start_time": m._proc_start_time(os.getpid()),
+                       "run_id": "rid"}, f)
+        approval = os.path.join(self.tmp, "approve-nofake.json")
+        with open(approval, "w", encoding="utf-8") as f:
+            json.dump({"sha256": m._sha256_file(path),
+                       "approved_at": "2026-11-19T16:00:00+08:00",
+                       "approver": "owner", "reason": "looks dead",
+                       "identity_evidence": "snapshot"}, f)
+        ok, why = m.lease_force_release(path, approval)
+        self.assertFalse(ok)
+        self.assertEqual(why, "process_alive")
+        reg = os.path.join(self.tmp, "corrupt-registry.jsonl")
+        if os.path.exists(reg):
+            kinds = [json.loads(l)["kind"] for l in open(reg, encoding="utf-8").read().splitlines()]
+            self.assertNotIn("lease-recovery", kinds, "被拒绝的恢复留下了批准记录")
+
     def test_force_release_blocks_when_audit_registration_fails(self):
         """R1：登记失败必须阻断恢复——没有审计记录的「恢复成功」比不恢复更危险。"""
         path = os.path.join(self.tmp, "lease-audit.json")

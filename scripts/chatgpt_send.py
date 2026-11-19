@@ -932,8 +932,10 @@ def lease_force_release(path, approval_path):
     而是留一条**需要人明确批准、且留痕**的通道。批准文件字段：
         {"sha256": "<损坏租约的哈希>", "approved_at": "<ISO8601>",
          "approver": "<谁批的>", "reason": "<为什么批>"}
-    返回 (ok, reason)。reason ∈ absent / no_approval / approval_incomplete /
-    sha256_mismatch / process_alive / quarantine_failed / quarantined。
+    返回 (ok, reason)。reason 枚举：
+        absent / no_approval / approval_incomplete / sha256_mismatch / process_alive /
+        identity_unconfirmed / audit_registration_failed / quarantine_failed /
+        lock_timeout / quarantined
     """
     if not os.path.exists(path):
         return True, "absent"
@@ -963,10 +965,6 @@ def _force_release_locked(path, approval_path):
         return False, "unreadable:%s" % e
     if got != want:
         return False, "sha256_mismatch"
-    # R1：先把证据登记下来（原哈希/大小/发现时间），再谈恢复。
-    # 登记失败必须阻断——「恢复成功但没有审计记录」比不恢复更危险。
-    if _record_corruption("lease-recovery", path, "approved_recovery") is None:
-        return False, "audit_registration_failed"
     # R3/R4：能读出 pid 且进程还活着 → 不许恢复（文件坏了不代表进程死了）
     info, readable = _read_ephemeral(path)
     if readable:
@@ -978,6 +976,10 @@ def _force_release_locked(path, approval_path):
         # 子进程检查、B7 状态核对结果），否则拒绝——不能让「批准」替「证据」。
         if not str(approval.get("identity_evidence") or "").strip():
             return False, "identity_unconfirmed"
+    # R1：**前置检查全部通过后**才登记恢复事件。先登记后检查会在「被拒绝」时留下
+    # 「已批准恢复」的假记录，审计上等于谎报一次恢复。
+    if _record_corruption("lease-recovery", path, "approved_recovery") is None:
+        return False, "audit_registration_failed"
     bad = "%s.corrupt-%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
     try:
         os.replace(path, bad)      # R7：隔离归档，不覆盖
