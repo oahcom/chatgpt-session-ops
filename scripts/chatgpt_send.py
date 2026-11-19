@@ -639,7 +639,9 @@ def resolve_proxy_info(refresh=False):
                 # 端口开着不代表能用：必须真握手一次（死节点会 CONNECT 200 后断流）
                 ok, why = _proxy_alive(cand, timeout=cfg.get("autodetect_timeout", 5))
                 if not ok:
-                    print("跳过本机代理 %d（探测失败：%s）" % (p, why), flush=True)
+                    # 走 stderr：这条提示会出现在每次解析里，不能弄脏 --proxy-show 的 JSON
+                    print("跳过本机代理 %d（探测失败：%s）" % (p, why),
+                          file=sys.stderr, flush=True)
                     continue
             url, source = cand, "autodetect:%d" % p
             break
@@ -1491,14 +1493,23 @@ class AnonBrowser:
                 continue
         return False
 
+    def _cdp(self):
+        """导入 cdp.CDPClient（顺手把技能目录塞进 sys.path）。
+
+        别在方法里直接 `from cdp import ...`：egress_ip 曾因此拿不到模块，
+        报 "No module named 'cdp'" 而不是真正去连浏览器。
+        """
+        if self.cdp_dir not in sys.path:
+            sys.path.insert(0, self.cdp_dir)
+        try:
+            from cdp import CDPClient
+        except Exception as e:
+            raise RuntimeError("CDP 客户端不可用（%s）：%s" % (self.cdp_dir, e))
+        return CDPClient
+
     def client(self):
         if self._client is None:
-            if self.cdp_dir not in sys.path:
-                sys.path.insert(0, self.cdp_dir)
-            try:
-                from cdp import CDPClient
-            except Exception as e:
-                raise RuntimeError("CDP 客户端不可用（%s）：%s" % (self.cdp_dir, e))
+            CDPClient = self._cdp()
             cl = CDPClient(port=self.port, timeout=90)
             if not cl.is_alive() and self._autostart():
                 cl = CDPClient(port=self.port, timeout=90)
@@ -1606,7 +1617,8 @@ class AnonBrowser:
 
         不导航当前页：当前页可能是正在续聊的 /uc/<id>，导航它等于毁掉可写通道。
         """
-        from cdp import CDPClient
+        CDPClient = self._cdp()
+        self.client()          # 没起就按统一出口自动拉起（--proxy 由 _autostart 带上）
         tid, res = "", None
         try:
             b = CDPClient(port=self.port, timeout=timeout)
@@ -2355,6 +2367,8 @@ def main():
             if res.get("browser_ip") and res.get("proxy_ip"):
                 res["browser_match"] = res["browser_ip"] == res["proxy_ip"]
         ok = bool(res.get("proxy_ip")) and not res.get("same")
+        if "--browser" in args[1:] and res.get("browser_ip") is None:
+            ok = False      # 要求验浏览器却没验成，不能算通过
         if res.get("browser_match") is False:
             ok = False
             res["verdict"] = "浏览器出口与 API 不一致：浏览器没走代理，重启浏览器并带 --proxy"
