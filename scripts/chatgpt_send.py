@@ -917,11 +917,16 @@ def reply_digest(raw_body):
         ok, ct = _as_ctime(msg.get("create_time"))
         if not ok:
             return None        # 时间戳不可用 → 顺序不可信，核不了
-        if author.get("role") != "assistant":
-            continue        # 非 assistant 节点不参与对账（含用户多模态消息，F-19）
+        # D-01（第31轮审查）：**所有角色**先做 part 合法性检查——文档承诺
+        # 「body 里有一处畸形就整体 None」，user 节点也不能例外。旧版把
+        # `_split_parts` 放在 assistant 判断之后，user 的非法 part 被 continue
+        # 跳过，摘要仍对一份含畸形节点的 mapping 出具可信外观。
+        # 注意：用户**合法结构化 part**（多模态）不算畸形，照常放行（F-19）。
         texts, structured, malformed = _split_parts(parts)
         if malformed:
-            return None    # 非法 part → 摘要算出来的 sha256/chars 不再对应真实内容
+            return None    # 任何节点的非法 part → 摘要不再对应真实内容
+        if author.get("role") != "assistant":
+            continue        # 非 assistant 节点不参与对账（含用户多模态消息，F-19）
         if structured:
             return None    # F-19：assistant 消息含非文本内容 → 核不了全文
         if not texts or not "".join(texts).strip():

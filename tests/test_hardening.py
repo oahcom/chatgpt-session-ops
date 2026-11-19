@@ -2133,6 +2133,18 @@ class TestParserEdges(TmpBase):
         self.assertIsNotNone(dg, "用户多模态消息不影响 assistant 消息的对账")
         self.assertEqual(dg["chars"], 4)
 
+    def test_illegal_part_in_user_message_makes_digest_none(self):
+        """D-01（第31轮）：完整性证明器承诺「body 有一处畸形就整体 None」——
+        user 节点的非法 part（既非字符串也非结构化对象）也不能被跳过。"""
+        body = json.dumps({"mapping": {
+            "u": {"message": {"author": {"role": "user"},
+                              "content": {"parts": [123]}, "create_time": 1}},
+            "a": {"message": {"id": "msg-1", "author": {"role": "assistant"},
+                              "content": {"parts": ["正常回复"]}, "create_time": 5}},
+        }})
+        self.assertIsNone(m.reply_digest(body),
+                          "user 非法 part 不得被忽略后仍出具可信摘要")
+
     def test_structured_assistant_part_makes_digest_none(self):
         """F-19：assistant 消息含非文本内容 → 核不了全文，整体判不可用。"""
         body = json.dumps({"mapping": {
