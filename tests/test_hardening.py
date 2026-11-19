@@ -287,6 +287,45 @@ class TestStateFiles(TmpBase):
         [t.join() for t in ts]
         self.assertEqual(m._load_json(p, {})["n"], 80)
 
+    def test_thread_lock_serialises_same_process(self):
+        """同进程两线程必须由 threading.Lock 串行——不依赖文件锁（Windows 上 O_EXCL+fsync 太慢）。"""
+        p = os.path.join(self.tmp, "tl.json")
+        lk1 = m._thread_lock_for(p)
+        lk2 = m._thread_lock_for(p)
+        self.assertIs(lk1, lk2, "同路径应返回同一个线程锁")
+        self.assertTrue(lk1.acquire(blocking=False))
+        self.assertFalse(lk2.acquire(blocking=False), "第一个线程持有时第二个不该拿到")
+        lk1.release()
+        self.assertTrue(lk2.acquire(blocking=False), "释放后应可获取")
+        lk2.release()
+
+    def test_strict_update_raises_locktimeout_not_silent(self):
+        """strict=True 超时必须抛 LockTimeout，绝不「跳过加锁继续写」。"""
+        p = os.path.join(self.tmp, "st.json")
+        m._save_json(p, {"n": 0})
+        lk = m._thread_lock_for(p)
+        lk.acquire()
+        try:
+            with self.assertRaises(m.LockTimeout):
+                m._update_json(p, lambda d: d.__setitem__("n", 1), {"n": 0},
+                               timeout=0.2, retries=1)
+        finally:
+            lk.release()
+        self.assertEqual(m._load_json(p, {})["n"], 0, "超时后不该写入")
+
+    def test_strict_save_raises_locktimeout_not_silent(self):
+        """strict=True 的 _save_json 超时必须抛 LockTimeout，绝不无锁写。"""
+        p = os.path.join(self.tmp, "ss.json")
+        m._save_json(p, {"n": 0})
+        lk = m._thread_lock_for(p)
+        lk.acquire()
+        try:
+            with self.assertRaises(m.LockTimeout):
+                m._save_json(p, {"n": 99}, timeout=0.2)
+        finally:
+            lk.release()
+        self.assertEqual(m._load_json(p, {})["n"], 0, "超时后不该写入")
+
 
 # ---------------------------------------------------------------- 轮转
 class TestRotation(TmpBase):
@@ -2212,12 +2251,161 @@ class TestEvidenceMatrix(unittest.TestCase):
                 else:
                     self.assertTrue(has_human, "HUMAN 必须给理由")
 
+    def _level_of(self):
+        out = {}
+        for clause, cells in self._rows().items():
+            m = re.search(r"\*\*([A-Z_]+)\*\*", " ".join(cells))
+            out[clause] = m.group(1) if m else None
+        return out
+
+    def test_stats_table_matches_rows(self):
+        """统计表与正文行必须逐条对得上。
+
+        事故：统计是手写的，改了一条等级却忘了改表，于是「20 条 FULL」和表里
+        列了 19 个 ID 长期并存——读者只信数字，不会去数。这里双向核：
+        数字 == 列出的 ID 个数 == 正文里该等级的行数。
+        """
+        text = self._read("references", "evidence-matrix.md")
+        level_of = self._level_of()
+        stated = {}
+        for line in text.splitlines():
+            m = re.match(r"^\|\s*(FULL|PARTIAL|CODE_ONLY|HUMAN)\s*\|\s*(\d+)\s*\|(.*)$", line)
+            if m:
+                stated[m.group(1)] = (int(m.group(2)),
+                                      m.group(3).replace("|", " ").split())
+        self.assertEqual(sorted(stated), ["CODE_ONLY", "FULL", "HUMAN", "PARTIAL"],
+                         "统计表解析失败：四个等级没找齐")
+        for level, (count, ids) in stated.items():
+            actual = sorted(c for c, v in level_of.items() if v == level)
+            with self.subTest(level=level):
+                self.assertEqual(count, len(ids), "%s 的条数与列出的 ID 个数不符" % level)
+                self.assertEqual(sorted(ids), actual, "%s 的 ID 列表与正文行不符" % level)
+        m = re.search(r"^\|\s*合计\s*\|\s*(\d+)\s*\|", text, re.M)
+        self.assertIsNotNone(m, "统计表缺合计行")
+        self.assertEqual(int(m.group(1)), len(level_of), "合计与正文行数不符")
+
+    def test_prose_counts_match_rows(self):
+        """正文里手写的「49 条 / FULL 20 条 / 32 条有离线用例」也必须对得上行。"""
+        level_of = self._level_of()
+        total = len(level_of)
+        counts = {lv: sum(1 for v in level_of.values() if v == lv)
+                  for lv in ("FULL", "PARTIAL", "CODE_ONLY", "HUMAN")}
+
+        base = self._read("references", "baselines.md")
+        for n in re.findall(r"当前分布（(\d+) 条", base):
+            self.assertEqual(int(n), total, "baselines.md 的当前分布总数与矩阵行数不符")
+        for level, n in re.findall(r"\*\*(FULL|PARTIAL|CODE_ONLY|HUMAN) (\d+) 条\*\*", base):
+            self.assertEqual(int(n), counts[level],
+                             "baselines.md 里 %s 的条数与矩阵不符" % level)
+
+        matrix = self._read("references", "evidence-matrix.md")
+        for n in re.findall(r"的 (\d+) 条判定口径", matrix):
+            self.assertEqual(int(n), total, "evidence-matrix.md 开头声明的条款数与行数不符")
+        m = re.search(r"(\d+) 条里 \*\*(\d+) 条（\d+%）真正机械化\*\*，(\d+) 条半机械化，"
+                      r"(\d+) 条只有代码，(\d+) 条人判", matrix)
+        self.assertIsNotNone(m, "矩阵结论段解析失败")
+        self.assertEqual((int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                          int(m.group(4)), int(m.group(5))),
+                         (total, counts["FULL"], counts["PARTIAL"],
+                          counts["CODE_ONLY"], counts["HUMAN"]),
+                         "矩阵结论段的四个数字与正文行不符")
+
+        skill = self._read("SKILL.md")
+        m = re.search(r"(\d+) 条有离线用例、(\d+) 条只有代码、(\d+) 条纯人判", skill)
+        self.assertIsNotNone(m, "SKILL.md 的证据分布解析失败")
+        self.assertEqual(int(m.group(1)), counts["FULL"] + counts["PARTIAL"],
+                         "「有离线用例」应等于 FULL + PARTIAL")
+        self.assertEqual(int(m.group(2)), counts["CODE_ONLY"])
+        self.assertEqual(int(m.group(3)), counts["HUMAN"])
+
+    def test_claimed_regression_count_matches_actual(self):
+        """文档里写的「N 条回归」必须等于真实用例数。
+
+        事故：一轮里改了三次用例数，`SKILL.md` 还写着 158、矩阵写 151——这种漂移
+        人眼抓不住，只能让测试自己数 `def test_`。
+        """
+        tests_src = open(os.path.join(HERE, "test_hardening.py"), encoding="utf-8").read()
+        actual = len(re.findall(r"^\s+def (test_\w+)\s*\(", tests_src, re.M))
+        self.assertGreater(actual, 100, "用例数解析失败，规则可能没匹配上")
+        claims = []
+        files = (("SKILL.md", ("SKILL.md",)),
+                 ("baselines.md", ("references", "baselines.md")),
+                 ("evidence-matrix.md", ("references", "evidence-matrix.md")))
+        pats = (r"当前回归 (\d+) 条", r"当前 (\d+) 条回归", r"全绿（当前 (\d+) 条）",
+                r"离线回归（(\d+) 条）", r"(\d+) 条，覆盖 id 校验",
+                r"会直接红。当前 (\d+) 条。")
+        for label, parts in files:
+            text = self._read(*parts)
+            for pat in pats:
+                for n in re.findall(pat, text):
+                    claims.append((label, int(n)))
+        self.assertTrue(claims, "一个回归条数声明都没找到，规则失效")
+        for fn, n in claims:
+            with self.subTest(file=fn, claimed=n):
+                self.assertEqual(n, actual,
+                                 "%s 声称 %d 条回归，实际 %d 条" % (fn, n, actual))
+
     def test_no_row_is_evidence_free(self):
         for clause, cells in self._rows().items():
             joined = " ".join(cells)
             with self.subTest(clause=clause):
                 self.assertRegex(joined, r"(test|code|live|human):",
                                  "%s 没有任何证据标注" % clause)
+
+
+class TestReviewLog(unittest.TestCase):
+    """§F 审查记录自洽：轮数声明、轮次连续性、每轮有裁定。
+
+    第六轮审查抓到过「轮次表不全」，第十四轮之后这条仍是手写的——手写就会漏。
+    这里只做三件可判定的事：声明几轮 = 表里有几行；行号从 1 连续到 N；
+    每行都写了裁定（`PASS` / `NEEDS-REVISION`），不许有「待裁定」蒙混。
+    """
+
+    ROOT = os.path.dirname(HERE)
+    CN = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6,
+          "七": 7, "八": 8, "九": 9, "十": 10}
+
+    @classmethod
+    def _cn2int(cls, s):
+        if "十" not in s:
+            return cls.CN[s]
+        head, _, tail = s.partition("十")
+        return (cls.CN[head] if head else 1) * 10 + (cls.CN[tail] if tail else 0)
+
+    def _text(self):
+        with open(os.path.join(self.ROOT, "references", "baselines.md"), encoding="utf-8") as f:
+            return f.read()
+
+    def _section(self):
+        text = self._text()
+        i = text.index("## F. 审查记录与未采纳项")
+        j = text.index("## G. 证据矩阵")
+        return text[i:j]
+
+    def _rows(self):
+        # 只在 §F 内找「| 数字 | 版本 | 裁定 |」的行：整篇扫描会把 C 类配方表也算进来
+        return re.findall(r"^\|\s*(\d{1,2})\s*\|\s*(v[\d.]+[^|]*)\|([^|]*)\|([^|]*)\|",
+                          self._section(), re.M)
+
+    def test_declared_round_count_matches_table(self):
+        text = self._text()
+        m = re.search(r"经 ChatGPT 思考模式\*\*([一二三四五六七八九十]+)轮对外对抗审查", text)
+        self.assertIsNotNone(m, "找不到「N 轮对外对抗审查」的声明")
+        declared = self._cn2int(m.group(1))
+        rows = self._rows()
+        self.assertTrue(rows, "§F 轮次表一行都没解析到")
+        nums = [int(r[0]) for r in rows]
+        self.assertEqual(nums, list(range(1, len(nums) + 1)),
+                         "轮次编号不连续或有重复：%s" % nums)
+        self.assertEqual(declared, len(nums),
+                         "开头声明 %d 轮，表里有 %d 行" % (declared, len(nums)))
+
+    def test_every_round_has_verdict(self):
+        for num, ver, _verdict, _note in self._rows():
+            with self.subTest(round=num):
+                self.assertRegex(ver, r"v\d\.\d", "第 %s 轮没写受审版本" % num)
+                self.assertRegex(_verdict, r"PASS|NEEDS-REVISION",
+                                 "第 %s 轮没写裁定" % num)
 
 
 if __name__ == "__main__":

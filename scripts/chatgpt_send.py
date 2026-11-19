@@ -580,14 +580,30 @@ def _load_json(path, default):
         return copy.deepcopy(default)
 
 
-# ---------- 状态文件跨进程锁 ----------
-# 三个 json 都是「读-改-写」，两个进程同时跑会互相覆盖（比如两个发送器同时推进游标，
-# 就会把均分打成 2:0）。这里用 O_EXCL 锁文件做排他，带 stale 检测与线程级重入保护。
-# 重入保护必须按线程记（早先按路径记一个集合，等于让同进程的第二个线程直接跳过加锁，
-# 并发下照样丢更新）；跨进程仍然靠 O_EXCL 锁文件。
-_LOCK_HELD = {}            # path -> 持有者线程 ident
+# ---------- 状态文件锁：线程级互斥 + 跨进程文件锁 ----------
+# 三个 json 都是「读-改-写」，并发不加锁会互相覆盖（比如两个发送器同时推进游标，
+# 就会把均分打成 2:0）。
+# 两层保护：
+#   1. 同进程多线程 → threading.Lock（零 I/O，不超时不死锁）；
+#   2. 跨进程 → O_EXCL 锁文件（带 stale 检测）。
+# 只靠文件锁在 Windows 上高竞争下极慢（O_EXCL + fsync + os.remove 每次都碰磁盘），
+# 4 线程 × 20 次读-改-写能把 strict 3s 超时全部吃满。
+# 重入保护按线程记（_LOCK_HELD）；线程锁天然可重入由 _LOCK_HELD 短路。
+_LOCK_HELD = {}            # path -> 持有者线程 ident（重入短路）
+_THREAD_LOCKS = {}         # path -> threading.Lock（同进程互斥）
+_THREAD_LOCKS_GUARD = threading.Lock()
 LOCK_STALE_SEC = 60        # 锁文件超过这个年龄视为残留（进程被杀）
 LOCK_TIMEOUT_SEC = 3.0     # 临界区都在毫秒级；等 3s 足够，等 8s 只会在拥塞时放大停顿
+
+
+def _thread_lock_for(path):
+    """取（或建）path 对应的线程锁。建表操作本身用全局锁保护。"""
+    with _THREAD_LOCKS_GUARD:
+        lk = _THREAD_LOCKS.get(path)
+        if lk is None:
+            lk = threading.Lock()
+            _THREAD_LOCKS[path] = lk
+        return lk
 
 
 def _proc_alive(pid):
@@ -696,60 +712,77 @@ def _file_lock(path, timeout=LOCK_TIMEOUT_SEC, strict=False):
     if _LOCK_HELD.get(path) == me:  # 同线程重入：直接放行（避免自锁）
         yield
         return
+    # 第一层：同进程线程互斥（零 I/O，O(1)，不会因 Windows fsync 排队）
+    tlock = _thread_lock_for(path)
+    if not tlock.acquire(timeout=timeout):
+        if strict:
+            raise LockTimeout("线程锁等待超时（%s）" % os.path.basename(path))
+        print("WARN: 线程锁等待超时，跳过加锁（%s）" % os.path.basename(path), flush=True)
+        yield
+        return
+    # 第二层：跨进程文件锁（O_EXCL）
     lock = path + ".lock"
     end = time.time() + timeout
     fd = None
-    while True:
-        try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            # 锁里写持有者身份：只靠 mtime 会在 PID 复用/长任务时误判（A22）
-            try:
-                os.write(fd, json.dumps({
-                    "pid": os.getpid(),
-                    "process_start_time": _proc_start_time(os.getpid()),
-                    "created_at": time.time(),
-                    "thread": me,
-                    "path": os.path.basename(path),
-                }).encode("utf-8"))
-            except OSError:
-                pass
-            break
-        except FileExistsError:
-            try:
-                if _lock_holder_stale(lock):
-                    os.remove(lock)  # 干掉残留锁（已确认持有者不在）
-                    continue
-            except OSError:
-                pass
-            if time.time() >= end:
-                if strict:
-                    raise LockTimeout("锁等待超时（%s）" % os.path.basename(path))
-                print("WARN: 状态文件锁等待超时，跳过加锁（%s）" % os.path.basename(path), flush=True)
-                break
-            time.sleep(0.1)
-        except OSError as e:
-            if strict:
-                raise LockTimeout("加锁失败（%s）：%s" % (os.path.basename(path), e))
-            print("WARN: 状态文件加锁失败（%s）：%s" % (os.path.basename(path), e), flush=True)
-            break
-    _LOCK_HELD[path] = me
     try:
-        yield
+        while True:
+            try:
+                fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                # 锁里写持有者身份：只靠 mtime 会在 PID 复用/长任务时误判（A22）
+                try:
+                    os.write(fd, json.dumps({
+                        "pid": os.getpid(),
+                        "process_start_time": _proc_start_time(os.getpid()),
+                        "created_at": time.time(),
+                        "thread": me,
+                        "path": os.path.basename(path),
+                    }).encode("utf-8"))
+                except OSError:
+                    pass
+                break
+            except FileExistsError:
+                try:
+                    if _lock_holder_stale(lock):
+                        os.remove(lock)  # 干掉残留锁（已确认持有者不在）
+                        continue
+                except OSError:
+                    pass
+                if time.time() >= end:
+                    if strict:
+                        raise LockTimeout("文件锁等待超时（%s）" % os.path.basename(path))
+                    print("WARN: 状态文件锁等待超时，跳过加锁（%s）" % os.path.basename(path), flush=True)
+                    break
+                time.sleep(0.01)   # 10ms 轮询：高频读-改-写时 100ms 会错过释放窗口
+            except OSError as e:
+                if strict:
+                    raise LockTimeout("加锁失败（%s）：%s" % (os.path.basename(path), e))
+                print("WARN: 状态文件加锁失败（%s）：%s" % (os.path.basename(path), e), flush=True)
+                break
+        _LOCK_HELD[path] = me
+        try:
+            yield
+        finally:
+            _LOCK_HELD.pop(path, None)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    os.remove(lock)
+                except OSError:
+                    pass
     finally:
-        _LOCK_HELD.pop(path, None)
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            try:
-                os.remove(lock)
-            except OSError:
-                pass
+        tlock.release()
 
 
-def _save_json(path, data):
-    with _file_lock(path):
+def _save_json(path, data, timeout=LOCK_TIMEOUT_SEC):
+    """锁内原子写。抢不到锁绝不无锁写（strict=True，对齐 B8/B15 fail-closed 口径）。
+
+    超时抛 LockTimeout——调用方必须把 LockTimeout 当「本次写入未落盘」处理。
+    不做重试：写入是单步操作，调用方有 _update_json 的重试兜底；独立调用方自行决定重试。
+    """
+    with _file_lock(path, timeout=timeout, strict=True):
         _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2))
 
 
@@ -1178,14 +1211,28 @@ def release_slot(slot_path, run_id=None):
         return False
 
 
-def _update_json(path, mutate, default):
-    """锁内读-改-写，杜绝并发丢更新。mutate(data) 就地修改，返回 False 表示无需落盘。"""
-    with _file_lock(path):
-        data = _load_json(path, default)
-        if mutate(data) is False:
-            return data
-        _save_json(path, data)
-        return data
+def _update_json(path, mutate, default, timeout=LOCK_TIMEOUT_SEC, retries=3):
+    """锁内读-改-写，杜绝并发丢更新。mutate(data) 就地修改，返回 False 表示无需落盘。
+
+    抢不到锁时绝不无锁进临界区（strict=True，对齐 B8/B15 fail-closed 口径）：
+    非 strict 超时后「跳过加锁继续跑」会让多个线程同时读-改-写，互相覆盖 = 丢更新。
+    短暂重试后仍失败才抛 LockTimeout——调用方必须把 LockTimeout 当「本轮状态未更新」处理。
+    mutate 被设计为幂等（每次对全新加载的 data 调用），重试安全。
+    落盘直接用 _atomic_write（不再嵌套 _save_json 的 _file_lock）——临界区已持锁。
+    """
+    last = None
+    for _ in range(retries):
+        try:
+            with _file_lock(path, timeout=timeout, strict=True):
+                data = _load_json(path, default)
+                if mutate(data) is False:
+                    return data
+                _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2))
+                return data
+        except LockTimeout as e:
+            last = e
+            time.sleep(0.05)
+    raise last
 
 
 def _normalize_rotation(st):
@@ -1220,13 +1267,20 @@ def mutate_rotation(fn):
         st["updated"] = _now()
         out.update(st)
 
-    _update_json(ROTATION_FILE, mutate, {})
+    try:
+        _update_json(ROTATION_FILE, mutate, {})
+    except LockTimeout as e:
+        # 锁超时 = 本轮状态未更新；返回 out（空或部分），调用方拿到的就是「没改上」的信号
+        print("WARN: 轮转状态更新失败（锁超时，本轮状态未变更）：%s" % e, flush=True)
     return _normalize_rotation(out)
 
 
 def save_rotation(st):
     st["updated"] = _now()
-    _save_json(ROTATION_FILE, st)
+    try:
+        _save_json(ROTATION_FILE, st)
+    except LockTimeout as e:
+        print("WARN: 轮转状态保存失败（锁超时，本次写入未落盘）：%s" % e, flush=True)
 
 
 def mark_unavailable(st, account, reason, ttl=None):
@@ -1303,7 +1357,10 @@ def record_conv(conv_id, account, prompt_file):
             for k in sorted(data, key=lambda x: (data[x] or {}).get("ts") or "")[:len(data) - 500]:
                 data.pop(k, None)
 
-    _update_json(CONV_MAP_FILE, mutate, {})
+    try:
+        _update_json(CONV_MAP_FILE, mutate, {})
+    except LockTimeout as e:
+        print("WARN: 会话归属登记失败（锁超时，本次未写入）：%s" % e, flush=True)
 
 
 def conv_owner(conv_id):
@@ -1320,7 +1377,10 @@ def load_anon_sessions():
 
 def save_anon_sessions(data):
     data["updated"] = _now()
-    _save_json(ANON_SESSIONS_FILE, data)
+    try:
+        _save_json(ANON_SESSIONS_FILE, data)
+    except LockTimeout as e:
+        print("WARN: 匿名会话保存失败（锁超时，本次写入未落盘）：%s" % e, flush=True)
 
 
 def record_anon_session(conv_id, tab=None, prompt="", reply="", device=""):
@@ -1351,7 +1411,10 @@ def record_anon_session(conv_id, tab=None, prompt="", reply="", device=""):
         s["status"] = "live" if tab else s.get("status", "archived")
         out.update(s)
 
-    _update_json(ANON_SESSIONS_FILE, mutate, {"sessions": {}})
+    try:
+        _update_json(ANON_SESSIONS_FILE, mutate, {"sessions": {}})
+    except LockTimeout as e:
+        print("WARN: 匿名会话登记失败（锁超时，本次未写入）：%s" % e, flush=True)
     return out
 
 
@@ -1369,7 +1432,10 @@ def mark_anon_archived(conv_id, reason=""):
         s["archived_reason"] = reason
         s["updated"] = _now()
 
-    _update_json(ANON_SESSIONS_FILE, mutate, {"sessions": {}})
+    try:
+        _update_json(ANON_SESSIONS_FILE, mutate, {"sessions": {}})
+    except LockTimeout as e:
+        print("WARN: 匿名会话归档失败（锁超时，本次未写入）：%s" % e, flush=True)
 
 
 # ---------- 匿名设备身份留存 ----------
@@ -2162,7 +2228,7 @@ class ChatGPTAPI:
             return False
         try:
             _save_json(os.path.join(self.base_dir, "cookies.json"), self.cookies)
-        except OSError:
+        except (OSError, LockTimeout):
             pass
         self.cookie = "; ".join(
             "%s=%s" % (c["name"], c["value"])

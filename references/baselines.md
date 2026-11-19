@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**十四轮对外对抗审查**逐条改写（每轮裁定见 §F；**第十四轮 `PASS`**，第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 163 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**十四轮对外对抗审查**逐条改写（每轮裁定见 §F；**第十四轮 `PASS`**，第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**当前 171 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -34,7 +34,7 @@
 | 2 | 这个会话归谁 | `--owner <conv_id>` | 输出唯一账号 |
 | 3 | 配额有没有冷却 | `--rotation` | `unavailable` 为空或目标账号不在其中 |
 | 4 | 匿名要用先看设备 | `--anon-devices` | 目标设备 `jar=true` |
-| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 163 条） |
+| 5 | 改代码了吗 | `python -m unittest discover -s tests` | 全绿（当前 171 条） |
 
 ### A1–A4 内容主权（不可协商）
 
@@ -224,11 +224,12 @@
 
 **B8/B15 实现**：`acquire_slot()` / `release_slot()` 在同一把跨进程锁内完成「回收死槽 + 计数 + 占位」，返回 `(slot_path, run_id)`，满员返回 `(None, run_id)` 由调用方记 `QUEUED`；`lease_acquire/heartbeat/release/reclaim` + `_lease_reclaimable()` 覆盖 `lease_valid / process_gone / pid_reused / identity_unreadable / run_id_mismatch / alive` 六种回收判定。回归含 6 进程同时抢槽（断言有效槽位 ≤3 且互不重叠）与租约六态。超时分两档（B15 硬要求）：执行体响应 cancel 且确实停下 → `TIMEOUT` 并释放租约；**执行体不响应取消、仍在跑 → `TIMEOUT_ORPHAN` 且保留租约**（此时释放租约等于放第二个实例进来，双跑比僵尸更危险）。心跳与超时由 `lease_run()` 落地：`HEARTBEAT_SEC=15`、`LEASE_SEC=60`、`RUN_MAX_SEC=3600` 三个常量可注入，回归用**按比例缩小的秒数**（如 lease 0.4s / heartbeat 0.1s / max 0.2s）验证同一套逻辑——证明「运行超过租约时心跳确实续期、不会被判过期」以及「超 `RUN_MAX_SEC` 时，执行体已停 → `TIMEOUT` + 释放租约，执行体不停 → `TIMEOUT_ORPHAN` + 保留租约」，不需要真等 15 分钟和 1 小时。
 
-**B8 三条补充口径（v1.8，由真实超发事故倒推）**：
+**B8 五条补充口径（v1.8，由真实超发事故倒推）**：
 
 1. **抢不到锁 = 不启动**。`_file_lock(..., strict=True)` 超时抛 `LockTimeout`，`acquire_slot` 捕获后按 `QUEUED` 返回 `(None, run_id)`。旧版超时后打印 WARN 就「跳过加锁继续跑」，6 进程抢槽实测出现过 **6 个槽位同时被占**——并发上限这种硬约束上，「WARN 不等于阻断」是致命的。
 2. **空/半截槽位 5s 内不得当死槽**。槽位是「先 `O_EXCL` 占名、再写内容」，读的人必然能读到半截 JSON；5s 内一律视作活槽。
-3. **B15-R 损坏租约恢复闸口**（第十轮审查要求，已落地）。租约读不懂就永不自动回收，会带来「永久占位」；解法不是加 TTL，而是留一条**需人批准且留痕**的通道 `lease_force_release(path, approval_path)`：
+3. **同进程多线程互斥用 `threading.Lock`，文件锁只管跨进程**（v1.8 补）。纯文件锁（`O_EXCL` + fsync + `os.remove`）在 Windows 上高竞争下极慢：4 线程 × 20 次读-改-写能把 strict 3s 超时全部吃满（实测死锁级挂起）。解法是加一层 per-path `threading.Lock`（`_thread_lock_for`），同进程线程先拿线程锁再拿文件锁；线程锁零 I/O、O(1)，天然不会因磁盘排队。文件锁仍保留，兜跨进程场景。`_update_json` 的落盘直接用 `_atomic_write`（不再嵌套 `_save_json` 的 `_file_lock`），消除嵌套锁开销。回归：`test_thread_lock_serialises_same_process`（同路径返回同一把锁且互斥）、`test_strict_update_raises_locktimeout_not_silent`、`test_strict_save_raises_locktimeout_not_silent`（strict 超时抛 `LockTimeout` 不静默写）。
+4. **B15-R 损坏租约恢复闸口**（第十轮审查要求，已落地）。租约读不懂就永不自动回收，会带来「永久占位」；解法不是加 TTL，而是留一条**需人批准且留痕**的通道 `lease_force_release(path, approval_path)`：
 
 | 步骤 | 落地 |
 |---|---|
@@ -243,7 +244,7 @@
 **返回值是稳定枚举，不是错误消息**（第十三轮审查 F-01）：`reason` 只能是 `FORCE_RELEASE_REASONS` 之一——`absent / no_approval / approval_incomplete / unreadable / sha256_mismatch / process_alive / identity_unconfirmed / audit_registration_failed / quarantine_failed / lock_timeout / quarantined`。**禁止把异常文本拼进 reason**（原实现写过 `unreadable:%s`、`quarantine_failed:%s`、`quarantine_failed:path_still_present`）：调用方没法用等值比较分流，且换个 Python 版本错误消息一变、判定跟着变，等于把实现细节泄进对外契约。异常细节走 `_diag()` 打 WARN 日志。批准通过但隔离失败时，另补一条 `lease-recovery-failed` 行——否则审计上只看到 `approved_recovery`，看不到恢复其实没落地，等于谎报一次已完成的恢复。
 
 **为什么不能只看 PID**：原执行体可能已派生子进程，或副作用已提交但未持久化确认；因此 R5 是人工步骤，脚本只负责「不让你在没有记录的情况下悄悄放行」。回归：`test_corrupt_lease_needs_approval_to_release`、`test_process_alive_blocks_force_release`、`test_corrupt_slot_is_registered`、`test_force_release_reason_is_stable_enum`、`test_force_release_unreadable_hash_is_stable`、`test_quarantine_failure_is_stable`、`test_rejected_recovery_leaves_no_audit_row_for_hash_and_identity`。
-4. **瞬时文件禁止用 `_load_json` 读**。`_load_json` 会把「解析失败的非空文件」隔离改名（A21 对长期状态文件是对的），但用在槽位上等于**把别人刚占的槽位挪走**，文件名一空出来第二个进程立刻能占——这是超发的真正根因。瞬时文件走 `_read_ephemeral()`：读不懂就当它还在，不回收也不改名。租约同理：不可读 → 按占用处理，禁止回收。
+5. **瞬时文件禁止用 `_load_json` 读**。`_load_json` 会把「解析失败的非空文件」隔离改名（A21 对长期状态文件是对的），但用在槽位上等于**把别人刚占的槽位挪走**，文件名一空出来第二个进程立刻能占——这是超发的真正根因。瞬时文件走 `_read_ephemeral()`：读不懂就当它还在，不回收也不改名。租约同理：不可读 → 按占用处理，禁止回收。
 
 > **B14/B15 编号说明**：v1.0 的 B14 是联动红线（无独立判定口径），审查据此判「B14 缺失」。v1.1 保留 B14 为红线表，把审查提出的「运行实例租约」独立为 **B15**——两类约束不同（红线是跨类禁令，B15 是调度器级生命周期），不合并。
 
@@ -333,7 +334,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | automation 名称 / 排程 | 同上 + `--check-name`、`--check-schedule`、`--check-oneshot` | B1/B4/B5/B10/B11 |
 | 排程口径 | `automation_update list` 全量盘点 | B1–B5 |
 
-**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 163 条。
+**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix` 校验，新增条款不补证据会直接红。当前 171 条。
 
 ---
 
