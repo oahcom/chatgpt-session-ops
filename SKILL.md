@@ -197,6 +197,22 @@ The approved expected post-registration registry count is 1180, calculated as 49
 
 The previous 685 expectation and `549/116/10/8` distribution must not be reused.
 
+##### Fail-closed behavior: incomplete account enumeration
+
+When `--list-all` encounters HTTP 401 or `token_revoked` for any account:
+
+- `complete` MUST be false.
+- That account's enumeration status MUST be `failed`.
+- The eligible candidate set MUST be cleared.
+- No partial candidate may be treated as a complete enumeration.
+- This is expected fail-closed behavior, not an implementation failure.
+
+The operator must not read a partial enumeration as a complete account inventory, and must not relax fail-closed in order to let the remaining accounts proceed.
+
+Credential renewal after a server-side OAuth revocation (`token_revoked`) requires the user to re-authenticate in a browser and re-export `access_token.txt` / `cookies.json`. There is no non-interactive path; do not retry, rotate proxy, or edit the token file.
+
+Consequence for the registry: an account stuck at `failed` keeps its last-known records and its visible conversations stay unverified. Report it as `BLOCKED_CREDENTIAL_RENEWAL` and do not count the unverified remainder as either complete or zero.
+
 自动走完整链路：live tail（GET 429 时缓存 tail 兜底）→ requirements + PoW → POST（**必带 conversation_id**）→ **校验落点会话一致**（取 SSE **首个带 id 的** `data:` 事件；落点不一致 → **判失败**，回复写入 `quarantine/` 隔离档案（**完整原始响应**另存并记 sha256）并返回 target/actual 两个 id，实际落点会话另记待认领登记，不静默改归属）→ SSE 收割 → 落盘 `replies/reply-*.md`。
 
 ### 2. 开全新会话（Owner 裁决模式，登录态优先）
@@ -399,6 +415,7 @@ python scripts/chatgpt_send.py --proxy-clear                # 清掉 proxy.json 
 - `baselines.md` — **A/B 类基线（可判定版 v1.8，49 条）**：每条带判定口径与违例后果，附 C 类现成配方（每小时巡检、落盘看门狗、到期处置、配额哨兵）、D 类事故→条款映射、E 类变更纪律、G 类证据矩阵说明。**开工前扫 A0/B0 清单，排程前读 B1–B15，改代码前读对应条款。**
 - `evidence-matrix.md` — **逐条对账「这条基线由什么证明」**：`test:` 用例名 / `code:` 符号 / `live:` 实测日期 / `human:` 人判理由，四类分开标注；33 条有离线用例、3 条只有代码、13 条纯人判，缺口按危害排序列在文末。改基线必须同步这张表——`TestEvidenceMatrix` 会校验引用是否真实存在。
 - `api-protocol.md` — 实测协议细节：端点、PoW 算法、POST 请求体全字段、SSE 解析、mapping tail 计算、状态码处置、限速纪律。改脚本前先读。
+- `INCIDENT-2026-11-20-CONVERSATION-REGISTRY-LOSS-AND-RECOVERY.md` — **事故记录**：旧 500 条裁剪器删掉 387 条归属记录 → 并集最小动作恢复 904。含时间切面、并发写入者、证据 SHA-256 清单、`restore_conv_map_minimal()` vs `register_conversations_batch()` 的职责边界，以及「不得宣称四账号已收敛 / 不得宣称批量登记已生产验证」的禁止结论。
 
 ### tests/
 
