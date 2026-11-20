@@ -2415,6 +2415,19 @@ def record_conv(conv_id, account, prompt_file):
                     )
                     return False
 
+                owner = existing_metadata.get("owner")
+                if validate_account_identity(owner):
+                    if (
+                        normalize_account_identity(owner)
+                        != normalize_account_identity(existing_account)
+                    ):
+                        print(
+                            "WARN: 会话归属 owner/account 冲突，拒绝覆盖：%s"
+                            % conv_id,
+                            flush=True,
+                        )
+                        return False
+
                 if (
                     normalize_account_identity(existing_account)
                     != account_identity
@@ -5405,6 +5418,223 @@ def rotation_summary():
     }
 
 
+def reconcile_conversation_ownership(
+    enumeration_results,
+    registry_snapshot,
+    configured_accounts,
+):
+    """Compare complete per-account observations with a registry snapshot.
+
+    enumeration_results maps account names to:
+        {"status": int, "error": str, "items": list, "state": str}
+
+    state is "complete", "failed", or "not_attempted".
+    A successful result requires status == 200 and an empty error.
+    This function is pure: it does not read or write files.
+    """
+    configured = tuple(configured_accounts)
+    registry = (
+        registry_snapshot
+        if isinstance(registry_snapshot, dict)
+        else {}
+    )
+
+    enumeration = {}
+    all_complete = True
+    observations = {}
+    invalid_ids = 0
+
+    for account in configured:
+        result = enumeration_results.get(account)
+        if not isinstance(result, dict):
+            result = {
+                "status": None,
+                "error": "account was not enumerated",
+                "items": [],
+                "state": "not_attempted",
+            }
+
+        status = result.get("status")
+        error = result.get("error") or ""
+        state = result.get("state") or (
+            "complete" if status == 200 and not error else "failed"
+        )
+        successful = (
+            state == "complete"
+            and status == 200
+            and not error
+        )
+
+        enumeration[account] = {
+            "state": "complete" if successful else state,
+            "status": status,
+            "error": error,
+        }
+
+        if not successful:
+            all_complete = False
+            continue
+
+        items = result.get("items")
+        if not isinstance(items, list):
+            enumeration[account]["state"] = "failed"
+            enumeration[account]["error"] = (
+                "invalid internal item collection"
+            )
+            all_complete = False
+            continue
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            raw_id = item.get("id")
+            try:
+                conv_id = safe_id(raw_id, "conversation id")
+            except (TypeError, ValueError):
+                invalid_ids += 1
+                continue
+
+            if conv_id != raw_id:
+                invalid_ids += 1
+                continue
+
+            observations.setdefault(conv_id, set()).add(account)
+
+    duplicates = []
+    observed_not_registered = []
+    registered_not_observed = []
+    registry_conflicts = []
+    eligible_registrations = []
+
+    for conv_id, accounts in sorted(observations.items()):
+        observed_accounts = sorted(accounts)
+
+        if len(observed_accounts) > 1:
+            duplicates.append({
+                "id": conv_id,
+                "accounts": observed_accounts,
+                "status": "duplicate_observation",
+            })
+            continue
+
+        observed_account = observed_accounts[0]
+        existing = registry.get(conv_id)
+
+        if conv_id not in registry:
+            observed_not_registered.append({
+                "id": conv_id,
+                "account": observed_account,
+            })
+            if (
+                observed_account in configured
+                and observed_account != "nologin"
+            ):
+                eligible_registrations.append({
+                    "id": conv_id,
+                    "account": observed_account,
+                })
+            continue
+
+        if not isinstance(existing, dict):
+            registry_conflicts.append({
+                "id": conv_id,
+                "observed_accounts": observed_accounts,
+                "registry_account": None,
+                "reason": (
+                    "existing registry record is not a canonical dictionary"
+                ),
+            })
+            continue
+
+        registry_account = existing.get("account")
+        if not validate_account_identity(registry_account):
+            registry_conflicts.append({
+                "id": conv_id,
+                "observed_accounts": observed_accounts,
+                "registry_account": None,
+                "reason": "existing registry account is invalid",
+            })
+            continue
+
+        try:
+            registry_canonical = normalize_account_identity(
+                registry_account
+            )
+            observed_canonical = normalize_account_identity(
+                observed_account
+            )
+        except (TypeError, ValueError):
+            registry_conflicts.append({
+                "id": conv_id,
+                "observed_accounts": observed_accounts,
+                "registry_account": registry_account,
+                "reason": "account identity normalization failed",
+            })
+            continue
+
+        owner = existing.get("owner")
+        if validate_account_identity(owner):
+            try:
+                owner_canonical = normalize_account_identity(owner)
+            except (TypeError, ValueError):
+                owner_canonical = None
+
+            if (
+                owner_canonical is not None
+                and owner_canonical != registry_canonical
+            ):
+                registry_conflicts.append({
+                    "id": conv_id,
+                    "observed_accounts": observed_accounts,
+                    "registry_account": registry_account,
+                    "reason": (
+                        "registry owner disagrees with registry account"
+                    ),
+                })
+                continue
+
+        if registry_canonical != observed_canonical:
+            registry_conflicts.append({
+                "id": conv_id,
+                "observed_accounts": observed_accounts,
+                "registry_account": registry_account,
+                "reason": (
+                    "observed account disagrees with registered owner"
+                ),
+            })
+
+    observed_ids = set(observations)
+
+    for conv_id, record in registry.items():
+        if conv_id in observed_ids:
+            continue
+
+        registered_not_observed.append({
+            "id": conv_id,
+            "account": (
+                record.get("account")
+                if isinstance(record, dict)
+                else None
+            ),
+        })
+
+    if not all_complete:
+        eligible_registrations = []
+
+    return {
+        "complete": all_complete,
+        "enumeration": enumeration,
+        "eligible_registrations": eligible_registrations,
+        "registered": [],
+        "registered_not_observed": registered_not_observed,
+        "observed_not_registered": observed_not_registered,
+        "duplicates": duplicates,
+        "registry_conflicts": registry_conflicts,
+        "invalid_ids": invalid_ids,
+    }
+
+
 def main():
     args = sys.argv[1:]
     thinking_flag = "--thinking" in args
@@ -5762,35 +5992,241 @@ def main():
         return 0 if status == 200 else 1
     # ---- 会话清单 ----
     if args and args[0] == "--list-all":
+        allowed_flags = {"--apply", "--include-nologin"}
+        supplied_flags = set(args[1:])
+
+        if (
+            len(supplied_flags) != len(args[1:])
+            or not supplied_flags.issubset(allowed_flags)
+        ):
+            print(
+                "usage: --list-all [--apply] [--include-nologin]",
+                flush=True,
+            )
+            return 2
+
+        apply_changes = "--apply" in supplied_flags
+        include_nologin = "--include-nologin" in supplied_flags
+
+        configured_accounts = ["acct1", "acct2", "acct3", "acct4"]
+        if include_nologin:
+            configured_accounts.append("nologin")
+
         combined = []
         errors = []
         quota = {}
-        for name in ("acct1", "acct2", "acct3", "acct4", "nologin"):
+        enumeration_results = {}
+        stopped_by_rate_limit = False
+
+        for name in configured_accounts:
+            if stopped_by_rate_limit:
+                enumeration_results[name] = {
+                    "status": None,
+                    "error": (
+                        "not attempted after an earlier account "
+                        "returned HTTP 429"
+                    ),
+                    "items": [],
+                    "state": "not_attempted",
+                }
+                continue
+
             try:
                 api = ChatGPTAPI(account=name)
             except (OSError, json.JSONDecodeError) as e:
-                if name != "nologin":
-                    errors.append("%s: credentials unavailable (%s)" % (name, e))
-                    continue
-                raise
-            items, status, error = api.list_conversations()
-            combined.extend(items)
+                if name == "nologin":
+                    raise
+
+                message = "credentials unavailable (%s)" % e
+                errors.append("%s: %s" % (name, message))
+                enumeration_results[name] = {
+                    "status": None,
+                    "error": message,
+                    "items": [],
+                    "state": "failed",
+                }
+                continue
+
+            try:
+                items, status, error = api.list_conversations()
+            except (OSError, json.JSONDecodeError) as e:
+                message = "enumeration failed (%s)" % e
+                errors.append("%s: %s" % (name, message))
+                enumeration_results[name] = {
+                    "status": None,
+                    "error": message,
+                    "items": [],
+                    "state": "failed",
+                }
+                continue
+
+            error = error or ""
+            successful = status == 200 and not error
+            safe_items = items if isinstance(items, list) else []
+
+            combined.extend(safe_items)
             quota[name] = api.quota
-            if status != 200 or error:
-                errors.append("%s: HTTP %s %s" % (name, status, error))
+
+            enumeration_results[name] = {
+                "status": status,
+                "error": error,
+                "items": safe_items,
+                "state": "complete" if successful else "failed",
+            }
+
+            if not successful:
+                errors.append(
+                    "%s: HTTP %s %s" % (name, status, error)
+                )
                 if status == 429:
-                    break
+                    stopped_by_rate_limit = True
+
+        registry_snapshot = None
+        registry_read_failed = False
+
+        try:
+            with _file_lock(
+                CONV_MAP_FILE,
+                timeout=LOCK_TIMEOUT_SEC,
+                strict=True,
+            ):
+                registry_snapshot = _read_conv_map_for_migration()
+        except (OSError, ValueError, LockTimeout) as e:
+            registry_read_failed = True
+            errors.append(
+                "registry: unable to read registry (%s)" % e
+            )
+
+        if not registry_read_failed and not isinstance(
+            registry_snapshot, dict
+        ):
+            registry_read_failed = True
+            errors.append("registry: invalid registry structure")
+
+        reconciliation = reconcile_conversation_ownership(
+            enumeration_results,
+            registry_snapshot if not registry_read_failed else {},
+            configured_accounts,
+        )
+
+        if registry_read_failed:
+            reconciliation["complete"] = False
+            reconciliation["eligible_registrations"] = []
+
+        if (
+            apply_changes
+            and reconciliation["complete"]
+            and not registry_read_failed
+        ):
+            registrations = list(
+                reconciliation["eligible_registrations"]
+            )
+
+            for registration in registrations:
+                record_conv(
+                    registration["id"],
+                    registration["account"],
+                    None,
+                )
+
+            # record_conv() owns locking, conflict protection and pruning.
+            # Its return value cannot establish whether a write succeeded.
+            # Verify the actual final registry under the same read protocol.
+            try:
+                with _file_lock(
+                    CONV_MAP_FILE,
+                    timeout=LOCK_TIMEOUT_SEC,
+                    strict=True,
+                ):
+                    final_registry = _read_conv_map_for_migration()
+
+                if not isinstance(final_registry, dict):
+                    raise ValueError(
+                        "conversation registry must be a dictionary"
+                    )
+
+                registered_now = []
+
+                for registration in registrations:
+                    conv_id = registration["id"]
+                    expected_account = registration["account"]
+                    record = final_registry.get(conv_id)
+
+                    if not isinstance(record, dict):
+                        continue
+
+                    actual_account = record.get("account")
+                    if not validate_account_identity(actual_account):
+                        continue
+
+                    try:
+                        actual_canonical = normalize_account_identity(
+                            actual_account
+                        )
+                        expected_canonical = normalize_account_identity(
+                            expected_account
+                        )
+                    except (TypeError, ValueError):
+                        continue
+
+                    if actual_canonical == expected_canonical:
+                        registered_now.append({
+                            "id": conv_id,
+                            "account": actual_account,
+                        })
+
+                reconciliation["registered"] = registered_now
+
+            except (OSError, ValueError, LockTimeout) as e:
+                errors.append(
+                    "registry: post-write verification failed (%s)" % e
+                )
+                reconciliation["registered"] = []
+
         by_account = {}
-        for c in combined:
-            by_account.setdefault(c["account"], []).append(c)
-        summary = {k: len(v) for k, v in by_account.items()}
-        print(json.dumps({
+        for conversation in combined:
+            if (
+                isinstance(conversation, dict)
+                and isinstance(conversation.get("account"), str)
+            ):
+                by_account.setdefault(
+                    conversation["account"], []
+                ).append(conversation)
+
+        summary = {
+            key: len(value)
+            for key, value in by_account.items()
+        }
+
+        output = {
             "conversations": combined,
             "by_account": by_account,
             "summary": summary,
             "quota": quota,
             "errors": errors,
-        }, ensure_ascii=False, indent=2))
+            "enumeration": reconciliation["enumeration"],
+            "reconciliation": {
+                "complete": reconciliation["complete"],
+                "apply_requested": apply_changes,
+                "registered": reconciliation["registered"],
+                "eligible_registrations": (
+                    reconciliation["eligible_registrations"]
+                ),
+                "registered_not_observed": (
+                    reconciliation["registered_not_observed"]
+                ),
+                "observed_not_registered": (
+                    reconciliation["observed_not_registered"]
+                ),
+                "duplicates": reconciliation["duplicates"],
+                "registry_conflicts": (
+                    reconciliation["registry_conflicts"]
+                ),
+                "invalid_ids": reconciliation["invalid_ids"],
+            },
+        }
+
+        print(json.dumps(output, ensure_ascii=False, indent=2))
         return 1 if errors else 0
     if not args:
         print(__doc__)
