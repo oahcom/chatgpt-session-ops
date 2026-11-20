@@ -2218,24 +2218,256 @@ def anon_fallback_ready(st, outcomes):
     return anon_fallback_block_reason(st, outcomes) is None
 
 
+def atomic_write_conv_map(data, lock_held=False):
+    """
+    Persist the conversation registry atomically.
+
+    Normal callers use _save_json(), which acquires the cross-process lock.
+    Migration may pass lock_held=True after acquiring _file_lock itself.
+
+    Never perform an unlocked write.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("conversation registry must be a dictionary")
+
+    if lock_held:
+        _atomic_write(CONV_MAP_FILE, json.dumps(data, ensure_ascii=False, indent=2))
+    else:
+        _save_json(CONV_MAP_FILE, data)
+
+
+def _read_conv_map_for_migration():
+    """
+    Read the registry while its cross-process lock is held.
+
+    Unlike the general-purpose _load_json(), this function refuses to
+    replace a malformed registry with an empty dictionary.
+
+    A corrupt source is preserved for operator diagnosis.
+    """
+    try:
+        with open(CONV_MAP_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+
+    if not isinstance(data, dict):
+        raise ValueError("conversation registry root must be an object")
+
+    return data
+
+
+def _normalize_conv_registry_record(conv_id, raw):
+    """
+    Return (normalized_record, diagnostic).
+
+    Invalid entries are preserved by the caller.
+    Valid dictionary metadata is preserved without interpretation.
+    """
+    try:
+        validated_id = safe_id(conv_id, "conversation id")
+    except (TypeError, ValueError) as exc:
+        return None, "invalid conversation id: %s" % exc
+
+    if validated_id != conv_id:
+        return None, "conversation id requires normalization"
+
+    if isinstance(raw, str):
+        if not validate_account_identity(raw):
+            return None, "invalid legacy account identity"
+
+        return {
+            "account": raw,
+            "prompt": None,
+            "ts": None,
+        }, None
+
+    if not isinstance(raw, dict):
+        return None, "record must be an object or legacy account string"
+
+    account = raw.get("account")
+
+    if not validate_account_identity(account):
+        return None, "invalid or missing account identity"
+
+    # Preserve every existing field, including note and free-form owner.
+    # Missing ts is historical absence, not a reason to invent a timestamp.
+    return dict(raw), None
+
+
+def migrate_conv_accounts():
+    """
+    Convert valid legacy string records into canonical dictionary records.
+
+    Safety:
+    - Acquires the existing cross-process lock.
+    - Reads the latest registry inside the lock.
+    - Preserves malformed records and reports diagnostics.
+    - Preserves all valid existing dictionary metadata.
+    - Writes only when an actual conversion is required.
+    - Uses atomic replacement.
+    - Is idempotent.
+
+    Returns a bounded summary dictionary.
+    """
+    summary = {
+        "status": "ok",
+        "total": 0,
+        "migrated": 0,
+        "unchanged": 0,
+        "invalid": [],
+        "changed": False,
+    }
+
+    with _file_lock(CONV_MAP_FILE, timeout=LOCK_TIMEOUT_SEC, strict=True):
+        data = _read_conv_map_for_migration()
+        summary["total"] = len(data)
+
+        normalized = dict(data)
+        changed = False
+
+        for conv_id, raw in data.items():
+            record, diagnostic = _normalize_conv_registry_record(
+                conv_id, raw
+            )
+
+            if diagnostic is not None:
+                summary["invalid"].append({
+                    "conv_id": str(conv_id)[:80],
+                    "reason": diagnostic,
+                })
+                summary["unchanged"] += 1
+                continue
+
+            if isinstance(raw, str):
+                normalized[conv_id] = record
+                summary["migrated"] += 1
+                changed = True
+            else:
+                summary["unchanged"] += 1
+
+        if changed:
+            atomic_write_conv_map(normalized, lock_held=True)
+
+        summary["changed"] = changed
+
+    return summary
+
+
 def record_conv(conv_id, account, prompt_file):
+    """
+    Register a successfully created/used conversation.
+
+    Ownership cannot be silently transferred to a different account.
+    Existing unrelated metadata is preserved.
+    """
     if not conv_id:
         return
-    if not _ID_RE.match(conv_id):  # 外部传入的 id 先过校验再进状态表，避免污染/穿越
-        print("WARN: 拒绝登记非法 conv_id：%r" % (conv_id,), flush=True)
-        return
-
-    def mutate(data):
-        data[conv_id] = {"account": account, "prompt": prompt_file, "ts": _now()}
-        if len(data) > 500:  # 只保留最近 500 条
-            # F-34：条目值可能是损坏的非 dict（手改/旧版写坏），排序键必须收敛
-            for k in sorted(data, key=lambda x: _as_dict(data[x]).get("ts") or "")[:len(data) - 500]:
-                data.pop(k, None)
 
     try:
+        conv_id = safe_id(conv_id, "conversation id")
+    except (TypeError, ValueError) as exc:
+        print(
+            "WARN: 拒绝登记非法 conv_id：%r (%s)" % (conv_id, exc),
+            flush=True,
+        )
+        return
+
+    if not validate_account_identity(account):
+        print(
+            "WARN: 拒绝登记非法 account identity：%r" % (account,),
+            flush=True,
+        )
+        return
+
+    try:
+        account_identity = normalize_account_identity(account)
+
+        def mutate(data):
+            if not isinstance(data, dict):
+                raise ValueError("conversation registry must be a dictionary")
+
+            exists = conv_id in data
+            existing = data.get(conv_id)
+
+            if exists:
+                if isinstance(existing, str):
+                    existing_account = existing
+                    existing_metadata = {
+                        "account": existing,
+                    }
+                elif isinstance(existing, dict):
+                    existing_account = existing.get("account")
+                    existing_metadata = dict(existing)
+                else:
+                    print(
+                        "WARN: 会话归属记录格式非法，拒绝覆盖：%s"
+                        % conv_id,
+                        flush=True,
+                    )
+                    return False
+
+                if not validate_account_identity(existing_account):
+                    print(
+                        "WARN: 会话归属记录身份非法，拒绝覆盖：%s"
+                        % conv_id,
+                        flush=True,
+                    )
+                    return False
+
+                if (
+                    normalize_account_identity(existing_account)
+                    != account_identity
+                ):
+                    print(
+                        "WARN: 会话归属冲突，拒绝覆盖：%s "
+                        "(registered=%s, requested=%s)"
+                        % (conv_id, existing_account, account),
+                        flush=True,
+                    )
+                    return False
+
+            else:
+                existing_metadata = None
+
+            if existing_metadata is None:
+                record = {
+                    "account": account,
+                    "prompt": prompt_file,
+                    "ts": _now(),
+                }
+            else:
+                # Keep the historical spelling of account (e.g. default)
+                # and preserve all unrelated metadata.
+                record = existing_metadata
+                record["prompt"] = prompt_file
+                record["ts"] = _now()
+
+            data[conv_id] = record
+
+            if len(data) > 500:
+                removable = sorted(
+                    (
+                        k for k in data
+                        if k != conv_id
+                    ),
+                    key=lambda k: (
+                        isinstance(data[k], str),
+                        _as_dict(data[k]).get("ts") or "",
+                    ),
+                )
+
+                for key in removable[:len(data) - 500]:
+                    data.pop(key, None)
+
         _update_json(CONV_MAP_FILE, mutate, {})
-    except LockTimeout as e:
-        print("WARN: 会话归属登记失败（锁超时，本次未写入）：%s" % e, flush=True)
+
+    except LockTimeout as exc:
+        print(
+            "WARN: 会话归属登记失败（锁超时，本次未写入）：%s"
+            % exc,
+            flush=True,
+        )
 
 
 _VALID_ACCOUNT_IDENTITIES = frozenset((
@@ -2272,39 +2504,42 @@ def validate_account_identity(account):
 
 
 def lookup_conversation_owner(conv_id):
-    """
-    Read and structurally validate one conversation ownership record.
+    """Resolve a conversation's stored account ownership.
 
-    Return:
-        {"status": "known", "account": <registered account>}
-        {"status": "unknown", "account": None}
-        {"status": "invalid", "account": None}
-        {"status": "conflict", "account": None}
+    Returns:
+        {"status": "known", "account": <account>} when ownership is valid.
+        {"status": "unknown", "account": None} when no record exists.
+        {"status": "invalid", "account": None} when the ID or record is invalid.
+        {"status": "conflict", "account": None} when account assertions disagree.
 
-    This function is read-only. It does not migrate or rewrite registry data.
+    Legacy bare-string records are invalid until migrate_conv_accounts()
+    converts them to canonical dictionary records. The optional "owner"
+    field is free-form metadata unless it exactly names a valid account
+    identity; in that case it is treated as a legacy account assertion.
     """
     try:
-        safe_id(conv_id, "conversation id")
+        conv_id = safe_id(conv_id, "conversation id")
     except (TypeError, ValueError):
         return {"status": "invalid", "account": None}
 
     try:
         with open(CONV_MAP_FILE, "r", encoding="utf-8") as f:
-            registry = json.load(f)
+            data = json.load(f)
     except FileNotFoundError:
         return {"status": "unknown", "account": None}
     except (OSError, UnicodeError, json.JSONDecodeError):
         return {"status": "invalid", "account": None}
 
-    if not isinstance(registry, dict):
+    if not isinstance(data, dict):
         return {"status": "invalid", "account": None}
 
-    if conv_id not in registry:
+    if conv_id not in data:
         return {"status": "unknown", "account": None}
 
-    record = registry[conv_id]
+    record = data[conv_id]
 
-    # Legacy bare-string records are deliberately not trusted as ownership.
+    # Legacy bare-string records are not trusted for routing.
+    # migrate_conv_accounts() is the only supported conversion path.
     if not isinstance(record, dict):
         return {"status": "invalid", "account": None}
 
@@ -2312,14 +2547,16 @@ def lookup_conversation_owner(conv_id):
     if not validate_account_identity(account):
         return {"status": "invalid", "account": None}
 
-    # Some historical records contain an additional "owner" field.
-    # If present, it must be a valid identity consistent with "account".
-    if "owner" in record:
-        owner = record.get("owner")
-        if not validate_account_identity(owner):
+    # "owner" is normally free-form run/instance metadata.
+    # For compatibility with the Stage 1 contract, recognize it as
+    # an account assertion only when it exactly names a valid identity.
+    owner = record.get("owner")
+    if validate_account_identity(owner):
+        try:
+            if normalize_account_identity(owner) != normalize_account_identity(account):
+                return {"status": "conflict", "account": None}
+        except (TypeError, ValueError):
             return {"status": "invalid", "account": None}
-        if normalize_account_identity(owner) != normalize_account_identity(account):
-            return {"status": "conflict", "account": None}
 
     return {"status": "known", "account": account}
 
