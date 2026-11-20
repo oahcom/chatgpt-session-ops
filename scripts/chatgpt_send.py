@@ -2458,21 +2458,6 @@ def record_conv(conv_id, account, prompt_file):
 
             data[conv_id] = record
 
-            if len(data) > 500:
-                removable = sorted(
-                    (
-                        k for k in data
-                        if k != conv_id
-                    ),
-                    key=lambda k: (
-                        isinstance(data[k], str),
-                        _as_dict(data[k]).get("ts") or "",
-                    ),
-                )
-
-                for key in removable[:len(data) - 500]:
-                    data.pop(key, None)
-
         _update_json(CONV_MAP_FILE, mutate, {})
 
     except LockTimeout as exc:
@@ -5505,6 +5490,7 @@ def reconcile_conversation_ownership(
     observed_not_registered = []
     registered_not_observed = []
     registry_conflicts = []
+    malformed_registry_records = []
     eligible_registrations = []
 
     for conv_id, accounts in sorted(observations.items()):
@@ -5610,13 +5596,47 @@ def reconcile_conversation_ownership(
         if conv_id in observed_ids:
             continue
 
+        if isinstance(record, str):
+            if not validate_account_identity(record):
+                malformed_registry_records.append({
+                    "id": conv_id,
+                    "reason": "legacy registry account identity is invalid",
+                })
+                continue
+
+            if record == "nologin":
+                continue
+
+            registered_not_observed.append({
+                "id": conv_id,
+                "account": record,
+            })
+            continue
+
+        if not isinstance(record, dict):
+            malformed_registry_records.append({
+                "id": conv_id,
+                "reason": (
+                    "registry record is neither a dictionary "
+                    "nor a legacy account string"
+                ),
+            })
+            continue
+
+        account = record.get("account")
+        if not validate_account_identity(account):
+            malformed_registry_records.append({
+                "id": conv_id,
+                "reason": "registry record account is missing or invalid",
+            })
+            continue
+
+        if account == "nologin":
+            continue
+
         registered_not_observed.append({
             "id": conv_id,
-            "account": (
-                record.get("account")
-                if isinstance(record, dict)
-                else None
-            ),
+            "account": account,
         })
 
     if not all_complete:
@@ -5631,6 +5651,7 @@ def reconcile_conversation_ownership(
         "observed_not_registered": observed_not_registered,
         "duplicates": duplicates,
         "registry_conflicts": registry_conflicts,
+        "malformed_registry_records": malformed_registry_records,
         "invalid_ids": invalid_ids,
     }
 
@@ -6221,6 +6242,9 @@ def main():
                 "duplicates": reconciliation["duplicates"],
                 "registry_conflicts": (
                     reconciliation["registry_conflicts"]
+                ),
+                "malformed_registry_records": (
+                    reconciliation["malformed_registry_records"]
                 ),
                 "invalid_ids": reconciliation["invalid_ids"],
             },

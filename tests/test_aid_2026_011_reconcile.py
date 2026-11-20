@@ -359,12 +359,28 @@ class AID2026011ReconcileTestCase(unittest.TestCase):
                 "prompt": None,
                 "ts": "2020-01-%02dT00:00:00" % (index % 28 + 1),
             }
-            for index in range(500)
+            for index in range(493)
         }
 
-        responses = make_responses({
-            "acct3": [{"id": "new-reconciliation-id"}],
-        })
+        items = {
+            "acct1": [
+                {"id": "bulk-acct1-%03d" % index}
+                for index in range(549)
+            ],
+            "acct2": [
+                {"id": "bulk-acct2-%03d" % index}
+                for index in range(116)
+            ],
+            "acct3": [
+                {"id": "bulk-acct3-%03d" % index}
+                for index in range(10)
+            ],
+            "acct4": [
+                {"id": "bulk-acct4-%03d" % index}
+                for index in range(8)
+            ],
+        }
+        responses = make_responses(items)
 
         original_bytes = self.write_registry(initial)
 
@@ -373,16 +389,10 @@ class AID2026011ReconcileTestCase(unittest.TestCase):
             responses,
         )
 
+        # Dry-run must leave the existing file byte-for-byte unchanged.
         self.assertEqual(self.registry_bytes(), original_bytes)
-        self.assertEqual(
-            json.loads(self.registry_bytes().decode("utf-8")),
-            initial,
-        )
 
-        # Restore the same initial snapshot before the apply invocation.
-        self.write_registry(initial)
-
-        _, output, _ = self.run_main(
+        self.run_main(
             ["--list-all", "--apply"],
             responses,
         )
@@ -390,16 +400,26 @@ class AID2026011ReconcileTestCase(unittest.TestCase):
         with open(self.registry_path, "r", encoding="utf-8") as f:
             after_apply = json.load(f)
 
-        self.assertIn("new-reconciliation-id", after_apply)
-        self.assertEqual(len(after_apply), 500)
-        self.assertNotIn("old-000", after_apply)
-        self.assertEqual(
-            output["reconciliation"]["registered"],
-            [{
-                "id": "new-reconciliation-id",
-                "account": "acct3",
-            }],
-        )
+        # Every pre-existing record survives the bulk registration.
+        for conv_id, record in initial.items():
+            self.assertEqual(after_apply.get(conv_id), record)
+
+        # All 683 new IDs are added; no 500-record truncation occurs.
+        self.assertEqual(len(after_apply), 493 + 683)
+
+        for account, count in (
+            ("acct1", 549),
+            ("acct2", 116),
+            ("acct3", 10),
+            ("acct4", 8),
+        ):
+            for index in range(count):
+                conv_id = "bulk-%s-%03d" % (account, index)
+                self.assertEqual(
+                    after_apply[conv_id]["account"],
+                    account,
+                )
+                self.assertIsNone(after_apply[conv_id]["prompt"])
 
     # 13. Q2: HTTP 429 stops subsequent enumeration and all registration.
 
@@ -511,3 +531,48 @@ class AID2026011ReconcileTestCase(unittest.TestCase):
         )
 
         self.assertEqual(self.registry_bytes(), original_bytes)
+
+
+    def test_reconcile_excludes_nologin_from_registered_not_observed(self):
+        results = complete_results()
+
+        result = self.reconcile(results, {
+            "anonymous-dict": {"account": "nologin"},
+            "anonymous-legacy": "nologin",
+            "ordinary-record": {"account": "acct1"},
+        })
+
+        self.assertEqual(
+            result["registered_not_observed"],
+            [{"id": "ordinary-record", "account": "acct1"}],
+        )
+
+    def test_reconcile_reports_malformed_unobserved_records_separately(self):
+        results = complete_results()
+
+        result = self.reconcile(results, {
+            "valid-record": {"account": "acct1"},
+            "null-account": {"account": None},
+            "non-dictionary": ["acct2"],
+        })
+
+        self.assertEqual(
+            result["registered_not_observed"],
+            [{"id": "valid-record", "account": "acct1"}],
+        )
+        self.assertEqual(
+            result["malformed_registry_records"],
+            [
+                {
+                    "id": "null-account",
+                    "reason": "registry record account is missing or invalid",
+                },
+                {
+                    "id": "non-dictionary",
+                    "reason": (
+                        "registry record is neither a dictionary "
+                        "nor a legacy account string"
+                    ),
+                },
+            ],
+        )
