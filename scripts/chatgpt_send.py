@@ -2725,6 +2725,196 @@ def register_conversations_batch(registrations):
         return registered
 
 
+def restore_conv_map_minimal(candidate):
+    """
+    Restore missing conversation ownership records from an audited candidate.
+
+    Safety properties:
+      - Acquires the same strict registry lock used by normal writers.
+      - Re-reads the live registry while holding that lock.
+      - Never replaces or edits an existing registry entry.
+      - Adds only valid, unambiguous candidate entries whose IDs are absent.
+      - Converts validated legacy account strings to canonical records.
+      - Performs at most one atomic write.
+      - Reads the registry back under the lock and verifies the write.
+      - Never prunes the registry.
+
+    Returns a report. Conflicting candidate entries are reported and skipped.
+    Raises on registry corruption/quarantine, invalid registry shape, lock
+    timeout, write failure, or failed read-back verification.
+    """
+    if not isinstance(candidate, dict):
+        raise ValueError("restore candidate must be a dictionary")
+
+    path = CONV_MAP_FILE
+    added = []
+    preserved = []
+    conflicts = []
+    invalid_ids = 0
+
+    def _canonical_candidate_record(raw):
+        # Legacy strings are accepted only when the string itself is a
+        # valid account identity. They are converted to the Stage 2 shape.
+        if isinstance(raw, str):
+            if not validate_account_identity(raw):
+                return None, "invalid_legacy_account"
+            return {
+                "account": raw,
+                "prompt": None,
+                "ts": None,
+            }, None
+
+        if not isinstance(raw, dict):
+            return None, "invalid_record_type"
+
+        record = dict(raw)
+        account = record.get("account")
+        if not validate_account_identity(account):
+            return None, "invalid_account"
+
+        owner = record.get("owner")
+        if validate_account_identity(owner):
+            try:
+                if (
+                    normalize_account_identity(owner)
+                    != normalize_account_identity(account)
+                ):
+                    return None, "owner_account_conflict"
+            except (TypeError, ValueError):
+                return None, "invalid_owner_identity"
+
+        return record, None
+
+    # All reads, comparisons, writes, and verification occur under the
+    # exact same lock used by normal registry writers.
+    with _file_lock(path, timeout=LOCK_TIMEOUT_SEC, strict=True):
+        existed_before_read = os.path.exists(path)
+        live = _load_json(path, {})
+
+        # _load_json quarantines malformed JSON and returns the default.
+        # Detect that transition and abort rather than treating corruption
+        # as an empty registry and writing over the recovery state.
+        if existed_before_read and not os.path.exists(path):
+            raise RuntimeError(
+                "registry was quarantined during restore; refusing to write"
+            )
+
+        if not isinstance(live, dict):
+            raise RuntimeError(
+                "live conversation registry is not a dictionary; refusing restore"
+            )
+
+        merged = dict(live)
+
+        for raw_id, raw_record in candidate.items():
+            try:
+                conv_id = safe_id(raw_id, "conversation id")
+            except (TypeError, ValueError):
+                invalid_ids += 1
+                conflicts.append({
+                    "id": None,
+                    "reason": "invalid_candidate_id",
+                })
+                continue
+
+            candidate_record, reason = _canonical_candidate_record(raw_record)
+            if reason:
+                conflicts.append({
+                    "id": conv_id,
+                    "reason": reason,
+                })
+                continue
+
+            # Existing live data always wins. Never replace an existing
+            # entry with the older candidate snapshot.
+            if conv_id in live:
+                preserved.append(conv_id)
+
+                live_record = live[conv_id]
+                live_canonical, live_reason = _canonical_candidate_record(
+                    live_record
+                )
+
+                if live_reason:
+                    conflicts.append({
+                        "id": conv_id,
+                        "reason": "existing_live_record_" + live_reason,
+                    })
+                    continue
+
+                try:
+                    same_owner = (
+                        normalize_account_identity(
+                            live_canonical["account"]
+                        )
+                        == normalize_account_identity(
+                            candidate_record["account"]
+                        )
+                    )
+                except (KeyError, TypeError, ValueError):
+                    same_owner = False
+
+                if not same_owner:
+                    conflicts.append({
+                        "id": conv_id,
+                        "reason": "live_candidate_account_conflict",
+                    })
+                continue
+
+            # Candidate record is absent from the live registry and has
+            # passed ID, account, and owner validation.
+            merged[conv_id] = candidate_record
+            added.append(conv_id)
+
+        # One atomic write only, and only if there is something to add.
+        # Deliberately bypass record_conv() pruning: recovery must not
+        # delete historical records to enforce the normal 500-entry cap.
+        if added:
+            _atomic_write(
+                path,
+                json.dumps(merged, ensure_ascii=False, indent=2),
+            )
+
+        # Read back under the same lock. Detect quarantine here as well.
+        existed_before_verify = os.path.exists(path)
+        verified = _load_json(path, {})
+
+        if existed_before_verify and not os.path.exists(path):
+            raise RuntimeError(
+                "registry was quarantined during restore verification"
+            )
+
+        if not isinstance(verified, dict):
+            raise RuntimeError(
+                "registry read-back is not a dictionary"
+            )
+
+        if verified != merged:
+            raise RuntimeError(
+                "registry read-back mismatch; restore verification failed"
+            )
+
+        for conv_id in added:
+            if conv_id not in verified:
+                raise RuntimeError(
+                    "restored conversation missing after read-back: %s"
+                    % conv_id
+                )
+
+    return {
+        "status": "ok",
+        "added": added,
+        "added_count": len(added),
+        "preserved": preserved,
+        "preserved_count": len(preserved),
+        "conflicts": conflicts,
+        "conflict_count": len(conflicts),
+        "invalid_ids": invalid_ids,
+        "final_count": len(verified),
+        "pruned": 0,
+    }
+
+
 _VALID_ACCOUNT_IDENTITIES = frozenset((
     "default",
     "acct1",
