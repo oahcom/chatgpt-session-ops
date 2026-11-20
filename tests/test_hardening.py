@@ -859,6 +859,251 @@ class TestRotation(TmpBase):
         self.assertFalse(rotated, "nologin 429 触发匿名兜底 = 无限自递归\n%s" % out)
         self.assertEqual(rc, 1)
 
+    def _run_rotating_thinking(self, responses):
+        """不触网、不加载凭据，直接测试默认思考模式轮转。
+
+        responses:
+            {
+                "acct1": ThinkingModelUnavailable(...),
+                "acct2": (200, None, conv_id),
+                ...
+            }
+        """
+
+        real_api = m.ChatGPTAPI
+        real_send = m.send_prompt
+
+        calls = []
+
+        class _Api(object):
+            def __init__(self, account):
+                self.account = account
+                self.is_anon = account == "nologin"
+
+        def fake_api(account=None):
+            return _Api(account)
+
+        def fake_send(api, *args, **kwargs):
+            calls.append(api.account)
+
+            result = responses[api.account]
+
+            if isinstance(result, Exception):
+                raise result
+
+            return result
+
+        m.ChatGPTAPI = fake_api
+        m.send_prompt = fake_send
+
+        # 明确固定轮转起点，保证 acct1 -> acct2 -> acct3 -> acct4。
+        m.save_rotation(
+            m._normalize_rotation({"cursor": 0})
+        )
+
+        buf = io.StringIO()
+
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = m.create_chat_rotating(
+                    "p.md",
+                    thinking=True,
+                )
+        finally:
+            m.ChatGPTAPI = real_api
+            m.send_prompt = real_send
+
+        return rc, calls, buf.getvalue()
+
+    def test_rotating_thinking_401_on_first_account_uses_next(self):
+        """默认轮转：acct1 models 401，acct2 成功解析思考模型并建会话。
+
+        401 必须转成账号级不可用，而不是让 SystemExit 终止进程。
+        """
+
+        conv = "11111111-2222-4333-8444-555555555555"
+
+        responses = {
+            "acct1": m.ThinkingModelUnavailable(
+                "AUTH_INVALID",
+                "acct1",
+                "/backend-api/models HTTP 401",
+            ),
+            "acct2": (200, None, conv),
+            "acct3": (200, None, "22222222-3333-4444-8555-666666666666"),
+            "acct4": (200, None, "33333333-4444-4555-8666-777777777777"),
+        }
+
+        rc, calls, out = self._run_rotating_thinking(responses)
+
+        self.assertEqual(rc, 0, out)
+
+        self.assertEqual(
+            calls,
+            ["acct1", "acct2"],
+            "acct1 失败后必须尝试 acct2，成功后立即停止",
+        )
+
+        self.assertNotIn("nologin", calls)
+
+        st = m.load_rotation()
+
+        self.assertIn("acct1", st["unavailable"])
+        self.assertIn(
+            "THINKING_UNAVAILABLE[AUTH_INVALID]",
+            st["unavailable"]["acct1"]["reason"],
+        )
+
+        self.assertEqual(
+            st["last"]["account"],
+            "acct2",
+        )
+
+        self.assertIn(
+            "NEW_CONV %s account=acct2" % conv,
+            out,
+        )
+
+    def test_rotating_thinking_all_accounts_unavailable_fails(self):
+        """四个登录态均无法满足思考要求时，最终 exit 1。
+
+        不得：
+        - 降级 auto；
+        - 尝试 nologin；
+        - 无限重试；
+        - 把失败伪装成成功。
+        """
+
+        responses = {
+            "acct1": m.ThinkingModelUnavailable(
+                "AUTH_INVALID",
+                "acct1",
+                "HTTP 401",
+            ),
+            "acct2": m.ThinkingModelUnavailable(
+                "MODEL_ENDPOINT_UNAVAILABLE",
+                "acct2",
+                "HTTP 503",
+            ),
+            "acct3": m.ThinkingModelUnavailable(
+                "THINKING_MODEL_UNAVAILABLE",
+                "acct3",
+                "没有 -t- 模型",
+            ),
+            "acct4": m.ThinkingModelUnavailable(
+                "AUTH_INVALID",
+                "acct4",
+                "HTTP 401",
+            ),
+        }
+
+        rc, calls, out = self._run_rotating_thinking(responses)
+
+        self.assertEqual(rc, 1, out)
+
+        self.assertEqual(
+            calls,
+            ["acct1", "acct2", "acct3", "acct4"],
+            "四个登录态必须各尝试一次",
+        )
+
+        self.assertNotIn("nologin", calls)
+
+        self.assertIn(
+            '"terminal_cause": "THINKING_MODEL_UNAVAILABLE"',
+            out,
+        )
+
+        self.assertNotIn(
+            "thinking model: auto",
+            out,
+        )
+
+        st = m.load_rotation()
+
+        for account in m.ROTATION_PRIMARY:
+            with self.subTest(account=account):
+                self.assertIn(account, st["unavailable"])
+                self.assertIn(
+                    "THINKING_UNAVAILABLE[",
+                    st["unavailable"][account]["reason"],
+                )
+
+    def test_explicit_account_thinking_401_does_not_escalate(self):
+        """显式 --account acct1，models 401 必须失败，不得自动换号。"""
+
+        real_api = m.ChatGPTAPI
+        real_send = m.send_prompt
+        real_rotate = m.create_chat_rotating
+        real_argv = sys.argv
+
+        old_thinking = os.environ.get("CHATGPT_THINKING")
+
+        hit = {"rotate": False}
+
+        class _Api(object):
+            account = "acct1"
+            is_anon = False
+
+        def fake_send(*args, **kwargs):
+            raise m.ThinkingModelUnavailable(
+                "AUTH_INVALID",
+                "acct1",
+                "/backend-api/models HTTP 401",
+            )
+
+        def fake_rotate(*args, **kwargs):
+            hit["rotate"] = True
+            return 0
+
+        m.ChatGPTAPI = lambda account=None: _Api()
+        m.send_prompt = fake_send
+        m.create_chat_rotating = fake_rotate
+
+        os.environ["CHATGPT_THINKING"] = "1"
+
+        sys.argv = [
+            "chatgpt_send.py",
+            "--account",
+            "acct1",
+            "--new",
+            "p.md",
+        ]
+
+        buf = io.StringIO()
+
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = m.main()
+        finally:
+            m.ChatGPTAPI = real_api
+            m.send_prompt = real_send
+            m.create_chat_rotating = real_rotate
+            sys.argv = real_argv
+
+            if old_thinking is None:
+                os.environ.pop("CHATGPT_THINKING", None)
+            else:
+                os.environ["CHATGPT_THINKING"] = old_thinking
+
+        out = buf.getvalue()
+
+        self.assertEqual(rc, 1, out)
+        self.assertFalse(
+            hit["rotate"],
+            "显式账号思考模型失败不得触发默认轮转",
+        )
+
+        self.assertIn(
+            '"reason_code": "AUTH_INVALID"',
+            out,
+        )
+
+        self.assertIn(
+            '"account": "acct1"',
+            out,
+        )
+
 
 # ---------------------------------------------------------------- 落盘
 class TestReplySave(TmpBase):
@@ -1147,6 +1392,83 @@ class FakeBrowser:
 
 
 class TestAnonSendFailure(TmpBase):
+    """匿名浏览器失败路径测试。
+
+    使用临时 proxy.json 满足生产 require_proxy() 的 fail-closed 前置条件。
+    假代理只通过配置校验，不建立真实网络连接。
+    """
+
+    ENV_KEYS = (
+        "CHATGPT_PROXY",
+        "CHATGPT_PROXY_URL",
+        "CHATGPT_ALLOW_DIRECT",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "http_proxy",
+        "HTTP_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+    )
+
+    def setUp(self):
+        super().setUp()
+
+        # PROXY_FILE 是模块导入时计算的常量。
+        # 仅修改 BASE 不会改变它，必须显式重定向。
+        self._proxy_file = m.PROXY_FILE
+        m.PROXY_FILE = os.path.join(
+            self.tmp,
+            "proxy.json",
+        )
+
+        # 保存原有缓存，避免测试之间互相污染。
+        self._proxy_cache = dict(m._PROXY_CACHE)
+        m._PROXY_CACHE.clear()
+
+        # 清除外部代理和直连许可，确保只使用本测试配置。
+        self._proxy_env = {}
+
+        for key in self.ENV_KEYS:
+            self._proxy_env[key] = os.environ.pop(
+                key,
+                None,
+            )
+
+        # 假代理：require_proxy() 只解析配置字符串，
+        # AnonBrowser.__init__ 不建立代理连接。
+        with open(
+            m.PROXY_FILE,
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(
+                {
+                    "autodetect": False,
+                    "url": "socks5h://127.0.0.1:1080",
+                },
+                f,
+            )
+
+        # 防止其他测试留下的缓存覆盖临时配置。
+        m._PROXY_CACHE.clear()
+
+    def tearDown(self):
+        # 恢复模块级路径。
+        m.PROXY_FILE = self._proxy_file
+
+        # 恢复原缓存，而不是留下测试代理的缓存。
+        m._PROXY_CACHE.clear()
+        m._PROXY_CACHE.update(self._proxy_cache)
+
+        # 恢复所有环境变量。
+        for key, value in self._proxy_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+        super().tearDown()
+
     def test_orphan_session_keeps_its_device(self):
         api = object.__new__(m.ChatGPTAPI)
         api.account = "nologin"

@@ -3869,6 +3869,39 @@ def device_summary():
                      "full_jar=false 表示该快照由 Cookie 头重建，缺 HttpOnly 项")}
 
 
+# 思考模型解析：只缓存成功结果，失败必须允许后续重新解析。
+_THINKING_MODEL_CACHE = {}
+
+class ThinkingModelUnavailable(RuntimeError):
+    """当前账号无法满足强制思考模式要求。
+
+    reason_code:
+        AUTH_INVALID
+        MODEL_ENDPOINT_UNAVAILABLE
+        THINKING_MODEL_UNAVAILABLE
+    """
+
+    VALID_REASON_CODES = frozenset((
+        "AUTH_INVALID",
+        "MODEL_ENDPOINT_UNAVAILABLE",
+        "THINKING_MODEL_UNAVAILABLE",
+    ))
+
+    def __init__(self, reason_code, account, detail, model_slug=None):
+        if reason_code not in self.VALID_REASON_CODES:
+            raise ValueError("invalid thinking failure reason: %r" % reason_code)
+
+        self.reason_code = reason_code
+        self.account = account
+        self.detail = str(detail)
+        self.model_slug = model_slug
+
+        super().__init__(
+            "%s: account=%s: %s"
+            % (reason_code, account, self.detail)
+        )
+
+
 class ChatGPTAPI:
     def __init__(self, base_dir=None, account="default"):
         # CHATGPT_AUTH_DIR selects credential/cache root; account data stays isolated.
@@ -4329,55 +4362,165 @@ class ChatGPTAPI:
 
     # ---------- 思考模式 ----------
     @staticmethod
-    def resolve_thinking_model(api, cache={}):
-        """开思考模式时该用哪个 model slug。
+    def resolve_thinking_model(api, cache=None):
+        """解析强制思考模式所需的 model slug。
 
-        实测（2026-11-19，/backend-api/models）：同一标题有两个 slug，
-        带 `-t-` 的 max_tokens=262144，不带的是 34834 —— `-t-` 就是 thinking 变体，
-        也正是浏览器里「思考」按钮切换的那个。默认会话用 `auto`，不思考。
+        成功：返回包含 -t- 的模型 slug。
+        失败：抛 ThinkingModelUnavailable，携带明确原因分类。
 
-        优先级：CHATGPT_MODEL 显式指定 > 默认模型的 `-t-` 同名变体 > 任意大窗口 `-t-` 模型。
+        重要：
+        - 401 不得折叠成 auto。
+        - 非 200 不得折叠成 auto。
+        - 畸形模型清单不得折叠成 auto。
+        - 正常清单没有 -t- 变体不得折叠成 auto。
+        - 只有成功解析的模型才进入 cache。
         """
-        key = api.account
+
+        if cache is None:
+            cache = _THINKING_MODEL_CACHE
+
+        account = getattr(api, "account", "unknown")
+        explicit = os.environ.get("CHATGPT_MODEL") or ""
+
+        # 显式模型配置也参与 cache key，避免切换 CHATGPT_MODEL 后
+        # 错误复用之前账号的模型。
+        key = (account, explicit)
+
         if key in cache:
             return cache[key]
-        chosen = os.environ.get("CHATGPT_MODEL") or ""
-        if not chosen:
-            st, body = api.req("GET", API_BASE + "/backend-api/models")
-            if st != 200:
-                print("WARN: 取不到模型清单（st=%s），思考模式回退 auto" % st, flush=True)
-                return cache.setdefault(key, "auto")
-            try:
-                d = json.loads(body)
-            except Exception:
-                return cache.setdefault(key, "auto")
-            if not isinstance(d, dict):
-                return cache.setdefault(key, "auto")   # F-12：形状不对 → 回退 auto
-            models = [_as_dict(m) for m in _as_seq(d.get("models"))]
-            default = d.get("default_model_slug")
-            default = default if isinstance(default, str) else "auto"
-            by_slug = {m.get("slug"): m for m in models}
-            if "-t-" in default:
-                chosen = default
-            else:
-                want_title = _as_dict(by_slug.get(default)).get("title")
-                for m in models:
-                    slug = m.get("slug") or ""
-                    if "-t-" in slug and want_title and m.get("title") == want_title:
+
+        def unavailable(reason_code, detail):
+            raise ThinkingModelUnavailable(
+                reason_code=reason_code,
+                account=account,
+                detail=detail,
+            )
+
+        # 用户显式指定模型时不请求模型清单，但仍然强制检查 -t-。
+        if explicit:
+            if "-t-" not in explicit:
+                unavailable(
+                    "THINKING_MODEL_UNAVAILABLE",
+                    "CHATGPT_MODEL=%r 不是思考模型 slug" % explicit,
+                )
+
+            cache[key] = explicit
+            print("thinking model: %s（显式指定）" % explicit, flush=True)
+            return explicit
+
+        # 请求模型清单。
+        try:
+            status, body = api.req(
+                "GET",
+                API_BASE + "/backend-api/models",
+            )
+        except Exception as e:
+            unavailable(
+                "MODEL_ENDPOINT_UNAVAILABLE",
+                "请求 /backend-api/models 异常：%s: %s"
+                % (type(e).__name__, e),
+            )
+
+        # 必须保留 HTTP 状态码，不能在这里退化成 auto。
+        if status == 401:
+            unavailable(
+                "AUTH_INVALID",
+                "/backend-api/models 返回 HTTP 401，认证失效",
+            )
+
+        if status != 200:
+            unavailable(
+                "MODEL_ENDPOINT_UNAVAILABLE",
+                "/backend-api/models 返回 HTTP %s" % status,
+            )
+
+        # HTTP 200 但无法解析 JSON：端点响应不可用。
+        try:
+            data = json.loads(body)
+        except Exception as e:
+            unavailable(
+                "MODEL_ENDPOINT_UNAVAILABLE",
+                "模型清单 JSON 解析失败：%s" % e,
+            )
+
+        if not isinstance(data, dict):
+            unavailable(
+                "MODEL_ENDPOINT_UNAVAILABLE",
+                "模型清单顶层不是 JSON object",
+            )
+
+        raw_models = data.get("models")
+
+        if not isinstance(raw_models, list):
+            unavailable(
+                "MODEL_ENDPOINT_UNAVAILABLE",
+                "模型清单 models 字段缺失或不是数组",
+            )
+
+        models = [_as_dict(item) for item in raw_models]
+
+        default = data.get("default_model_slug")
+        if not isinstance(default, str):
+            default = "auto"
+
+        by_slug = {
+            model.get("slug"): model
+            for model in models
+            if isinstance(model.get("slug"), str)
+        }
+
+        chosen = ""
+
+        # 优先级 1：默认模型本身就是思考模型。
+        if "-t-" in default:
+            chosen = default
+
+        else:
+            # 优先级 2：同标题的 -t- 变体。
+            want_title = _as_dict(by_slug.get(default)).get("title")
+
+            for model in models:
+                slug = model.get("slug") or ""
+
+                if (
+                    "-t-" in slug
+                    and want_title
+                    and model.get("title") == want_title
+                ):
+                    chosen = slug
+                    break
+
+            # 优先级 3：任意大窗口思考模型。
+            if not chosen:
+                for model in models:
+                    slug = model.get("slug") or ""
+                    max_tokens = model.get("max_tokens")
+
+                    if (
+                        not isinstance(max_tokens, (int, float))
+                        or isinstance(max_tokens, bool)
+                    ):
+                        continue
+
+                    if "-t-" in slug and max_tokens > 100000:
                         chosen = slug
                         break
-                if not chosen:
-                    for m in models:
-                        slug = m.get("slug") or ""
-                        mt = m.get("max_tokens")
-                        if not isinstance(mt, (int, float)) or isinstance(mt, bool):
-                            continue
-                        if "-t-" in slug and mt > 100000:
-                            chosen = slug
-                            break
-        chosen = chosen or "auto"
+
+        # HTTP 200 + 合法清单，但没有任何可用思考模型。
+        if not chosen:
+            unavailable(
+                "THINKING_MODEL_UNAVAILABLE",
+                "模型清单正常，但没有可用的 -t- 思考模型",
+            )
+
+        # 只有成功结果可以缓存。
         cache[key] = chosen
-        print("thinking model: %s（默认 %s）" % (chosen, "auto"), flush=True)
+
+        print(
+            "thinking model: %s（默认 %s）" % (chosen, default),
+            flush=True,
+        )
+
         return chosen
 
     # ---------- harvest ----------
@@ -5370,22 +5513,26 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
             return 0, None, None
 
     if thinking is None:
-        thinking = os.environ.get("CHATGPT_THINKING", "") not in ("", "0", "false", "False")
+        thinking = os.environ.get(
+            "CHATGPT_THINKING", ""
+        ) not in ("", "0", "false", "False")
+
     model = None
+
     if thinking:
+        # 解析失败时直接传播专用异常。
+        # 不在 send_prompt 内降级 auto，也不调用 SystemExit。
         model = api.resolve_thinking_model(api)
-        # A27 硬要求：显式要思考就必须真开了思考。解析不出 `-t-` 一律拒绝投递（exit 1），
-        # 不允许静默回落 auto —— 否则「审查会话」会以不思考的身份跑完还被当正常。
+
+        # A27 最终防线：
+        # 即使解析函数被替换、mock 或错误实现，也不能让 auto 通过。
         if not model or "-t-" not in str(model):
-            if os.environ.get("CHATGPT_ALLOW_NON_THINKING", "") in ("1", "true", "True"):
-                print("WARN: 思考模型解析失败（%r），按 CHATGPT_ALLOW_NON_THINKING=1 降级为 auto"
-                      % (model,), flush=True)
-                model = None
-            else:
-                print("FAIL: 要求思考模式但解析不出 -t- 模型（model=%r）。"
-                      "先确认 /backend-api/models 可达；确实要降级请显式设 "
-                      "CHATGPT_ALLOW_NON_THINKING=1" % (model,), flush=True)
-                raise SystemExit(1)
+            raise ThinkingModelUnavailable(
+                reason_code="THINKING_MODEL_UNAVAILABLE",
+                account=getattr(api, "account", "unknown"),
+                detail="resolver 返回了无效思考模型：%r" % (model,),
+                model_slug=model,
+            )
 
     st, resp = 0, ""
     for attempt in (1, 2):
@@ -5620,9 +5767,47 @@ def _attempt_create(st, name, prompt_file, attempts, thinking=None):
             new_chat=True,
             thinking=thinking,
         )
+
+    except ThinkingModelUnavailable as e:
+        # 思考模型不可用是账号级失败，不是整个进程的退出信号。
+        # 记录账号状态，让 create_chat_rotating 尝试下一个身份。
+        status, conv = "THINKING_UNAVAILABLE", None
+
+        reason = "THINKING_UNAVAILABLE[%s]: %s" % (
+            e.reason_code,
+            e.detail,
+        )
+
+        def thinking_failed(s):
+            s["failures"][name] = (
+                s.get("failures", {}).get(name, 0) + 1
+            )
+            mark_unavailable(s, name, reason)
+
+        st.update(mutate_rotation(thinking_failed))
+
+        attempts.append({
+            "account": name,
+            "status": status,
+            "reason_code": e.reason_code,
+            "detail": e.detail,
+        })
+
+        print(
+            "rotate: %s 思考模型不可用（%s），切下一身份"
+            % (name, e.reason_code),
+            flush=True,
+        )
+
+        return status, None
+
     except Exception as e:
         status, conv = 0, None
-        print("rotate: %s 通道异常（%s）" % (name, e), flush=True)
+
+        print(
+            "rotate: %s 通道异常（%s）" % (name, e),
+            flush=True,
+        )
 
     attempts.append({
         "account": name,
@@ -5694,6 +5879,13 @@ def create_chat_rotating(prompt_file, thinking=None):
 
     HTTP 413 是单次发送的终止结果，不允许轮换或匿名兜底。
     """
+    if thinking is None:
+        thinking_requested = os.environ.get(
+            "CHATGPT_THINKING", ""
+        ) not in ("", "0", "false", "False")
+    else:
+        thinking_requested = bool(thinking)
+
     st = load_rotation()
     if purge_expired(st):
         st = mutate_rotation(purge_expired)
@@ -5722,7 +5914,11 @@ def create_chat_rotating(prompt_file, thinking=None):
 
     for name in plan:
         status, conv = _attempt_create(
-            st, name, prompt_file, attempts, thinking
+            st,
+            name,
+            prompt_file,
+            attempts,
+            thinking_requested,
         )
         outcomes[name] = status
 
@@ -5767,6 +5963,40 @@ def create_chat_rotating(prompt_file, thinking=None):
                 flush=True,
             )
             return 0
+
+    # 强制思考模式：四个登录态都不能提供 -t- 模型时，
+    # 必须明确失败，不允许匿名兜底，也不允许 auto 降级。
+    def is_thinking_unavailable(value):
+        if value == "THINKING_UNAVAILABLE":
+            return True
+
+        if isinstance(value, str):
+            return value.startswith(
+                "SKIP:THINKING_UNAVAILABLE["
+            )
+
+        return False
+
+    all_thinking_unavailable = all(
+        is_thinking_unavailable(outcomes.get(name))
+        for name in ROTATION_PRIMARY
+    )
+
+    if thinking_requested and all_thinking_unavailable:
+        print(
+            json.dumps(
+                {
+                    "result": "failed",
+                    "terminal": True,
+                    "terminal_cause": "THINKING_MODEL_UNAVAILABLE",
+                    "outcomes": outcomes,
+                    "attempts": attempts,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return 1
 
     block = anon_fallback_block_reason(st, outcomes)
 
@@ -6681,6 +6911,24 @@ def main():
             try:
                 status, _path, conv = send_prompt(api, None, args[1], new_chat=True,
                                                   thinking=True if thinking_flag else None)
+
+            except ThinkingModelUnavailable as e:
+                # 显式指定账号意味着用户明确选择身份。
+                # 该账号思考模型不可用时直接失败，不自动切换账号。
+                print(
+                    json.dumps(
+                        {
+                            "result": "error",
+                            "reason_code": e.reason_code,
+                            "account": e.account,
+                            "detail": e.detail,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+                return 1
+
             except Exception as e:
                 print(json.dumps({"result": "error", "detail": str(e)}, ensure_ascii=False))
                 return 1
