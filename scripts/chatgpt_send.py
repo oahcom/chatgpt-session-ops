@@ -2238,6 +2238,168 @@ def record_conv(conv_id, account, prompt_file):
         print("WARN: 会话归属登记失败（锁超时，本次未写入）：%s" % e, flush=True)
 
 
+_VALID_ACCOUNT_IDENTITIES = frozenset((
+    "default",
+    "acct1",
+    "acct2",
+    "acct3",
+    "acct4",
+    "nologin",
+))
+
+
+def normalize_account_identity(account):
+    """
+    Validate an account identity and return its comparison identity.
+
+    "default" and "acct1" share the same credential root and therefore
+    compare as the same identity. Other account identities remain distinct.
+    """
+    if not isinstance(account, str) or account not in _VALID_ACCOUNT_IDENTITIES:
+        raise ValueError("invalid account identity")
+    if account == "default":
+        return "acct1"
+    return account
+
+
+def validate_account_identity(account):
+    """Return True only for a configured account identity."""
+    try:
+        normalize_account_identity(account)
+        return True
+    except ValueError:
+        return False
+
+
+def lookup_conversation_owner(conv_id):
+    """
+    Read and structurally validate one conversation ownership record.
+
+    Return:
+        {"status": "known", "account": <registered account>}
+        {"status": "unknown", "account": None}
+        {"status": "invalid", "account": None}
+        {"status": "conflict", "account": None}
+
+    This function is read-only. It does not migrate or rewrite registry data.
+    """
+    try:
+        safe_id(conv_id, "conversation id")
+    except (TypeError, ValueError):
+        return {"status": "invalid", "account": None}
+
+    try:
+        with open(CONV_MAP_FILE, "r", encoding="utf-8") as f:
+            registry = json.load(f)
+    except FileNotFoundError:
+        return {"status": "unknown", "account": None}
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {"status": "invalid", "account": None}
+
+    if not isinstance(registry, dict):
+        return {"status": "invalid", "account": None}
+
+    if conv_id not in registry:
+        return {"status": "unknown", "account": None}
+
+    record = registry[conv_id]
+
+    # Legacy bare-string records are deliberately not trusted as ownership.
+    if not isinstance(record, dict):
+        return {"status": "invalid", "account": None}
+
+    account = record.get("account")
+    if not validate_account_identity(account):
+        return {"status": "invalid", "account": None}
+
+    # Some historical records contain an additional "owner" field.
+    # If present, it must be a valid identity consistent with "account".
+    if "owner" in record:
+        owner = record.get("owner")
+        if not validate_account_identity(owner):
+            return {"status": "invalid", "account": None}
+        if normalize_account_identity(owner) != normalize_account_identity(account):
+            return {"status": "conflict", "account": None}
+
+    return {"status": "known", "account": account}
+
+
+def resolve_conversation_account(conv_id, explicit_account=None):
+    """
+    Central conversation/account resolver.
+
+    explicit_account=None means the caller did not explicitly select an
+    account. A valid explicit account permits access to an unknown-owner
+    conversation, but never overrides a known or contradictory registry entry.
+
+    Return:
+        {"status": ..., "account": ...}
+    """
+    if explicit_account is not None:
+        if not validate_account_identity(explicit_account):
+            return {"status": "invalid", "account": None}
+
+    result = lookup_conversation_owner(conv_id)
+    status = result["status"]
+
+    if status == "known":
+        registered_account = result["account"]
+
+        if explicit_account is not None:
+            if (
+                normalize_account_identity(explicit_account)
+                != normalize_account_identity(registered_account)
+            ):
+                return {"status": "conflict", "account": None}
+            return {"status": "known", "account": explicit_account}
+
+        return {"status": "known", "account": registered_account}
+
+    if status == "unknown":
+        if explicit_account is not None:
+            return {"status": "unknown", "account": explicit_account}
+        return {"status": "unknown", "account": None}
+
+    return {"status": status, "account": None}
+
+
+def conversation_owner_cli_result(raw_conv_id):
+    """
+    Produce the stable --owner JSON payload and exit status.
+
+    Invalid input is never echoed. Unknown, invalid, and conflicting
+    ownership all fail closed with exit status 2.
+    """
+    try:
+        conv_id = safe_id(raw_conv_id, "conversation id")
+    except (TypeError, ValueError):
+        return {
+            "conv_id": None,
+            "account": None,
+            "known": False,
+            "status": "invalid",
+        }, 2
+
+    result = lookup_conversation_owner(conv_id)
+    status = result["status"]
+
+    if status == "known":
+        account = result["account"]
+        return {
+            "conv_id": conv_id,
+            "account": account,
+            "known": True,
+            "status": "known",
+        }, 0
+
+    return {
+        "conv_id": conv_id,
+        "account": None,
+        "known": False,
+        "status": status,
+    }, 2
+
+
 def conv_owner(conv_id):
     # F-12：_load_json 成功但文件内容不是 dict（手改成 [] 等）时不得直接 .get
     info = _as_dict(_as_dict(_load_json(CONV_MAP_FILE, {})).get(conv_id))
@@ -5240,12 +5402,9 @@ def main():
         print(json.dumps(rotation_summary(), ensure_ascii=False, indent=2))
         return 0
     if len(args) == 2 and args[0] == "--owner":
-        cid = cli_id(args[1])
-        if cid is None:
-            return 2
-        owner = conv_owner(cid)
-        print(json.dumps({"conv_id": cid, "account": owner, "known": bool(owner)}, ensure_ascii=False))
-        return 0 if owner else 1
+        payload, exit_code = conversation_owner_cli_result(args[1])
+        print(json.dumps(payload, ensure_ascii=False))
+        return exit_code
     # ---- 匿名会话 id 对照表 ----
     if args and args[0] == "--anon-list":
         data = load_anon_sessions()
@@ -5454,13 +5613,42 @@ def main():
     conv_id = cli_id(raw_id) if raw_id else ""
     if raw_id and conv_id is None:
         return 2
-    owner = conv_owner(conv_id) if conv_id else None
-    if not explicit_account and owner and owner != account:
-        print("route: 会话 %s 登记归属 %s，自动切换身份" % (conv_id[:8], owner), flush=True)
-        account = owner
-    elif explicit_account and owner and owner != account:
-        print("WARN: 会话 %s 登记归属 %s，当前显式使用 %s（可能 404/403）"
-              % (conv_id[:8], owner, account), flush=True)
+    if conv_id:
+        resolution = resolve_conversation_account(
+            conv_id,
+            account if explicit_account else None,
+        )
+        ownership_status = resolution["status"]
+
+        if ownership_status == "invalid":
+            if explicit_account and not validate_account_identity(account):
+                print("ERROR: invalid account identity", flush=True)
+            else:
+                print("ERROR: invalid conversation id", flush=True)
+            return 2
+
+        if ownership_status == "conflict":
+            # A known registered owner must never be overridden by an
+            # explicitly selected, different account. Contradictory registry
+            # records are refused by the same fail-closed path.
+            print(
+                "ERROR: explicit account conflicts with registered conversation owner; refusing to route",
+                flush=True,
+            )
+            return 2
+
+        if ownership_status == "unknown":
+            if not explicit_account:
+                print(
+                    "ERROR: conversation ownership is unknown; specify --account explicitly",
+                    flush=True,
+                )
+                return 2
+            account = resolution["account"]
+
+        elif ownership_status == "known":
+            account = resolution["account"]
+
     api = build(account)
     if api is None:
         return 2
