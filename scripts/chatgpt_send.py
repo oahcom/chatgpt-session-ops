@@ -96,7 +96,7 @@
       resets_in/retry_after/Retry-After 的真实时限退避（_retry_after，缺省才默认），风控补 cookie+PoW。
       可用 conv-api/<id8>.json 缓存 tail 兜底 parent_message_id。
     - POST 200 即消息已提交；SSE 流只用于收割，需读到 EOF（勿提前关连接）。
-    - 413 conversation_too_large → 用 continue_full.py 走「开始新聊天」摘要续接。
+    - HTTP 413 Payload Too Large → 本次发送终止；不轮换账号、不自动重试；检查实际请求体及服务端错误响应。
 """
 import base64
 import contextlib
@@ -4578,8 +4578,12 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
             continue
         break
 
-    if st == 413 or "conversation_too_large" in resp:
-        print("413 conversation_too_large —— 用 continue_full.py 走「开始新聊天」摘要续接", flush=True)
+    if st == 413:
+        print(
+            "HTTP 413 Payload Too Large —— 本次发送终止；不轮换账号，不自动重试。"
+            "请检查实际请求体及服务端错误响应。",
+            flush=True,
+        )
         return 413, None, None
     if st != 200:
         print("resp: %s" % resp[:200], flush=True)
@@ -4743,7 +4747,11 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
 
 
 def _attempt_create(st, name, prompt_file, attempts, thinking=None):
-    """用指定身份建会话并记录结果；返回 (status, conv_id)。"""
+    """用指定身份建会话并记录结果；返回 (status, conv_id)。
+
+    HTTP 413 是本次发送的终止信号，不是账号级故障，
+    不增加失败计数，不设置账号冷却。
+    """
     try:
         api = ChatGPTAPI(account=name)
     except (ValueError, OSError, json.JSONDecodeError) as e:
@@ -4752,24 +4760,50 @@ def _attempt_create(st, name, prompt_file, attempts, thinking=None):
             s["failures"][name] = s.get("failures", {}).get(name, 0) + 1
 
         st.update(mutate_rotation(init_fail))
-        attempts.append({"account": name, "status": "INIT_FAIL", "detail": str(e)})
+        attempts.append({
+            "account": name,
+            "status": "INIT_FAIL",
+            "detail": str(e),
+        })
         print("rotate: %s 凭据不可用，跳过（%s）" % (name, e), flush=True)
         return "INIT_FAIL", None
+
     try:
-        status, _path, conv = send_prompt(api, None, prompt_file, new_chat=True, thinking=thinking)
+        status, _path, conv = send_prompt(
+            api,
+            None,
+            prompt_file,
+            new_chat=True,
+            thinking=thinking,
+        )
     except Exception as e:
         status, conv = 0, None
         print("rotate: %s 通道异常（%s）" % (name, e), flush=True)
-    attempts.append({"account": name, "status": status, "conv_id": conv})
+
+    attempts.append({
+        "account": name,
+        "status": status,
+        "conv_id": conv,
+    })
+
     if status == 200:
-        # conv 可能为 None（POST 成功但 SSE 未解析出 id）；不能当失败去试下一个身份，
-        # 否则会重复建会话、把一条 prompt 花两次配额。
         return status, conv
+
+    # HTTP 413 terminates this send.
+    # It must not modify account failures or cooldown state.
+    if status == 413:
+        print(
+            "rotate: %s 收到 HTTP 413，本次发送终止；不轮换账号、不设置冷却"
+            % name,
+            flush=True,
+        )
+        return 413, None
+
     reason, ttl = None, None
+
     if status == 401:
         reason = "HTTP 401（认证失效，需重新提取凭据）"
     elif status == 403:
-        # PoW/风控或隐性限速，可自愈：短冷却，勿长期封禁
         reason, ttl = "HTTP 403（PoW/风控，冷却后重试）", COOLDOWN_403
     elif status == 429:
         reason, ttl = "HTTP 429 限速冷却", COOLDOWN_429
@@ -4782,9 +4816,12 @@ def _attempt_create(st, name, prompt_file, attempts, thinking=None):
             mark_unavailable(s, name, reason, ttl)
 
     st.update(mutate_rotation(failed))
-    print("rotate: %s 建会话失败(st=%s)，切下一身份" % (name, status), flush=True)
-    return status, None
 
+    print(
+        "rotate: %s 建会话失败(st=%s)，切下一身份" % (name, status),
+        flush=True,
+    )
+    return status, None
 
 def _mark_success(st, name, conv, prompt_file, attempts):
     def mutate(s):
@@ -4805,60 +4842,146 @@ def _mark_success(st, name, conv, prompt_file, attempts):
 
 
 def create_chat_rotating(prompt_file, thinking=None):
-    """登录态优先建会话：acct1/acct2/acct3/acct4 均分轮转；仅当全部都 429 才用匿名兜底。
+    """登录态优先建会话：acct1/acct2/acct3/acct4 均分轮转；
+    仅当全部都 429 才用匿名兜底。
 
     匿名会话不进任何账号历史（会话列表恒为空），只按 conv_id 短期可读，
     因此只作为限速时的应急产能，不承担需要留存/续接的任务。
+
+    HTTP 413 是单次发送的终止结果，不允许轮换或匿名兜底。
     """
     st = load_rotation()
     if purge_expired(st):
-        # 锁内重读再清：解封动作不能把并发进程刚写进去的计数/游标覆盖回旧值
         st = mutate_rotation(purge_expired)
+
     outcomes, attempts, skipped = {}, [], {}
+
     for name in ROTATION_PRIMARY:
         if is_unavailable(st, name):
-            reason = _as_dict(_as_dict(st.get("unavailable")).get(name)).get("reason", "unavailable")
+            reason = _as_dict(
+                _as_dict(st.get("unavailable")).get(name)
+            ).get("reason", "unavailable")
             skipped[name] = reason
             outcomes[name] = "SKIP:" + reason
+
     plan = [a for a in rotation_plan(st) if a not in skipped]
-    print("rotation plan: %s (cursor=%s)%s" % (
-        " -> ".join(plan) or "(无可用登录态)", st["cursor"],
-        "；跳过 " + json.dumps(skipped, ensure_ascii=False) if skipped else ""), flush=True)
+
+    print(
+        "rotation plan: %s (cursor=%s)%s" % (
+            " -> ".join(plan) or "(无可用登录态)",
+            st["cursor"],
+            "；跳过 " + json.dumps(skipped, ensure_ascii=False)
+            if skipped else "",
+        ),
+        flush=True,
+    )
 
     for name in plan:
-        status, conv = _attempt_create(st, name, prompt_file, attempts, thinking)
+        status, conv = _attempt_create(
+            st, name, prompt_file, attempts, thinking
+        )
         outcomes[name] = status
+
+        # Terminal failure: stop immediately.
+        # Never attempt another account or anonymous fallback.
+        if status == 413:
+            print(
+                json.dumps(
+                    {
+                        "result": "failed",
+                        "terminal": True,
+                        "terminal_cause": "HTTP_413",
+                        "account": name,
+                        "outcomes": outcomes,
+                        "attempts": attempts,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            return 1
+
         if conv:
             _mark_success(st, name, conv, prompt_file, attempts)
             return 0
+
         if status == 200:
-            print("WARN: %s 建会话返回 200 但未解析出 conv_id（消息可能已送达），"
-                  "为免重复建会话停止轮转" % name, flush=True)
-            print(json.dumps({"result": "ok_no_conv_id", "account": name,
-                              "attempts": attempts}, ensure_ascii=False), flush=True)
+            print(
+                "WARN: %s 建会话返回 200 但未解析出 conv_id（消息可能已送达），"
+                "为免重复建会话停止轮转" % name,
+                flush=True,
+            )
+            print(
+                json.dumps(
+                    {
+                        "result": "ok_no_conv_id",
+                        "account": name,
+                        "attempts": attempts,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
             return 0
 
-    # ---- 兜底：全部登录态都 429（本次命中或 429 冷却中）才允许用匿名 ----
     block = anon_fallback_block_reason(st, outcomes)
+
     if block is None:
-        print("全部登录态均 429 —— 启用匿名兜底（不入历史，仅短期可读，勿用于长任务）", flush=True)
-        status, conv = _attempt_create(st, "nologin", prompt_file, attempts, thinking)
+        print(
+            "全部登录态均 429 —— 启用匿名兜底"
+            "（不入历史，仅短期可读，勿用于长任务）",
+            flush=True,
+        )
+
+        status, conv = _attempt_create(
+            st, "nologin", prompt_file, attempts, thinking
+        )
+
         if conv:
             _mark_success(st, "nologin", conv, prompt_file, attempts)
-            print("WARN: 该会话为匿名会话，不出现在任何账号的会话列表，勿用于需留存的长任务", flush=True)
+            print(
+                "WARN: 该会话为匿名会话，不出现在任何账号的会话列表，"
+                "勿用于需留存的长任务",
+                flush=True,
+            )
             return 0
+
         if status == 200:
-            print("WARN: 匿名会话已建立但未解析出 conv_id，停止重试以免重复建会话", flush=True)
-            print(json.dumps({"result": "ok_no_conv_id", "account": "nologin",
-                              "attempts": attempts}, ensure_ascii=False), flush=True)
+            print(
+                "WARN: 匿名会话已建立但未解析出 conv_id，"
+                "停止重试以免重复建会话",
+                flush=True,
+            )
+            print(
+                json.dumps(
+                    {
+                        "result": "ok_no_conv_id",
+                        "account": "nologin",
+                        "attempts": attempts,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
             return 0
+
         outcomes["nologin"] = status
+
     else:
         print("匿名兜底未放行：%s" % block, flush=True)
 
-    print(json.dumps({"result": "failed", "outcomes": outcomes, "attempts": attempts}, ensure_ascii=False), flush=True)
+    print(
+        json.dumps(
+            {
+                "result": "failed",
+                "outcomes": outcomes,
+                "attempts": attempts,
+            },
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
     return 1
-
 
 def rotation_summary():
     st = load_rotation()
