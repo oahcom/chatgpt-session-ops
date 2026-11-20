@@ -145,6 +145,58 @@ python scripts/chatgpt_send.py --account acct2 <conv_id> <prompt_file>
 
 查询会话清单：`python scripts/chatgpt_send.py --account acct1 --list` 查询单一账号；`python scripts/chatgpt_send.py --list-all` 顺序查询本机已配置的 acct1、acct2、acct3、acct4 与匿名态，并为每条结果标注身份。`--list-all` 输出 `by_account`（按账号分组，便于归档）、`summary`（各账号计数）、`quota`（各账号最近响应的限速观测头，只读）与 `errors`。不可用的账号和接口错误会进入 errors；遇到 429 即停止剩余扫描。聚合结果只覆盖各身份自身有权看到的会话，不代表匿名态能读取私有会话。
 
+`--list-all` 默认 **dry-run（只读）**，加 `--apply` 才把「唯一观察、枚举完整、无冲突」的候选登记进 `conv-accounts.json`；`--include-nologin` 显式把匿名态纳入枚举。写入一律走 `record_conv()`，写完在同一把锁下回读磁盘填 `registered`。未知或重复 flag 直接 exit 2，不触网。
+
+##### Legacy conversation registry migration
+
+The supported conversion path for legacy bare-string records in `conv-accounts.json` is `migrate_conv_accounts()` in `scripts/chatgpt_send.py`.
+
+Legacy bare-string records remain invalid for normal ownership reconciliation. Do not interpret them as canonical ownership records, and do not convert them through `record_conv()` or by editing the JSON file manually. `migrate_conv_accounts()` is the sole supported conversion path.
+
+The migration function:
+
+- Acquires the existing cross-process registry lock.
+- Reads the latest registry while holding the lock.
+- Converts valid legacy account strings to canonical dictionary records.
+- Preserves malformed records and reports them in `invalid`.
+- Preserves existing dictionary metadata.
+- Writes only when a conversion is needed, using atomic replacement.
+- Is idempotent.
+
+**This function performs a real write. It has no dry-run mode.** Run it only during an authorized maintenance window, after taking and verifying a registry backup and pausing other registry writers.
+
+From the repository root, invoke it with:
+
+```bash
+python -c "import importlib.util,json,sys; p=r'scripts\chatgpt_send.py'; s=importlib.util.spec_from_file_location('chatgpt_send_migration',p); m=importlib.util.module_from_spec(s); sys.modules[s.name]=m; s.loader.exec_module(m); print(json.dumps(m.migrate_conv_accounts(),ensure_ascii=False,sort_keys=True))"
+```
+
+Stop and do not proceed to bulk registration if the returned summary differs from the expected `status=ok` / `migrated` count / `invalid=[]` / `changed=true`.
+
+After migration, run `--list-all` without `--apply`. Confirm that enumeration is complete, `registry_conflicts` is empty, `malformed_registry_records` is empty, `duplicates` is zero, and `invalid_ids` is zero. Only then may the separately authorized `--list-all --apply` registration operation proceed.
+
+After applying, run `--list-all` again and confirm that no eligible registrations remain. Do not restore a pre-migration backup over a registry that may have received subsequent writes. For a partial registration failure, prefer re-running reconciliation and applying the remaining eligible IDs after verifying the registry state.
+
+##### Production cutover baseline correction — 2026-11-20
+
+The previously documented bulk-registration expectation of 685 records with account distribution `549/116/10/8` was arithmetically inconsistent and is superseded.
+
+The approved production dry-run baseline is:
+
+- `eligible_registrations`: 684
+- acct1: 549
+- acct2: 117
+- acct3: 10
+- acct4: 8
+
+The account counts sum to 684.
+
+The migration converted 7 legacy string records without changing the registry ID set. All 7 migrated IDs were absent from the observed conversation set. Two independent post-migration dry-runs produced identical `(id, account)` observation sets.
+
+The approved expected post-registration registry count is 1180, calculated as 496 existing records plus 684 new registrations, assuming no other registry writes or deletions during the maintenance window.
+
+The previous 685 expectation and `549/116/10/8` distribution must not be reused.
+
 自动走完整链路：live tail（GET 429 时缓存 tail 兜底）→ requirements + PoW → POST（**必带 conversation_id**）→ **校验落点会话一致**（取 SSE **首个带 id 的** `data:` 事件；落点不一致 → **判失败**，回复写入 `quarantine/` 隔离档案（**完整原始响应**另存并记 sha256）并返回 target/actual 两个 id，实际落点会话另记待认领登记，不静默改归属）→ SSE 收割 → 落盘 `replies/reply-*.md`。
 
 ### 2. 开全新会话（Owner 裁决模式，登录态优先）

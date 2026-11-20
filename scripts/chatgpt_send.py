@@ -206,6 +206,56 @@ def _harden_perms(path):
         pass
 
 
+def _replace_with_bounded_retry(tmp, path):
+    """
+    Replace path atomically, retrying transient Windows sharing/access
+    failures with a strictly bounded delay budget.
+
+    Only WinError 5 and 32 are retryable. Lock acquisition and lock
+    timeout behavior are deliberately outside this function.
+    """
+    retry_delays = (0.05, 0.10, 0.20, 0.40, 0.80, 1.00)
+    max_attempts = len(retry_delays) + 1
+
+    for attempt in range(max_attempts):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError as exc:
+            winerror = getattr(exc, "winerror", None)
+            retryable = winerror in (5, 32)
+
+            if not retryable or attempt >= len(retry_delays):
+                try:
+                    os.unlink(tmp)
+                except FileNotFoundError:
+                    pass
+                except OSError as cleanup_error:
+                    raise OSError(
+                        "atomic replace failed and temporary-file cleanup "
+                        "also failed: tmp=%r path=%r cleanup_error=%r"
+                        % (tmp, path, cleanup_error)
+                    ) from exc
+                raise
+
+            time.sleep(retry_delays[attempt])
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            except OSError as cleanup_error:
+                raise OSError(
+                    "atomic replace failed and temporary-file cleanup "
+                    "also failed: tmp=%r path=%r cleanup_error=%r"
+                    % (tmp, path, cleanup_error)
+                )
+            raise
+
+    # Defensive only: the loop either returns or raises.
+    raise RuntimeError("atomic replace retry loop exited unexpectedly")
+
+
 def _atomic_write(path, text):
     """tmp → fsync → replace。状态 json 与匿名归档都只有这一份副本，写半截就全丢。
 
@@ -222,7 +272,7 @@ def _atomic_write(path, text):
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        _replace_with_bounded_retry(tmp, path)
         # 目录 fsync：rename 只保证「目录项变更」可见，不保证断电后仍在（POSIX 语义）
         try:
             dfd = os.open(parent or ".", os.O_RDONLY)
@@ -280,7 +330,7 @@ def _atomic_write_bytes(path, data):
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        _replace_with_bounded_retry(tmp, path)
         # 目录 fsync：rename 只保证「目录项变更」可见，不保证断电后仍在（POSIX 语义）
         try:
             dfd = os.open(parent or ".", os.O_RDONLY)
@@ -2466,6 +2516,213 @@ def record_conv(conv_id, account, prompt_file):
             % exc,
             flush=True,
         )
+
+
+def register_conversations_batch(registrations):
+    """
+    Register a batch of conversations in one locked atomic replacement.
+
+    The function:
+    - Acquires the same strict cross-process registry lock as record_conv.
+    - Reads the latest registry only after acquiring the lock.
+    - Validates every candidate before making any change.
+    - Preserves existing records when ownership already matches.
+    - Rejects legacy strings and malformed/conflicting existing records.
+    - Writes at most once through _atomic_write.
+    - Re-reads and verifies the committed registry before releasing the lock.
+
+    Returns the verified registered list.
+
+    Raises on any validation, lock, read, write, or verification failure.
+    No partial batch is intentionally committed.
+    """
+    if not isinstance(registrations, (list, tuple)):
+        raise TypeError("registrations must be a list or tuple")
+
+    normalized_candidates = []
+    candidate_accounts = {}
+
+    for registration in registrations:
+        if not isinstance(registration, dict):
+            raise ValueError("registration must be a dictionary")
+
+        try:
+            conv_id = safe_id(
+                registration.get("id"),
+                "conversation id",
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "invalid conversation id in batch: %r"
+                % (registration.get("id"),)
+            ) from exc
+
+        account = registration.get("account")
+        if not validate_account_identity(account):
+            raise ValueError(
+                "invalid account identity in batch: id=%s account=%r"
+                % (conv_id, account)
+            )
+
+        canonical_account = normalize_account_identity(account)
+
+        previous_account = candidate_accounts.get(conv_id)
+        if previous_account is not None:
+            if previous_account != canonical_account:
+                raise ValueError(
+                    "duplicate batch id has conflicting accounts: %s"
+                    % conv_id
+                )
+            # Identical duplicate input is deduplicated.
+            continue
+
+        candidate_accounts[conv_id] = canonical_account
+        normalized_candidates.append({
+            "id": conv_id,
+            "account": account,
+            "canonical_account": canonical_account,
+        })
+
+    with _file_lock(
+        CONV_MAP_FILE,
+        timeout=LOCK_TIMEOUT_SEC,
+        strict=True,
+    ):
+        registry = _read_conv_map_for_migration()
+
+        if not isinstance(registry, dict):
+            raise ValueError(
+                "conversation registry must be a dictionary"
+            )
+
+        # Validate the complete candidate set before changing the registry.
+        additions = []
+
+        for candidate in normalized_candidates:
+            conv_id = candidate["id"]
+            requested_account = candidate["account"]
+            requested_canonical = candidate["canonical_account"]
+
+            if conv_id not in registry:
+                additions.append({
+                    "id": conv_id,
+                    "account": requested_account,
+                })
+                continue
+
+            existing = registry[conv_id]
+
+            # Stage 2 policy: legacy bare strings are not canonical
+            # ownership records. They must go through migrate_conv_accounts.
+            if isinstance(existing, str):
+                raise ValueError(
+                    "legacy string registry record requires migration: %s"
+                    % conv_id
+                )
+
+            if not isinstance(existing, dict):
+                raise ValueError(
+                    "registry record format is invalid: %s" % conv_id
+                )
+
+            existing_account = existing.get("account")
+            if not validate_account_identity(existing_account):
+                raise ValueError(
+                    "registry record account is invalid: %s" % conv_id
+                )
+
+            owner = existing.get("owner")
+            if validate_account_identity(owner):
+                if (
+                    normalize_account_identity(owner)
+                    != normalize_account_identity(existing_account)
+                ):
+                    raise ValueError(
+                        "registry owner/account conflict: %s" % conv_id
+                    )
+
+            existing_canonical = normalize_account_identity(
+                existing_account
+            )
+            if existing_canonical != requested_canonical:
+                raise ValueError(
+                    "registry account conflict: id=%s registered=%s "
+                    "requested=%s"
+                    % (conv_id, existing_account, requested_account)
+                )
+
+        # No registry mutation occurs until every candidate has passed.
+        for item in additions:
+            registry[item["id"]] = {
+                "account": item["account"],
+                "prompt": None,
+                "ts": _now(),
+            }
+
+        if additions:
+            _atomic_write(
+                CONV_MAP_FILE,
+                json.dumps(
+                    registry,
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+
+        # Verify the actual on-disk result while still holding the lock.
+        final_registry = _read_conv_map_for_migration()
+
+        if not isinstance(final_registry, dict):
+            raise ValueError(
+                "conversation registry is not a dictionary after write"
+            )
+
+        registered = []
+
+        for candidate in normalized_candidates:
+            conv_id = candidate["id"]
+            expected_canonical = candidate["canonical_account"]
+            record = final_registry.get(conv_id)
+
+            if not isinstance(record, dict):
+                raise RuntimeError(
+                    "batch registration verification failed: %s"
+                    % conv_id
+                )
+
+            actual_account = record.get("account")
+            if not validate_account_identity(actual_account):
+                raise RuntimeError(
+                    "batch registration account verification failed: %s"
+                    % conv_id
+                )
+
+            if (
+                normalize_account_identity(actual_account)
+                != expected_canonical
+            ):
+                raise RuntimeError(
+                    "batch registration ownership verification failed: %s"
+                    % conv_id
+                )
+
+            owner = record.get("owner")
+            if validate_account_identity(owner):
+                if (
+                    normalize_account_identity(owner)
+                    != normalize_account_identity(actual_account)
+                ):
+                    raise RuntimeError(
+                        "batch registration owner verification failed: %s"
+                        % conv_id
+                    )
+
+            registered.append({
+                "id": conv_id,
+                "account": actual_account,
+            })
+
+        return registered
 
 
 _VALID_ACCOUNT_IDENTITIES = frozenset((
@@ -6143,64 +6400,20 @@ def main():
                 reconciliation["eligible_registrations"]
             )
 
-            for registration in registrations:
-                record_conv(
-                    registration["id"],
-                    registration["account"],
-                    None,
+            try:
+                reconciliation["registered"] = (
+                    register_conversations_batch(registrations)
                 )
 
-            # record_conv() owns locking, conflict protection and pruning.
-            # Its return value cannot establish whether a write succeeded.
-            # Verify the actual final registry under the same read protocol.
-            try:
-                with _file_lock(
-                    CONV_MAP_FILE,
-                    timeout=LOCK_TIMEOUT_SEC,
-                    strict=True,
-                ):
-                    final_registry = _read_conv_map_for_migration()
-
-                if not isinstance(final_registry, dict):
-                    raise ValueError(
-                        "conversation registry must be a dictionary"
-                    )
-
-                registered_now = []
-
-                for registration in registrations:
-                    conv_id = registration["id"]
-                    expected_account = registration["account"]
-                    record = final_registry.get(conv_id)
-
-                    if not isinstance(record, dict):
-                        continue
-
-                    actual_account = record.get("account")
-                    if not validate_account_identity(actual_account):
-                        continue
-
-                    try:
-                        actual_canonical = normalize_account_identity(
-                            actual_account
-                        )
-                        expected_canonical = normalize_account_identity(
-                            expected_account
-                        )
-                    except (TypeError, ValueError):
-                        continue
-
-                    if actual_canonical == expected_canonical:
-                        registered_now.append({
-                            "id": conv_id,
-                            "account": actual_account,
-                        })
-
-                reconciliation["registered"] = registered_now
-
-            except (OSError, ValueError, LockTimeout) as e:
+            except (
+                OSError,
+                TypeError,
+                ValueError,
+                RuntimeError,
+                LockTimeout,
+            ) as e:
                 errors.append(
-                    "registry: post-write verification failed (%s)" % e
+                    "registry: batch registration failed (%s)" % e
                 )
                 reconciliation["registered"] = []
 
