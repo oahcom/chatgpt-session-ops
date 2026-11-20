@@ -55,13 +55,13 @@ ChatGPT 会话操控与生命周期管理。把"手和眼"（I/O、投递、收�
 
 ## 前置：认证
 
-账号凭据隔离：acct1 复用既有默认目录（`CHATGPT_AUTH_DIR` 或脚本同目录），acct2 使用 `scripts/accounts/acct2/`，各自读取 `cookies.json` 与 `access_token.txt`。**凭据属个人数据，不随仓库分发**：按 `scripts/accounts/README.md` 的结构自行放入即可，acct2 装好即与 acct1 等价参与轮转。
+账号凭据隔离：acct1 复用既有默认目录（`CHATGPT_AUTH_DIR` 或脚本同目录），acct2 / acct3 使用 `scripts/accounts/acct2/`、`scripts/accounts/acct3/`，各自读取 `cookies.json` 与 `access_token.txt`。**凭据属个人数据，不随仓库分发**：按 `scripts/accounts/README.md` 的结构自行放入即可，acct2 / acct3 装好即与 acct1 等价参与轮转。
 
-**身份优先级：登录态优先，匿名只做兜底。** `--new` 默认在 `acct1 / acct2` 之间均分轮转；`nologin`（匿名）**仅当两个登录态都 429**（本次命中或处于 429 冷却）时才启用，401/403 不触发兜底。`CHATGPT_ANON_FALLBACK=0` 可彻底禁用。需要匿名时也可显式 `--account nologin --new`。
+**身份优先级：登录态优先，匿名只做兜底。** `--new` 默认在 `acct1 / acct2 / acct3` 之间均分轮转；`nologin`（匿名）**仅当全部登录态都 429**（本次命中或处于 429 冷却）时才启用，401/403 不触发兜底。`CHATGPT_ANON_FALLBACK=0` 可彻底禁用。需要匿名时也可显式 `--account nologin --new`。
 
 **429 限流的处置（用户裁定：换账号，或直接用匿名渠道）。** 四条硬规则：
 
-1. **显式指定主身份也照样换号。** `--account acct1 --new` 遇 429 时，先给 acct1 记 429 冷却，再转轮转（换 acct2；acct2 也 429 则走匿名）。理由：429 时会话**尚未建成**，重试不会重复建会话、不会多花配额——显式身份只约束「用谁起」，不约束「限速后还能干什么」。
+1. **显式指定主身份也照样换号。** `--account acct1 --new` 遇 429 时，先给 acct1 记 429 冷却，再转轮转（换 acct2 / acct3；全部 429 则走匿名）。理由：429 时会话**尚未建成**，重试不会重复建会话、不会多花配额——显式身份只约束「用谁起」，不约束「限速后还能干什么」。
 2. **401 / 403 不换号。** 401 是凭据失效（该重新提取），403 是 PoW/风控（短冷却自愈）；换身份只会把病因藏起来。
 3. **显式 `--account nologin` 遇 429 不再兜底。** 再兜底还是匿名，等于无限自递归。
 4. **既有会话遇 429 只能退避。** 会话归属固定：换账号 404、匿名更读不到这条会话。按返回体的真实时限退避后重试，或 `--new` 另起（那条路才会换号/走匿名）。
@@ -114,7 +114,7 @@ python scripts/chatgpt_send.py --anon-restore <device>           # 把留存身�
 | 按 id 经 API 读 | 可以：建会话 13 分钟后仍 `200`；陌生 `oai-did` 访问返回 `404 conversation_inaccessible` |
 | 是否进服务端历史 | **否**：`GET /backend-anon/conversations` 恒 0 条 |
 
-因此：**匿名通道适合一次性、短周期、即问即取的任务（如 Owner 裁决）以及两个登录态都 429 时的应急产能**；需要长期留存、归档、跨机续接的会话仍用 acct1/acct2。标签页丢失时脚本显式报错并指向 `--anon-read`，不会静默新建。
+因此：**匿名通道适合一次性、短周期、即问即取的任务（如 Owner 裁决）以及全部登录态都 429 时的应急产能**；需要长期留存、归档、跨机续接的会话仍用 acct1/acct2/acct3。标签页丢失时脚本显式报错并指向 `--anon-read`，不会静默新建。
 
 **nologin 走浏览器通道，不是纯 API。** 匿名态建/发必须过 Cloudflare Turnstile：纯 API 的 `POST /backend-anon/conversation` 恒 403 `Unusual activity`（`chat-requirements` 返回 `turnstile.required=true` + `force_login=true`）。实测可行路径是 **UI 建会话 + API 收割**：
 
@@ -126,7 +126,7 @@ python scripts/chatgpt_send.py --anon-restore <device>           # 把留存身�
 
 **凭据不全的身份会在 POST 时 403**：acct2 的 cookies.json 只有 `session-token` + `oai-did`（2 条），GET 全部正常但 POST 判 `Unusual activity`——缺 `__cf_bm`/`_cfuvid`/`__cflb`。脚本在首次 403 时自动 `warm_cookies()`（访问首页接收 Set-Cookie 并回写 cookies.json）再重试一次，实测可自愈。
 
-提取流程：启动已配置 CDP 的 Edge（默认端口 9222，`CHATGPT_CDP_PORT` 可改），用户本人登录 ChatGPT 后运行 `python scripts/extract_auth.py`，一次写出 `cookies.json`（仅 chatgpt.com / openai.com 域，含 HttpOnly）与 `access_token.txt`（来自 `/api/auth/session`），两者都 chmod 600。脚本只处理当前浏览器已登录的默认账号；acct2 凭据此前通过用户已登录的 InPrivate 窗口经 DevConsole 提取，重新提取时仍需用户本人在浏览器完成登录，不要在聊天中发送或粘贴 cookie、access token。
+提取流程：启动已配置 CDP 的 Edge（默认端口 9222，`CHATGPT_CDP_PORT` 可改），用户本人登录 ChatGPT 后运行 `python scripts/extract_auth.py`，一次写出 `cookies.json`（仅 chatgpt.com / openai.com 域，含 HttpOnly）与 `access_token.txt`（来自 `/api/auth/session`），两者都 chmod 600。脚本只处理当前浏览器已登录的默认账号；acct2 / acct3 凭据通过用户已登录的 InPrivate 窗口经 DevConsole 提取——在该窗口控制台同源 `fetch('/api/auth/session')` 取 accessToken、`document.cookie` 取可读 cookie，POST 到本机回环接收服务（或下载 JSON 再由本技能读取），落盘到 `accounts/<acct>/`。重新提取时仍需用户本人在浏览器完成登录，不要在聊天中发送或粘贴 cookie、access token。实测（2026-11-20，acct3）：浏览器 CSP/PNA 会把发往 `127.0.0.1` 的 `fetch` 拦下，兜底走「下载 `acct3-export.json`」再读文件即可；导出的 cookie 缺 CF 系列，首轮 `warm_cookies()` 会补 `__cflb`/`__cf_bm`/`_cfuvid` 后 POST 恢复正常。
 
 ## 核心工作流
 
@@ -143,7 +143,7 @@ python scripts/chatgpt_send.py --account acct2 <conv_id> <prompt_file>
 
 各账号限速彼此独立。429 时对原身份退避至少 90 秒，GET 可用该身份缓存；不要并发运行同一账号请求。
 
-查询会话清单：`python scripts/chatgpt_send.py --account acct1 --list` 查询单一账号；`python scripts/chatgpt_send.py --list-all` 顺序查询本机已配置的 acct1、acct2 与匿名态，并为每条结果标注身份。`--list-all` 输出 `by_account`（按账号分组，便于归档）、`summary`（各账号计数）、`quota`（各账号最近响应的限速观测头，只读）与 `errors`。不可用的账号和接口错误会进入 errors；遇到 429 即停止剩余扫描。聚合结果只覆盖各身份自身有权看到的会话，不代表匿名态能读取私有会话。
+查询会话清单：`python scripts/chatgpt_send.py --account acct1 --list` 查询单一账号；`python scripts/chatgpt_send.py --list-all` 顺序查询本机已配置的 acct1、acct2、acct3 与匿名态，并为每条结果标注身份。`--list-all` 输出 `by_account`（按账号分组，便于归档）、`summary`（各账号计数）、`quota`（各账号最近响应的限速观测头，只读）与 `errors`。不可用的账号和接口错误会进入 errors；遇到 429 即停止剩余扫描。聚合结果只覆盖各身份自身有权看到的会话，不代表匿名态能读取私有会话。
 
 自动走完整链路：live tail（GET 429 时缓存 tail 兜底）→ requirements + PoW → POST（**必带 conversation_id**）→ **校验落点会话一致**（取 SSE **首个带 id 的** `data:` 事件；落点不一致 → **判失败**，回复写入 `quarantine/` 隔离档案（**完整原始响应**另存并记 sha256）并返回 target/actual 两个 id，实际落点会话另记待认领登记，不静默改归属）→ SSE 收割 → 落盘 `replies/reply-*.md`。
 
@@ -151,14 +151,14 @@ python scripts/chatgpt_send.py --account acct2 <conv_id> <prompt_file>
 
 ```bash
 python scripts/chatgpt_send.py --thinking --new <prompt_file>       # 思考模式（评审/裁决必开）
-python scripts/chatgpt_send.py --new <prompt_file>                  # 默认：acct1/acct2 均分
+python scripts/chatgpt_send.py --new <prompt_file>                  # 默认：acct1/acct2/acct3 均分
 python scripts/chatgpt_send.py --account acct2 --new <prompt_file>  # 指定身份
 python scripts/chatgpt_send.py --rotation                           # 游标/计数/兜底次数
 python scripts/chatgpt_send.py --rotation-enable acct2              # 解封某身份
 python scripts/chatgpt_send.py --owner <conv_id>                    # 查会话归属账号
 ```
 
-轮转规则：`acct1 → acct2 → acct1 …` 均分（游标持久化在 `scripts/account-rotation.json`，只在登录态之间推进）。匿名仅在两个登录态都 429 时兜底，且创建后打印 `WARN` 提示不入历史。每次成功都把 `conv_id → 账号` 登记到 `scripts/conv-accounts.json`；之后投递/收割该会话、未显式指定 `--account` 时自动路由。
+轮转规则：`acct1 → acct2 → acct3 → acct1 …` 均分（游标持久化在 `scripts/account-rotation.json`，只在登录态之间推进）。匿名仅在全部登录态都 429 时兜底，且创建后打印 `WARN` 提示不入历史。每次成功都把 `conv_id → 账号` 登记到 `scripts/conv-accounts.json`；之后投递/收割该会话、未显式指定 `--account` 时自动路由。
 
 轮转容错：
 
@@ -195,7 +195,7 @@ python scripts/chatgpt_send.py --tail <conv_id>
    - **风控**（`risk`：403 Unusual activity、Cloudflare 质询页）→ 补 cookie（`warm_cookies()`）+ 重跑 PoW 流程，仍失败进冷却，不定时硬闯。
    - GET 被限速时用 `conv-api/` 缓存 tail 兜底 parent_message_id。
 4. **账号路由**：`--new` 默认登录态均分；既有会话按 `conv-accounts.json` 自动路由；显式 `--account` 优先，与登记冲突时告警。
-5. **匿名纪律**：匿名只做限速兜底与一次性短任务；**需要留存、归档、跨机续接的会话必须用 acct1/acct2**。匿名会话丢设备 cookie 即永久失联，且从不进历史。
+5. **匿名纪律**：匿名只做限速兜底与一次性短任务；**需要留存、归档、跨机续接的会话必须用 acct1/acct2/acct3**。匿名会话丢设备 cookie 即永久失联，且从不进历史。
 6. **落盘约定**：`prompts/`（编号前缀 NN-topic.md）、`replies/`（reply-<conv_id8>-<topic>.md 全文不截断）、`conv-api/`（GET 缓存）、`newchat-map.json`、`sessions-registry.json`、`send-queue-log.md`。
 7. **禁止**：自撰/改写自产提示词；**自行做逻辑规划/实现方案/补全设计**（一切逻辑规划实现必须由 ChatGPT 主导，方案不完整回问 ChatGPT 补全）；POST 不带 conversation_id 发进既有任务会话；并发抢 GET 配额；未查 open PR 就开同主题实现；删除任何会话产物。
 8. **定时任务粒度（用户明示强制 2026-11-19）**：**所有定时任务一律按 1 小时维度排程，禁止天维度（天维度过久）**。落地口径：循环任务用每小时（间隔 ≤1h）；到期处置/远期复核不得挂天级 one-shot，改为**每小时条件巡检**（提示词内置"未到点→静默退出；已到点且未处置→执行；已处置→静默退出"门控）；一次性看门狗/闹钟 ≤1h。违规排程（DAILY、数日后 one-shot）一律改小时维度。**本条为管理基线**（管理所有 AI 代理的 WorkBuddy automation 排程）：创建/修改任何 automation 前先读本条；过期 one-shot 一律 PAUSED 归档，不得留 ACTIVE 尸体；跨天/跨周的到期项用每小时条件巡检 + validFrom/validUntil 收窗，避免无效空转。完整条款见 `references/baselines.md` 的 **B1–B15**（含并发上限 3、`unknown_interrupted` 幂等续跑、只读看门狗零写副作用、无事静默）。

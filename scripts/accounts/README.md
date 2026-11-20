@@ -12,6 +12,9 @@ scripts/
     ├── acct2/
     │   ├── cookies.json          ← acct2
     │   └── access_token.txt
+    ├── acct3/
+    │   ├── cookies.json          ← acct3
+    │   └── access_token.txt
     └── nologin/                  ← 脚本自动生成，不要手写
         ├── device-cookie.txt
         └── devices/<oai-did>.txt
@@ -44,7 +47,7 @@ acct1 也可以整目录外置：设 `CHATGPT_AUTH_DIR=/path/to/dir`，脚本会
 python scripts/extract_auth.py
 ```
 
-只覆盖默认账号（acct1）。第二个身份需在同一浏览器另行登录后导出到 `accounts/acct2/`。
+只覆盖默认账号（acct1）。额外身份（acct2 / acct3）需在已登录的 InPrivate 窗口经 DevConsole 同源取 token + 可读 cookie，导出到 `accounts/acct2/`、`accounts/acct3/`；本机回环接收服务被 CSP/PNA 拦下时，兜底下载 JSON 再读取。导出的 cookie 若缺 CF 系列，首轮 `warm_cookies()` 会补齐。
 
 ## nologin/
 
