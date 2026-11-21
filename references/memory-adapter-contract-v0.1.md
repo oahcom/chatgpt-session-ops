@@ -251,8 +251,12 @@ Constraints:
 - work_item_id must pass identifier validation.
 - limit must be greater than zero.
 - threshold must be finite and between 0 and 1.
-- An absent session_id means cross-Session retrieval
-  within the specified WorkItem.
+- When session_id is present, retrieval MUST be restricted to entries
+  matching both the explicit work_item_id and the supplied session_id.
+- When session_id is absent, retrieval MAY span Sessions, but MUST
+  remain restricted to the explicit work_item_id.
+- Implementations MUST NOT interpret an absent session_id as an
+  unrestricted or global search.
 
 The retrieval scope is always the explicit WorkItem.
 
@@ -260,9 +264,41 @@ No global fallback is allowed.
 
 ## 10. Retrieve response
 
+The response to the request in §9 (session_id = "session-002").
+Every returned entry matches both the requested work_item_id and the
+requested session_id.
+
 {
   "contract_version": "0.1",
   "request_id": "req_002",
+  "ok": true,
+  "result": {
+    "entries": [
+      {
+        "memory_id": "550e8400-e29b-41d4-a716-446655440000",
+        "work_item_id": "wi_550e8400-e29b-41d4-a716-446655440000",
+        "session_id": "session-002",
+        "content": "The migration was completed.",
+        "provenance": {
+          "source_type": "execution_result",
+          "source_id": "session-002",
+          "captured_at": "2026-11-21T10:00:00Z"
+        },
+        "created_at": "2026-11-21T10:00:00Z",
+        "score": 0.85
+      }
+    ],
+    "entries_included": 1,
+    "entries_omitted": 0
+  }
+}
+
+The same WorkItem queried without session_id may return entries from
+several Sessions inside that WorkItem:
+
+{
+  "contract_version": "0.1",
+  "request_id": "req_003",
   "ok": true,
   "result": {
     "entries": [
@@ -278,9 +314,22 @@ No global fallback is allowed.
         },
         "created_at": "2026-11-21T10:00:00Z",
         "score": 0.85
+      },
+      {
+        "memory_id": "660e8400-e29b-41d4-a716-446655440001",
+        "work_item_id": "wi_550e8400-e29b-41d4-a716-446655440000",
+        "session_id": "session-002",
+        "content": "The migration was verified.",
+        "provenance": {
+          "source_type": "execution_result",
+          "source_id": "session-002",
+          "captured_at": "2026-11-21T11:00:00Z"
+        },
+        "created_at": "2026-11-21T11:00:00Z",
+        "score": 0.72
       }
     ],
-    "entries_included": 1,
+    "entries_included": 2,
     "entries_omitted": 0
   }
 }
