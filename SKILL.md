@@ -167,7 +167,7 @@ python scripts/chatgpt_send.py --account acct2 <conv_id> <prompt_file>
 
 各账号限速彼此独立。429 时对原身份退避至少 90 秒，GET 可用该身份缓存；不要并发运行同一账号请求。
 
-查询会话清单：`python scripts/chatgpt_send.py --account acct1 --list` 查询单一账号；`python scripts/chatgpt_send.py --list-all` 顺序查询本机已配置的 acct1、acct2、acct3、acct4、acct5、acct6 与匿名态，并为每条结果标注身份。`--list-all` 输出 `by_account`（按账号分组，便于归档）、`summary`（各账号计数）、`quota`（各账号最近响应的限速观测头，只读）与 `errors`。不可用的账号和接口错误会进入 errors；遇到 429 即停止剩余扫描。聚合结果只覆盖各身份自身有权看到的会话，不代表匿名态能读取私有会话。
+查询会话清单：`python scripts/chatgpt_send.py --account acct1 --list` 查询单一账号；`python scripts/chatgpt_send.py --list-all` 顺序查询本机已配置的**六个登录态**（`acct1`–`acct6`，即 `ROTATION_PRIMARY`），并为每条结果标注身份。**默认不含匿名态**——匿名态只在显式加 `--include-nologin` 时才纳入枚举。`--list-all` 输出 `by_account`（按账号分组，便于归档）、`summary`（各账号计数）、`quota`（各账号最近响应的限速观测头，只读）与 `errors`。不可用的账号和接口错误会进入 errors；遇到 429 即停止剩余扫描。聚合结果只覆盖各身份自身有权看到的会话，不代表匿名态能读取私有会话。
 
 `--list-all` 默认 **dry-run（只读）**，加 `--apply` 才把「唯一观察、枚举完整、无冲突」的候选登记进 `conv-accounts.json`；`--include-nologin` 显式把匿名态纳入枚举。写入一律走 `record_conv()`，写完在同一把锁下回读磁盘填 `registered`。未知或重复 flag 直接 exit 2，不触网。
 
@@ -245,10 +245,45 @@ Consequence for the registry: an account stuck at `failed` keeps its last-known 
 python scripts/chatgpt_send.py --thinking --new <prompt_file>       # 思考模式（评审/裁决必开）
 python scripts/chatgpt_send.py --new <prompt_file>                  # 默认：acct1/acct2/acct3/acct4/acct5/acct6 均分
 python scripts/chatgpt_send.py --account acct2 --new <prompt_file>  # 指定身份
+python scripts/chatgpt_send.py --account auto --new <prompt_file>   # 自动挑（仅 --new 分支支持）
 python scripts/chatgpt_send.py --rotation                           # 游标/计数/兜底次数
 python scripts/chatgpt_send.py --rotation-enable acct2              # 解封某身份
+python scripts/chatgpt_send.py --rotation-disable acct2             # 手动封某身份（不触网）
+python scripts/chatgpt_send.py --rotation-reset                     # 清零游标与全部计数（写操作，见下）
 python scripts/chatgpt_send.py --owner <conv_id>                    # 查会话归属账号
 ```
+
+**`--rotation-enable` / `--rotation-disable`**（一对，纯本地状态，不触网）：
+
+| flag | 改什么 | 说明 |
+|---|---|---|
+| `--rotation-enable <name>` | 从 `unavailable` 移除该身份，`failures` 清零 | 解封。`<name>` 必须在 `ROTATION_ORDER` 内（`acct1`–`acct6` / `nologin`），否则退 2 |
+| `--rotation-disable <name>` | 标记 `manually disabled` 并计入 `unavailable` | 手动封。`reason` 写死为 `manually disabled`，与 401/429 的自动冷却区分开——`anon_fallback_block_reason()` 会单独识别这个字符串 |
+
+两者都立即打印完整 `rotation_summary()`。**`--rotation-enable` 不能解除「凭据真的失效」**：它只清本地标记，401 的病因在服务端（A18）。
+
+**`--rotation-reset`**（写操作，不可逆）：
+
+```python
+s["cursor"] = 0
+s["fallback_uses"] = 0
+s["created"] = {a: 0 for a in s["order"]}
+s["failures"] = {a: 0 for a in s["order"]}
+s.pop("last", None)
+```
+
+- **清什么**：主游标、匿名兜底计数、各身份建会话计数、各身份失败计数、最近一次记录。
+- **不清什么**：`unavailable`（不可用标记与 TTL **原样保留**）。所以「想解封」要用 `--rotation-enable`，`--rotation-reset` 解不了封。
+- **什么时候用**：均分严重偏斜（某身份计数远超其他）且确认不是失败累积导致时；或测试后恢复干净起点。
+- **风险**：计数清零后 `share` 观测值归零重算，历史配额分布不可追溯。**不要在排查 429 期间用**——会把失败证据一起抹掉。
+- **与 `--rotation-disable` 的区别**：`reset` 动的是**统计量**，`disable` 动的是**可用性**。两者正交，别混用。
+
+**`--account auto` 的边界**：`auto` **不是**合法账号身份（不在 `_VALID_ACCOUNT_IDENTITIES`），只在 `--new` 分支被特殊处理为「走默认轮转」。所以：
+
+- ✅ `--account auto --new <file>` —— 等同不指定 `--account`
+- ❌ `--account auto --list` / `--account auto <conv_id>` —— 走 `validate_account_identity` 校验失败，**退 2**
+
+用法文案里列了 `auto` 是为了 `--new` 的可读性，不代表它是通用身份。
 
 轮转规则：`acct1 → acct2 → acct3 → acct4 → acct5 → acct6 → acct1 …` 均分（游标持久化在 `scripts/account-rotation.json`，只在登录态之间推进）。匿名仅在全部登录态都 429 时兜底，且创建后打印 `WARN` 提示不入历史。每次成功都把 `conv_id → 账号` 登记到 `scripts/conv-accounts.json`；之后投递/收割该会话、未显式指定 `--account` 时自动路由。
 
@@ -439,13 +474,14 @@ python scripts/chatgpt_send.py --proxy-clear                # 清掉 proxy.json 
 ### references/
 
 - `baselines.md` — **A/B 类基线（可判定版 v1.8，50 条）**：每条带判定口径与违例后果，附 C 类现成配方（每小时巡检、落盘看门狗、到期处置、配额哨兵）、D 类事故→条款映射、E 类变更纪律、G 类证据矩阵说明。**开工前扫 A0/B0 清单，排程前读 B1–B15，改代码前读对应条款。**
-- `evidence-matrix.md` — **逐条对账「这条基线由什么证明」**：`test:` 用例名 / `code:` 符号 / `live:` 实测日期 / `human:` 人判理由，四类分开标注；34 条有离线用例、3 条只有代码、13 条纯人判，缺口按危害排序列在文末。改基线必须同步这张表——`TestEvidenceMatrix` 会校验引用是否真实存在。
+- `evidence-matrix.md` — **逐条对账「这条基线由什么证明」**：`test:` 用例名 / `code:` 符号 / `live:` 实测日期 / `human:` 人判理由，四类分开标注；34 条有离线用例、3 条只有代码、14 条纯人判，缺口按危害排序列在文末。改基线必须同步这张表——`TestEvidenceMatrix` 会校验引用是否真实存在。
 - `TESTING-mutation-verification.md` — **安全测试方法论（DECISION-156 血的教训）**：一条没做过变异验证的安全测试等于没有测试。含五步法（正常 → 恶意 → 边界 → **修复回滚后的变异验证** → **确认执行了目标分支**）、本轮四条用例的变异记录、五个反面模式（mock 参数没人用、断言恒真、测试自己抛异常被当成红、只测纯函数、同语义多实现只测一份）、两份实现的漂移检测写法。**写任何安全类用例前先读这篇。**
 - `api-protocol.md` — 实测协议细节：端点、PoW 算法、POST 请求体全字段、SSE 解析、mapping tail 计算、状态码处置、限速纪律。改脚本前先读。
 - `INCIDENT-2026-11-20-CONVERSATION-REGISTRY-LOSS-AND-RECOVERY.md` — **事故记录**：旧 500 条裁剪器删掉 387 条归属记录 → 并集最小动作恢复 904。含时间切面、并发写入者、证据 SHA-256 清单、`restore_conv_map_minimal()` vs `register_conversations_batch()` 的职责边界，以及「不得宣称四账号已收敛 / 不得宣称批量登记已生产验证」的禁止结论。
 - `INCIDENT-2026-11-21-CONVERSATION-REGISTRY-LEGACY-TRUNCATION.md` — **事故记录（P2，独立第二病因，已 CLOSED）**：11-20 修复后注册表仍在丢条目。根因是旧项目脚本 `WorkBuddy/2026-11-18-13-49-20/chatgpt_send_local.py` 按 `ts` 只保留最近 500 条，与主脚本共用同一个 `conv-accounts.json`。含「存活条目 100% 被刷新过 ts」的刀切证据、F1 全写入者清单、F2 快照交叉比对、F3 restore 锁行为。处置：legacy 四处封死为只读（含 3 个裸写脚本）+ 主脚本 `RegistryShrinkRefused` 单调性守卫（删除阈值 0，跨进程高水位基准按 A/B/C/D 四态 fail-closed，基准永不领先磁盘）+ 586 条历史恢复。**不得与 11-20 合并为同一根因；关闭本事故不等于注册表治理全部完成。**
 - `GATE-B-BATCH-REGISTRATION-VERIFICATION.md` — **门槛 B 生产验证记录（DECISION-151 正式 PASS）**：`register_conversations_batch()` 首次执行登记 315 条（1112 → 1427，高水位同步，`audit=CONSISTENT`）；第二次 `eligible_registrations` 315 → 0，幂等性成立。含一项**方法论修正**：注册表字节相等不能作为跨会话断言——实测字节变化来自并发 `record_conv()` 改写既有记录的 `prompt`/`ts`，已用隔离实验证明 batch 对已存在候选**不写盘**（50 条候选，sha 前后相等）。**`registered` ≠ `added_count`**：前者是「已验证归属的候选数」，后者才是「本次新增数」，幂等性判据只能用后者（已实现 `reconciliation.added_count`）。`registered_not_observed=23` 按裁决保留，不得以「当前不可观测」推定历史登记无效。
 - `memory-adapter-contract-v0.1.md` — **SO ↔ MA 直连记忆契约 v0.1（FROZEN FOR DEVELOPMENT，2026-11-21 生效）**：本技能作为 protocol consumer，Memory Adapter 作为 provider，为单一权威 WorkItem 提供跨会话记忆连续性。**职责边界**：SO 拥有 WorkItem 身份/生命周期/会话关联/当前状态/「存什么」的选择权；MA 只负责记忆的持久化与检索，**不是** WorkItem 管理系统。改协议前先读——它已冻结，变更需双方同步升版本号。
+- `REGISTRY-ANOMALY-AUDIT-2026-11-21.md` — **注册表 9 条异常记录的审计说明（DECISION-158，保持原样不修改）**：4 条 8 位短 ID + 2 条 UUID `ts:null`（早期写入路径）、2 条标 `DO NOT dispatch` 的重复运行取证、1 条投递任务被杀后人工收割。含**安全性质核验**：`lookup_conversation_owner()` 完全不读 `ts`，`account` 非法即 fail-closed，不存在靠 `ts` 猜测归属的路径。**不要为这 9 条再发起清理任务**（补 `ts` 等于往审计链注入伪证，删除会解除 `DO NOT dispatch` 约束），除非出现新的安全证据。
 - **注册表写入纪律**：`conv-accounts.json` 只允许 `scripts/chatgpt_send.py` 写入。任何新增写入路径必须先过 `_registry_guard()`，落盘后再 `_registry_commit_baseline()`。删除既有 ID 一律拒绝（阈值 0）。高水位基准损坏时 fail-closed。
 - **高水位重建是数据安全动作**（DECISION-145 Q2）：必须 `CHATGPT_REGISTRY_HIGHWATER_RECONCILE=1` **加** `CHATGPT_REGISTRY_RECONCILE_REASON="人工核验说明"`，且**同进程只生效一次**（一次性授权，不是永久宽松模式）。每次重建先写 `conv-accounts.json.audit.jsonl`（追加式 JSONL + fsync）再改基准，记录 `ts_utc / op / basis / baseline_before{count,sha256} / registry{count,sha256} / lost_ids 完整差集 / git_sha / result`。审计写不成即中止重建。
 - **注册表只读审计**（DECISION-145 Q3）：`python scripts/chatgpt_send.py --registry-audit [--json]`。只读，不碰注册表也不碰基准，输出完整差集（不是只有数量），`Consistency` 取 `CONSISTENT / BASELINE_AHEAD / REGISTRY_AHEAD / BASELINE_MISSING / BASELINE_UNREADABLE / REGISTRY_UNREADABLE`，非 CONSISTENT 退 4。审计结果**不得**自动转成恢复动作。

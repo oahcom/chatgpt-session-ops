@@ -2547,8 +2547,8 @@ def purge_expired(st):
 
 
 def rotation_plan(st):
-    """登录取证身份（acct1/acct2/acct3/acct4/acct5/acct6）从游标起顺次尝试；不可用的排到末尾（避免死锁）。
-    匿名态不进入该计划——它只在两者都 429 时由 anon_fallback_ready() 决定是否兜底。"""
+    """登录态身份（acct1/acct2/acct3/acct4/acct5/acct6）从游标起顺次尝试；不可用的排到末尾（避免死锁）。
+    匿名态不进入该计划——它只在**全部登录态**都 429 时由 anon_fallback_ready() 决定是否兜底。"""
     st = _as_dict(st)
     cur = _as_int(st.get("cursor"), 0)                          # F-34
     n = len(ROTATION_PRIMARY)
