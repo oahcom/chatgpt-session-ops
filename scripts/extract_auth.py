@@ -41,8 +41,22 @@ def _harden(path):
         pass
 
 
+def _cookie_domain_allowed(domain):
+    """DECISION-156：只允许 OpenAI 自有域，精确域名或后缀，不做字符串包含。
+
+    `notchatgpt.com` / `evil-openai.com` / `chatgpt.com.evil.io` 都必须被拒。
+    与 chatgpt_send.py 的同名判定保持同一语义（两处独立实现，避免脚本互相依赖）。
+    """
+    d = (domain or "").strip().lower().lstrip(".")
+    if not d:
+        return False
+    for base in ("chatgpt.com", "openai.com"):
+        if d == base or d.endswith("." + base):
+            return True
+    return False
+
 def chatgpt_cookies(c):
-    """取完整 cookie（含 HttpOnly），只保留 ChatGPT 域。"""
+    """取完整 cookie（含 HttpOnly），只保留 ChatGPT / OpenAI 域。"""
     cookies = []
     try:
         c.send("Network.enable", {})
@@ -58,8 +72,7 @@ def chatgpt_cookies(c):
             print("Storage.getCookies 也失败：%s" % e, flush=True)
     out = []
     for ck in cookies:
-        domain = (ck.get("domain") or "").lstrip(".").lower()
-        if "chatgpt.com" in domain or "openai.com" in domain:
+        if _cookie_domain_allowed(ck.get("domain")):
             out.append(ck)
     return out
 

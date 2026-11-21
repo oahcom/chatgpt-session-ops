@@ -24,6 +24,7 @@ import threading
 import time
 import unittest
 import urllib.error
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.environ.get("CHATGPT_SEND_PY") or os.path.join(HERE, "..", "scripts", "chatgpt_send.py")
@@ -5179,6 +5180,149 @@ class TestAccountRecoveryAcct5(unittest.TestCase):
         for name in m.ROTATION_PRIMARY:
             self.assertIn(name, st["failures"])
             self.assertIn(name, st["created"])
+
+class TestCookiePersistenceBoundary(unittest.TestCase):
+    """DECISION-156：Cookie 持久化边界。
+
+    实测事故：acct1 的 cookies.json 里混进整包 Google 会话（50 条，覆盖
+    accounts.google.com / .google.com / .youtube.com / .google.co.jp /
+    .google.com.hk）。请求头过滤让它们发不出去，但 warm_cookies() 会把整个
+    列表反复回写磁盘——凭据存储边界失守。这里锁死「哪些凭据有资格被保存」。
+    """
+
+    def test_chatgpt_domain_allowed(self):
+        for d in ("chatgpt.com", ".chatgpt.com", "ws.chatgpt.com", "CHATGPT.COM"):
+            with self.subTest(domain=d):
+                self.assertTrue(m._cookie_domain_allowed(d))
+
+    def test_openai_domain_allowed(self):
+        for d in ("openai.com", ".openai.com", "auth.openai.com",
+                  ".auth.openai.com", "files.openai.com", ".bzr.openai.com"):
+            with self.subTest(domain=d):
+                self.assertTrue(m._cookie_domain_allowed(d))
+
+    def test_lookalike_domains_rejected(self):
+        """精确边界：包含不等于属于。"""
+        for d in ("notchatgpt.com", "evil-openai.com", "chatgpt.com.evil.io",
+                  "openai.com.evil.io", "fakechatgpt.com", "chatgpt.co",
+                  "myopenai.com", "google.com", ".google.com",
+                  "accounts.google.com", ".youtube.com", ".google.co.jp",
+                  ".google.com.hk", ".oaistatic.com"):
+            with self.subTest(domain=d):
+                self.assertFalse(m._cookie_domain_allowed(d))
+
+    def test_empty_and_malformed_domain_rejected(self):
+        for d in ("", None, "   ", ".", ".."):
+            with self.subTest(domain=repr(d)):
+                self.assertFalse(m._cookie_domain_allowed(d))
+
+    def test_filter_keeps_only_openai(self):
+        cookies = [
+            {"name": "oai-did", "value": "x", "domain": ".chatgpt.com"},
+            {"name": "__Secure-next-auth.session-token.0", "value": "y", "domain": "chatgpt.com"},
+            {"name": "__cf_bm", "value": "z", "domain": ".openai.com"},
+            {"name": "SID", "value": "g1", "domain": ".google.com"},
+            {"name": "HSID", "value": "g2", "domain": ".google.com"},
+            {"name": "LSID", "value": "g3", "domain": "accounts.google.com"},
+            {"name": "__Secure-1PSID", "value": "g4", "domain": ".youtube.com"},
+            {"name": "NID", "value": "g5", "domain": ".google.co.jp"},
+        ]
+        out = m._filter_openai_cookies(cookies)
+        self.assertEqual(len(out), 3)
+        self.assertEqual(
+            sorted(c["name"] for c in out),
+            ["__Secure-next-auth.session-token.0", "__cf_bm", "oai-did"],
+        )
+
+    def test_filter_preserves_all_fields(self):
+        """过滤不得重构字段——只挑不选。"""
+        c = {"name": "oai-did", "value": "v", "domain": ".chatgpt.com",
+             "path": "/", "secure": True, "httpOnly": True, "sameSite": "Lax",
+             "expires": 1796110471}
+        out = m._filter_openai_cookies([c])
+        self.assertEqual(out, [c])
+        self.assertIs(out[0], c)
+
+    def test_filter_handles_non_list_and_non_dict(self):
+        self.assertEqual(m._filter_openai_cookies(None), [])
+        self.assertEqual(m._filter_openai_cookies("x"), [])
+        self.assertEqual(m._filter_openai_cookies([]), [])
+        self.assertEqual(
+            m._filter_openai_cookies(["junk", None, 5,
+                                      {"name": "oai-did", "value": "v",
+                                       "domain": ".chatgpt.com"}]),
+            [{"name": "oai-did", "value": "v", "domain": ".chatgpt.com"}],
+        )
+
+    def test_warm_cookies_drops_foreign_cookies_on_writeback(self):
+        """回归：真实走 warm_cookies() 的回写路径。
+
+        输入 50 条 Google + 3 条 OpenAI，断言内存与磁盘最终都只剩 OpenAI 域。
+        网络层 mock，持久化与过滤走真实代码。
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            foreign = [{"name": "SID%d" % i, "value": "g", "domain": ".google.com"}
+                       for i in range(50)]
+            keep = [{"name": "oai-did", "value": "d", "domain": ".chatgpt.com"},
+                    {"name": "__cf_bm", "value": "c", "domain": ".openai.com"},
+                    {"name": "_account", "value": "a", "domain": "chatgpt.com"}]
+
+            api = m.ChatGPTAPI.__new__(m.ChatGPTAPI)
+            api.base_dir = tmp
+            api.cookies = foreign + keep
+            api.cookie = ""
+            api.is_anon = False
+            api.proxy = "http://127.0.0.1:7000"
+
+            with mock.patch.object(m, "build_opener_for", side_effect=_fake_build_opener):
+                api.warm_cookies()
+
+            self.assertEqual(len(api.cookies), 4, "内存里不该留 Google cookie")
+            self.assertTrue(all(m._cookie_domain_allowed(c["domain"]) for c in api.cookies))
+
+            on_disk = json.load(open(os.path.join(tmp, "cookies.json"), encoding="utf-8"))
+            self.assertEqual(len(on_disk), 4, "磁盘上不该留 Google cookie")
+            self.assertTrue(all(m._cookie_domain_allowed(c["domain"]) for c in on_disk))
+
+
+def _fake_build_opener(proxy, context=None, extra=()):
+    return _NullOpener(extra)
+
+
+class _NullOpener:
+    """warm_cookies 里 opener.open(...) 的替身：不触网，只往 jar 里塞一颗新 cookie。
+
+    warm_cookies 自己 new 一个 CookieJar，通过 `extra=[HTTPCookieProcessor(jar)]`
+    交给 build_opener_for。替身必须把 cookie 写进**那个** jar，否则 jar 里只有
+    原有 cookie，`changed` 为空会提前 return，回写分支压根不会被执行 —— 那样
+    测试就只是「跑了一遍但什么也没验证」。
+    """
+
+    def __init__(self, extra=()):
+        self._extra = list(extra)
+
+    def open(self, req, timeout=None):
+        for h in self._extra:
+            jar = getattr(h, "cookiejar", None)
+            if jar is None:
+                continue
+            import http.cookiejar as _cj
+            jar.set_cookie(_cj.Cookie(
+                0, "__cf_bm_fresh", "fresh", None, False, ".openai.com",
+                False, False, "/", True, False, None, False, None, None, {}))
+
+        class _R:
+            def read(self_inner):
+                return b""
+
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *a):
+                return False
+
+        return _R()
 
 class TestBatchAddedCountSemantics(TmpBase):
     """DECISION-151：`registered` != `added_count`，幂等性判据只能是后者。"""

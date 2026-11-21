@@ -74,14 +74,14 @@ ChatGPT 会话操控与生命周期管理。把"手和眼"（I/O、投递、收�
 
 | 身份 | 邮箱 | 认证方式 |
 |---|---|---|
-| `acct1` | 1491856051@qq.com | auth0 |
+| `acct1` | 1491856051@qq.com | google-oauth2 |
 | `acct2` | oahcom0831@gmail.com | auth0 |
 | `acct3` | 2293780783@qq.com | google-oauth2 |
 | `acct4` | oahcom@protonmail.com | auth0 |
 | `acct5` | 2651259457@qq.com | auth0 |
 | `acct6` | oachom0831@proton.me | auth0 |
 
-`acct3` 走 `google-oauth2`，刷新凭据的路径与其他五个（auth0）不同，需走 Google 授权而非邮箱密码登录。
+`acct1` 与 `acct3` 走 `google-oauth2`，刷新凭据的路径与其他四个（auth0）不同，需走 Google 授权而非邮箱密码登录。其余四个是 auth0。
 
 **429 限流的处置（用户裁定：换账号，或直接用匿名渠道）。** 四条硬规则：
 
@@ -302,6 +302,7 @@ python scripts/chatgpt_send.py --tail <conv_id>
 | 落盘原子性 | 一律 `tmp → fsync → replace`；失败清 tmp | 匿名归档是唯一副本，写半截等于会话彻底丢失 |
 | 回复全文 | 默认不截断；只有显式设 `CHATGPT_REPLY_MAX_CHARS` 才截，且头部注明 | 旧版静默只留**末尾** 2 万字，结论常常在前半段 |
 | 凭据权限 | POSIX 上 `cookies.json` 等落盘后 chmod 600 | 默认 umask 会让同机其他用户可读 |
+| Cookie 持久化边界 | `cookies.json` **只允许存 `chatgpt.com` / `openai.com` 域**（含子域）。`_cookie_domain_allowed()` 走精确域名或后缀匹配，**不做字符串包含**；`warm_cookies()` 回写前过滤内存与磁盘，`extract_auth.py` 导入时同语义过滤 | 请求头过滤只管「能不能发出去」，管不住「能不能存下来」。实测 acct1 的 `cookies.json` 混进 50 条 Google 会话（`accounts.google.com` / `.google.com` / `.youtube.com` / `.google.co.jp` / `.google.com.hk`），`warm_cookies()` 每次补 CF cookie 都把整包回写磁盘——等于把全站登录态反复备份。字符串包含判定还会误收 `notchatgpt.com` |
 | 429 退避 | 先定性再退避；上游限速按返回体 `resets_in`/`retry_after`/`Retry-After` 的真实时限（缺省才默认，封顶 3600 秒）；代理类失败不退避、改修代理 | 固定 90 秒既可能太快也可能白等，且会把代理故障误当限速 |
 | 文件锁重入 | 按**线程**记持有者（`path -> thread ident`） | 旧版按路径记集合，同进程第二个线程会跳过加锁，多线程下照样丢更新（已由单测锁死） |
 | `--tail` 退出码 | 没取到内容返回 1 | 否则脚本编排层无法区分「读到了」和「被限速」 |
@@ -328,7 +329,7 @@ python scripts/chatgpt_send.py --tail <conv_id>
 python -m unittest discover -s tests -v
 ```
 
-345 条，覆盖 id 校验与路径穿越、状态文件损坏隔离（语法坏与顶层类型坏同罪）与字段形状收敛（`_as_int` 等五件套，畸形字段一律「没有这个值」不抛异常）、原子写（tmp 名唯一，防同进程多线程互踩）与并发 80 次不丢更新、锁重入/stale 回收/持有者身份、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性、设备身份留存与多设备回退（含凭据剔除、429 停手、归属自愈），以及用离线桩跑通的投递主流程（含 413、空提示词、非法 id、发送异常时的孤儿会话登记）；出口代理（优先级、fail-closed、http/socks 真分流、死节点探测、出口判定、目标站探活、WebRTC 泄漏分类；坏端口＝配置非法在入口拒，探活对垃圾端口一律 False）；B8 六进程并发抢槽（抢不到锁即 QUEUED、半截槽位不回收）、B15 租约心跳与超时两档；交付正文托管（`--extract` 字节级、CRLF 不改、标记不唯一退 2、`--verify-copy` 单字节差异即拒）；调度口径（`--check-name` 12 条命名契约、`--check-schedule` 1 小时维度、`--check-oneshot` 一次性窗口）；证据矩阵自校验（条款与证据一一对应，引用不存在的用例即红）。**改锁、改落盘、改 id、改设备身份、改代理、改基线条款前先跑一遍。**
+353 条，覆盖 id 校验与路径穿越、状态文件损坏隔离（语法坏与顶层类型坏同罪）与字段形状收敛（`_as_int` 等五件套，畸形字段一律「没有这个值」不抛异常）、原子写（tmp 名唯一，防同进程多线程互踩）与并发 80 次不丢更新、锁重入/stale 回收/持有者身份、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性、设备身份留存与多设备回退（含凭据剔除、429 停手、归属自愈），以及用离线桩跑通的投递主流程（含 413、空提示词、非法 id、发送异常时的孤儿会话登记）；出口代理（优先级、fail-closed、http/socks 真分流、死节点探测、出口判定、目标站探活、WebRTC 泄漏分类；坏端口＝配置非法在入口拒，探活对垃圾端口一律 False）；B8 六进程并发抢槽（抢不到锁即 QUEUED、半截槽位不回收）、B15 租约心跳与超时两档；交付正文托管（`--extract` 字节级、CRLF 不改、标记不唯一退 2、`--verify-copy` 单字节差异即拒）；调度口径（`--check-name` 12 条命名契约、`--check-schedule` 1 小时维度、`--check-oneshot` 一次性窗口）；证据矩阵自校验（条款与证据一一对应，引用不存在的用例即红）。**改锁、改落盘、改 id、改设备身份、改代理、改基线条款前先跑一遍。**
 
 ### 交付正文与排程口径的机器闸口（v1.8）
 
@@ -438,7 +439,7 @@ python scripts/chatgpt_send.py --proxy-clear                # 清掉 proxy.json 
 ### references/
 
 - `baselines.md` — **A/B 类基线（可判定版 v1.8，49 条）**：每条带判定口径与违例后果，附 C 类现成配方（每小时巡检、落盘看门狗、到期处置、配额哨兵）、D 类事故→条款映射、E 类变更纪律、G 类证据矩阵说明。**开工前扫 A0/B0 清单，排程前读 B1–B15，改代码前读对应条款。**
-- `evidence-matrix.md` — **逐条对账「这条基线由什么证明」**：`test:` 用例名 / `code:` 符号 / `live:` 实测日期 / `human:` 人判理由，四类分开标注；33 条有离线用例、3 条只有代码、13 条纯人判，缺口按危害排序列在文末。改基线必须同步这张表——`TestEvidenceMatrix` 会校验引用是否真实存在。
+- `evidence-matrix.md` — **逐条对账「这条基线由什么证明」**：`test:` 用例名 / `code:` 符号 / `live:` 实测日期 / `human:` 人判理由，四类分开标注；34 条有离线用例、3 条只有代码、13 条纯人判，缺口按危害排序列在文末。改基线必须同步这张表——`TestEvidenceMatrix` 会校验引用是否真实存在。
 - `api-protocol.md` — 实测协议细节：端点、PoW 算法、POST 请求体全字段、SSE 解析、mapping tail 计算、状态码处置、限速纪律。改脚本前先读。
 - `INCIDENT-2026-11-20-CONVERSATION-REGISTRY-LOSS-AND-RECOVERY.md` — **事故记录**：旧 500 条裁剪器删掉 387 条归属记录 → 并集最小动作恢复 904。含时间切面、并发写入者、证据 SHA-256 清单、`restore_conv_map_minimal()` vs `register_conversations_batch()` 的职责边界，以及「不得宣称四账号已收敛 / 不得宣称批量登记已生产验证」的禁止结论。
 - `INCIDENT-2026-11-21-CONVERSATION-REGISTRY-LEGACY-TRUNCATION.md` — **事故记录（P2，独立第二病因，已 CLOSED）**：11-20 修复后注册表仍在丢条目。根因是旧项目脚本 `WorkBuddy/2026-11-18-13-49-20/chatgpt_send_local.py` 按 `ts` 只保留最近 500 条，与主脚本共用同一个 `conv-accounts.json`。含「存活条目 100% 被刷新过 ts」的刀切证据、F1 全写入者清单、F2 快照交叉比对、F3 restore 锁行为。处置：legacy 四处封死为只读（含 3 个裸写脚本）+ 主脚本 `RegistryShrinkRefused` 单调性守卫（删除阈值 0，跨进程高水位基准按 A/B/C/D 四态 fail-closed，基准永不领先磁盘）+ 586 条历史恢复。**不得与 11-20 合并为同一根因；关闭本事故不等于注册表治理全部完成。**
@@ -451,7 +452,7 @@ python scripts/chatgpt_send.py --proxy-clear                # 清掉 proxy.json 
 
 ### tests/
 
-- `test_hardening.py` — 离线回归（345 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW、设备身份留存与多设备回退、出口代理（含本地假 http/socks 代理真分流）。
+- `test_hardening.py` — 离线回归（353 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW、设备身份留存与多设备回退、出口代理（含本地假 http/socks 代理真分流）。
 
 ## 协议细节
 
@@ -460,3 +461,7 @@ PoW 算法、POST 请求体全字段、SSE 解析、mapping tail 计算等实现
 ## 代码仓库
 
 代码与协议文档已仓库化：<https://github.com/oahcom/chatgpt-session-ops>（公开）。仓库只含代码与文档，凭据、`replies/`、状态 json 全部由 `.gitignore` 排除；同步时只拷 `SKILL.md`、`references/`、`scripts/*.py`，勿带本机运行态。
+
+**备份文件（`.bak-<ts>` / `.corrupt-<ts>`）同属敏感物**：它们是凭据与私有会话 id 的历史快照，与正本同等级。`.gitignore` 已用 `*.bak-*` / `*.corrupt-*` 覆盖（此前只有精确文件名规则，`cookies.json.bak-20261121-191330` 这类副本能溜进仓库）。处置纪律：审计确认正本已完全覆盖备份内容后即删，不留档；**不要**把凭据备份丢进云同步目录。
+
+**`chmod 600` 只在 POSIX 生效**（`_harden_perms()` 在 Windows 直接 return）。本机是 Windows，凭据文件的实际访问控制靠 NTFS ACL（`icacls` 显示仅 SYSTEM / Administrators / 当前用户可读写），不要以为跑过 `chmod` 就安全了；把技能目录放进多用户共享盘时先查 `icacls`。

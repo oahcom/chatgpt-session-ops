@@ -132,6 +132,10 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36 Edg/157.0.4341.60")
 CTX = ssl.create_default_context()
+
+# DECISION-156：Cookie 持久化边界。只有这些域（及其子域）有资格被写盘。
+# 请求头过滤只看「能不能发出去」，这里管「能不能存下来」——两道独立的关。
+_OPENAI_COOKIE_DOMAINS = ("chatgpt.com", "openai.com")
 # CHATGPT_BASE：API 根。默认直连；指向闸口时走 asip/chatgpt_l7.py
 #   （http://127.0.0.1:17892，429 适配：账号层退避短路 + transport 换 ok）。
 API_BASE = os.environ.get("CHATGPT_BASE", "https://chatgpt.com").rstrip("/")
@@ -4229,6 +4233,28 @@ class ThinkingModelUnavailable(RuntimeError):
         )
 
 
+def _cookie_domain_allowed(domain):
+    """Cookie 持久化边界（DECISION-156）：只允许 OpenAI 自有域。
+
+    精确匹配域名或其后缀，**不做字符串包含**——`notchatgpt.com`、
+    `evil-openai.com`、`chatgpt.com.evil.io` 都必须被拒。
+    这是「哪些凭据有资格被保存」的边界，与请求头过滤（「哪些能发出去」）是两道独立的关。
+    """
+    d = (domain or "").strip().lower().lstrip(".")
+    if not d:
+        return False
+    for base in _OPENAI_COOKIE_DOMAINS:
+        if d == base or d.endswith("." + base):
+            return True
+    return False
+
+def _filter_openai_cookies(cookies):
+    """只保留 OpenAI 域的 cookie，其余原样丢弃。保留字段不做重构。"""
+    if not isinstance(cookies, list):
+        return []
+    return [c for c in cookies
+            if isinstance(c, dict) and _cookie_domain_allowed(c.get("domain"))]
+
 class ChatGPTAPI:
     def __init__(self, base_dir=None, account="default"):
         # CHATGPT_AUTH_DIR selects credential/cache root; account data stays isolated.
@@ -4343,10 +4369,20 @@ class ChatGPTAPI:
                 changed.append(ck.name + "(更新)")
         if not changed:
             return False
+        # DECISION-156：回写前先过持久化边界。混进来的非 OpenAI 域 cookie
+        # （实测见过整包 Google 会话：accounts.google.com / .google.com /
+        # .youtube.com / .google.co.jp / .google.com.hk）不得被反复落盘。
+        # 内存与磁盘同步收敛，避免两者不一致。
+        before = len(self.cookies)
+        self.cookies = _filter_openai_cookies(self.cookies)
+        dropped = before - len(self.cookies)
         try:
             _save_json(os.path.join(self.base_dir, "cookies.json"), self.cookies)
         except (OSError, LockTimeout):
             pass
+        if dropped:
+            print("warm_cookies: 丢弃 %d 条非 OpenAI 域 cookie（持久化边界）" % dropped,
+                  flush=True)
         self.cookie = "; ".join(
             "%s=%s" % (c["name"], c["value"])
             for c in self.cookies
