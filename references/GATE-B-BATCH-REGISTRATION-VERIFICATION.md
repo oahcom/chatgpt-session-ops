@@ -128,8 +128,74 @@ all already present   True
 
 **判定：门槛 B 通过。** 「字节不变」这一条按实际语义修正为「batch 不产生写入」，并已用隔离实验证明；不把并发写入者的改动记在 batch 账上。
 
-## 六、遗留与观察
+## 六、正式验收裁决（DECISION-151）
 
-1. **并发写入是常态，不是异常**：多个 WorkBuddy 会话共用同一 `conv-accounts.json`，`record_conv()` 会刷新既有记录的 `prompt`/`ts`。字节级相等不能作为跨会话场景的断言，应改为「ID 集合单调 + batch 无新增」。
-2. `registered_not_observed=23` 稳定存在：历史已登记但当前五个账号的会话列表都枚举不到。可能是被服务端回收或属于已删会话。**未做清理**，因为删除 ID 被 `_registry_guard` 一律拒绝（阈值 0），符合设计。
-3. acct6 仅 2 条归属记录（1 次 smoke + 1 次自动轮转 + 1 次报告投递），样本量不足以评估其配额特征。
+> **裁决：PASS（正式通过）**
+>
+> 验收依据：提交 `5f3a765` + 本文档。
+>
+> 1. 首次生产批量登记 315 条，注册表 1112 → 1427，新增数与预期完全一致。
+> 2. Highwater 与注册表同步，审计 `CONSISTENT 1427 / 1427`。
+> 3. 第二次执行无新增：`eligible_registrations=0`、`registered=0`，重复与冲突均为零。
+> 4. 第二次执行期间字节变化，经差异定位与隔离实验，确认来自并发 `record_conv()` 对既有记录的合法更新，**而非** `register_conversations_batch()`。
+> 5. 字节不变断言按 §4.3 修正：跨会话场景以「注册表 ID 集合单调不减、无新增 ID」为幂等性判据；字节完全一致仅在独占写入时作为附加断言。
+> 6. `registered_not_observed=23` 作为历史已知偏差保留，不删除、不自动清理，不构成阻断项。
+> 7. 本次未改生产代码（仅后补 §6.2 的语义修正）、未删除注册表条目、未改 acct4/acct6 凭据。
+>
+> **不得再以本次并发写入造成的字节变化为由，将门槛 B 重新判定为未完成。**
+
+### 6.1 三项子裁决
+
+| 编号 | 裁决 | 内容 |
+|---|---|---|
+| Q1 | 接受修正 | 断言措辞按 §4.3 改；**不要求**为通过门槛 B 而给 batch 加全局写锁或阻止并发会话 |
+| Q2 | 不删除 | 23 条历史不可观测记录保留；不改 `_registry_guard` 删除阈值；不引入自动删除路径；如需清理须另行裁决 |
+| Q3 | PASS | 门槛 B 正式关闭 |
+
+### 6.2 落地：`registered` ≠ `added_count`（已实现）
+
+裁决附带指出的测试规范缺陷：**返回数量与实际新增数量必须严格区分**。
+
+隔离实验中传入 50 条既有候选，`register_conversations_batch()` 返回 `registered=50`，但磁盘一字未写。把 `registered == 0` 当作零新增，是错误等价的。
+
+已实现（`chatgpt_send.py`）：
+
+```python
+# register_conversations_batch() 结尾
+# DECISION-151：`registered` 是「已验证归属的候选数」，不是「本次新增数」。
+# 传入已存在的候选时 registered 照常返回全部，但磁盘可能一字未写。
+_batch_last_added = len(additions)
+register_conversations_batch.last_added_count = _batch_last_added
+
+# --list-all --apply 调用点
+reconciliation["registered"] = register_conversations_batch(registrations)
+reconciliation["added_count"] = getattr(
+    register_conversations_batch, "last_added_count", None
+)
+```
+
+实测：
+
+```
+已有候选 50 条: registered=50  added_count=0  sha_equal=True
+全新候选  3 条: registered=3   added_count=3
+混合批次  2 条: registered=2   added_count=1（1 条已存在 + 1 条新增）
+```
+
+回归：`TestBatchAddedCountSemantics` 3 条。回归总数 336 → **339**。
+
+### 6.3 工程原则（保留）
+
+> **幂等性不等于整个共享文件永远不变化。**
+
+多会话并发写入系统中，三个问题不能用「一个 SHA-256 是否相等」代替：
+
+1. 本次操作有没有新增数据？→ `added_count`
+2. 本次操作有没有破坏既有数据？→ ID 集合单调不减 + `_registry_guard`
+3. 其他合法写入者有没有更新既有数据？→ 不在本次判据内
+
+## 七、遗留与观察
+
+1. **并发写入是常态，不是异常**：多个 WorkBuddy 会话共用同一 `conv-accounts.json`，`record_conv()` 会刷新既有记录的 `prompt`/`ts`。字节级相等不能作为跨会话场景的断言。
+2. `registered_not_observed=23` 稳定存在：历史已登记但当前五个账号的会话列表都枚举不到。**按 DECISION-151 Q2 保留，不清理。** 不能因为当前不可观测，就反向推定历史登记无效。
+3. acct6 归属记录样本仍少，配额特征需继续观察。

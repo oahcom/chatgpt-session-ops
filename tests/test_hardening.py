@@ -5120,5 +5120,57 @@ class TestAccountExpansionAcct6(unittest.TestCase):
             self.assertIn(name, st["created"])
 
 
+class TestBatchAddedCountSemantics(TmpBase):
+    """DECISION-151：`registered` != `added_count`，幂等性判据只能是后者。"""
+
+    def setUp(self):
+        super().setUp()
+        self._conv = m.CONV_MAP_FILE
+        m.CONV_MAP_FILE = os.path.join(self.tmp, "conv-accounts.json")
+        self.path = m.CONV_MAP_FILE
+
+    def tearDown(self):
+        m.CONV_MAP_FILE = self._conv
+        super().tearDown()
+
+    def _seed(self, ids):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({i: {"account": "acct1", "prompt": None, "ts": "t"} for i in ids}, f)
+
+    def test_existing_candidates_report_zero_added(self):
+        self._seed(["6afd7001-0000-83ee-8000-000000000001",
+                    "6afd7002-0000-83ee-8000-000000000002"])
+        before = open(self.path, "rb").read()
+
+        out = m.register_conversations_batch([
+            {"id": "6afd7001-0000-83ee-8000-000000000001", "account": "acct1"},
+            {"id": "6afd7002-0000-83ee-8000-000000000002", "account": "acct1"},
+        ])
+
+        # 已验证归属的候选照常返回全部……
+        self.assertEqual(len(out), 2)
+        # ……但真正新增为 0，且磁盘一字未动
+        self.assertEqual(m.register_conversations_batch.last_added_count, 0)
+        self.assertEqual(open(self.path, "rb").read(), before)
+
+    def test_new_candidates_report_matching_added(self):
+        self._seed(["6afd7101-0000-83ee-8000-000000000001"])
+        out = m.register_conversations_batch([
+            {"id": "6afd7102-0000-83ee-8000-000000000002", "account": "acct2"},
+            {"id": "6afd7103-0000-83ee-8000-000000000003", "account": "acct2"},
+        ])
+        self.assertEqual(len(out), 2)
+        self.assertEqual(m.register_conversations_batch.last_added_count, 2)
+
+    def test_mixed_batch_reports_only_new(self):
+        self._seed(["6afd7201-0000-83ee-8000-000000000001"])
+        out = m.register_conversations_batch([
+            {"id": "6afd7201-0000-83ee-8000-000000000001", "account": "acct1"},
+            {"id": "6afd7202-0000-83ee-8000-000000000002", "account": "acct3"},
+        ])
+        self.assertEqual(len(out), 2)
+        self.assertEqual(m.register_conversations_batch.last_added_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

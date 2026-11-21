@@ -3039,6 +3039,12 @@ def register_conversations_batch(registrations):
                 "account": actual_account,
             })
 
+        # DECISION-151：`registered` 是「已验证归属的候选数」，不是「本次新增数」。
+        # 传入已存在的候选时 registered 照常返回全部，但磁盘可能一字未写。
+        # 幂等性判据必须是 added_count，不能用 registered 长度代替。
+        _batch_last_added = len(additions)
+        register_conversations_batch.last_added_count = _batch_last_added
+
         return registered
 
 
@@ -7166,6 +7172,11 @@ def main():
                 reconciliation["registered"] = (
                     register_conversations_batch(registrations)
                 )
+                # DECISION-151：显式给出「本次真正新增数」。
+                # registered 含「已存在且归属一致」的候选，不能当幂等性判据。
+                reconciliation["added_count"] = getattr(
+                    register_conversations_batch, "last_added_count", None
+                )
 
             except (
                 OSError,
@@ -7178,6 +7189,7 @@ def main():
                     "registry: batch registration failed (%s)" % e
                 )
                 reconciliation["registered"] = []
+                reconciliation["added_count"] = 0
 
         by_account = {}
         for conversation in combined:
