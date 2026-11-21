@@ -372,9 +372,9 @@ class AID2026011Tests(unittest.TestCase):
 
         self.assertEqual(result, 0)
 
-        self.assertEqual(len(calls), 5)
-        self.assertEqual(set(calls[:4]), set(m.ROTATION_PRIMARY))
-        self.assertEqual(calls[4], "nologin")
+        self.assertEqual(len(calls), len(m.ROTATION_PRIMARY) + 1)
+        self.assertEqual(set(calls[:len(m.ROTATION_PRIMARY)]), set(m.ROTATION_PRIMARY))
+        self.assertEqual(calls[len(m.ROTATION_PRIMARY)], "nologin")
 
     def test_200_without_conv_id_stops_rotation(self):
         """Assert a 200 without identity does not cause another account attempt."""

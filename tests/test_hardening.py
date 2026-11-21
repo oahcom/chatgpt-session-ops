@@ -995,6 +995,11 @@ class TestRotation(TmpBase):
                 "acct4",
                 "HTTP 401",
             ),
+            "acct6": m.ThinkingModelUnavailable(
+                "MODEL_ENDPOINT_UNAVAILABLE",
+                "acct6",
+                "HTTP 502",
+            ),
         }
 
         rc, calls, out = self._run_rotating_thinking(responses)
@@ -1003,8 +1008,8 @@ class TestRotation(TmpBase):
 
         self.assertEqual(
             calls,
-            ["acct1", "acct2", "acct3", "acct4"],
-            "四个登录态必须各尝试一次",
+            list(m.ROTATION_PRIMARY),
+            "全部登录态必须各尝试一次",
         )
 
         self.assertNotIn("nologin", calls)
@@ -5067,6 +5072,52 @@ class TestRegistryAuditAndReconcileAudit(TmpBase):
             f.write("[]")
         res = m.registry_audit(self.path)
         self.assertEqual(res["consistency"], "REGISTRY_UNREADABLE")
+
+
+class TestAccountExpansionAcct6(unittest.TestCase):
+    """DECISION-147：acct6 进轮转，但身份白名单仍是显式枚举（不做目录扫描）。"""
+
+    def test_acct6_in_rotation_constants(self):
+        self.assertIn("acct6", m.ROTATION_ORDER)
+        self.assertIn("acct6", m.ROTATION_PRIMARY)
+        # nologin 仍只能是兜底，不能进 PRIMARY
+        self.assertNotIn("nologin", m.ROTATION_PRIMARY)
+        self.assertLess(
+            m.ROTATION_ORDER.index("acct6"),
+            m.ROTATION_ORDER.index("nologin"),
+        )
+
+    def test_acct6_is_a_valid_identity(self):
+        self.assertIn("acct6", m._VALID_ACCOUNT_IDENTITIES)
+        self.assertEqual(m.normalize_account_identity("acct6"), "acct6")
+
+    def test_unknown_identity_still_rejected(self):
+        """扩表不等于放开：磁盘上放个 acct9 目录也不该被接受。"""
+        for bad in ("acct5", "acct9", "../etc", "acct6/../acct1", ""):
+            with self.assertRaises((ValueError, Exception)):
+                m.normalize_account_identity(bad)
+
+    def test_acct6_rotation_participates_and_shares_cursor(self):
+        """cursor 推进必须覆盖 acct6，而不是在 4 个老账号里打转。"""
+        seen = []
+        for start in range(len(m.ROTATION_PRIMARY)):
+            st = m._normalize_rotation({"cursor": start})
+            plan = [m.ROTATION_PRIMARY[(st["cursor"] + i) % len(m.ROTATION_PRIMARY)]
+                    for i in range(len(m.ROTATION_PRIMARY))]
+            seen.extend(plan)
+        self.assertIn("acct6", seen)
+        self.assertEqual(
+            len([a for a in seen if a == "acct6"]),
+            len(m.ROTATION_PRIMARY),
+            "每个 cursor 起点下 acct6 都应恰好出现一次",
+        )
+
+    def test_acct6_failure_state_is_isolated(self):
+        """acct6 的失败计数不得污染其他账号。"""
+        st = m._normalize_rotation({})
+        for name in m.ROTATION_PRIMARY:
+            self.assertIn(name, st["failures"])
+            self.assertIn(name, st["created"])
 
 
 if __name__ == "__main__":

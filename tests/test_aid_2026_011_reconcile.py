@@ -22,7 +22,8 @@ sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
 
 
-ACCOUNTS = ("acct1", "acct2", "acct3", "acct4")
+# 跟随生产常量，避免每次扩账号都要改测试（DECISION-147）。
+ACCOUNTS = tuple(MODULE.ROTATION_PRIMARY)
 
 
 class FakeAPI:
