@@ -2189,14 +2189,28 @@ def _registry_guard(path, before, after):
     known, error = _read_baseline(baseline_path)
 
     if error:
-        if os.environ.get("CHATGPT_REGISTRY_HIGHWATER_RECONCILE") == "1":
-            print("WARN: 高水位基准损坏（%s），按人工核验要求重建" % error, flush=True)
-            _write_baseline(baseline_path, set(after))
-            return
-        raise RegistryBaselineUnavailable(
-            "baseline %s %s; set CHATGPT_REGISTRY_HIGHWATER_RECONCILE=1 "
-            "after manual verification to rebuild" % (baseline_path, error)
-        )
+        reason = _reconcile_reason()
+        if reason is None:
+            raise RegistryBaselineUnavailable(
+                "baseline %s %s; set CHATGPT_REGISTRY_HIGHWATER_RECONCILE=1 "
+                "(and CHATGPT_REGISTRY_RECONCILE_REASON) after manual verification "
+                "to rebuild" % (baseline_path, error)
+            )
+        _append_registry_audit(path, {
+            "result": "attempted",
+            "basis": reason,
+            "cause": "baseline_unavailable: %s" % error,
+            "baseline_before": {"path": baseline_path,
+                                "sha256": _sha256_or_none(baseline_path),
+                                "count": None},
+            "registry": {"count": len(after),
+                         "sha256": _sha256_or_none(path)},
+            "lost_ids": [],
+            "git_sha": _git_sha(),
+        })
+        print("WARN: 高水位基准损坏（%s），按人工核验要求重建" % error, flush=True)
+        _write_baseline(baseline_path, set(after))
+        return
 
     if known is None:                          # D2-A 首次初始化
         if not after:
@@ -2210,19 +2224,33 @@ def _registry_guard(path, before, after):
 
     vanished = known - set(after)              # D2-D 基准领先
     if vanished:
-        if os.environ.get("CHATGPT_REGISTRY_HIGHWATER_RECONCILE") == "1":
-            print(
-                "WARN: 人工核验放行，重建高水位基准（丢弃 %d 个历史 ID）: %s"
-                % (len(vanished), sorted(vanished)[:5]), flush=True,
+        reason = _reconcile_reason()
+        if reason is None:
+            raise RegistryShrinkRefused(
+                "registry lost %d previously committed id(s) (cross-process): %s; "
+                "set CHATGPT_REGISTRY_HIGHWATER_RECONCILE=1 "
+                "(and CHATGPT_REGISTRY_RECONCILE_REASON) after manual "
+                "verification to rebuild the baseline"
+                % (len(vanished), sorted(vanished)[:5])
             )
-            _write_baseline(baseline_path, set(after))
-            return
-        raise RegistryShrinkRefused(
-            "registry lost %d previously committed id(s) (cross-process): %s; "
-            "set CHATGPT_REGISTRY_HIGHWATER_RECONCILE=1 after manual "
-            "verification to rebuild the baseline"
-            % (len(vanished), sorted(vanished)[:5])
+        # 审计先落盘再重建：中途崩溃也能查出「谁在什么时候放弃了哪些 ID」。
+        _append_registry_audit(path, {
+            "result": "attempted",
+            "basis": reason,
+            "cause": "baseline_ahead",
+            "baseline_before": {"path": baseline_path,
+                                "sha256": _sha256_or_none(baseline_path),
+                                "count": len(known)},
+            "registry": {"count": len(after), "sha256": _sha256_or_none(path)},
+            "lost_ids": sorted(vanished),
+            "git_sha": _git_sha(),
+        })
+        print(
+            "WARN: 人工核验放行，重建高水位基准（丢弃 %d 个历史 ID）: %s"
+            % (len(vanished), sorted(vanished)[:5]), flush=True,
         )
+        _write_baseline(baseline_path, set(after))
+        return
 
     _probe_baseline_writable(baseline_path)
 
@@ -2240,6 +2268,147 @@ def _registry_commit_baseline(path, after):
         raise RegistryBaselineUnavailable(
             "registry committed but baseline update failed: %s" % exc
         )
+
+
+def _audit_path(path):
+    return str(path) + ".audit.jsonl"
+
+
+def _sha256_or_none(path):
+    """读不到返回 None——审计里如实写 null，不编造哈希。"""
+    try:
+        return _sha256_file(path)
+    except OSError:
+        return None
+
+
+def _git_sha():
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
+
+
+def _append_registry_audit(path, record):
+    """DECISION-145 Q2：高水位重建属数据安全动作，必须持久化留痕，不能只靠 stdout。
+
+    追加式 JSONL + fsync：崩溃也不会丢已写记录，且永不被注册表写入覆盖。
+    落盘失败不吞——审计写不成就不该声称「已留痕」。
+    """
+    record = dict(record)
+    record.setdefault("ts_utc", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    record.setdefault("op", "HIGHWATER_RECONCILE")
+    line = json.dumps(record, ensure_ascii=False, sort_keys=True)
+    with open(_audit_path(path), "a", encoding="utf-8", newline="\n") as f:
+        f.write(line + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+_RECONCILE_CONSUMED = []
+
+
+def _reconcile_reason():
+    """一次性人工授权：读得到就消费掉，同进程第二次调用返回 None。
+
+    DECISION-145：不得成为永久宽松模式。env 只能解释为「这一次核验后重建」，
+    所以同一进程内用一次即失效；跨进程由基线重建本身消解（重建后不再有差集）。
+    """
+    if os.environ.get("CHATGPT_REGISTRY_HIGHWATER_RECONCILE") != "1":
+        return None
+    if _RECONCILE_CONSUMED:
+        return None
+    _RECONCILE_CONSUMED.append(True)
+    return (os.environ.get("CHATGPT_REGISTRY_RECONCILE_REASON") or "").strip() \
+        or "unspecified (CHATGPT_REGISTRY_RECONCILE_REASON not set)"
+
+
+def registry_audit(path=None):
+    """DECISION-145 Q3：只读一致性审计。绝不修改注册表、绝不修改基准、
+    绝不把审计结果自动转成恢复动作。
+    """
+    path = path or CONV_MAP_FILE
+    baseline_path = _baseline_path(path)
+    res = {
+        "registry_path": os.path.abspath(path),
+        "baseline_path": os.path.abspath(baseline_path),
+        "registry_ids": 0,
+        "baseline_ids": None,
+        "baseline_error": None,
+        "missing_from_registry": [],   # baseline - registry：基准领先
+        "new_in_registry": [],         # registry - baseline：基准滞后（安全方向）
+        "consistency": "UNKNOWN",
+        "mutation": "NONE",
+        "recovery": None,
+        "registry_sha256": _sha256_or_none(path),
+        "baseline_sha256": _sha256_or_none(baseline_path),
+    }
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            reg = json.load(f)
+        if not isinstance(reg, dict):
+            raise ValueError("registry is not a JSON object")
+    except (OSError, ValueError) as exc:
+        res["consistency"] = "REGISTRY_UNREADABLE"
+        res["baseline_error"] = "registry: %s" % exc
+        return res
+    reg_ids = set(reg)
+    res["registry_ids"] = len(reg_ids)
+
+    known, error = _read_baseline(baseline_path)
+    if error:
+        res["consistency"] = "BASELINE_UNREADABLE"
+        res["baseline_error"] = error
+        return res
+    if known is None:
+        res["consistency"] = "BASELINE_MISSING"
+        return res
+
+    res["baseline_ids"] = len(known)
+    missing = sorted(known - reg_ids)
+    new = sorted(reg_ids - known)
+    res["missing_from_registry"] = missing
+    res["new_in_registry"] = new
+    if missing:
+        res["consistency"] = "BASELINE_AHEAD"
+        res["recovery"] = "MANUAL_REVIEW_REQUIRED"
+    elif new:
+        res["consistency"] = "REGISTRY_AHEAD"
+    else:
+        res["consistency"] = "CONSISTENT"
+    return res
+
+
+def format_registry_audit(res):
+    """人读格式（裁决要求含完整差集，不能只给数量）。"""
+    L = ["Registry Audit", "",
+         "Registry:           %s" % res["registry_path"],
+         "Baseline:           %s" % res["baseline_path"],
+         "Registry IDs:       %d" % res["registry_ids"],
+         "Baseline IDs:       %s" % ("n/a" if res["baseline_ids"] is None
+                                     else res["baseline_ids"]), ""]
+    if res["baseline_error"]:
+        L.append("Error:              %s" % res["baseline_error"])
+        L.append("")
+    L.append("Baseline - Registry (missing): %d" % len(res["missing_from_registry"]))
+    for i in res["missing_from_registry"]:
+        L.append("  - %s" % i)
+    L.append("")
+    L.append("Registry - Baseline (new):     %d" % len(res["new_in_registry"]))
+    for i in res["new_in_registry"]:
+        L.append("  + %s" % i)
+    L += ["",
+          "Consistency:        %s" % res["consistency"],
+          "Mutation:           NONE"]
+    if res["recovery"]:
+        L.append("Recovery:           %s" % res["recovery"])
+    return "\n".join(L)
 
 
 def _update_json(path, mutate, default, timeout=LOCK_TIMEOUT_SEC, retries=3):
@@ -6698,6 +6867,15 @@ def main():
     if args and args[0] in ("--rotation", "--rotation-status"):
         print(json.dumps(rotation_summary(), ensure_ascii=False, indent=2))
         return 0
+    # ---- 注册表只读审计（DECISION-145 Q3）----
+    if args and args[0] == "--registry-audit":
+        res = registry_audit()
+        if "--json" in args[1:]:
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+        else:
+            print(format_registry_audit(res))
+        # 只读命令：可读性不一致不算脚本失败，但仍用非零码提示需要人工看
+        return 0 if res["consistency"] == "CONSISTENT" else 4
     if len(args) == 2 and args[0] in ("--rotation-enable", "--rotation-disable"):
         name = args[1]
         if name not in ROTATION_ORDER:

@@ -4925,5 +4925,149 @@ class TestRegistryHighwaterLifecycle(TmpBase):
         self.assertEqual(len(m._load_json(self.path, {})), 1)
 
 
+class TestRegistryAuditAndReconcileAudit(TmpBase):
+    """DECISION-145 Q2/Q3：重建留痕 + 只读 --registry-audit。"""
+
+    def setUp(self):
+        super().setUp()
+        self._conv = m.CONV_MAP_FILE
+        m.CONV_MAP_FILE = os.path.join(self.tmp, "conv-accounts.json")
+        self.path = m.CONV_MAP_FILE
+        self.baseline = self.path + ".highwater.json"
+        self.audit = self.path + ".audit.jsonl"
+        self._env = os.environ.pop("CHATGPT_REGISTRY_HIGHWATER_RECONCILE", None)
+        self._reason = os.environ.pop("CHATGPT_REGISTRY_RECONCILE_REASON", None)
+        m._RECONCILE_CONSUMED.clear()
+
+    def tearDown(self):
+        m.CONV_MAP_FILE = self._conv
+        for k, v in (("CHATGPT_REGISTRY_HIGHWATER_RECONCILE", self._env),
+                     ("CHATGPT_REGISTRY_RECONCILE_REASON", self._reason)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        m._RECONCILE_CONSUMED.clear()
+        super().tearDown()
+
+    def _seed(self, ids):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({i: {"account": "acct1", "prompt": None, "ts": "t"} for i in ids}, f)
+
+    def _audit_rows(self):
+        with open(self.audit, "r", encoding="utf-8") as f:
+            return [json.loads(l) for l in f if l.strip()]
+
+    # ---- Q2：重建必须留痕 ----
+    def test_reconcile_writes_persistent_audit_with_full_diff(self):
+        self._seed(["6afd6001-0000-83ee-8000-000000000001",
+                    "6afd6002-0000-83ee-8000-000000000002"])
+        m._write_baseline(self.baseline, {"6afd6001-0000-83ee-8000-000000000001",
+                                          "6afd6002-0000-83ee-8000-000000000002",
+                                          "6afd6003-0000-83ee-8000-000000000003"})
+        os.environ["CHATGPT_REGISTRY_HIGHWATER_RECONCILE"] = "1"
+        os.environ["CHATGPT_REGISTRY_RECONCILE_REASON"] = "人工核验：确认该 id 属已删会话"
+
+        m.record_conv("6afd6004-0000-83ee-8000-000000000004", "acct1", "p.md")
+
+        rows = self._audit_rows()
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r["op"], "HIGHWATER_RECONCILE")
+        self.assertEqual(r["basis"], "人工核验：确认该 id 属已删会话")
+        self.assertEqual(r["lost_ids"], ["6afd6003-0000-83ee-8000-000000000003"])
+        self.assertEqual(r["baseline_before"]["count"], 3)
+        self.assertTrue(r["baseline_before"]["sha256"])
+        # registry 记录的是「重建后将被写入的注册表」：2 条既有 + 本次新增 1 条
+        self.assertEqual(r["registry"]["count"], 3)
+        self.assertIn("ts_utc", r)
+        self.assertIn("git_sha", r)
+        self.assertEqual(r["result"], "attempted")
+
+    def test_reconcile_without_reason_still_records_placeholder(self):
+        self._seed(["6afd6101-0000-83ee-8000-000000000001"])
+        m._write_baseline(self.baseline, {"6afd6101-0000-83ee-8000-000000000001",
+                                          "6afd6102-0000-83ee-8000-000000000002"})
+        os.environ["CHATGPT_REGISTRY_HIGHWATER_RECONCILE"] = "1"
+
+        m.record_conv("6afd6103-0000-83ee-8000-000000000003", "acct1", "p.md")
+
+        r = self._audit_rows()[0]
+        self.assertIn("unspecified", r["basis"])
+
+    def test_reconcile_env_is_one_shot_per_process(self):
+        """DECISION-145：不得成为永久宽松模式。"""
+        self._seed(["6afd6201-0000-83ee-8000-000000000001"])
+        m._write_baseline(self.baseline, {"6afd6201-0000-83ee-8000-000000000001",
+                                          "6afd6202-0000-83ee-8000-000000000002"})
+        os.environ["CHATGPT_REGISTRY_HIGHWATER_RECONCILE"] = "1"
+        m.record_conv("6afd6203-0000-83ee-8000-000000000003", "acct1", "p.md")
+
+        # 第二次再遇到基准领先，env 仍在但授权已消费 → 必须拒绝
+        m._write_baseline(self.baseline, {"6afd6201-0000-83ee-8000-000000000001",
+                                          "6afd6202-0000-83ee-8000-000000000002",
+                                          "6afd6209-0000-83ee-8000-000000000009"})
+        with self.assertRaises(m.RegistryShrinkRefused):
+            m.record_conv("6afd6204-0000-83ee-8000-000000000004", "acct1", "p.md")
+
+    def test_no_audit_written_when_reconcile_refused(self):
+        self._seed(["6afd6301-0000-83ee-8000-000000000001"])
+        m._write_baseline(self.baseline, {"6afd6301-0000-83ee-8000-000000000001",
+                                          "6afd6302-0000-83ee-8000-000000000002"})
+        with self.assertRaises(m.RegistryShrinkRefused):
+            m.record_conv("6afd6303-0000-83ee-8000-000000000003", "acct1", "p.md")
+        self.assertFalse(os.path.exists(self.audit))
+
+    # ---- Q3：只读审计 ----
+    def test_audit_reports_consistent_and_mutates_nothing(self):
+        self._seed(["6afd6401-0000-83ee-8000-000000000001"])
+        m._write_baseline(self.baseline, {"6afd6401-0000-83ee-8000-000000000001"})
+        before = open(self.path, "rb").read()
+        b_before = open(self.baseline, "rb").read()
+
+        res = m.registry_audit(self.path)
+
+        self.assertEqual(res["consistency"], "CONSISTENT")
+        self.assertEqual(res["mutation"], "NONE")
+        self.assertEqual(res["missing_from_registry"], [])
+        self.assertEqual(open(self.path, "rb").read(), before)
+        self.assertEqual(open(self.baseline, "rb").read(), b_before)
+
+    def test_audit_reports_baseline_ahead_with_full_id_list(self):
+        self._seed(["6afd6501-0000-83ee-8000-000000000001"])
+        m._write_baseline(self.baseline, {"6afd6501-0000-83ee-8000-000000000001",
+                                          "6afd6502-0000-83ee-8000-000000000002",
+                                          "6afd6503-0000-83ee-8000-000000000003"})
+        res = m.registry_audit(self.path)
+        self.assertEqual(res["consistency"], "BASELINE_AHEAD")
+        self.assertEqual(res["recovery"], "MANUAL_REVIEW_REQUIRED")
+        self.assertEqual(res["missing_from_registry"],
+                         ["6afd6502-0000-83ee-8000-000000000002",
+                          "6afd6503-0000-83ee-8000-000000000003"])
+        # 审计不得自动恢复
+        self.assertEqual(len(m._load_json(self.path, {})), 1)
+        self.assertEqual(res["mutation"], "NONE")
+
+    def test_audit_reports_missing_baseline(self):
+        self._seed(["6afd6601-0000-83ee-8000-000000000001"])
+        res = m.registry_audit(self.path)
+        self.assertEqual(res["consistency"], "BASELINE_MISSING")
+        self.assertFalse(os.path.exists(self.baseline))
+
+    def test_audit_reports_corrupt_baseline(self):
+        self._seed(["6afd6701-0000-83ee-8000-000000000001"])
+        with open(self.baseline, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        res = m.registry_audit(self.path)
+        self.assertEqual(res["consistency"], "BASELINE_UNREADABLE")
+        self.assertTrue(res["baseline_error"])
+
+    def test_audit_reports_unreadable_registry(self):
+        with open(self.path, "w", encoding="utf-8") as f:
+            f.write("[]")
+        res = m.registry_audit(self.path)
+        self.assertEqual(res["consistency"], "REGISTRY_UNREADABLE")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
