@@ -995,6 +995,11 @@ class TestRotation(TmpBase):
                 "acct4",
                 "HTTP 401",
             ),
+            "acct5": m.ThinkingModelUnavailable(
+                "AUTH_INVALID",
+                "acct5",
+                "HTTP 401",
+            ),
             "acct6": m.ThinkingModelUnavailable(
                 "MODEL_ENDPOINT_UNAVAILABLE",
                 "acct6",
@@ -5093,7 +5098,7 @@ class TestAccountExpansionAcct6(unittest.TestCase):
 
     def test_unknown_identity_still_rejected(self):
         """扩表不等于放开：磁盘上放个 acct9 目录也不该被接受。"""
-        for bad in ("acct5", "acct9", "../etc", "acct6/../acct1", ""):
+        for bad in ("acct7", "acct9", "../etc", "acct6/../acct1", ""):
             with self.assertRaises((ValueError, Exception)):
                 m.normalize_account_identity(bad)
 
@@ -5119,6 +5124,61 @@ class TestAccountExpansionAcct6(unittest.TestCase):
             self.assertIn(name, st["failures"])
             self.assertIn(name, st["created"])
 
+
+class TestAccountRecoveryAcct5(unittest.TestCase):
+    """DECISION-154：acct5 凭据被新登录覆盖后重新验证通过，恢复为第六身份。
+
+    源文件名与内容不符（`acct6-export (1).json` 里其实是 acct5），
+    因此身份判定必须以凭据内容（sub/email）为准，不得按文件名。
+    """
+
+    def test_acct5_in_rotation_constants(self):
+        self.assertIn("acct5", m.ROTATION_ORDER)
+        self.assertIn("acct5", m.ROTATION_PRIMARY)
+        self.assertNotIn("nologin", m.ROTATION_PRIMARY)
+        self.assertLess(
+            m.ROTATION_ORDER.index("acct5"),
+            m.ROTATION_ORDER.index("nologin"),
+        )
+
+    def test_acct5_keeps_natural_number_order(self):
+        """DECISION-154 Q2=A：按编号自然序，acct5 夹在 acct4 与 acct6 之间。"""
+        self.assertLess(m.ROTATION_ORDER.index("acct4"), m.ROTATION_ORDER.index("acct5"))
+        self.assertLess(m.ROTATION_ORDER.index("acct5"), m.ROTATION_ORDER.index("acct6"))
+        self.assertEqual(
+            list(m.ROTATION_PRIMARY),
+            sorted(m.ROTATION_PRIMARY),
+            "PRIMARY 必须是编号升序",
+        )
+
+    def test_acct5_is_a_valid_identity(self):
+        self.assertIn("acct5", m._VALID_ACCOUNT_IDENTITIES)
+        self.assertEqual(m.normalize_account_identity("acct5"), "acct5")
+
+    def test_recovery_does_not_open_the_whitelist(self):
+        """恢复一个身份不等于放开枚举：相邻编号仍须被拒。"""
+        for bad in ("acct7", "acct0", "acct55", "acct5/../acct1", "ACCT5"):
+            with self.assertRaises((ValueError, Exception)):
+                m.normalize_account_identity(bad)
+
+    def test_acct5_rotation_participates_and_shares_cursor(self):
+        seen = []
+        for start in range(len(m.ROTATION_PRIMARY)):
+            st = m._normalize_rotation({"cursor": start})
+            plan = [m.ROTATION_PRIMARY[(st["cursor"] + i) % len(m.ROTATION_PRIMARY)]
+                    for i in range(len(m.ROTATION_PRIMARY))]
+            seen.extend(plan)
+        self.assertEqual(
+            len([a for a in seen if a == "acct5"]),
+            len(m.ROTATION_PRIMARY),
+            "每个 cursor 起点下 acct5 都应恰好出现一次",
+        )
+
+    def test_acct5_failure_state_is_isolated(self):
+        st = m._normalize_rotation({})
+        for name in m.ROTATION_PRIMARY:
+            self.assertIn(name, st["failures"])
+            self.assertIn(name, st["created"])
 
 class TestBatchAddedCountSemantics(TmpBase):
     """DECISION-151：`registered` != `added_count`，幂等性判据只能是后者。"""

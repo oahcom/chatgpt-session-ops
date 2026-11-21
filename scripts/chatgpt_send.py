@@ -59,7 +59,7 @@
           对不上就依次试其他留存设备并自动修正归属（--anon-devices 可查）。
 
 建会话身份优先级（--new 默认行为）：
-    第一优先：acct1 / acct2 / acct3 / acct4 / acct6 均分轮转（游标只在五个登录态之间推进）。
+    第一优先：acct1 / acct2 / acct3 / acct4 / acct5 / acct6 均分轮转（游标只在六个登录态之间推进）。
     兜底：仅当全部登录态都 429（本次命中或处于 429 冷却）时，才启用 nologin 匿名通道。
     不兜底的情形：401（认证失效，应重新提取凭据）、403（PoW/风控，短冷却后自愈）。
     为什么匿名只做兜底：匿名会话不入任何会话列表（list 恒为空），与设备身份(oai-did)绑定，
@@ -76,10 +76,10 @@
     quota          各账号最近一次响应的限速观测头（只读）
     errors         不可用账号 / 接口错误
 
-账号凭据放在 accounts/<acct1|acct2|acct3|acct4|acct6>/{cookies.json,access_token.txt}。
+账号凭据放在 accounts/<acct1|acct2|acct3|acct4|acct5|acct6>/{cookies.json,access_token.txt}。
 --list-all 只聚合各身份获准查看的会话；429 时停止扫描。
 
-前置：acct1/default 认证文件在本脚本目录；acct2/acct3/acct4/acct6 分别在 accounts/acct2/、accounts/acct3/、accounts/acct4/、accounts/acct6/ 下：
+前置：acct1/default 认证文件在本脚本目录；acct2/acct3/acct4/acct5/acct6 分别在 accounts/acct2/、accounts/acct3/、accounts/acct4/、accounts/acct5/、accounts/acct6/ 下：
     cookies.json      由 extract_auth.py 从 Edge CDP 提取
     access_token.txt  同上（accessToken）
     pow_solver.py     PoW 解算器
@@ -137,11 +137,11 @@ CTX = ssl.create_default_context()
 API_BASE = os.environ.get("CHATGPT_BASE", "https://chatgpt.com").rstrip("/")
 
 # ---------- 建会话身份轮转 ----------
-# 优先登录态：acct1 / acct2 / acct3 / acct4 / acct6 均分轮转；nologin（匿名）只作兜底——
+# 优先登录态：acct1 / acct2 / acct3 / acct4 / acct5 / acct6 均分轮转；nologin（匿名）只作兜底——
 # 实测匿名会话不进任何会话历史（list 返回 0 条），随时可能被服务端回收，
 # 仅按 conv_id 在短期内可读，因此只在全部登录态都 429 时启用。
-ROTATION_ORDER = ("acct1", "acct2", "acct3", "acct4", "acct6", "nologin")
-ROTATION_PRIMARY = ("acct1", "acct2", "acct3", "acct4", "acct6")
+ROTATION_ORDER = ("acct1", "acct2", "acct3", "acct4", "acct5", "acct6", "nologin")
+ROTATION_PRIMARY = ("acct1", "acct2", "acct3", "acct4", "acct5", "acct6")
 ROTATION_FALLBACK = ("nologin",)
 ROTATION_FILE = os.path.join(BASE, "account-rotation.json")
 CONV_MAP_FILE = os.path.join(BASE, "conv-accounts.json")
@@ -2543,7 +2543,7 @@ def purge_expired(st):
 
 
 def rotation_plan(st):
-    """登录取证身份（acct1/acct2/acct3/acct4/acct6）从游标起顺次尝试；不可用的排到末尾（避免死锁）。
+    """登录取证身份（acct1/acct2/acct3/acct4/acct5/acct6）从游标起顺次尝试；不可用的排到末尾（避免死锁）。
     匿名态不进入该计划——它只在两者都 429 时由 anon_fallback_ready() 决定是否兜底。"""
     st = _as_dict(st)
     cur = _as_int(st.get("cursor"), 0)                          # F-34
@@ -3246,6 +3246,7 @@ _VALID_ACCOUNT_IDENTITIES = frozenset((
     "acct2",
     "acct3",
     "acct4",
+    "acct5",
     "acct6",
     "nologin",
 ))
@@ -6210,7 +6211,7 @@ def _mark_success(st, name, conv, prompt_file, attempts):
 
 
 def create_chat_rotating(prompt_file, thinking=None):
-    """登录态优先建会话：acct1/acct2/acct3/acct4/acct6 均分轮转；
+    """登录态优先建会话：acct1/acct2/acct3/acct4/acct5/acct6 均分轮转；
     仅当全部都 429 才用匿名兜底。
 
     匿名会话不进任何账号历史（会话列表恒为空），只按 conv_id 短期可读，
@@ -6402,7 +6403,7 @@ def rotation_summary():
     prim = {a: _as_float(created.get(a), 0.0) for a in ROTATION_PRIMARY}   # F-30
     prim_total = sum(prim.values()) or 1
     return {
-        "policy": "acct1/acct2/acct3/acct4/acct6 均分轮转；nologin 仅在全部 429 时兜底（其会话不入历史）",
+        "policy": "acct1/acct2/acct3/acct4/acct5/acct6 均分轮转；nologin 仅在全部 429 时兜底（其会话不入历史）",
         "primary": list(ROTATION_PRIMARY),
         "fallback": list(ROTATION_FALLBACK),
         "cursor": st["cursor"],
@@ -6889,7 +6890,7 @@ def main():
     if len(args) == 2 and args[0] in ("--rotation-enable", "--rotation-disable"):
         name = args[1]
         if name not in ROTATION_ORDER:
-            print("usage: %s acct1|acct2|acct3|acct4|acct6|nologin" % args[0], flush=True)
+            print("usage: %s acct1|acct2|acct3|acct4|acct5|acct6|nologin" % args[0], flush=True)
             return 2
         enable = args[0] == "--rotation-enable"
 
@@ -7253,7 +7254,7 @@ def main():
     # ---- 开新会话 ----
     if args[0] == "--new":
         if len(args) != 2:
-            print("usage: [--account acct1|acct2|acct3|acct4|acct6|nologin|auto] [--thinking] --new <prompt_file>", flush=True)
+            print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin|auto] [--thinking] --new <prompt_file>", flush=True)
             return 2
         if explicit_account and account != "auto":
             api = build(account)
@@ -7300,16 +7301,16 @@ def main():
                 mutate_rotation(mark)
                 return create_chat_rotating(args[1], thinking=True if thinking_flag else None)
             return 0 if status == 200 else 1
-        # 默认：acct1/acct2/acct3/acct4/acct6 均分轮转，全部 429 才匿名兜底
+        # 默认：acct1/acct2/acct3/acct4/acct5/acct6 均分轮转，全部 429 才匿名兜底
         return create_chat_rotating(args[1], thinking=True if thinking_flag else None)
 
     # ---- 既有会话：未显式指定身份时按登记归属路由 ----
     # 先做参数校验，别在缺参数时索引越界（曾导致 `--tail` 空参数直接 IndexError）
     if args[0] == "--list" and len(args) != 1:
-        print("usage: [--account acct1|acct2|acct3|acct4|acct6|nologin] --list", flush=True)
+        print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin] --list", flush=True)
         return 2
     if args[0] == "--tail" and len(args) != 2:
-        print("usage: [--account acct1|acct2|acct3|acct4|acct6|nologin] --tail <conv_id>", flush=True)
+        print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin] --tail <conv_id>", flush=True)
         return 2
     raw_id = args[1] if args[0] == "--tail" else (args[0] if not args[0].startswith("--") else "")
     conv_id = cli_id(raw_id) if raw_id else ""
@@ -7368,7 +7369,7 @@ def main():
             return 1
         return 0
     if len(args) != 2:
-        print("usage: [--account acct1|acct2|acct3|acct4|acct6|nologin] <conv_id> <prompt_file>", flush=True)
+        print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin] <conv_id> <prompt_file>", flush=True)
         return 2
     try:
         status, _path, conv = send_prompt(api, conv_id, args[1],
