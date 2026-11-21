@@ -28,6 +28,7 @@ from src.session_ops.memory_adapter_client import (  # noqa: E402
 )
 
 COMMAND_ENV = "SO_MEMORY_ADAPTER_COMMAND"
+REQUIRE_ENV = "SO_MEMORY_ADAPTER_REQUIRE_E2E"
 
 
 def adapter_command() -> list[str] | None:
@@ -44,6 +45,27 @@ SKIP_REASON = (
     "%s is not set; a real Memory Adapter executable is required for "
     "end-to-end verification" % COMMAND_ENV
 )
+
+# Gate mode: when SO_MEMORY_ADAPTER_REQUIRE_E2E=1, a missing adapter must FAIL,
+# never skip. CI must not report integration success while the real binary never
+# ran.
+GATE_REASON = (
+    "%s is set, so end-to-end verification is mandatory, but %s is not set"
+    % (REQUIRE_ENV, COMMAND_ENV)
+)
+
+
+def gate_enabled() -> bool:
+    return os.environ.get(REQUIRE_ENV, "").strip().lower() in {"1", "true", "yes"}
+
+
+class EndToEndGateTestCase(unittest.TestCase):
+    """Gate mode turns a missing adapter into a failure instead of a skip."""
+
+    def test_gate_requires_a_real_adapter(self) -> None:
+        if not gate_enabled():
+            self.skipTest("%s is not set; gate mode is off" % REQUIRE_ENV)
+        self.assertIsNotNone(adapter_command(), GATE_REASON)
 
 
 @unittest.skipUnless(adapter_command(), SKIP_REASON)
