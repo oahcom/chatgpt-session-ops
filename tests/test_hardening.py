@@ -4744,9 +4744,14 @@ class TestRegistryMonotonicGuard(TmpBase):
         super().setUp()
         self._conv = m.CONV_MAP_FILE
         m.CONV_MAP_FILE = os.path.join(self.tmp, "conv-accounts.json")
+        self._env = os.environ.pop("CHATGPT_REGISTRY_HIGHWATER_RECONCILE", None)
 
     def tearDown(self):
         m.CONV_MAP_FILE = self._conv
+        if self._env is not None:
+            os.environ["CHATGPT_REGISTRY_HIGHWATER_RECONCILE"] = self._env
+        else:
+            os.environ.pop("CHATGPT_REGISTRY_HIGHWATER_RECONCILE", None)
         super().tearDown()
 
     def test_record_conv_refuses_to_drop_existing_id(self):
@@ -4784,6 +4789,140 @@ class TestRegistryMonotonicGuard(TmpBase):
             ["6afd0005-5555-83ee-8000-000000000005",
              "6afd0006-6666-83ee-8000-000000000006"],
         )
+
+
+class TestRegistryHighwaterLifecycle(TmpBase):
+    """DECISION-144 D2：高水位四态 A/B/C/D 与提交顺序。"""
+
+    def setUp(self):
+        super().setUp()
+        self._conv = m.CONV_MAP_FILE
+        m.CONV_MAP_FILE = os.path.join(self.tmp, "conv-accounts.json")
+        self.path = m.CONV_MAP_FILE
+        self.baseline = self.path + ".highwater.json"
+        self._env = os.environ.pop("CHATGPT_REGISTRY_HIGHWATER_RECONCILE", None)
+
+    def tearDown(self):
+        m.CONV_MAP_FILE = self._conv
+        if self._env is not None:
+            os.environ["CHATGPT_REGISTRY_HIGHWATER_RECONCILE"] = self._env
+        else:
+            os.environ.pop("CHATGPT_REGISTRY_HIGHWATER_RECONCILE", None)
+        super().tearDown()
+
+    def _seed(self, ids):
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({i: {"account": "acct1", "prompt": None, "ts": "t"} for i in ids}, f)
+
+    def _baseline_ids(self):
+        with open(self.baseline, "r", encoding="utf-8") as f:
+            return set(json.load(f)["ids"])
+
+    # ---- D2-A 首次初始化 ----
+    def test_first_init_uses_real_registry_not_empty(self):
+        self._seed(["6afd1001-0000-83ee-8000-000000000001"])
+        self.assertFalse(os.path.exists(self.baseline))
+
+        m.record_conv("6afd1002-0000-83ee-8000-000000000002", "acct1", "p.md")
+
+        self.assertTrue(os.path.exists(self.baseline))
+        self.assertEqual(
+            self._baseline_ids(),
+            {"6afd1001-0000-83ee-8000-000000000001",
+             "6afd1002-0000-83ee-8000-000000000002"},
+        )
+
+    def test_first_init_refuses_empty_registry(self):
+        with self.assertRaises(m.RegistryBaselineUnavailable):
+            m._registry_guard(self.path, {}, {})
+        self.assertFalse(os.path.exists(self.baseline))
+
+    # ---- D2-B 正常比对 ----
+    def test_valid_baseline_allows_addition(self):
+        self._seed(["6afd2001-0000-83ee-8000-000000000001"])
+        m.record_conv("6afd2002-0000-83ee-8000-000000000002", "acct1", "p.md")
+        m.record_conv("6afd2003-0000-83ee-8000-000000000003", "acct1", "p.md")
+        self.assertEqual(len(m._load_json(self.path, {})), 3)
+
+    # ---- D2-C 基准损坏/不可写 ----
+    def test_corrupt_baseline_refuses_write(self):
+        self._seed(["6afd3001-0000-83ee-8000-000000000001"])
+        with open(self.baseline, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        with self.assertRaises(m.RegistryBaselineUnavailable):
+            m.record_conv("6afd3002-0000-83ee-8000-000000000002", "acct1", "p.md")
+        # 注册表未被写入
+        self.assertEqual(len(m._load_json(self.path, {})), 1)
+
+    def test_baseline_missing_ids_key_refuses_write(self):
+        self._seed(["6afd3003-0000-83ee-8000-000000000001"])
+        with open(self.baseline, "w", encoding="utf-8") as f:
+            json.dump({"count": 0}, f)
+        with self.assertRaises(m.RegistryBaselineUnavailable):
+            m.record_conv("6afd3004-0000-83ee-8000-000000000002", "acct1", "p.md")
+
+    def test_unwritable_baseline_refuses_write_before_touching_registry(self):
+        self._seed(["6afd3005-0000-83ee-8000-000000000001"])
+        m._write_baseline(self.baseline, {"6afd3005-0000-83ee-8000-000000000001"})
+
+        real_probe = m._probe_baseline_writable
+        def boom(path):
+            raise m.RegistryBaselineUnavailable("simulated unwritable baseline")
+        m._probe_baseline_writable = boom
+        try:
+            with self.assertRaises(m.RegistryBaselineUnavailable):
+                m.record_conv("6afd3006-0000-83ee-8000-000000000002", "acct1", "p.md")
+        finally:
+            m._probe_baseline_writable = real_probe
+        self.assertEqual(len(m._load_json(self.path, {})), 1)
+
+    # ---- D2-D 基准领先 ----
+    def test_baseline_ahead_refuses_without_reconcile_flag(self):
+        self._seed(["6afd4001-0000-83ee-8000-000000000001"])
+        m._write_baseline(
+            self.baseline,
+            {"6afd4001-0000-83ee-8000-000000000001",
+             "6afd4099-0000-83ee-8000-000000000099"},   # 磁盘上不存在
+        )
+        with self.assertRaises(m.RegistryShrinkRefused):
+            m.record_conv("6afd4002-0000-83ee-8000-000000000002", "acct1", "p.md")
+        self.assertEqual(len(m._load_json(self.path, {})), 1)
+
+    def test_baseline_ahead_recovers_with_reconcile_flag(self):
+        self._seed(["6afd4003-0000-83ee-8000-000000000001"])
+        m._write_baseline(
+            self.baseline,
+            {"6afd4003-0000-83ee-8000-000000000001",
+             "6afd4098-0000-83ee-8000-000000000098"},
+        )
+        os.environ["CHATGPT_REGISTRY_HIGHWATER_RECONCILE"] = "1"
+        m.record_conv("6afd4004-0000-83ee-8000-000000000004", "acct1", "p.md")
+        self.assertEqual(
+            self._baseline_ids(),
+            {"6afd4003-0000-83ee-8000-000000000001",
+             "6afd4004-0000-83ee-8000-000000000004"},
+        )
+
+    # ---- 提交顺序：基准永不领先注册表 ----
+    def test_baseline_never_leads_registry_on_write_failure(self):
+        self._seed(["6afd5001-0000-83ee-8000-000000000001"])
+        m._write_baseline(self.baseline, {"6afd5001-0000-83ee-8000-000000000001"})
+
+        real_write = m._atomic_write
+        def fail(path, text):
+            raise OSError("simulated registry write failure")
+        m._atomic_write = fail
+        try:
+            with self.assertRaises(OSError):
+                m.record_conv("6afd5002-0000-83ee-8000-000000000002", "acct1", "p.md")
+        finally:
+            m._atomic_write = real_write
+
+        # 注册表没写进去，基准也不能包含那条 id
+        self.assertEqual(
+            self._baseline_ids(), {"6afd5001-0000-83ee-8000-000000000001"}
+        )
+        self.assertEqual(len(m._load_json(self.path, {})), 1)
 
 
 if __name__ == "__main__":

@@ -2105,59 +2105,141 @@ def release_slot(slot_path, run_id=None):
 
 
 class RegistryShrinkRefused(RuntimeError):
-    """注册表写入试图删除既有会话 ID（DECISION-143：删除阈值 0）。"""
+    """注册表写入试图删除既有会话 ID（DECISION-143/144：删除阈值 0）。"""
+
+
+class RegistryBaselineUnavailable(RuntimeError):
+    """高水位基准缺失/损坏/不可写，跨进程保护失效，拒绝写入（DECISION-144 D2-C）。"""
+
+
+def _baseline_path(path):
+    return str(path) + ".highwater.json"
+
+
+def _read_baseline(baseline_path):
+    """返回 (ids_set, error)。error 非空即「存在但不可用」，属 D2-C。"""
+    if not os.path.exists(baseline_path):
+        return None, None                      # D2-A：不存在，交给调用方初始化
+    try:
+        with open(baseline_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as exc:
+        return None, "unreadable: %s" % exc
+    if not isinstance(data, dict) or not isinstance(data.get("ids"), list):
+        return None, "malformed: missing ids list"
+    try:
+        return set(safe_id(i, "baseline id") for i in data["ids"]), None
+    except (TypeError, ValueError) as exc:
+        return None, "malformed id: %s" % exc
+
+
+def _write_baseline(baseline_path, ids):
+    """原子落盘高水位。独立 tmp+replace，不占用「注册表每次 mutation 只写一次」的配额。"""
+    tmp = baseline_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(
+            {"ids": sorted(ids), "count": len(ids), "updated": _now()},
+            f, ensure_ascii=False, indent=2,
+        )
+    os.replace(tmp, baseline_path)
+
+
+def _probe_baseline_writable(baseline_path):
+    """写前探针：确认基准可写。写不成就在动注册表之前失败（D2-C）。"""
+    probe = baseline_path + ".probe"
+    try:
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("{}")
+        os.remove(probe)
+    except OSError as exc:
+        raise RegistryBaselineUnavailable(
+            "baseline not writable (%s): %s" % (baseline_path, exc)
+        )
 
 
 def _registry_guard(path, before, after):
-    """单调性守卫：既有 ID 一个都不许消失。
+    """写前检查：既有 ID 一个都不许消失，且高水位基准必须可用（DECISION-144 D2）。
 
-    单次写入保护（第一层）：比较 mutation 前后的 ID 集合。
-    跨进程保护（第二层）：对照高水位基准文件，防止别的进程已经提前删掉。
-    只在 path 是注册表本体时生效，测试用的临时注册表同样受保护。
+    单次写入保护（第一层）：before/after 的 ID 集合差。
+    跨进程保护（第二层）：对照高水位基准，防止别的进程已经提前删掉。
+
+    D2 四态：
+      A 基准缺失 → 用当前注册表初始化（不初始化成空集），然后放行
+      B 基准有效 → 正常比对
+      C 基准损坏/不可写 → RegistryBaselineUnavailable，拒绝 mutation
+      D 基准领先注册表（ids - after 非空）→ 拒绝，不自动降级；
+        人工核验后用 CHATGPT_REGISTRY_HIGHWATER_RECONCILE=1 重建基准
+
+    提交顺序：本函数只做检查与初始化，基准推进由 _registry_commit_baseline()
+    在注册表真正落盘之后执行——保证基准永不领先于磁盘上的注册表。
     """
     if not isinstance(before, dict) or not isinstance(after, dict):
         return
     if os.path.basename(str(path)) != "conv-accounts.json":
         return  # 只管注册表本体，轮转/匿名等状态文件不受此约束
+
     lost = set(before) - set(after)
     if lost:
         raise RegistryShrinkRefused(
             "registry write would delete %d existing conversation id(s): %s"
             % (len(lost), sorted(lost)[:5])
         )
-    baseline_path = path + ".highwater.json"
-    try:
-        with open(baseline_path, "r", encoding="utf-8") as f:
-            baseline = json.load(f)
-    except (OSError, ValueError):
-        baseline = None
-    if isinstance(baseline, dict):
-        known = set(baseline.get("ids") or ())
-        vanished = known - set(after)
-        if vanished:
-            raise RegistryShrinkRefused(
-                "registry lost %d previously committed id(s) (cross-process): %s"
-                % (len(vanished), sorted(vanished)[:5])
+
+    baseline_path = _baseline_path(path)
+    known, error = _read_baseline(baseline_path)
+
+    if error:
+        if os.environ.get("CHATGPT_REGISTRY_HIGHWATER_RECONCILE") == "1":
+            print("WARN: 高水位基准损坏（%s），按人工核验要求重建" % error, flush=True)
+            _write_baseline(baseline_path, set(after))
+            return
+        raise RegistryBaselineUnavailable(
+            "baseline %s %s; set CHATGPT_REGISTRY_HIGHWATER_RECONCILE=1 "
+            "after manual verification to rebuild" % (baseline_path, error)
+        )
+
+    if known is None:                          # D2-A 首次初始化
+        if not after:
+            raise RegistryBaselineUnavailable(
+                "refusing to initialize baseline from an empty registry: %s"
+                % baseline_path
             )
-    if set(after) != set(before):
-        # 高水位基准是辅助产物，用独立写法落盘：
-        # 不走 _atomic_write，以免破坏「注册表每次 mutation 只写一次」的既有契约。
-        tmp = baseline_path + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(
-                    {
-                        "ids": sorted(after),
-                        "count": len(after),
-                        "updated": _now(),
-                    },
-                    f,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            os.replace(tmp, baseline_path)
-        except OSError:
-            pass  # 基准写不成不阻塞主写入；下一轮会重试建立
+        _probe_baseline_writable(baseline_path)
+        _write_baseline(baseline_path, set(after))
+        return
+
+    vanished = known - set(after)              # D2-D 基准领先
+    if vanished:
+        if os.environ.get("CHATGPT_REGISTRY_HIGHWATER_RECONCILE") == "1":
+            print(
+                "WARN: 人工核验放行，重建高水位基准（丢弃 %d 个历史 ID）: %s"
+                % (len(vanished), sorted(vanished)[:5]), flush=True,
+            )
+            _write_baseline(baseline_path, set(after))
+            return
+        raise RegistryShrinkRefused(
+            "registry lost %d previously committed id(s) (cross-process): %s; "
+            "set CHATGPT_REGISTRY_HIGHWATER_RECONCILE=1 after manual "
+            "verification to rebuild the baseline"
+            % (len(vanished), sorted(vanished)[:5])
+        )
+
+    _probe_baseline_writable(baseline_path)
+
+
+def _registry_commit_baseline(path, after):
+    """注册表落盘成功后推进高水位。失败不回滚注册表（基准滞后是安全方向），
+    但必须显式报错，不能静默。"""
+    if not isinstance(after, dict):
+        return
+    if os.path.basename(str(path)) != "conv-accounts.json":
+        return
+    try:
+        _write_baseline(_baseline_path(path), set(after))
+    except OSError as exc:
+        raise RegistryBaselineUnavailable(
+            "registry committed but baseline update failed: %s" % exc
+        )
 
 
 def _update_json(path, mutate, default, timeout=LOCK_TIMEOUT_SEC, retries=3):
@@ -2179,6 +2261,7 @@ def _update_json(path, mutate, default, timeout=LOCK_TIMEOUT_SEC, retries=3):
                     return data
                 _registry_guard(path, before, data)
                 _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2))
+                _registry_commit_baseline(path, data)
                 return data
         except LockTimeout as e:
             last = e
@@ -2338,8 +2421,12 @@ def atomic_write_conv_map(data, lock_held=False):
     if not isinstance(data, dict):
         raise ValueError("conversation registry must be a dictionary")
 
+    # DECISION-144 D3：任何写注册表的入口都必须过单调性守卫。
+    # 调用方若已持锁（lock_held=True），这里只读不写，不会二次加锁。
     if lock_held:
+        _registry_guard(CONV_MAP_FILE, _load_json(CONV_MAP_FILE, {}), data)
         _atomic_write(CONV_MAP_FILE, json.dumps(data, ensure_ascii=False, indent=2))
+        _registry_commit_baseline(CONV_MAP_FILE, data)
     else:
         _save_json(CONV_MAP_FILE, data)
 
@@ -2728,6 +2815,7 @@ def register_conversations_batch(registrations):
                     indent=2,
                 ),
             )
+            _registry_commit_baseline(CONV_MAP_FILE, registry)
 
         # Verify the actual on-disk result while still holding the lock.
         final_registry = _read_conv_map_for_migration()
@@ -2935,6 +3023,7 @@ def restore_conv_map_minimal(candidate):
                 path,
                 json.dumps(merged, ensure_ascii=False, indent=2),
             )
+            _registry_commit_baseline(path, merged)
 
         # Read back under the same lock. Detect quarantine here as well.
         existed_before_verify = os.path.exists(path)

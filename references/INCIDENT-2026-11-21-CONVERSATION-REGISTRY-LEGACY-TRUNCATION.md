@@ -1,9 +1,13 @@
 # INCIDENT 2026-11-21 — 会话注册表 legacy 剪裁（第二病因）
 
+- **状态**：**CLOSED**（DECISION-144 D4：原剪裁机制已修复、历史数据已恢复，允许关闭）
 - **事故编号**：`INCIDENT-2026-11-21-CONVERSATION-REGISTRY-LEGACY-TRUNCATION`
 - **定级**：P2
-- **裁定**：ChatGPT `DECISION-143`（会话 `6b014426-11b4-83e8-81d5-fd7de03e54f8`，acct2）
+- **裁定**：ChatGPT `DECISION-143`（`6b014426-11b4-83e8-81d5-fd7de03e54f8`，acct2）、
+  `DECISION-144` 独立验收（`6b014d8f-e6f0-83ee-86b0-1a98bc102245`，acct3）
 - **关联事故**：`INCIDENT-2026-11-20-CONVERSATION-REGISTRY-LOSS-AND-RECOVERY`（同一症状，独立病因，不合并）
+- **剩余风险（独立追踪，不在本报告范围内）**：三个 legacy 裸写脚本的并发丢更新风险，
+  见 §13。**关闭本报告不等于注册表治理全部完成。**
 
 ## 1. 一句话
 
@@ -224,16 +228,78 @@ acct3 因最近活跃 → ts 被刷新 → 存活并新增。
 - [x] 恢复后连续运行验证没有再次发生条目下降
 - [x] 11-20 与 11-21 两份事故报告均已正确关联
 
-## 11. 不做的事
+## 11. 不做的事（原则）
 
 - **不以「恢复到 938 / 908 / 1091」作为成功标准。** 历史数字只作证据。
   成功标准是 ID 集合完整性、归属正确性、写入路径唯一性。
 - **不删除旧项目目录。** 它含有历史提示词与审计证据，只降级为只读。
 - **不合并两份事故报告。**
 
-## 12. 遗留
+## 12. DECISION-144 追加处置（独立验收后补齐）
 
-- 3 个 legacy 裸写脚本（`map_req01.py` / `fix_map_req01.py` / `_m42d_ruling.py`）
-  未加封死。它们不在自动化路径上，但若被手工运行仍可能丢更新。
-  待 ChatGPT 裁定是否同批处理。
-- `chatgpt_send_local.py` 的 `conv_owner()` 仍可读注册表，这是有意保留的只读能力。
+### 12.1 D1 — 三个 legacy 裸写脚本同批封死
+
+| 文件 | 原写入方式 | 处置 |
+|---|---|---|
+| `map_req01.py` | 裸 `json.dump` + `os.replace`，无锁 | 首行 `raise SystemExit` |
+| `fix_map_req01.py` | 裸写，无锁 | 首行 `raise SystemExit` |
+| `_m42d_ruling.py` | 第 5 段裸 `json.dump` | 首行 `raise SystemExit` |
+
+保留原脚本正文（提示词、审计材料、历史逻辑）在阻断语句之后，只读不执行。
+运行时实测三个脚本均以 `read-only (DECISION-144 D1)` 退出。
+
+### 12.2 D2 — 高水位从 fail-open 改为 fail-closed
+
+原实现 `except OSError: pass` 已删除。按 D2 四态重写：
+
+| 态 | 条件 | 行为 |
+|---|---|---|
+| A | 基准不存在 | 用**当前真实注册表**初始化（拒绝空集初始化），探针确认可写后落盘，然后放行 |
+| B | 基准有效 | 正常比对 `known - after` |
+| C | 基准损坏/缺 `ids`/不可写 | `RegistryBaselineUnavailable`，**拒绝 mutation** |
+| D | 基准领先注册表 | `RegistryShrinkRefused`，**不自动降级**；人工核验后置 `CHATGPT_REGISTRY_HIGHWATER_RECONCILE=1` 重建 |
+
+**提交顺序**：`_registry_guard()` 只做检查与初始化；
+`_registry_commit_baseline()` 在注册表 `_atomic_write` **成功之后**才推进基准。
+保证基准永不领先磁盘 —— 否则下一次正常写入会被自己的基准错误阻断。
+
+### 12.3 D3 — 全部生产写入路径静态审查
+
+AST 扫描 `chatgpt_send.py` 全部函数，筛出「触碰 `CONV_MAP_FILE` 且有写原语」的：
+
+| 函数 | 写原语 | guard |
+|---|---|---|
+| `record_conv` | `_update_json` | ✅ 经 `_update_json` → `_registry_guard` |
+| `register_conversations_batch` | `_atomic_write` | ✅ 直接调用 |
+| `restore_conv_map_minimal` | `_atomic_write` | ✅ 直接调用 |
+| `atomic_write_conv_map` | `_atomic_write` / `_save_json` | ✅ **本轮补挂**（原为漏点） |
+
+`--list-all --apply` → `register_conversations_batch()` → `_registry_guard()`，
+单一路径，不重复加 guard。
+
+其余 17 个写原语函数（`save_rotation` / `record_anon_session` / `lease_acquire` 等）
+均不触碰 `CONV_MAP_FILE`，不受此约束。
+
+**唯一直接写注册表的原语**是 `_atomic_write(CONV_MAP_FILE, ...)`，
+全部 4 处调用点均已前置 guard + 后置 baseline commit。
+
+### 12.4 生产实测
+
+- 基准与注册表一致：`registry 1095 == baseline 1095`
+- 模拟 legacy 剪裁 20 条后尝试写入 → `RegistryShrinkRefused: registry lost 20 previously committed id(s) (cross-process)`，已还原
+
+### 12.5 D4 — 关闭口径
+
+本报告关闭的依据是**确定性 500 条剪裁机制已消灭 + 历史数据已恢复**，
+不以「三个 legacy 裸写脚本全部封死」为前提（DECISION-144 D4 明确）。
+
+§13 的剩余风险独立追踪，不并入本事故，也不把「潜在并发丢更新」误登记为「已发生的剪裁事故」。
+
+## 13. 剩余风险（独立工作项，未闭环）
+
+三个 legacy 裸写脚本已于 D1 封死。**仍开放的是治理层面的问题**：
+
+- `WorkBuddy/2026-11-18-13-49-20/` 目录内仍有历史提示词与证据，
+  未来若新建脚本直写 `conv-accounts.json`，现有守卫只拦「删除」，不拦「并发覆盖后重新新增」。
+- 高水位基准只保证「已提交 ID 不消失」，不保证「同一 ID 的 account 归属不被改写」
+  （归属改写由 `record_conv` 内部的冲突拒绝逻辑负责，属另一层）。
