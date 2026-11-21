@@ -1,65 +1,69 @@
-# 凭据目录约定
+# 凭据目录结构（acct2–acct6 / nologin）
 
-本目录**只放结构说明，不放任何凭据**。`cookies.json`、`access_token.txt`、`device-cookie.txt` 与 `devices/` 全部被 `.gitignore` 排除。
+**这些目录不入库**（`.gitignore` 已排除 `cookies.json` / `access_token.txt` /
+`devices/` / `device-cookie.txt`）。这里只说明**该放什么、放成什么样**，
+不要提交任何真实凭据。
 
-## 布局
+## 登录态（acct2 / acct3 / acct4 / acct5 / acct6）
+
+每个目录两份文件：
 
 ```
-scripts/
-├── cookies.json                  ← acct1
-├── access_token.txt              ← acct1
-└── accounts/
-    ├── acct2/
-    │   ├── cookies.json          ← acct2
-    │   └── access_token.txt
-    ├── acct3/
-    │   ├── cookies.json          ← acct3
-    │   └── access_token.txt
-    ├── acct4/
-    │   ├── cookies.json          ← acct4
-    │   └── access_token.txt
-    └── nologin/                  ← 脚本自动生成，不要手写
-        ├── device-cookie.txt
-        └── devices/<oai-did>.txt
+accounts/<acct>/
+├── cookies.json       # cookie 数组，见下
+└── access_token.txt   # 纯文本，单行，无尾随换行
 ```
 
-acct1 也可以整目录外置：设 `CHATGPT_AUTH_DIR=/path/to/dir`，脚本会去那里读 `cookies.json` 与 `access_token.txt`。
+`acct1` 是例外：它复用默认凭据根（`CHATGPT_AUTH_DIR` 或 `scripts/` 本身），
+不在 `accounts/` 下。
 
-## 格式
+### cookies.json
 
-**cookies.json** — Playwright/CDP 风格的 cookie 数组（字段超集即可，脚本只取 `name` / `value` / `domain`）：
+顶层必须是**数组**（不是 `{"cookies": [...]}`），每项至少含 `name` / `value` / `domain`：
 
 ```json
 [
-  {"name": "__Secure-next-auth.session-token", "value": "...", "domain": "chatgpt.com"},
-  {"name": "oai-did", "value": "...", "domain": "chatgpt.com"},
-  {"name": "__cf_bm", "value": "...", "domain": "chatgpt.com"}
+  {"name": "__Secure-next-auth.session-token.0", "value": "...", "domain": ".chatgpt.com"},
+  {"name": "__Secure-next-auth.session-token.1", "value": "...", "domain": ".chatgpt.com"},
+  {"name": "oai-did", "value": "...", "domain": ".chatgpt.com"},
+  {"name": "__cf_bm", "value": "...", "domain": ".openai.com"}
 ]
 ```
 
-**access_token.txt** — 单行，`/backend-api` 的 Bearer token（JWT 以 `eyJ` 开头），不带 `Bearer ` 前缀。
+**`domain` 只允许 `chatgpt.com` / `openai.com` 及其子域**（A29 / DECISION-156）。
+其余域一律被丢弃——脚本在 `__init__` 拼请求头、`warm_cookies()` 回写、
+`Storage.getCookies` 导入三处都会过滤，所以混进来的 Google 会话发不出去、
+也存不下来。**不要手工往里加非 OpenAI 域**，加了也只会被静默丢掉。
 
-## 别只放两条 cookie
+### access_token.txt
 
-只存 `session-token` + `oai-did` 时 GET 全通、但 `POST /backend-api/conversation` 恒 403 `Unusual activity`——缺的是 Cloudflare 会话 cookie（`__cf_bm`、`__cfuvid`、`__cflb`）。脚本首次 403 会自动 `warm_cookies()`（访问首页接收 Set-Cookie 并回写 `cookies.json`）再重试，实测可自愈；但优先一次性提取完整 cookie 更稳。
+从 `/api/auth/session` 的 `accessToken` 字段取。**单行、无尾随换行**——
+带换行会让长度校验差 1 字节，与其它账号不一致。
 
-## 怎么拿
+## 匿名态（nologin）
 
-```bash
-# Edge 以调试端口启动并登录 ChatGPT 后
-python scripts/extract_auth.py
+```
+accounts/nologin/
+├── device-cookie.txt          # 最新一份 Cookie 头（兼容旧版）
+└── devices/<oai-did>.txt      # 按设备分档的 Cookie 头
+    devices/<oai-did>.json     # 同设备完整 jar（含 HttpOnly），可回灌浏览器
 ```
 
-只覆盖默认账号（acct1）。额外身份（acct2 / acct3 / acct4）需在已登录的 InPrivate 窗口经 DevConsole 同源取 token + 可读 cookie，导出到 `accounts/acct2/`、`accounts/acct3/`、`accounts/acct4/`；本机回环接收服务被 CSP/PNA 拦下时，兜底下载 JSON 再读取（**导出文件名要带账号编号，否则会覆盖上一次的导出**）。导出的 cookie 若缺 CF 系列，首轮 `warm_cookies()` 会补齐。
+匿名会话**只认 `oai-did`**：换浏览器 profile 后设备号变了，新 cookie 读旧会话
+就是 404。`devices/` 扫掉 = 那些设备上的历史匿名会话永久失联。
 
-## nologin/
+## 提取方式
 
-匿名态没有账号，只有**设备身份**。`device-cookie.txt` 是当前浏览器的 `oai-did`，`devices/<oai-did>.txt` 是按设备分档的快照——`--anon-read` 会用对照表里记录的设备号取对应快照，所以换 profile 后旧匿名会话仍可读。
+- **acct1**：`python scripts/extract_auth.py`（走 CDP，默认端口 9222）
+- **acct2–acct6**：已登录的 InPrivate 窗口里同源 `fetch('/api/auth/session')` 取
+  token、`document.cookie` 取可读 cookie，导出 JSON 再落到对应目录。
+  浏览器 CSP/PNA 会拦发往 `127.0.0.1` 的 fetch，**兜底走「下载 JSON 再读文件」**。
 
-**删掉 `devices/` 等于永久失去那些设备上的历史匿名会话**，服务端没有任何副本。
+## 三条纪律
 
-## 安全
-
-- 不要提交、不要粘贴到聊天或 issue。
-- `access_token.txt` 有效期到期（JWT `exp`）后重新提取，不要手工续期。
-- 多机共用请把凭据放在加密盘并用 `CHATGPT_AUTH_DIR` 指过去，不要放进仓库工作区。
+1. **凭据内容判定身份，不按文件名。** 实测遇到过文件名写 `acct6-export.json`
+   而内容是 acct5 的情况——按文件名装会挤掉正常账号，净损失一个身份。
+   用 `sub`（JWT）或邮箱核对。
+2. **不要在聊天里粘贴 cookie / access token。**
+3. **重新提取必须由本人在浏览器完成登录**，没有非交互路径。服务端
+   `token_revoked` 是 OAuth 吊销，重试/换代理/改文件都不会好。
