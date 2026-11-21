@@ -5181,7 +5181,7 @@ class TestAccountRecoveryAcct5(unittest.TestCase):
             self.assertIn(name, st["failures"])
             self.assertIn(name, st["created"])
 
-class TestCookiePersistenceBoundary(unittest.TestCase):
+class TestCookiePersistenceBoundary(TmpBase):
     """DECISION-156：Cookie 持久化边界。
 
     实测事故：acct1 的 cookies.json 里混进整包 Google 会话（50 条，覆盖
@@ -5341,6 +5341,48 @@ class TestCookiePersistenceBoundary(unittest.TestCase):
             on_disk = json.load(open(os.path.join(tmp, "cookies.json"), encoding="utf-8"))
             self.assertEqual(len(on_disk), 4, "磁盘上不该留 Google cookie")
             self.assertTrue(all(m._cookie_domain_allowed(c["domain"]) for c in on_disk))
+
+    def test_save_device_cookie_drops_foreign_domain(self):
+        """落盘信任边界：`save_device_cookie` 必须自己 fail-closed。
+
+        调用方今天恰好都先过 `cookie_jar()` 的过滤，但这是「恰好」而不是契约。
+        直接喂一个混了 evil.com 的 jar，断言非 OpenAI 域既不进 .txt 也不进 .json。
+        """
+        jar = [{"name": "oai-did", "value": DEV_A, "domain": ".chatgpt.com", "path": "/"},
+               {"name": "sid", "value": "x", "domain": "evil.com", "path": "/"}]
+        self.assertEqual(m.save_device_cookie(jar), DEV_A)
+
+        ddir = m.anon_device_dir()
+        txt = _read(os.path.join(ddir, DEV_A + ".txt"))
+        js = json.loads(_read(os.path.join(ddir, DEV_A + ".json")))
+        self.assertNotIn("sid=x", txt)
+        self.assertEqual([c["name"] for c in js], ["oai-did"])
+
+        device_txt = os.path.join(m.BASE, "accounts", "nologin", "device-cookie.txt")
+        self.assertNotIn("sid=x", _read(device_txt))
+
+    def test_save_device_cookie_all_foreign_yields_nothing(self):
+        """整包都是外人域 → 拿不到合法 oai-did → 返回 "" 且不落任何文件。"""
+        jar = [{"name": "oai-did", "value": DEV_A, "domain": "notchatgpt.com"},
+               {"name": "SID", "value": "g", "domain": ".google.com"}]
+        self.assertEqual(m.save_device_cookie(jar), "")
+        self.assertFalse(os.path.exists(os.path.join(m.anon_device_dir(), DEV_A + ".json")))
+        self.assertFalse(os.path.exists(os.path.join(m.anon_device_dir(), DEV_A + ".txt")))
+        self.assertFalse(
+            os.path.exists(os.path.join(m.BASE, "accounts", "nologin", "device-cookie.txt")))
+
+    def test_save_device_cookie_legit_jar_unaffected(self):
+        """收紧不得误伤：纯 .chatgpt.com jar 照常落盘并返回 did。"""
+        jar = [{"name": "oai-did", "value": DEV_A, "domain": ".chatgpt.com", "path": "/"},
+               {"name": "__cf_bm", "value": "cf", "domain": ".chatgpt.com", "path": "/"}]
+        self.assertEqual(m.save_device_cookie(jar), DEV_A)
+        self.assertEqual(len(m.load_device_jar(DEV_A)), 2)
+        self.assertIn("oai-did=" + DEV_A, m.load_device_cookie(DEV_A))
+
+    def test_save_device_cookie_str_path_still_works(self):
+        """老快照兼容：str 输入被合成 .chatgpt.com，必须仍通过域判定。"""
+        self.assertEqual(m.save_device_cookie("oai-did=%s; __cf_bm=x" % DEV_A), DEV_A)
+        self.assertIn("oai-did=" + DEV_A, m.load_device_cookie(DEV_A))
 
 
 def _fake_build_opener(proxy, context=None, extra=()):

@@ -4072,12 +4072,13 @@ def _device_jar(did):
 
 
 def _sanitize_jar(jar):
-    """剔除登录态凭据类 cookie，只留设备身份与 CF 系列。
+    """剔除登录态凭据类 cookie 与非 OpenAI 域 cookie，只留设备身份与 CF 系列。
 
     浏览器若恰好处于登录态（用户手动开过这个 profile），把整包 jar 写盘
     等于把 session token 存进 nologin 目录。宁可不留，也不落凭据。
+    域判定同样在此 fail-closed：本函数是落盘信任边界，不能依赖调用方先过滤。
     """
-    out, dropped = [], []
+    out, dropped, foreign = [], [], []
     for ck in jar or []:
         if not isinstance(ck, dict) or not ck.get("name"):
             continue
@@ -4085,12 +4086,18 @@ def _sanitize_jar(jar):
         if AUTH_COOKIE_RE.search(name):
             dropped.append(name)
             continue
+        if not _cookie_domain_allowed(ck.get("domain")):
+            foreign.append("%s@%s" % (name, ck.get("domain") or ""))
+            continue
         out.append({k: ck[k] for k in
                     ("name", "value", "domain", "path", "expires", "httpOnly", "secure", "sameSite")
                     if ck.get(k) is not None})
     if dropped:
         print("WARN: 设备快照丢弃登录态 cookie（%s）：匿名通道不需要，且不该落盘"
               % ", ".join(sorted(set(dropped))), flush=True)
+    if foreign:
+        print("WARN: 设备快照丢弃非 OpenAI 域 cookie（%s）：凭据只存自有域"
+              % ", ".join(sorted(set(foreign))), flush=True)
     return out
 
 
