@@ -4283,8 +4283,7 @@ class ChatGPTAPI:
             self.cookie = "; ".join(
                 "%s=%s" % (ck["name"], ck["value"])
                 for ck in self.cookies
-                if isinstance(ck, dict) and ("chatgpt.com" in (ck.get("domain") or "")
-                                             or "openai.com" in (ck.get("domain") or ""))
+                if isinstance(ck, dict) and _cookie_domain_allowed(ck.get("domain"))
             )
         # 出口：全部网络动作统一从 CHATGPT_PROXY / proxy.json 取，取不到就拒绝联网。
         # 支持 http/https/socks5/socks5h；本机地址（CDP、本地闸口）自动绕过。
@@ -4386,7 +4385,7 @@ class ChatGPTAPI:
         self.cookie = "; ".join(
             "%s=%s" % (c["name"], c["value"])
             for c in self.cookies
-            if "chatgpt.com" in (c.get("domain") or "") or "openai.com" in (c.get("domain") or "")
+            if _cookie_domain_allowed(c.get("domain"))
         )
         print("warm_cookies: 补充 %s" % ", ".join(changed), flush=True)
         return True
@@ -5085,8 +5084,8 @@ class AnonBrowser:
                     pass
             jar = []
             for ck in (res or {}).get("cookies") or []:
-                domain = (ck.get("domain") or "").lstrip(".").lower()
-                if "chatgpt.com" not in domain and "openai.com" not in domain:
+                # DECISION-156：导入侧同样只收 OpenAI 自有域（精确匹配，不做包含）。
+                if not _cookie_domain_allowed(ck.get("domain")):
                     continue
                 jar.append({k: ck[k] for k in
                             ("name", "value", "domain", "path", "expires", "httpOnly",

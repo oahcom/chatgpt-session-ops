@@ -5254,6 +5254,34 @@ class TestCookiePersistenceBoundary(unittest.TestCase):
             [{"name": "oai-did", "value": "v", "domain": ".chatgpt.com"}],
         )
 
+    def test_cookie_header_built_at_init_excludes_foreign_domains(self):
+        """构造请求头时就必须过滤——不能只在回写磁盘时过滤。
+
+        第三处同类绕过：`__init__` 与 `warm_cookies()` 末尾都在拼 Cookie 头，
+        原实现用 `"chatgpt.com" in domain` 字符串包含，`notchatgpt.com` 会被
+        当自己人发出去。这里直接构造实例，断言头里只剩 OpenAI 域。
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "cookies.json"), "w", encoding="utf-8") as f:
+                json.dump([
+                    {"name": "oai-did", "value": "d", "domain": ".chatgpt.com"},
+                    {"name": "__cf_bm", "value": "c", "domain": ".openai.com"},
+                    {"name": "SID", "value": "g", "domain": ".google.com"},
+                    {"name": "evil", "value": "x", "domain": "notchatgpt.com"},
+                    {"name": "evil2", "value": "y", "domain": "chatgpt.com.evil.io"},
+                ], f)
+            with open(os.path.join(tmp, "access_token.txt"), "w", encoding="utf-8") as f:
+                f.write("tok")
+
+            with mock.patch.object(m, "resolve_proxy_info",
+                                   return_value={"source": "t", "url": "http://127.0.0.1:7000"}):
+                api = m.ChatGPTAPI(base_dir=tmp, account="acct1")
+
+            self.assertEqual(api.cookie, "oai-did=d; __cf_bm=c")
+            self.assertNotIn("SID", api.cookie)
+            self.assertNotIn("notchatgpt", api.cookie)
+
     def test_warm_cookies_drops_foreign_cookies_on_writeback(self):
         """回归：真实走 warm_cookies() 的回写路径。
 
