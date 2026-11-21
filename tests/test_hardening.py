@@ -5254,6 +5254,35 @@ class TestCookiePersistenceBoundary(unittest.TestCase):
             [{"name": "oai-did", "value": "v", "domain": ".chatgpt.com"}],
         )
 
+    def test_extract_auth_shares_the_same_domain_semantics(self):
+        """两份独立实现必须由同一组向量约束（DECISION-156 验收要求）。
+
+        `extract_auth.py` 故意不 import 主脚本（避免脚本互相依赖），于是
+        `_cookie_domain_allowed` 存在两份实现。两份实现最危险的失败模式不是
+        一起错，而是**漂移**：有人只改了一处，边界就在另一条路径上裂开。
+        这里把同一组向量同时喂给两份实现，任一处语义变化立刻红。
+        """
+        src = os.path.join(HERE, "..", "scripts", "extract_auth.py")
+        spec = importlib.util.spec_from_file_location("extract_auth_under_test", src)
+        ea = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(ea)
+
+        allow = ("chatgpt.com", ".chatgpt.com", "ws.chatgpt.com",
+                 "openai.com", ".openai.com", "auth.openai.com", "CHATGPT.COM")
+        deny = ("notchatgpt.com", "evil-openai.com", "chatgpt.com.evil.io",
+                "openai.com.evil.io", "chatgpt.co", "myopenai.com",
+                "google.com", ".google.com", "accounts.google.com",
+                ".youtube.com", ".oaistatic.com", "", None, "  ", ".")
+
+        for d in allow:
+            with self.subTest(domain=d, kind="allow"):
+                self.assertTrue(m._cookie_domain_allowed(d), "主脚本应允许 %r" % (d,))
+                self.assertTrue(ea._cookie_domain_allowed(d), "extract_auth 应允许 %r" % (d,))
+        for d in deny:
+            with self.subTest(domain=d, kind="deny"):
+                self.assertFalse(m._cookie_domain_allowed(d), "主脚本应拒绝 %r" % (d,))
+                self.assertFalse(ea._cookie_domain_allowed(d), "extract_auth 应拒绝 %r" % (d,))
+
     def test_cookie_header_built_at_init_excludes_foreign_domains(self):
         """构造请求头时就必须过滤——不能只在回写磁盘时过滤。
 

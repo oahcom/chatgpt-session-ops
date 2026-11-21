@@ -302,7 +302,7 @@ python scripts/chatgpt_send.py --tail <conv_id>
 | 落盘原子性 | 一律 `tmp → fsync → replace`；失败清 tmp | 匿名归档是唯一副本，写半截等于会话彻底丢失 |
 | 回复全文 | 默认不截断；只有显式设 `CHATGPT_REPLY_MAX_CHARS` 才截，且头部注明 | 旧版静默只留**末尾** 2 万字，结论常常在前半段 |
 | 凭据权限 | POSIX 上 `cookies.json` 等落盘后 chmod 600 | 默认 umask 会让同机其他用户可读 |
-| Cookie 持久化边界 | `cookies.json` **只允许存 `chatgpt.com` / `openai.com` 域**（含子域）。`_cookie_domain_allowed()` 走精确域名或后缀匹配，**不做字符串包含**；`warm_cookies()` 回写前过滤内存与磁盘，`extract_auth.py` 导入时同语义过滤 | 请求头过滤只管「能不能发出去」，管不住「能不能存下来」。实测 acct1 的 `cookies.json` 混进 50 条 Google 会话（`accounts.google.com` / `.google.com` / `.youtube.com` / `.google.co.jp` / `.google.com.hk`），`warm_cookies()` 每次补 CF cookie 都把整包回写磁盘——等于把全站登录态反复备份。字符串包含判定还会误收 `notchatgpt.com` |
+| Cookie 持久化边界 | `cookies.json` **只允许存 `chatgpt.com` / `openai.com` 域**（含子域）。`_cookie_domain_allowed()` 走精确域名或后缀匹配，**不做字符串包含**；**四个入口全部走同一判定**：`ChatGPTAPI.__init__` 拼请求头、`warm_cookies()` 回写与重建头、`AnonBrowser` 的 `Storage.getCookies` 导入、`extract_auth.py` 导出 | 请求头过滤只管「能不能发出去」，管不住「能不能存下来」。实测 acct1 的 `cookies.json` 混进 50 条 Google 会话（`accounts.google.com` / `.google.com` / `.youtube.com` / `.google.co.jp` / `.google.com.hk`），`warm_cookies()` 每次补 CF cookie 都把整包回写磁盘——等于把全站登录态反复备份。字符串包含判定更糟：`notchatgpt.com`、`chatgpt.com.evil.io` 的 cookie 会**被真的发进 chatgpt.com 的请求头**（变异验证实测 `evil=x; evil2=y` 出现在出站头里）。**品牌归属 ≠ 凭据授权**：`.oaistatic.com` 是 OpenAI 自己的域，但不在白名单（不参与认证，且 `chatgpt.com` 域已有同名 `_cfuvid`）——扩白名单必须有功能需求和验证证据 |
 | 429 退避 | 先定性再退避；上游限速按返回体 `resets_in`/`retry_after`/`Retry-After` 的真实时限（缺省才默认，封顶 3600 秒）；代理类失败不退避、改修代理 | 固定 90 秒既可能太快也可能白等，且会把代理故障误当限速 |
 | 文件锁重入 | 按**线程**记持有者（`path -> thread ident`） | 旧版按路径记集合，同进程第二个线程会跳过加锁，多线程下照样丢更新（已由单测锁死） |
 | `--tail` 退出码 | 没取到内容返回 1 | 否则脚本编排层无法区分「读到了」和「被限速」 |
@@ -329,7 +329,7 @@ python scripts/chatgpt_send.py --tail <conv_id>
 python -m unittest discover -s tests -v
 ```
 
-354 条，覆盖 id 校验与路径穿越、状态文件损坏隔离（语法坏与顶层类型坏同罪）与字段形状收敛（`_as_int` 等五件套，畸形字段一律「没有这个值」不抛异常）、原子写（tmp 名唯一，防同进程多线程互踩）与并发 80 次不丢更新、锁重入/stale 回收/持有者身份、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性、设备身份留存与多设备回退（含凭据剔除、429 停手、归属自愈），以及用离线桩跑通的投递主流程（含 413、空提示词、非法 id、发送异常时的孤儿会话登记）；出口代理（优先级、fail-closed、http/socks 真分流、死节点探测、出口判定、目标站探活、WebRTC 泄漏分类；坏端口＝配置非法在入口拒，探活对垃圾端口一律 False）；B8 六进程并发抢槽（抢不到锁即 QUEUED、半截槽位不回收）、B15 租约心跳与超时两档；交付正文托管（`--extract` 字节级、CRLF 不改、标记不唯一退 2、`--verify-copy` 单字节差异即拒）；调度口径（`--check-name` 12 条命名契约、`--check-schedule` 1 小时维度、`--check-oneshot` 一次性窗口）；证据矩阵自校验（条款与证据一一对应，引用不存在的用例即红）。**改锁、改落盘、改 id、改设备身份、改代理、改基线条款前先跑一遍。**
+355 条，覆盖 id 校验与路径穿越、状态文件损坏隔离（语法坏与顶层类型坏同罪）与字段形状收敛（`_as_int` 等五件套，畸形字段一律「没有这个值」不抛异常）、原子写（tmp 名唯一，防同进程多线程互踩）与并发 80 次不丢更新、锁重入/stale 回收/持有者身份、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性、设备身份留存与多设备回退（含凭据剔除、429 停手、归属自愈），以及用离线桩跑通的投递主流程（含 413、空提示词、非法 id、发送异常时的孤儿会话登记）；出口代理（优先级、fail-closed、http/socks 真分流、死节点探测、出口判定、目标站探活、WebRTC 泄漏分类；坏端口＝配置非法在入口拒，探活对垃圾端口一律 False）；B8 六进程并发抢槽（抢不到锁即 QUEUED、半截槽位不回收）、B15 租约心跳与超时两档；交付正文托管（`--extract` 字节级、CRLF 不改、标记不唯一退 2、`--verify-copy` 单字节差异即拒）；调度口径（`--check-name` 12 条命名契约、`--check-schedule` 1 小时维度、`--check-oneshot` 一次性窗口）；证据矩阵自校验（条款与证据一一对应，引用不存在的用例即红）。**改锁、改落盘、改 id、改设备身份、改代理、改基线条款前先跑一遍。**
 
 ### 交付正文与排程口径的机器闸口（v1.8）
 
@@ -452,7 +452,7 @@ python scripts/chatgpt_send.py --proxy-clear                # 清掉 proxy.json 
 
 ### tests/
 
-- `test_hardening.py` — 离线回归（354 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW、设备身份留存与多设备回退、出口代理（含本地假 http/socks 代理真分流）。
+- `test_hardening.py` — 离线回归（355 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW、设备身份留存与多设备回退、出口代理（含本地假 http/socks 代理真分流）。
 
 ## 协议细节
 
@@ -464,4 +464,6 @@ PoW 算法、POST 请求体全字段、SSE 解析、mapping tail 计算等实现
 
 **备份文件（`.bak-<ts>` / `.corrupt-<ts>`）同属敏感物**：它们是凭据与私有会话 id 的历史快照，与正本同等级。`.gitignore` 已用 `*.bak-*` / `*.corrupt-*` 覆盖（此前只有精确文件名规则，`cookies.json.bak-20261121-191330` 这类副本能溜进仓库）。处置纪律：审计确认正本已完全覆盖备份内容后即删，不留档；**不要**把凭据备份丢进云同步目录。
 
-**`chmod 600` 只在 POSIX 生效**（`_harden_perms()` 在 Windows 直接 return）。本机是 Windows，凭据文件的实际访问控制靠 NTFS ACL（`icacls` 显示仅 SYSTEM / Administrators / 当前用户可读写），不要以为跑过 `chmod` 就安全了；把技能目录放进多用户共享盘时先查 `icacls`。
+**`chmod 600` 只在 POSIX 生效**（`_harden_perms()` 在 Windows 直接 return）。本机是 Windows，凭据文件的实际访问控制靠 NTFS ACL（`icacls` 显示仅 SYSTEM / Administrators / 当前用户可读写），不要以为跑过 `chmod` 就安全了；把技能目录放进多用户共享盘时先查 `icacls`。**这是当前这台机器经核验的状态，不可推广成「Windows 默认安全」**（DECISION-156 Q4：接受文档方案，本轮不做 ACL 自动化；将来若做，必须先实现「设权限后仍能读凭据」的自检，失败明确报错而不是静默继续）。
+
+**安全类回归测试的硬要求（DECISION-156 Q6，长期有效）**：安全用例必须证明「缺陷重新出现时会失败」。五步：正常路径 → 恶意输入 → 边界输入 → **修复回滚后的变异验证** → **确认实际执行了目标代码分支**。最后两条是这次的血泪——第一版 `_NullOpener` 根本没把 cookie 写进 `warm_cookies()` 自己 new 的 jar，`changed` 为空直接提前 return，测试「跑了一遍但什么都没验证」，是靠变异验证（回滚后断言 `54 != 4` 失败）才发现的。没有变异验证的安全测试，等于没有测试。

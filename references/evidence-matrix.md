@@ -13,7 +13,7 @@
 
 **矩阵自身受回归保护**：`tests/test_hardening.py::TestEvidenceMatrix` 会校验「条款集合 = 矩阵行集合」「每个 `test:`/`code:` 引用都能解析」「每条至少一种证据」。也就是说，新增条款而不补证据行、或引用了不存在的用例，测试会直接红。
 
-> 最后更新：2026-11-21（v1.9）。当前回归 354 条，全绿（1 条 POSIX-only skip）。
+> 最后更新：2026-11-21（v1.9）。当前回归 355 条，全绿（1 条 POSIX-only skip）。
 
 ---
 
@@ -50,7 +50,7 @@
 | A26 | **FULL** | 测试+代码 | `test:test_probe_site_ok` `test:test_probe_site_blocked_by_vpn` `test:test_probe_site_challenge_is_usable` `test:test_probe_site_other_status_not_ok` `test:test_proxy_check_requires_site_ok` `code:probe_site` | 目标站 verdict 五分类，只有 ok/challenge 算通 |
 | A27 | **FULL** | 测试+代码+实测 | `test:test_thinking_uses_thinking_slug` `test:test_default_keeps_auto_model` `code:resolve_thinking_model` `code:enable_thinking` `live:2026-11-19` | `-t-` 变体解析不出就退 1；浏览器侧幂等开按钮 |
 | A28 | **FULL** | 测试+代码 | `test:test_truncated_stream_completed_by_get` `code:send` | `IncompleteRead.partial` 按 200 处理 + GET 补全文 |
-| A29 | **FULL** | 测试+代码+实测 | `test:test_chatgpt_domain_allowed` `test:test_openai_domain_allowed` `test:test_lookalike_domains_rejected` `test:test_empty_and_malformed_domain_rejected` `test:test_filter_keeps_only_openai` `test:test_filter_preserves_all_fields` `test:test_filter_handles_non_list_and_non_dict` `test:test_cookie_header_built_at_init_excludes_foreign_domains` `test:test_warm_cookies_drops_foreign_cookies_on_writeback` `code:_cookie_domain_allowed` `code:_filter_openai_cookies` `code:warm_cookies` `live:2026-11-21` | 持久化边界与请求头过滤是**两道独立的关**：前者管「哪些有资格被保存」。精确域名/后缀匹配——`notchatgpt.com`、`evil-openai.com`、`chatgpt.com.evil.io` 全部拒绝（字符串包含会误收）；`warm_cookies()` 回写前同步收敛内存与磁盘，避免两者不一致；回归用 50 条 Google + 3 条 OpenAI 走真实回写路径，且已做变异验证（回滚过滤后断言 `54 != 4` 直接失败，证明这条用例不是空跑）。**三处同类绕过全部堵上**：`__init__` 拼 Cookie 头、`warm_cookies()` 回写、`extract_auth.py` 导入——任一漏掉都等于边界失效，变异验证显示回滚 `__init__` 后 `evil=x; evil2=y` 会被真的发出去 |
+| A29 | **FULL** | 测试+代码+实测 | `test:test_chatgpt_domain_allowed` `test:test_openai_domain_allowed` `test:test_lookalike_domains_rejected` `test:test_empty_and_malformed_domain_rejected` `test:test_filter_keeps_only_openai` `test:test_filter_preserves_all_fields` `test:test_filter_handles_non_list_and_non_dict` `test:test_extract_auth_shares_the_same_domain_semantics` `test:test_cookie_header_built_at_init_excludes_foreign_domains` `test:test_warm_cookies_drops_foreign_cookies_on_writeback` `code:_cookie_domain_allowed` `code:_filter_openai_cookies` `code:warm_cookies` `live:2026-11-21` | 持久化边界与请求头过滤是**两道独立的关**：前者管「哪些有资格被保存」。精确域名/后缀匹配——`notchatgpt.com`、`evil-openai.com`、`chatgpt.com.evil.io` 全部拒绝（字符串包含会误收）；`warm_cookies()` 回写前同步收敛内存与磁盘，避免两者不一致；回归用 50 条 Google + 3 条 OpenAI 走真实回写路径，且已做变异验证（回滚过滤后断言 `54 != 4` 直接失败，证明这条用例不是空跑）。**三处同类绕过全部堵上**：`__init__` 拼 Cookie 头、`warm_cookies()` 回写、`extract_auth.py` 导入——任一漏掉都等于边界失效，变异验证显示回滚 `__init__` 后 `evil=x; evil2=y` 会被真的发出去 |
 
 ## B. 定时任务基线
 
