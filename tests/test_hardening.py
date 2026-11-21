@@ -1500,6 +1500,66 @@ class TestAnonSendFailure(TmpBase):
                 os.environ["CHATGPT_ANON_CDP_PORT"] = old
 
 
+class TestAnonSendSuccess(TmpBase):
+    """匿名通道**成功**路径：建会话 → 收割 → 归档。
+
+    2026-11-21 实证过的真实事故：`send_anon` 把 `harvest_mapping_checked()`
+    的二元组按三元组解包，于是匿名会话**一旦建成就在收割处必抛 ValueError**，
+    调用方只看到「失败」。结果是匿名通道被整体误判为不可用（并写进了治理
+    记录：nologin「审计载体缺失」），实际是收割代码崩了。
+    本用例钉住成功路径能走完并落盘，防止回归。
+    """
+
+    class _Browser:
+        def __init__(self, did, cid, reply):
+            self.did, self.cid, self.reply = did, cid, reply
+            self.last_cid = self.last_tab = None
+
+        def cookie_jar(self):
+            return [{"name": "oai-did", "value": self.did,
+                     "domain": ".chatgpt.com", "path": "/"}]
+
+        def identity(self):
+            return m.save_device_cookie(self.cookie_jar())
+
+        def send(self, text, conv_id=None):
+            self.last_cid, self.last_tab = self.cid, "tab-ok"
+            return self.cid, self.reply, "tab-ok"
+
+    def test_anon_send_harvests_and_archives(self):
+        did = "cccccccc-3333-4333-8333-333333333333"
+        cid = "dddddddd-4444-4444-8444-444444444444"
+        body = json.dumps({"mapping": {"m1": {"message": {
+            "id": "m1", "author": {"role": "assistant"},
+            "content": {"parts": ["ANON_OK"]}, "create_time": 1}}}})
+
+        api = object.__new__(m.ChatGPTAPI)
+        api.account, api.is_anon, api.cookie = "nologin", True, ""
+        api.base_dir = self.tmp
+        api.anon = self._Browser(did, cid, "ANON_OK")
+        api.req = lambda *a, **k: (200, body)
+
+        status, path, got = m.send_anon(api, None, "p.md", "hello")
+
+        self.assertEqual(status, 200, "成功路径不得因解包崩溃而退化成失败")
+        self.assertEqual(got, cid)
+        self.assertTrue(path and os.path.exists(path), "回复必须落盘")
+        with open(path, encoding="utf-8") as f:
+            self.assertIn("ANON_OK", f.read())
+        s = m.anon_session(cid)
+        self.assertIsNotNone(s, "成功路径同样要登记会话归属")
+        self.assertEqual(s.get("device"), did)
+
+    def test_harvest_returns_two_tuple(self):
+        """契约钉死：harvest_mapping_checked 是二元组，不是三元组。"""
+        raw = json.dumps({"mapping": {"m": {"message": {
+            "id": "m", "author": {"role": "assistant"},
+            "content": {"parts": ["x"]}, "create_time": 1}}}})
+        out = m.ChatGPTAPI.harvest_mapping_checked(raw)
+        self.assertEqual(len(out), 2, "签名是 (text, complete)")
+        self.assertEqual(out, ("x", True))
+
+
 # ---------------------------------------------------------------- 投递流程（离线桩）
 class FakeAPI:
     """只实现 send_prompt 用到的那几个方法，用来在没有网络/凭据时跑通主流程。"""
@@ -1575,12 +1635,16 @@ class TestSendFlow(TmpBase):
     def test_happy_path_keeps_conversation_id(self):
         cid = "11111111-2222-4333-8444-555555555555"
         api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "hello"))
+        # `#` 开头的行**不删**：旧版按注释头删行，把 Rust 的 `#[derive]`/`#[test]`/
+        # `#[cfg]` 和 markdown 标题一起吃掉，投递的代码正文被静默截断
+        # （2026-11-21 r1d/r1e 实证）。本用例钉住「原文照发」。
         prompt = self._prompt("# 注释行会被去掉\n真正的正文\n")
         status, path, conv = m.send_prompt(api, cid, prompt)
         self.assertEqual(status, 200)
         self.assertEqual(conv, cid, "必须认回原会话，不能静默落新会话")
         self.assertEqual(api.sent[0]["conv_id"], cid)
-        self.assertEqual(api.sent[0]["text"], "真正的正文")
+        self.assertEqual(api.sent[0]["text"], "# 注释行会被去掉\n真正的正文",
+                         "`#` 行必须原样保留，删行会静默截断 Rust 属性")
         self.assertIn("hello", _read(path))
 
     def test_thinking_uses_thinking_slug(self):
@@ -4671,6 +4735,55 @@ class TestReviewLog(unittest.TestCase):
                 self.assertRegex(ver, r"v\d\.\d", "第 %s 轮没写受审版本" % num)
                 self.assertRegex(_verdict, r"PASS|NEEDS-REVISION",
                                  "第 %s 轮没写裁定" % num)
+
+
+class TestRegistryMonotonicGuard(TmpBase):
+    """DECISION-143：注册表只增不删，删除阈值 0。"""
+
+    def setUp(self):
+        super().setUp()
+        self._conv = m.CONV_MAP_FILE
+        m.CONV_MAP_FILE = os.path.join(self.tmp, "conv-accounts.json")
+
+    def tearDown(self):
+        m.CONV_MAP_FILE = self._conv
+        super().tearDown()
+
+    def test_record_conv_refuses_to_drop_existing_id(self):
+        m.record_conv("6afd0001-1111-83ee-8000-000000000001", "acct1", "p1.md")
+        m.record_conv("6afd0002-2222-83ee-8000-000000000002", "acct1", "p2.md")
+
+        def shrink(data):
+            data.pop("6afd0001-1111-83ee-8000-000000000001")
+            return True
+
+        with self.assertRaises(m.RegistryShrinkRefused):
+            m._update_json(m.CONV_MAP_FILE, shrink, {})
+
+        on_disk = m._load_json(m.CONV_MAP_FILE, {})
+        self.assertIn("6afd0001-1111-83ee-8000-000000000001", on_disk)
+        self.assertIn("6afd0002-2222-83ee-8000-000000000002", on_disk)
+
+    def test_guard_detects_cross_process_deletion_via_highwater(self):
+        path = m.CONV_MAP_FILE
+        m.record_conv("6afd0003-3333-83ee-8000-000000000003", "acct1", "p3.md")
+        self.assertTrue(os.path.exists(path + ".highwater.json"))
+
+        # 模拟另一个写入者绕过 guard 直接删掉一条（legacy 脚本行为）。
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({}, f)
+
+        with self.assertRaises(m.RegistryShrinkRefused):
+            m.record_conv("6afd0004-4444-83ee-8000-000000000004", "acct1", "p4.md")
+
+    def test_guard_allows_pure_addition(self):
+        m.record_conv("6afd0005-5555-83ee-8000-000000000005", "acct2", "p5.md")
+        m.record_conv("6afd0006-6666-83ee-8000-000000000006", "acct2", "p6.md")
+        self.assertEqual(
+            sorted(m._load_json(m.CONV_MAP_FILE, {})),
+            ["6afd0005-5555-83ee-8000-000000000005",
+             "6afd0006-6666-83ee-8000-000000000006"],
+        )
 
 
 if __name__ == "__main__":

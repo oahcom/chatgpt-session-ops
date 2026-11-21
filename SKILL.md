@@ -304,7 +304,7 @@ python scripts/chatgpt_send.py --tail <conv_id>
 python -m unittest discover -s tests -v
 ```
 
-308 条，覆盖 id 校验与路径穿越、状态文件损坏隔离（语法坏与顶层类型坏同罪）与字段形状收敛（`_as_int` 等五件套，畸形字段一律「没有这个值」不抛异常）、原子写（tmp 名唯一，防同进程多线程互踩）与并发 80 次不丢更新、锁重入/stale 回收/持有者身份、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性、设备身份留存与多设备回退（含凭据剔除、429 停手、归属自愈），以及用离线桩跑通的投递主流程（含 413、空提示词、非法 id、发送异常时的孤儿会话登记）；出口代理（优先级、fail-closed、http/socks 真分流、死节点探测、出口判定、目标站探活、WebRTC 泄漏分类；坏端口＝配置非法在入口拒，探活对垃圾端口一律 False）；B8 六进程并发抢槽（抢不到锁即 QUEUED、半截槽位不回收）、B15 租约心跳与超时两档；交付正文托管（`--extract` 字节级、CRLF 不改、标记不唯一退 2、`--verify-copy` 单字节差异即拒）；调度口径（`--check-name` 12 条命名契约、`--check-schedule` 1 小时维度、`--check-oneshot` 一次性窗口）；证据矩阵自校验（条款与证据一一对应，引用不存在的用例即红）。**改锁、改落盘、改 id、改设备身份、改代理、改基线条款前先跑一遍。**
+313 条，覆盖 id 校验与路径穿越、状态文件损坏隔离（语法坏与顶层类型坏同罪）与字段形状收敛（`_as_int` 等五件套，畸形字段一律「没有这个值」不抛异常）、原子写（tmp 名唯一，防同进程多线程互踩）与并发 80 次不丢更新、锁重入/stale 回收/持有者身份、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性、设备身份留存与多设备回退（含凭据剔除、429 停手、归属自愈），以及用离线桩跑通的投递主流程（含 413、空提示词、非法 id、发送异常时的孤儿会话登记）；出口代理（优先级、fail-closed、http/socks 真分流、死节点探测、出口判定、目标站探活、WebRTC 泄漏分类；坏端口＝配置非法在入口拒，探活对垃圾端口一律 False）；B8 六进程并发抢槽（抢不到锁即 QUEUED、半截槽位不回收）、B15 租约心跳与超时两档；交付正文托管（`--extract` 字节级、CRLF 不改、标记不唯一退 2、`--verify-copy` 单字节差异即拒）；调度口径（`--check-name` 12 条命名契约、`--check-schedule` 1 小时维度、`--check-oneshot` 一次性窗口）；证据矩阵自校验（条款与证据一一对应，引用不存在的用例即红）。**改锁、改落盘、改 id、改设备身份、改代理、改基线条款前先跑一遍。**
 
 ### 交付正文与排程口径的机器闸口（v1.8）
 
@@ -384,6 +384,7 @@ python scripts/chatgpt_send.py --proxy-clear                # 清掉 proxy.json 
 | 上下文压缩/续接后发现仓库出现自己没写的提交 | **上下文压缩不杀后台进程**：丢失段启动的协调驱动仍存活，与新代理并行写同一 repo | 恢复后**先盘点**（`git log`、文件 mtime）再动手；发现并行写者改为协作（审其产物、补缺口），不重做不回滚 |
 | 构建脚本 git HEAD 报旧 SHA / 产物指向旧树 | 同工作区有双 repo：`workspace/repo`（可能滞留旧头）vs `workspace/state/repo`（真头） | 构建/取证脚本显式指对 repo 路径；每次开工先 `git log -1` 确认头与预期一致 |
 | 413 conversation_too_large | 会话满员 | continue_full.py 摘要续接 |
+| **投递的代码正文里 `#[derive]` / `#[test]` / `#[cfg]` / markdown 标题全部消失** | 投递器把 `#` 开头行当注释删（旧版 `[l for l in text.splitlines() if not l.strip().startswith("#")]`）；Rust 属性行恰好全部以 `#` 开头 | 该行已改为只做空正文判定、不删任何行（2026-11-21）。**症状识别**：会话反馈"正文里没有属性行"时先查投递器，别怀疑会话。回归自检：投递前后 `text.count("#[derive")` 必须相等 |
 | 流读取为空 | `with` 提前关连接 | 读到 EOF（chatgpt_send.py 已正确处理） |
 | 输入框填入失败 | 用了 innerHTML 或裸赋值 | 文本域用原生 setter + InputEvent，或 CDP `Input.insertText` |
 | 401 | 认证失效 | 重跑 extract_auth.py |
@@ -416,10 +417,12 @@ python scripts/chatgpt_send.py --proxy-clear                # 清掉 proxy.json 
 - `evidence-matrix.md` — **逐条对账「这条基线由什么证明」**：`test:` 用例名 / `code:` 符号 / `live:` 实测日期 / `human:` 人判理由，四类分开标注；33 条有离线用例、3 条只有代码、13 条纯人判，缺口按危害排序列在文末。改基线必须同步这张表——`TestEvidenceMatrix` 会校验引用是否真实存在。
 - `api-protocol.md` — 实测协议细节：端点、PoW 算法、POST 请求体全字段、SSE 解析、mapping tail 计算、状态码处置、限速纪律。改脚本前先读。
 - `INCIDENT-2026-11-20-CONVERSATION-REGISTRY-LOSS-AND-RECOVERY.md` — **事故记录**：旧 500 条裁剪器删掉 387 条归属记录 → 并集最小动作恢复 904。含时间切面、并发写入者、证据 SHA-256 清单、`restore_conv_map_minimal()` vs `register_conversations_batch()` 的职责边界，以及「不得宣称四账号已收敛 / 不得宣称批量登记已生产验证」的禁止结论。
+- `INCIDENT-2026-11-21-CONVERSATION-REGISTRY-LEGACY-TRUNCATION.md` — **事故记录（P2，独立第二病因）**：11-20 修复后注册表仍在丢条目。根因是旧项目脚本 `WorkBuddy/2026-11-18-13-49-20/chatgpt_send_local.py` 按 `ts` 只保留最近 500 条，与主脚本共用同一个 `conv-accounts.json`。含「存活条目 100% 被刷新过 ts」的刀切证据、F1 全写入者清单、F2 快照交叉比对、F3 restore 锁行为。处置：legacy 三处封死为只读 + 主脚本 `RegistryShrinkRefused` 单调性守卫（删除阈值 0，含跨进程高水位基准）+ 586 条历史恢复。**不得与 11-20 合并为同一根因。**
+
 
 ### tests/
 
-- `test_hardening.py` — 离线回归（308 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW、设备身份留存与多设备回退、出口代理（含本地假 http/socks 代理真分流）。
+- `test_hardening.py` — 离线回归（313 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW、设备身份留存与多设备回退、出口代理（含本地假 http/socks 代理真分流）。
 
 ## 协议细节
 

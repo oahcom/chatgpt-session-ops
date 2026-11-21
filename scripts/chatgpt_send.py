@@ -2104,6 +2104,62 @@ def release_slot(slot_path, run_id=None):
         return False
 
 
+class RegistryShrinkRefused(RuntimeError):
+    """注册表写入试图删除既有会话 ID（DECISION-143：删除阈值 0）。"""
+
+
+def _registry_guard(path, before, after):
+    """单调性守卫：既有 ID 一个都不许消失。
+
+    单次写入保护（第一层）：比较 mutation 前后的 ID 集合。
+    跨进程保护（第二层）：对照高水位基准文件，防止别的进程已经提前删掉。
+    只在 path 是注册表本体时生效，测试用的临时注册表同样受保护。
+    """
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return
+    if os.path.basename(str(path)) != "conv-accounts.json":
+        return  # 只管注册表本体，轮转/匿名等状态文件不受此约束
+    lost = set(before) - set(after)
+    if lost:
+        raise RegistryShrinkRefused(
+            "registry write would delete %d existing conversation id(s): %s"
+            % (len(lost), sorted(lost)[:5])
+        )
+    baseline_path = path + ".highwater.json"
+    try:
+        with open(baseline_path, "r", encoding="utf-8") as f:
+            baseline = json.load(f)
+    except (OSError, ValueError):
+        baseline = None
+    if isinstance(baseline, dict):
+        known = set(baseline.get("ids") or ())
+        vanished = known - set(after)
+        if vanished:
+            raise RegistryShrinkRefused(
+                "registry lost %d previously committed id(s) (cross-process): %s"
+                % (len(vanished), sorted(vanished)[:5])
+            )
+    if set(after) != set(before):
+        # 高水位基准是辅助产物，用独立写法落盘：
+        # 不走 _atomic_write，以免破坏「注册表每次 mutation 只写一次」的既有契约。
+        tmp = baseline_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(
+                    {
+                        "ids": sorted(after),
+                        "count": len(after),
+                        "updated": _now(),
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            os.replace(tmp, baseline_path)
+        except OSError:
+            pass  # 基准写不成不阻塞主写入；下一轮会重试建立
+
+
 def _update_json(path, mutate, default, timeout=LOCK_TIMEOUT_SEC, retries=3):
     """锁内读-改-写，杜绝并发丢更新。mutate(data) 就地修改，返回 False 表示无需落盘。
 
@@ -2118,8 +2174,10 @@ def _update_json(path, mutate, default, timeout=LOCK_TIMEOUT_SEC, retries=3):
         try:
             with _file_lock(path, timeout=timeout, strict=True):
                 data = _load_json(path, default)
+                before = dict(data) if isinstance(data, dict) else data
                 if mutate(data) is False:
                     return data
+                _registry_guard(path, before, data)
                 _atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2))
                 return data
         except LockTimeout as e:
@@ -2589,6 +2647,7 @@ def register_conversations_batch(registrations):
         strict=True,
     ):
         registry = _read_conv_map_for_migration()
+        registry_before = dict(registry) if isinstance(registry, dict) else registry
 
         if not isinstance(registry, dict):
             raise ValueError(
@@ -2660,6 +2719,7 @@ def register_conversations_batch(registrations):
             }
 
         if additions:
+            _registry_guard(CONV_MAP_FILE, registry_before, registry)
             _atomic_write(
                 CONV_MAP_FILE,
                 json.dumps(
@@ -2870,6 +2930,7 @@ def restore_conv_map_minimal(candidate):
         # Deliberately bypass record_conv() pruning: recovery must not
         # delete historical records to enforce the normal 500-entry cap.
         if added:
+            _registry_guard(path, live, merged)
             _atomic_write(
                 path,
                 json.dumps(merged, ensure_ascii=False, indent=2),
@@ -4342,7 +4403,6 @@ class ChatGPTAPI:
             "messages": [{"id": str(uuid.uuid4()), "author": {"role": "user"},
                           "content": {"content_type": "text", "parts": [text]},
                           "metadata": {}}],
-            "parent_message_id": parent_message_id,
             "model": model or "auto",
             "timezone_offset_min": 480,
             "suggestions": [],
@@ -4355,6 +4415,8 @@ class ChatGPTAPI:
         }
         if conv_id:  # 空 = 开新会话（Owner 模式）；非空必须带上，否则静默落新会话
             body["conversation_id"] = conv_id
+        if parent_message_id:  # 可选：GET 限速时省略，落点仍由 SSE 首事件唯一 id 校验
+            body["parent_message_id"] = parent_message_id
         return self.req("POST", API_BASE + "/backend-api/conversation", body, {
             "OpenAI-Sentinel-Chat-Requirements-Token": req_token,
             "OpenAI-Sentinel-Proof-Token": proof,
@@ -5280,9 +5342,9 @@ def send_anon(api, conv_id, prompt_file, text):
     reply = ""
     st, body = api.req("GET", API_BASE + "/backend-api/conversation/" + cid, timeout=90)
     if st == 200:
-        reply, acomplete, adetail = api.harvest_mapping_checked(body)
+        reply, acomplete = api.harvest_mapping_checked(body)
         if reply and not acomplete:
-            print("WARN: 匿名会话 mapping 收割不完整（%s）——按尽力而为处理" % adetail, flush=True)
+            print("WARN: 匿名会话 mapping 收割不完整——按尽力而为处理", flush=True)
     if not reply:
         reply = dom_reply
     path = api.save_reply(cid, os.path.basename(prompt_file), reply)
@@ -5491,9 +5553,15 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
         raise RuntimeError("读不到提示词文件 %s：%s" % (prompt_file, e))
     if not text.strip():
         raise RuntimeError("提示词文件为空：%s" % prompt_file)
-    lines = [l for l in text.splitlines() if not l.strip().startswith("#")]
-    text = "\n".join(lines).strip()
+    # ponytail: 只做空正文判定，不再删行。旧版 `[l for l in ... if not
+    # l.strip().startswith("#")]` 把 Rust 属性 `#[derive]`/`#[test]`/`#[cfg]`
+    # 和 markdown 标题一起当注释删掉，投递的代码正文被静默截断（2026-11-21
+    # r1d/r1e 实证：提示词 11 个 derive、26 个 test 到达会话时全部消失）。
+    # 若将来确实要支持注释头，改成显式标记（如 `//prompt-comment:`）再删。
+    text = text.strip()
     if not text:
+        raise RuntimeError("提示词没有正文：%s" % prompt_file)
+    if not any(not l.strip().startswith("#") for l in text.splitlines()):
         raise RuntimeError("提示词没有正文（只有注释行）：%s" % prompt_file)
     pfile = os.path.basename(prompt_file)
 
@@ -5509,8 +5577,11 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
             tail = api.cached_tail(conv_id)
             print("using cached tail:", tail, flush=True)
         if not tail:
-            print("FAIL: no parent_message_id (GET 被限速且无缓存 tail)", flush=True)
-            return 0, None, None
+            # 2026-11-20：GET /backend-api/conversation/{id} 有独立配额桶
+            # （x-oai-history-detail-rate-limited，retry-after 58s）。
+            # 实测省略 parent_message_id 仍落原会话（test_no_parent.py LANDED），
+            # 落点由 SSE 首事件唯一 conversation_id 证明，故降级而非失败。
+            print("no parent_message_id —— 省略 parent 投递（落点由 SSE 校验）", flush=True)
 
     if thinking is None:
         thinking = os.environ.get(
