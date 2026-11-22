@@ -12,7 +12,7 @@ env:
   # Pinned Memory Adapter commit that provides src/bin/memory-stdio.rs.
   # MA main does NOT contain that file. Any MA-side implementation change the
   # SO E2E suite depends on MUST bump this SHA in the same PR that depends on it.
-  MA_PINNED_SHA: caeadc5295095f72521beeaf2c1357fa99e6c11b
+  MA_PINNED_SHA: 2f302344271d7eb60a0f32a4f6f19a9490463926
 
 jobs:
   unit:
@@ -45,6 +45,73 @@ jobs:
                   )
           PY
           echo "CHATGPT_CDP_DIR=${SHIM}" >> "${GITHUB_ENV}"
+
+      # A single corrupted character in a guard turns the guard into a no-op:
+      # bash parses the wreckage as a command, the step fails to fail, and the
+      # job reports success. That is how the memory-stdio path spent its whole
+      # life mangled while the pinned-SHA existence check stayed green.
+      #
+      # The assertion below deliberately reads a DIFFERENT step's run block than
+      # the one it lives in. An earlier version matched a string that also
+      # appeared in its own source, so deleting the real guard still passed
+      # (mutation-verified). Structure, not text, is what gets asserted now.
+      - name: Reject corrupted workflow guard text
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          path = Path(".github/workflows/ci.yml")
+          raw = path.read_bytes()
+
+          forbidden = {"\uff5c", "\u2581"}
+          found = sorted(
+              f"U+{ord(c):04X}" for c in forbidden if c.encode("utf-8") in raw
+          )
+          if found:
+              sys.exit("ERROR: forbidden tokenizer residue: " + ", ".join(found))
+
+          text = raw.decode("utf-8")
+          lines = text.splitlines()
+
+          starts = [
+              i for i, line in enumerate(lines)
+              if line == "      - name: Clone Memory Adapter at pinned SHA"
+          ]
+          if len(starts) != 1:
+              sys.exit("ERROR: expected exactly one pinned checkout step")
+
+          start = starts[0]
+          end = next(
+              (i for i in range(start + 1, len(lines)) if lines[i].startswith("      - ")),
+              len(lines),
+          )
+          block = lines[start:end]
+
+          run_positions = [i for i, line in enumerate(block) if line == "        run: |"]
+          if len(run_positions) != 1:
+              sys.exit("ERROR: pinned checkout step must contain exactly one run block")
+
+          script_lines = []
+          for line in block[run_positions[0] + 1:]:
+              if line and not line.startswith("          "):
+                  break
+              script_lines.append(line[10:] if line else "")
+          script = "\n".join(script_lines)
+
+          guard = re.compile(
+              r"(?m)^if[ \t]+\[[ \t]+![ \t]+-f[ \t]+"
+              r"ma/src/bin/memory-stdio\.rs[ \t]+\];[ \t]*then$"
+          )
+          if len(guard.findall(script)) != 1:
+              sys.exit("ERROR: pinned checkout existence guard missing or duplicated")
+
+          print("PASS: pinned checkout guard present and unique")
+          PY
 
       - name: Run unit tests
         shell: bash
@@ -136,9 +203,21 @@ jobs:
           set -euo pipefail
           git clone --no-checkout \
             "https://x-access-token:${MA_TOKEN}@github.com/oahcom/ai-memory-adapter.git" ma
+          git -C ma fetch --no-tags origin main
+          if ! git -C ma merge-base --is-ancestor "${MA_PINNED_SHA}" origin/main; then
+            echo "::error::MA_PINNED_SHA is not an ancestor of MA main"
+            echo "The pin is stale or belongs to a divergent history."
+            exit 1
+          fi
+          MA_AHEAD=$(git -C ma rev-list --count "${MA_PINNED_SHA}..origin/main")
+          if [ "${MA_AHEAD}" -ne 0 ]; then
+            echo "::error::MA_PINNED_SHA is ${MA_AHEAD} commits behind MA main"
+            echo "Review the upstream changes and deliberately promote the pin."
+            exit 1
+          fi
           git -C ma checkout --detach "${MA_PINNED_SHA}"
           echo "MA HEAD: $(git -C ma rev-parse HEAD)"
-          if [ ! -f ma/src/bin/memory-std<｜begin▁of▁sentence｜>电影io.rs ]; then
+          if [ ! -f ma/src/bin/memory-stdio.rs ]; then
             echo "::error::pinned SHA ${MA_PINNED_SHA} does not contain src/bin/memory-stdio.rs"
             echo "Update MA_PINNED_SHA in .github/workflows/ci.yml to a commit that has it."
             exit 1
