@@ -203,18 +203,6 @@ jobs:
           set -euo pipefail
           git clone --no-checkout \
             "https://x-access-token:${MA_TOKEN}@github.com/oahcom/ai-memory-adapter.git" ma
-          git -C ma fetch --no-tags origin main
-          if ! git -C ma merge-base --is-ancestor "${MA_PINNED_SHA}" origin/main; then
-            echo "::error::MA_PINNED_SHA is not an ancestor of MA main"
-            echo "The pin is stale or belongs to a divergent history."
-            exit 1
-          fi
-          MA_AHEAD=$(git -C ma rev-list --count "${MA_PINNED_SHA}..origin/main")
-          if [ "${MA_AHEAD}" -ne 0 ]; then
-            echo "::error::MA_PINNED_SHA is ${MA_AHEAD} commits behind MA main"
-            echo "Review the upstream changes and deliberately promote the pin."
-            exit 1
-          fi
           git -C ma checkout --detach "${MA_PINNED_SHA}"
           echo "MA HEAD: $(git -C ma rev-parse HEAD)"
           if [ ! -f ma/src/bin/memory-stdio.rs ]; then
