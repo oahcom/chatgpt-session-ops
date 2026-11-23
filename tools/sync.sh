@@ -5,11 +5,11 @@
 # This script is deprecated and MUST NOT be used for any official
 # chatgpt-session-ops synchronization, publication, or release.
 #
-# The authoritative repository is B:
-#   C:\Users\Administrator\WorkBuddy\2026-11-19-11-53-45\chatgpt-session-ops
+# The authoritative repository is B: this checkout (see git rev-parse
+# --show-toplevel); no absolute path is recorded here.
 #
-# The WorkBuddy Skill runtime copy is A:
-#   C:\Users\Administrator\.workbuddy\skills\chatgpt-session-ops
+# The WorkBuddy Skill runtime copy is A: the installed WorkBuddy skill
+# directory for chatgpt-session-ops (resolve at runtime, no absolute path).
 #
 # The only authorized release direction is B -> A, using the explicit
 # file/path allowlist, runtime-path exclusions, and SHA-256 verification
