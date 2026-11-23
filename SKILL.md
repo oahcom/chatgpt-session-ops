@@ -457,13 +457,14 @@ python scripts/mcp_connector.py eligibility --accounts acct1,acct2,acct3,acct4,a
 - 注册路径：`links/oauth` **只对账号自己拥有的 connector 生效**。拿别人的私有 connector（如 acct1 的 `asdk_app_6b02f952…`，`status=ONLY_ME`）去 link，任何账号都返回 `403 Unauthorized`；这跟 session 无关（acct2 用 token+cookie+PoW 对自己的 connector 直接 200）。**403 的正确解读是「无权访问该 connector」，不是「缺 session」。**
 - `links/oauth` 需要 cookie + sentinel（PoW）。纯 Bearer 不带 PoW 会 403。直接用 `ChatGPTAPI.req()` 并附 `OpenAI-Sentinel-Chat-Requirements-Token` / `-Proof-Token` 即可。完整链路是四步：`links/oauth` 拿 authorize URL → Keycloak 登录 → 把带 `code` 的最终回调 URL 提交给 `links/oauth/callback` → `list_accessible` 校验。
 - `list_accessible` 的 body 必须是 `{"principals": []}`；传 `[{"type":"USER","id":…}]` 会 422（枚举只认大写 USER/WORKSPACE/ORG/PROJECT/ENT_TENANT）。
-- **创建 connector 的真实契约（2026-11-23 抓包更正）**：`POST /aip/connectors/mcp` 只接受 `mcp_url`（不是 `base_url`）。`auth_request` **不是** `oauth_config` 的平铺对象，而是 `{"supported_auth": [ <oauth_config> ]}`，body 还必须带 `"logo_url": null`。平铺形式照样返回 200，但 `supported_auth` 会退化成 `[{"type":"NONE"}]`。详见 `references/mcp-oauth-connector-contract.md`。
-- **`type` 由服务端匿名探测决定，不由 `auth_request.type` 决定**。`openai-mcp/1.0.0` 匿名 `POST {mcp_url}`：200 → `NONE`；401 且能完成 OAuth 元数据发现 → `OAUTH`；401 但发现失败 → `424 mcp_error upstream_status=401`。把 `auth_request.type` 写成 `API_KEY` / `BEARER` / `CUSTOM` 是白费力气，后端直接忽略。
+- **创建 connector 的请求契约（2026-11-23 实测，单一部署）**：`POST /aip/connectors/mcp` 只接受 `mcp_url`（不是 `base_url`）。`auth_request` **不是** `oauth_config` 的平铺对象，而是 `{"supported_auth": [<oauth_config>]}`，body 还必须带 `"logo_url": null`。平铺形式照样返回 200，但 `supported_auth` 会退化成 `[{"type":"NONE"}]`。详见 `references/mcp-oauth-connector-contract.md`。
+- **`type` 由服务端匿名探测决定**（2026-11-23 实测；不是对所有后端版本的承诺）。`openai-mcp/1.0.0` 匿名 `POST {mcp_url}`：200 → `NONE`；401 且能完成 OAuth 元数据发现 → `OAUTH`；401 但发现失败 → `424 mcp_error upstream_status=401`。这三条是已验证路径，不是穷尽状态机。实测中单独把 `auth_request.type` 写成 `API_KEY` / `BEARER` / `CUSTOM` / `NONE` 都没有改变最终判定——但别推广成「`auth_request` 无意义」，`supported_auth` 的嵌套结构直接决定 OAuth 配置能否被识别。
 - 同一 UA 的 401 也解释了 `MCP_ACTION_DISCOVERY_FAILED`（2026-11-22 `openai-mcp/1.0.0` 拉 tools 收到 401，nginx access.log 原文可查）。**actions 为空不是认证没走通**，是 ChatGPT 那次发现被 401 拒了之后不再重拉。
 - 判定认证是否真的通，用 `scripts/probe_mcp_cf.py`：走完整 PKCE 拿真 token → `initialize` → `tools/list`。注意必须用 Chromium 的请求上下文（`p.request.new_context`），urllib/curl 会被 Cloudflare 拦成 `1010 Access denied`（浏览器签名），那是探测工具的假阴性，不是服务端拒绝。
 - acct2–6 的 cookie 里没有 `__Secure-next-auth.session-token`（acct2 有）。**这不影响任何 `aip/*` 操作**：身份来自 access_token 的 Bearer + sentinel PoW，浏览器会话本身可以是匿名的（`/backend-api/me` 返回 `ua-…`、`email:""`）。不需要为「浏览器要登录」纠结，也不需要批量登录六个邮箱。
 - **UI 入口是 `/plugins`**：`/settings/connectors` 对免费账号白屏（body 为空）。`/plugins` → 顶栏「添加」→「添加自定义 MCP 服务器」。侧栏那个「添加」是另一回事，用 JS `.click()` 会打到侧栏，必须用真实鼠标坐标。
-- 匿名放行 `initialize` / `tools/list` **已被证伪且不应再做**：放行 `initialize` 会让匿名探测变 200 → `type=NONE`；`tools/list` 返回空列表只会让 actions 为空。正确做法是只把 `WWW-Authenticate` 换成纯挑战头（见上一条），不提供任何匿名 200 服务。
+- 匿名放行 `initialize` / `tools/list` **已被证伪且不应再做**：放行 `initialize` 会让匿名探测变 200 → `type=NONE`；`tools/list` 返回空列表只会让 actions 为空。正确做法是在网关把匿名请求的 `WWW-Authenticate` 换成纯挑战（判据必须落在「请求有没有带 Authorization」上，不能按状态码一刀切），不提供任何匿名 200 服务。
+- **网关改 `WWW-Authenticate` 是有代价的补丁**，不是干净解法（干净解法是 MCP 服务端自己对匿名请求回纯挑战）：`proxy_hide_header` 不分状态码，会吞掉上游在非 401 上的挑战；location 级 `add_header` 会阻断 server 层头的继承，实测导致 `/mcp` 丢掉 HSTS 和 X-Frame-Options。改完必须验四态并复查安全头，细节见 `references/mcp-oauth-connector-contract.md` §2.2。
 - 不修改 `account-rotation.json`，不读取其游标决定 Connect 任务顺序。
 - `ELIGIBILITY_UNKNOWN`（接口异常）不得当作最终结论，需结合实测 API 响应判定。
 

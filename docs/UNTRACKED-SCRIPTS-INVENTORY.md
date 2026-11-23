@@ -65,37 +65,7 @@
 |---|---|---|---|---|
 | mcp_link.py | 当前 A/scripts 中已不存在；原历史快照记录其为 MCP 连接/授权流程脚本 | 历史用途涉及 MCP 服务端、本机账号及认证状态 | 本机运维 | #95 历史快照记录为本机运维；2026-11-23 实测当前 A/scripts/mcp_link.py 不存在。保留原分类作为历史记录，不代表该文件当前仍存在 |
 
-### 2. 本轮删除的临时探索脚本（18 项）
-
-下列文件均为 2026-11-23 为摸清 MCP OAuth connector 契约而临时写入 A/scripts 的一次性探索脚本，
-在契约确认并固化为 `references/mcp-oauth-connector-contract.md` 后已全部删除。
-它们从未进入 #95 的 49 行快照，也从未提交到本仓库；在此登记以免后续误判为"曾经存在但下落不明"。
-
-| 文件名 | 删除前用途 | 删除原因 | 分类 |
-|---|---|---|---|
-| browser_link.py | 用 Playwright 走浏览器完成 connector 关联 | 契约已确认，改为 `link_once.py` 走 API，浏览器路径无用 | 已废弃 |
-| cap_callback.py | 抓取回调请求的完整参数 | 回调端点已确认为 `links/oauth/callback` | 已废弃 |
-| cap_create.py | 抓取创建 connector 的请求体 | 已确认为 `{"mcp_url", "auth_request": {"supported_auth": [...]}, "logo_url": null}` | 已废弃 |
-| cap_mcp_create.py | 同上，侧重 UI 表单提交 | 同上 | 已废弃 |
-| capture_full.py | 抓取完整响应（含 header） | `WWW-Authenticate` 契约已确认，无需再抓 | 已废弃 |
-| capture_oauth_req.py | 抓取 OAuth 授权链路请求 | 四步链路已固化进 reference | 已废弃 |
-| dump_dialog.py | 打印 UI 弹窗 DOM | `/plugins` 入口已确认，UI 探索结束 | 已废弃 |
-| fill_ui_create.py | 表单填值提交创建 | 改为 API 创建，UI 路径不再使用 | 已废弃 |
-| find_cb_endpoint.py | 穷举回调落库端点 | 端点已确认，穷举无意义 | 已废弃 |
-| get_code.py | 从授权跳转链路里提取 `code` | 已并入 `link_once.py` | 已废弃 |
-| mcp_create_oauth.py | 创建带 oauth 的 connector（早期猜测写法） | 平铺 `auth_request` 是错误写法，已由 `mcp_create_ui.py` 取代 | 已废弃 |
-| mcp_create_oauth2.py | 同上，第二版猜测 | 同上 | 已废弃 |
-| mcp_create_oauth3.py | 同上，第三版猜测 | 同上 | 已废弃 |
-| mcp_link.py | MCP 连接/授权流程脚本（完整链路雏形） | 拆分为 `link_once.py` + `verify_all.py` | 已废弃 |
-| mcp_link2.py | 同上，第二版 | 同上 | 已废弃 |
-| post_callback.py | 手工 POST 回调 | 已并入 `link_once.py` | 已废弃 |
-| submit_ui_create.py | UI 提交按钮点击 | 改为 API 创建 | 已废弃 |
-| who2.py | 早期身份探测 | 已由 `scripts/chatgpt_send.py` 的 me 命令覆盖 | 已废弃 |
-
-`del_connector.py`（尝试用各种猜测端点删除 connector）同样已删除，删因是"缺 sentinel 头导致误判无删除端点"；
-其结论已更正并写入 `references/mcp-oauth-connector-contract.md` 第 5 节。
-
-### 3. 新增文件
+### 2. 新增文件
 
 | 文件名 | 实际用途 / 入口行为 | 主要副作用或访问对象 | 分类 | 分类依据 |
 |---|---|---|---|---|
@@ -105,9 +75,12 @@
 | mcp_create_ui.py | 以正确 body 形状（`auth_request.supported_auth[]` + `logo_url`）创建 MCP connector，并打印返回的 `supported_auth` | 使用本机账号凭据；在账号下创建 connector（可能产生需清理的残留） | 本机运维 | 2026-11-23 新增；创建动作有服务端副作用且绑定本机账号 |
 | probe_all_ids.py | 把历史 transcript 中出现过的 `asdk_app_*` id 逐个按账号 GET，输出 connector 名称与 auth 状态 | 使用本机账号凭据只读访问 connector detail 接口；读取本机 transcript 文件 | 本机运维 | #95 快照将其列为"待核验"；2026-11-23 检查完整源码后确认依赖本机 transcript 与账号上下文，属本机运维 |
 
-### 4. 快照与增量的适用范围
+### 3. 快照与增量的适用范围
 
 - #95 的 49 行记录继续作为原始历史快照，不因文件删除或新增而改写。
-- 本增量记录反映 2026-11-23 实测的三类变化：`mcp_link.py` 等 19 个探索脚本被删除、5 个脚本新增或经源码确认、`audit_rmc.py` 为新增脚本。
+- 本增量只记录**当前** A/scripts 的状态变化：`mcp_link.py` 已不存在，上表 5 个文件新增或经源码确认。
+  其中 `cleanup_connectors.py` 与 `probe_all_ids.py` 在 #95 快照中已存在（原分类"待核验"），此处是源码核验后的分类确认，不是新增文件。
+- 本轮删除的脚本属于历史事件，不记入本清单，见 `docs/UNTRACKED-SCRIPTS-HISTORY.md`。
+  两份文件语义不同：本清单描述「现在有什么」，HISTORY 描述「过去出现过什么、何时删除」。
 - 除上述范围外，不重新分类或改写 #95 快照中的其他文件。
 - 本记录中的分类沿用既有五类枚举：`本机运维`、`正式候选`、`重复`、`已废弃`、`待核验`。
