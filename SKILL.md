@@ -463,7 +463,7 @@ python scripts/mcp_connector.py eligibility --accounts acct1,acct2,acct3,acct4,a
 - 判定认证是否真的通，用 `scripts/probe_mcp_cf.py`：走完整 PKCE 拿真 token → `initialize` → `tools/list`。注意必须用 Chromium 的请求上下文（`p.request.new_context`），urllib/curl 会被 Cloudflare 拦成 `1010 Access denied`（浏览器签名），那是探测工具的假阴性，不是服务端拒绝。
 - acct2–6 的 cookie 里没有 `__Secure-next-auth.session-token`（acct2 有）。**这不影响任何 `aip/*` 操作**：身份来自 access_token 的 Bearer + sentinel PoW，浏览器会话本身可以是匿名的（`/backend-api/me` 返回 `ua-…`、`email:""`）。不需要为「浏览器要登录」纠结，也不需要批量登录六个邮箱。
 - **UI 入口是 `/plugins`**：`/settings/connectors` 对免费账号白屏（body 为空）。`/plugins` → 顶栏「添加」→「添加自定义 MCP 服务器」。侧栏那个「添加」是另一回事，用 JS `.click()` 会打到侧栏，必须用真实鼠标坐标。
-- 匿名放行 `initialize` / `tools/list` **已被证伪且不应再做**：放行 `initialize` 会让匿名探测变 200 → `type=NONE`；`tools/list` 返回空列表只会让 actions 为空。正确做法是在网关把匿名请求的 `WWW-Authenticate` 换成纯挑战（判据必须落在「请求有没有带 Authorization」上，不能按状态码一刀切），不提供任何匿名 200 服务。
+- 匿名放行 `initialize` / `tools/list` **已被证伪且不应再做**：放行 `initialize` 会让匿名探测变 200 → `type=NONE`；`tools/list` 返回空列表只会让 actions 为空。正确做法是在网关把匿名请求的 `WWW-Authenticate` 换成纯挑战，不提供任何匿名 200 服务。判据只有一条：**只对完全没带 `Authorization` 的请求合成挑战，其余透传上游原话**。别按状态码一刀切，也别按「有没有 Authorization」就给 `error="invalid_token"`——`Basic`、空 `Bearer`、以及带合法 token 但权限不足的 401，都不是 token 无效，硬写就是伪造拒绝原因。
 - **网关改 `WWW-Authenticate` 是有代价的补丁**，不是干净解法（干净解法是 MCP 服务端自己对匿名请求回纯挑战）：`proxy_hide_header` 不分状态码，会吞掉上游在非 401 上的挑战；location 级 `add_header` 会阻断 server 层头的继承，实测导致 `/mcp` 丢掉 HSTS 和 X-Frame-Options。改完必须验四态并复查安全头，细节见 `references/mcp-oauth-connector-contract.md` §2.2。
 - 不修改 `account-rotation.json`，不读取其游标决定 Connect 任务顺序。
 - `ELIGIBILITY_UNKNOWN`（接口异常）不得当作最终结论，需结合实测 API 响应判定。

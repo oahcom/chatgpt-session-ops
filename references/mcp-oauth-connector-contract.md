@@ -92,13 +92,13 @@ POST /backend-api/aip/connectors/mcp/oauth_config
 
 ### 2.1 `WWW-Authenticate` 的 `error` 参数是硬门槛
 
-在 401 上，挑战必须**不带** `error`：
+对本次实测的匿名 401 OAuth 发现路径，`WWW-Authenticate` 不得带 `error="invalid_token"`。本次没有穷举其他 `error` 取值的行为，不推断它们有相同处理结果（见上表最后两行）。
 
 ```
 # 通过 —— 纯挑战，客户端会去发现元数据
 WWW-Authenticate: Bearer realm="…", resource_metadata="https://…/.well-known/oauth-protected-resource/mcp", scope="…"
 
-# 失败 —— 带 error，创建直接 424
+# 失败 —— 带 error="invalid_token"，创建直接 424
 WWW-Authenticate: Bearer realm="…", resource_metadata="…", scope="…", error="invalid_token"
 ```
 
@@ -108,13 +108,18 @@ RFC 6750 §3.1 把 `invalid_token` 定义为「已提供的 access token 无效�
 
 **先说结论：这是网关侧打补丁，不是干净解法。** 干净解法是让 MCP 服务端自己对匿名请求回纯挑战；只要服务端还这么回，网关就得改写，而改写有代价（见下）。
 
-关键点是**判据必须落在请求上，不能落在状态码上**。只按 `$status == 401` 改写，会把「带了无效 token」的请求也改成纯挑战——那正好毁掉 RFC 6750 里唯一正确的信号，客户端收到纯挑战会以为该重做 OAuth 发现，而不是刷新 token。
+判据有两条，缺一条就会制造新的错误语义。
+
+**其一，只对「请求完全没带 `Authorization`」合成挑战，其余透传上游原话。**
+
+理由是：**请求头的存在只说明客户端提供了什么，不说明服务端为什么拒绝。** 只看「有没有 `Authorization`」就写 `error="invalid_token"`，会把 `Authorization: Basic …` 和空的 `Bearer ` 也标成「token 无效」——那不是观察，是伪造的拒绝原因。同理，即便客户端带了合法 Bearer，服务端也可能因为权限不足等原因回 401，那不是 `invalid_token`。
 
 ```nginx
-# 按请求是否携带 Authorization 分档，而不是按状态码一刀切。
 map $http_authorization $rmc_challenge_by_request {
+    # 只有匿名探测这一种情况需要合成。
     ""      "Bearer realm=\"rmc\", resource_metadata=\"https://<host>/.well-known/oauth-protected-resource/mcp\", scope=\"rmc:tools\"";
-    default "Bearer realm=\"rmc\", resource_metadata=\"https://<host>/.well-known/oauth-protected-resource/mcp\", scope=\"rmc:tools\", error=\"invalid_token\"";
+    # 其余照搬上游；上游没给挑战就不给，不替它编理由。
+    default $upstream_http_www_authenticate;
 }
 
 map $status $rmc_challenge {
@@ -123,10 +128,10 @@ map $status $rmc_challenge {
 }
 
 location /mcp {
-    # proxy_hide_header 是无条件的：所有状态码的上游 WWW-Authenticate 都会被丢掉，
-    # 然后由上面两个 map 重建。上游若在非 401 上也发挑战（如 403 insufficient_scope），
-    # 那个挑战会被吞掉。
+    # 两个 proxy_hide_header 都无条件生效：上游对应头先全部丢掉，再由下面重建。
     proxy_hide_header WWW-Authenticate;
+    proxy_hide_header X-Content-Type-Options;   # 上游也发 nosniff，藏掉避免重复
+
     add_header WWW-Authenticate $rmc_challenge always;
 
     # location 里一旦出现 add_header，就不再继承 server 层的 add_header。
@@ -139,22 +144,31 @@ location /mcp {
 }
 ```
 
-`X-Content-Type-Options` 在实测里出现了两次（server 层一次、上游自带一次），值相同，无害；`strict-transport-security` 和 `x-frame-options` 只在下游恢复后出现一次。
+**其二，认清 `proxy_hide_header` 不分状态码。** 非 401 的上游挑战同样会被吞掉，包括将来可能出现的 `403 … error="insufficient_scope"`。当前 `rmc-hub` 不发这类挑战，所以没有实际损失；但只要上游将来要往客户端传达 scope 不足之类信息，这个配置就会挡住。**这是已知限制，不是已解决的问题。**
 
-三点实测结论（nginx 1.28.3 / Ubuntu）：
+> 当前配置仅为解决本次匿名 401 OAuth 元数据发现问题的部署补丁，不保证保留上游所有状态码下的 `WWW-Authenticate` 语义，尤其非 401 上游挑战可能被隐藏。若服务端将来需要向客户端传达 `insufficient_scope` 等挑战，应优先修复上游，或改用能按状态码与响应内容做条件处理的响应头过滤方案（如 njs）。
+
+四点实测结论（nginx 1.28.3 / Ubuntu）：
 
 1. **空值 `add_header` 不会生成响应头。** 非 401 时 `$rmc_challenge` 为空，实际不发这个头。但这是 nginx 实现行为（`ngx_http_add_header()` 里有 `if (value->len)`），不是文档承诺；换版本要重测。
-2. **`proxy_hide_header` 不分状态码。** 它隐藏的是该上游响应里的所有 `WWW-Authenticate`。代价如上。
-3. **`add_header` 阻断继承。** 这是最容易被忽略的一条：加了 location 级 `add_header` 后，server 层的 HSTS / X-Frame-Options 不再下发到 `/mcp`。本项目实测确认过——修复前 `/mcp` 的 401 只有 `X-Content-Type-Options`，没有 HSTS 和 X-Frame-Options；修复后两者恢复。
+2. **`add_header` 阻断继承。** 加了 location 级 `add_header` 后，server 层的 HSTS / X-Frame-Options 不再下发到 `/mcp`。实测确认：修复前 `/mcp` 的 401 只有 `X-Content-Type-Options`，没有 HSTS 也没有 X-Frame-Options；修复后两者恢复。**这意味着以后往 server 层加安全头，必须同步检查 `/mcp`**——这三条不是永久完整清单。
+3. **`$upstream_http_www_authenticate` 可用。** 所以「透传上游原话」在纯 nginx 里走得通，不需要 njs。
+4. **重复头要主动消除。** 上游本来就发 `X-Content-Type-Options: nosniff`，location 再加一条就有两个同名头。同值重复一般不致命，但不同代理与中间件对重复头的合并方式并不一致，既然知道，就不要留着。
 
-改完必须验四态（`200` / `401` 匿名 / `401` 带坏 token / 非 401 错误），并确认没有重复的 `WWW-Authenticate`：
+**五态回归**（每次动这段配置都跑）：
 
 ```bash
-# 匿名：应只看到纯挑战，且带 HSTS
-curl -sk -o /dev/null -D - -X POST https://127.0.0.1/mcp -H "Host: <host>" -d '{}' | grep -iE '^(HTTP|www-authenticate|strict-transport|x-frame)'
-# 坏 token：应看到 error="invalid_token"
-curl -sk -o /dev/null -D - -X POST https://127.0.0.1/mcp -H "Host: <host>" -H "Authorization: Bearer bogus" -d '{}' | grep -i 'www-authenticate'
+H="Host: <host>"; U=https://127.0.0.1/mcp
+p(){ curl -sk -o /dev/null -D - -X POST $U -H "$H" -H "Content-Type: application/json" "$@" -d '{}' \
+     | grep -iE '^(HTTP|www-authenticate|strict-transport|x-frame|x-content-type)'; }
+p                                    # 匿名          -> 纯挑战
+p -H "Authorization: Bearer bogus"   # 坏 Bearer     -> error="invalid_token"
+p -H "Authorization: Basic dXNlcjpw" # Basic         -> 与上游逐字一致
+p -H "Authorization: Bearer"         # 空 Bearer     -> 与上游逐字一致
+p -H "X-Probe: 1"                    # 非 401 路径   -> 无挑战头
 ```
+
+前两态判「该有的有没有」，后两态判「不该编的有没有编」。第 5 条只能验证不会凭空多出头；`proxy_hide_header` 吞掉非 401 上游挑战这一限制，命令验不出来。
 
 ### 2.3 不要做的两件事
 
