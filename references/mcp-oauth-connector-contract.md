@@ -11,9 +11,9 @@
 ## 0. 一句话结论
 
 `type` 不是请求里能指定的字段，而是服务端对 MCP 端点做匿名探测后的**判定结果**；
-`auth_request` 的形状决定这个判定能否生效；`WWW-Authenticate` 里有没有 `error` 参数决定探测走到哪一步。
+`auth_request` 的形状决定这个判定能否生效；401 挑战里有没有 `error="invalid_token"` 决定探测走到哪一步（其他 `error` 取值未验证）。
 
-三条都由本次实测支撑，但支撑范围仅限下文列出的分支；未列出的状态码和边界情况没有验证过，不要外推。
+以上各条都由本次实测支撑，但支撑范围仅限下文列出的分支；未列出的状态码、其他 `error` 取值和边界情况没有验证过，不要外推。
 
 ---
 
@@ -91,7 +91,7 @@ POST /backend-api/aip/connectors/mcp/oauth_config
 | 元数据 200 但格式非法 | 算不算发现失败，未知 |
 | 元数据可取但 `issuer` / `resource` 不匹配 | 是否通过客户端校验，未知 |
 
-### 2.1 `WWW-Authenticate` 的 `error` 参数是硬门槛
+### 2.1 401 挑战里带 `error="invalid_token"` 是硬门槛
 
 对本次实测的匿名 401 OAuth 发现路径，`WWW-Authenticate` 不得带 `error="invalid_token"`。本次没有穷举其他 `error` 取值的行为，不推断它们有相同处理结果（见上表最后两行）。
 
