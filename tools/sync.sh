@@ -1,4 +1,27 @@
 #!/usr/bin/env bash
+# ==============================================================================
+# DEPRECATED — NOT AN AUTHORIZED PROJECT SYNC OR RELEASE TOOL
+#
+# This script is deprecated and MUST NOT be used for any official
+# chatgpt-session-ops synchronization, publication, or release.
+#
+# The authoritative repository is B:
+#   C:\Users\Administrator\WorkBuddy\2026-11-19-11-53-45\chatgpt-session-ops
+#
+# The WorkBuddy Skill runtime copy is A:
+#   C:\Users\Administrator\.workbuddy\skills\chatgpt-session-ops
+#
+# The only authorized release direction is B -> A, using the explicit
+# file/path allowlist, runtime-path exclusions, and SHA-256 verification
+# documented in:
+#   docs/RELEASE-AUTHORITY.md
+#
+# Do NOT use this script for project release.
+# Do NOT use recursive directory mirroring or whole-directory overwrite.
+# Do NOT replace this procedure with rsync, robocopy /MIR, or equivalent.
+#
+# This file is retained for historical/reference purposes only.
+# ==============================================================================
 # 从本机技能目录同步代码到本仓库，并在提交前做敏感信息拦截。
 # 用法： bash tools/sync.sh [技能目录]
 #   默认技能目录：$HOME/.workbuddy/skills/chatgpt-session-ops

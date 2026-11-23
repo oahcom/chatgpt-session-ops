@@ -20,12 +20,17 @@ scripts/accounts/nologin/devices/
 # ==========================================================
 account-rotation.json
 conv-accounts.json
+conv-accounts.json.highwater.json
 anon-sessions.json
 anon-sessions/
 newchat-map.json
 sessions-registry.json
 quick-send-log.jsonl
 send-queue-log.md
+# 本机临时队列 / 探测输出（曾出现在 skill 运行目录，防止误入库）
+_convq*.txt
+_q*.txt
+*_send*.log
 replies/
 prompts/
 quarantine/
