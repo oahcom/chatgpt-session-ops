@@ -8,6 +8,7 @@
 归档写半截、回复被静默截断、锁重入与 stale 回收、轮转兜底判定。
 """
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -5473,6 +5474,126 @@ class TestBatchAddedCountSemantics(TmpBase):
         ])
         self.assertEqual(len(out), 2)
         self.assertEqual(m.register_conversations_batch.last_added_count, 1)
+
+
+class TestConversationLog(TmpBase):
+    """会话日志：提示词与回复全文按会话拆分留存，并可检索。
+
+    核心是「不留日志就等于没发生」：投递本身成功、但日志缺失时，事后完全无法
+    复原当时发了什么、回了什么。所以断言必须落在**落盘内容**上，不能只断言文件存在。
+    """
+
+    def _prompt(self, body, name="p.md"):
+        p = os.path.join(self.tmp, name)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(body)
+        return p
+
+    def _sse(self, conv_id, reply):
+        return "\n".join([
+            'data: {"conversation_id": "%s", "message": {"author": {"role": "assistant"},'
+            ' "content": {"parts": ["%s"]}}}' % (conv_id, reply),
+            "data: [DONE]",
+        ])
+
+    def test_prompt_and_reply_are_logged_per_conversation(self):
+        """一轮交互必须落成「按 conv_id 命名」的一行，且含提示词与回复全文。"""
+        cid = "11111111-2222-4333-8444-555555555555"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "回复正文ABC"))
+        body = "提示词正文XYZ"
+        status, path, conv = m.send_prompt(api, cid, self._prompt(body))
+        self.assertEqual(status, 200)
+
+        log = os.path.join(m.log_dir(), cid + ".jsonl")
+        self.assertTrue(os.path.exists(log), "必须按会话维度落一个日志文件")
+        recs = list(m.iter_log_records(cid))
+        self.assertEqual(len(recs), 1)
+        r = recs[0]
+        self.assertEqual(r["conv_id"], cid)
+        self.assertEqual(r["prompt"], body, "提示词全文必须留存")
+        self.assertEqual(r["reply"], "回复正文ABC", "回复全文必须留存")
+        self.assertEqual(r["prompt_sha256"],
+                         hashlib.sha256(body.encode("utf-8")).hexdigest())
+        self.assertEqual(r["reply_sha256"],
+                         hashlib.sha256("回复正文ABC".encode("utf-8")).hexdigest())
+        self.assertEqual(r["status"], 200)
+
+    def test_new_chat_logs_under_real_conversation_id(self):
+        """新会话必须记在**服务器实际返回**的 id 下，不能记到 None/目标 id。"""
+        real = "9f8e7d6c-1111-4222-8333-444455556666"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(real, "hi"))
+        status, path, conv = m.send_prompt(api, None, self._prompt("新会话提示词"),
+                                          new_chat=True)
+        self.assertEqual(status, 200)
+        self.assertTrue(os.path.exists(os.path.join(m.log_dir(), real + ".jsonl")),
+                        "日志文件名必须是真实 conv_id")
+        self.assertEqual(os.listdir(m.log_dir()), [real + ".jsonl"],
+                         "不得产生 _unassigned 之类的杂物")
+        self.assertEqual(list(m.iter_log_records(real))[0]["prompt"], "新会话提示词")
+
+    def test_exception_still_leaves_a_trace(self):
+        """投递抛异常也必须留痕——否则「发过什么」彻底无法复原。"""
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse("x", "y"))
+        api.requirements = lambda: (None, None)   # 强制走失败分支
+        with self.assertRaises(Exception):
+            m.send_prompt(api, None, self._prompt("异常前提示词"), new_chat=True)
+        recs = list(m.iter_log_records())
+        self.assertEqual(len(recs), 1, "抛异常也要落一条")
+        self.assertEqual(recs[0]["prompt"], "异常前提示词")
+        self.assertIsNone(recs[0]["status"], "未完成时必须显式记 None，不能伪装成功")
+        self.assertTrue(recs[0]["error"], "错误原因必须可读")
+
+    def test_search_scoped_and_global(self):
+        """检索必须能命中提示词或回复，且 --conv 能限定到单一会话。"""
+        cid1 = "aaaaaaaa-1111-4111-8111-111111111111"
+        cid2 = "bbbbbbbb-2222-4222-8222-222222222222"
+        for cid, ptext, rtext in ((cid1, "关键词在提示词里", "无关回复"),
+                                  (cid2, "别的提示词", "关键词在回复里")):
+            api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, rtext))
+            m.send_prompt(api, cid, self._prompt(ptext, name=cid + ".md"))
+
+        all_hits = m.search_logs("关键词")
+        self.assertEqual({h["conv_id"] for h in all_hits}, {cid1, cid2},
+                         "全局检索要同时命中提示词侧与回复侧")
+        only = m.search_logs("关键词", conv_id=cid1)
+        self.assertEqual([h["conv_id"] for h in only], [cid1], "--conv 必须限定作用域")
+
+    def test_search_is_case_insensitive_and_limits(self):
+        cid = "cccccccc-3333-4333-8333-333333333333"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "TokenAlpha"))
+        m.send_prompt(api, cid, self._prompt("tokenalpha 在提示词"))
+        self.assertEqual(len(m.search_logs("TOKENALPHA")), 1)
+        self.assertEqual(len(m.search_logs("tokenalpha", limit=0)), 1, "limit=0 表示不限制")
+
+    def test_illegal_conv_id_never_escapes_directory(self):
+        """非法 id 不得拼出 ../ 路径——这是 id 白名单的同一类风险。"""
+        p = m.conversation_log_path("../../evil")
+        self.assertTrue(p.startswith(m.log_dir()), "日志路径必须落在日志目录内")
+        self.assertTrue(p.endswith("_unassigned.jsonl"))
+
+    def test_corrupt_log_line_does_not_break_retrieval(self):
+        """日志被写坏（半行/非法 JSON）时，检索要跳过坏行而不是整体不可用。"""
+        cid = "dddddddd-4444-4444-8444-444444444444"
+        d = m.log_dir()
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, cid + ".jsonl"), "w", encoding="utf-8") as f:
+            f.write('{"conv_id": "%s", "prompt": "好行", "reply": ""}\n' % cid)
+            f.write("{半截坏行\n")
+            f.write("\n")
+        recs = list(m.iter_log_records(cid))
+        self.assertEqual(len(recs), 1, "坏行必须被跳过")
+        self.assertEqual(recs[0]["prompt"], "好行")
+
+    def test_log_failure_never_breaks_sending(self):
+        """日志写不进去时投递必须照常成功——留痕失败不能变成新的故障源。"""
+        cid = "eeeeeeee-5555-4555-8555-555555555555"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "照常回复"))
+        blocker = os.path.join(self.tmp, "logs")
+        with open(blocker, "w", encoding="utf-8") as f:   # 用同名文件占住目录
+            f.write("x")
+        status, path, conv = m.send_prompt(api, cid, self._prompt("提示词照发"))
+        self.assertEqual(status, 200, "日志失败不得影响投递结论")
+        self.assertIn("照常回复", _read(path))
 
 
 if __name__ == "__main__":
