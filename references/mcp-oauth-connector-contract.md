@@ -71,13 +71,14 @@ POST /backend-api/aip/connectors/mcp/oauth_config
 
 ```
 匿名 POST {mcp_url}
-├─ 200                                   → 实测 type = NONE
+├─ 200                                      → 实测 type = NONE
 └─ 401
-     ├─ 挑战不带 error，且元数据发现成功     → 实测 type = OAUTH
-     └─ 挑战带 error，或元数据发现失败       → 实测 424 mcp_error upstream_status=401
+     ├─ 纯挑战（无 error），且元数据发现成功   → 实测 type = OAUTH
+     ├─ 挑战带 error="invalid_token"          → 实测 424 mcp_error upstream_status=401
+     └─ 元数据发现失败                        → 实测 424 mcp_error upstream_status=401
 ```
 
-**这是三条已验证路径，不是穷尽状态机。** 下列情况没有测过，不要按上图推断：
+**这是四条已验证路径，不是穷尽状态机。** 下列情况没有测过，不要按上图推断：
 
 | 未验证 | 为什么不能推断 |
 |---|---|
