@@ -11,13 +11,18 @@
 This project maintains two distinct copies:
 
 - **B — authoritative Git repository**
-  - Path: `C:\Users\Administrator\WorkBuddy\2026-11-19-11-53-45\chatgpt-session-ops`
+  - Path: this repository checkout (relative path: `.`). Locate it via
+    `git rev-parse --show-toplevel` from any directory inside the checkout.
+    The historical absolute path is intentionally not recorded here so the
+    policy remains portable across machines and drives.
   - The only authoritative source for tracked project code, documentation,
     tests, and release decisions.
   - Changes must be reviewed and committed here.
 
 - **A — WorkBuddy Skill runtime copy**
-  - Path: `C:\Users\Administrator\.workbuddy\skills\chatgpt-session-ops`
+  - Path: the installed WorkBuddy skill directory for `chatgpt-session-ops`
+    (resolve at runtime, e.g. `<workbuddy-skills-dir>/chatgpt-session-ops`).
+    The machine-specific absolute path is intentionally not recorded here.
   - The installed runtime copy used by WorkBuddy.
   - It may contain machine-local accounts, credentials, browser state,
     temporary files, diagnostic scripts, and other runtime artifacts.
