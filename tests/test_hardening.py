@@ -5476,6 +5476,43 @@ class TestBatchAddedCountSemantics(TmpBase):
         self.assertEqual(m.register_conversations_batch.last_added_count, 1)
 
 
+def _load_p1():
+    """加载 continue_full.py（它 import cdp，测试里用桩顶掉）。"""
+    import types
+    fake_cdp = types.ModuleType("cdp")
+    class _C:
+        def __init__(self, *a, **k):
+            pass
+    fake_cdp.CDPClient = _C
+    spec = importlib.util.spec_from_file_location(
+        "continue_full_under_test", os.path.join(HERE, "..", "scripts", "continue_full.py"))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault("cdp", fake_cdp)
+    saved = sys.modules.get("cdp")
+    sys.modules["cdp"] = fake_cdp
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        if saved is not None:
+            sys.modules["cdp"] = saved
+    return mod
+
+
+class _FakeCdp:
+    """按顺序吐出 reply_snapshot 的返回值，用于驱动 reply_after 的判定分支。"""
+
+    def __init__(self, counts, last="未完成的正文", streaming=True):
+        self.counts = list(counts)
+        self.last = last
+        self.streaming = streaming
+
+    def evaluate(self, js):
+        n = self.counts.pop(0) if len(self.counts) > 1 else self.counts[0]
+        return {"value": json.dumps({
+            "count": n, "last": self.last,
+            "streaming": self.streaming, "hasError": False})}
+
+
 class TestConversationLog(TmpBase):
     """会话日志：提示词与回复全文按会话拆分留存，并可检索。
 
@@ -5736,6 +5773,140 @@ class TestConversationLog(TmpBase):
         self.assertIn("log_end", src, "P1 必须补写回复与终态")
         self.assertNotIn("lines = [l for l in prompt.splitlines()", src,
                          "P1 不得再按注释行删正文（会静默截断）")
+
+    # ---------- R374-01：P1 DOM 证据的归属与完整性 ----------
+
+    def test_p1_old_reply_cannot_pass_as_this_turn(self):
+        """旧回复留在 DOM 里、本轮没有新增时，不得把旧回复记成本轮的 captured。"""
+        p1 = _load_p1()
+        # 基线 3 条；发送后仍是 3 条（本轮没产生新消息）
+        c = _FakeCdp([3, 3])
+        text, state = p1.reply_after(c, {"count": 3, "last": "旧回复", "streaming": False,
+                                        "hasError": False}, settle_tries=2, settle_gap=0)
+        self.assertIsNone(text, "不得取旧回复")
+        self.assertEqual(state, "unavailable", "无法证明属于本轮 → unavailable，绝不是 captured")
+
+    def test_p1_streaming_reply_is_partial_not_captured(self):
+        """本轮回复已出现但仍在流式生成：必须记 partial，不能冒充完整。"""
+        p1 = _load_p1()
+        c = _FakeCdp([4])          # 新增了 1 条，但 streaming=True 一直不结束
+        text, state = p1.reply_after(c, {"count": 3, "last": "旧", "streaming": False,
+                                        "hasError": False}, settle_tries=2, settle_gap=0)
+        self.assertEqual(state, "partial")
+        self.assertEqual(text, "未完成的正文")
+
+    def test_p1_empty_reply_confirmed_is_empty(self):
+        """确认属于本轮、已完成、且正文为空 → empty（不是 unavailable）。"""
+        p1 = _load_p1()
+        c = _FakeCdp([4], last="", streaming=False)
+        text, state = p1.reply_after(c, {"count": 3, "last": "旧", "streaming": False,
+                                        "hasError": False}, settle_tries=2, settle_gap=0)
+        self.assertIsNone(text)
+        self.assertEqual(state, "empty")
+
+    def test_p1_confirmed_new_reply_is_captured(self):
+        """新增且已完成 → captured。"""
+        p1 = _load_p1()
+        c = _FakeCdp([4], last="本轮回复", streaming=False)
+        text, state = p1.reply_after(c, {"count": 3, "last": "旧", "streaming": False,
+                                        "hasError": False}, settle_tries=2, settle_gap=0)
+        self.assertEqual((text, state), ("本轮回复", "captured"))
+
+    def test_p1_no_baseline_means_unavailable(self):
+        """取不到基线就无法证明归属，只能 unavailable。"""
+        p1 = _load_p1()
+        text, state = p1.reply_after(_FakeCdp([1]), None, settle_tries=1, settle_gap=0)
+        self.assertIsNone(text)
+        self.assertEqual(state, "unavailable")
+
+    def test_p1_main_flow_takes_baseline_before_send(self):
+        """P1 主流程必须在 fill/发送**之前**取基线，且判定要经过 reply_after。
+
+        否则「取最后一条 assistant」的归属错误会在真实流程里复活——
+        单测 reply_after 挡不住，因为漏的是调用点。
+        """
+        src = _read(os.path.join(HERE, "..", "scripts", "continue_full.py"))
+        i_base = src.index("baseline = reply_snapshot(c)")
+        i_send = src.index('print("send:", c.evaluate(JS_SEND)')
+        self.assertLess(i_base, i_send, "基线必须在发送之前取")
+
+        # 不能再有无基线的直接判定（旧写法：captured if rp else empty）
+        self.assertNotIn('"captured" if rp else "empty"', src,
+                         "必须用 reply_after 判定，不能按非空就 captured")
+        self.assertIn("reply_after(c, baseline)", src, "判定必须传入基线")
+        self.assertNotIn("last_reply_text(c)", src, "旧的取最后一条写法必须消失")
+
+    # ---------- R374-02：pending 迁移幂等 ----------
+
+    def test_pending_migration_is_idempotent(self):
+        """迁移重复执行不得产生两份记录（崩溃后重试必须安全）。"""
+        cid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-1")
+        rec = {"turn_id": "t-1", "phase": "begin", "conv_id": "",
+               "prompt": "提示词", "prompt_chars": 3, "status": None,
+               "reply": "", "reply_state": "unrecorded"}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        m._migrate_pending("t-1", begin, cid)
+        self.assertEqual(len(m._read_jsonl(m.conversation_log_path(cid))), 1)
+
+        # 模拟崩溃后重试：pending 若还在（或手工重建同一份），再迁一次
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        m._migrate_pending("t-1", begin, cid)
+        got = m._read_jsonl(m.conversation_log_path(cid))
+        self.assertEqual(len(got), 1, "已有同 turn_id+phase 不得重复追加")
+
+    def test_pending_kept_when_migration_incomplete(self):
+        """迁移没搬完时必须保留 pending，供下次重试；读取端不得重复计数。"""
+        cid = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-2")
+        recs = [
+            {"turn_id": "t-2", "phase": "begin", "conv_id": "", "prompt": "P",
+             "prompt_chars": 1, "status": None, "reply": ""},
+            {"turn_id": "t-2", "phase": "end", "conv_id": "", "reply": "R",
+             "reply_chars": 1, "reply_state": "captured", "status": 200},
+        ]
+        with open(begin, "w", encoding="utf-8") as f:
+            for r in recs:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+        real_write = m._log_write
+        calls = {"n": 0}
+        def flaky(path, record):
+            calls["n"] += 1
+            if calls["n"] == 2:          # 第二行（end）写失败
+                raise OSError("模拟磁盘写失败")
+            return real_write(path, record)
+        m._log_write = flaky
+        try:
+            m._migrate_pending("t-2", begin, cid)
+        finally:
+            m._log_write = real_write
+        self.assertTrue(os.path.exists(begin), "没搬完必须保留 pending")
+
+        # 恢复后再迁一次 → 补齐，且不重复
+        m._migrate_pending("t-2", begin, cid)
+        got = m._read_jsonl(m.conversation_log_path(cid))
+        self.assertEqual(len(got), 2, "begin+end 各一份")
+        self.assertFalse(os.path.exists(begin), "搬完后才删 pending")
+
+    def test_cross_file_same_turn_not_double_counted(self):
+        """pending 未删时同一轮可能出现在两个文件，读取必须按 turn_id 去重。"""
+        cid = "cccccccc-dddd-4eee-8fff-000000000000"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        rec = {"turn_id": "dup-1", "phase": "begin", "conv_id": cid,
+               "prompt": "同一轮", "prompt_chars": 3, "status": None, "reply": ""}
+        for p in (m.conversation_log_path(cid), m.pending_log_path("dup-1")):
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        turns = list(m.iter_turns())
+        self.assertEqual(len(turns), 1, "同一 turn_id 只能算一轮")
 
 
 if __name__ == "__main__":

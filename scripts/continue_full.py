@@ -48,23 +48,71 @@ class _LogCtx:
         self._last_reply_text = None
 
 
-JS_LAST_REPLY = """(function(){
+JS_REPLY_SNAPSHOT = """(function(){
   var nodes = document.querySelectorAll('[data-message-author-role="assistant"]');
-  if (!nodes.length) return '';
-  var n = nodes[nodes.length - 1];
-  return (n.innerText || n.textContent || '').trim();
+  var last = nodes.length ? (nodes[nodes.length - 1].innerText || '') : '';
+  var body = document.body.innerText || '';
+  return JSON.stringify({
+    count: nodes.length,
+    last: last.trim(),
+    streaming: [...document.querySelectorAll('button')].some(function(b){
+      return /停止生成|stop/i.test(b.getAttribute('aria-label') || '');
+    }),
+    hasError: /Something went wrong|出现错误|网络错误/.test(body)
+  });
 })()"""
 
 
-def last_reply_text(c):
-    """从页面取最后一条 assistant 正文。取不到返回 None（≠ 空回复）。"""
+def reply_snapshot(c):
+    """取 assistant 消息的**当前快照**（条数 + 最后一条正文 + 是否仍在生成）。
+
+    R374-01：只拿"最后一条 assistant 正文"是不够的——上一轮的回复会留在 DOM 里，
+    本轮若发送失败，最后一条仍是旧回复，直接取就会把它记成本轮回复（归属错误）。
+    所以必须先在发送前取基线条数，发送后只认**新增**的那条。
+    """
     try:
-        v = c.evaluate(JS_LAST_REPLY).get("value")
+        raw = c.evaluate(JS_REPLY_SNAPSHOT).get("value")
+        d = json.loads(raw or "{}")
     except Exception:
         return None
-    if not isinstance(v, str):
+    if not isinstance(d, dict):
         return None
-    return v
+    return {
+        "count": int(d.get("count") or 0),
+        "last": d.get("last") or "",
+        "streaming": bool(d.get("streaming")),
+        "hasError": bool(d.get("hasError")),
+    }
+
+
+def reply_after(c, baseline, settle_tries=8, settle_gap=1.5):
+    """拿本轮新增的回复，并判定 captured / partial / empty / unavailable。
+
+    R374-01 的三条判据：
+      - 归属：条数必须比基线**多**，否则无法证明属于本轮 → unavailable
+      - 完整：仍在流式生成 → 等它停；停不下来就是 partial，不冒充完整
+      - 空：确认属于本轮且已完成、但正文为空 → empty
+    """
+    if baseline is None:
+        return None, "unavailable"
+    snap = None
+    for _ in range(settle_tries):
+        snap = reply_snapshot(c)
+        if snap is None:
+            return None, "unavailable"
+        if snap["count"] > baseline["count"] and not snap["streaming"]:
+            break
+        time.sleep(settle_gap)
+    if snap is None:
+        return None, "unavailable"
+    if snap["count"] <= baseline["count"]:
+        return None, "unavailable"        # 没新增 = 本轮无可归属回复，旧回复不得顶替
+    text = snap["last"]
+    if snap["streaming"]:
+        return (text or None), ("partial" if text else "unavailable")
+    if not text:
+        return None, "empty"
+    return text, "captured"
 
 JS_STATE = """(function(){
   var body = document.body.innerText || '';
@@ -222,6 +270,7 @@ def main():
     def _finish(status, conv_id, reply_state, error="", reply=None):
         """每条退出路径都必须留下终态，不允许"发了但不知道结果"。"""
         logctx._last_reply_text = reply
+        logctx.reply_source = "dom"     # R374-01：P1 只有 DOM 证据，标明来源
         try:
             _cs.log_end(logctx, turn_id, begin_path, old_id, conv_id,
                         status, None, reply_state, error=error)
@@ -252,6 +301,11 @@ def main():
     # 先开思考模式（幂等；关闭后才填词，避免切换模型把输入框里的内容吃掉）
     print("thinking:", enable_thinking(c), flush=True)
 
+    # R374-01：发送**之前**取 DOM 基线（条数），发送后只认新增的那条。
+    # 不取基线就只剩"最后一条 assistant"，会把上一轮的回复误记成本轮。
+    baseline = reply_snapshot(c)
+    print("reply baseline:", baseline, flush=True)
+
     # 尝试直接发送（可能已可发）
     print("fill:", fill_prompt(c, prompt), flush=True)
     time.sleep(1)
@@ -262,9 +316,9 @@ def main():
 
     if not (st.get("ctxLimit") or st.get("hasFup")):
         print("已发送或无需续接，退出")
-        rp = last_reply_text(c)
+        rp, rstate = reply_after(c, baseline)
         cur = conv_id_from_url(state(c).get("url", "")) or old_id
-        _finish(200, cur, "captured" if rp else "empty", reply=rp)
+        _finish(200, cur, rstate, reply=rp)
         return 0
 
     # 点「开始新聊天」续接（真实鼠标）
@@ -282,8 +336,8 @@ def main():
     print("new conv:", new_id, flush=True)
     if not new_id:
         print("FAIL: 未拿到新会话 id")
-        _finish(None, None, "unavailable", error="new_conv_id_unresolved",
-                reply=last_reply_text(c))
+        _rp, _rst = reply_after(c, baseline)
+        _finish(None, None, "unavailable", error="new_conv_id_unresolved", reply=_rp)
         return 2
 
     # 记录映射（原子写：满员续接的映射丢了就只能靠人工回忆旧 id）
@@ -313,7 +367,9 @@ def main():
         print("WARN: newchat-map.json 落盘失败（%s）：续接已发生，请手工记下 %s -> %s"
               % (e, old_id, new_id), flush=True)
 
-    # 新会话重发
+    # 新会话重发：切到新会话后条数已变，必须重取基线，否则归属判定失效
+    baseline = reply_snapshot(c)
+    print("reply baseline2:", baseline, flush=True)
     print("thinking2:", enable_thinking(c), flush=True)
     print("fill2:", fill_prompt(c, prompt), flush=True)
     time.sleep(1)
@@ -321,8 +377,8 @@ def main():
     time.sleep(4)
     print("done ->", state(c), flush=True)
     # 续接轮记在**新**会话下；旧会话只留 begin（它确实没收到这条）
-    rp = last_reply_text(c)
-    _finish(200, new_id, "captured" if rp else "empty", reply=rp)
+    rp, rstate = reply_after(c, baseline)
+    _finish(200, new_id, rstate, reply=rp)
     return 0
 
 

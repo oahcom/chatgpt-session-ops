@@ -5969,6 +5969,7 @@ def iter_turns(conv_id=None):
     只有 begin 没有 end 的轮次：reply_state 保持 "unrecorded"、status 保持 None，
     读取方据此可知"这轮发了、但结果没记上"，不会被当成完整留存。
     """
+    seen_turn = set()      # R374-02：跨文件去重——pending 未删时同一轮可能出现两份
     for fp in _log_files(conv_id):
         merged = {}
         order = []
@@ -6003,6 +6004,11 @@ def iter_turns(conv_id=None):
         for key in reversed(order):
             rec = merged[key]
             rec.pop("phase", None)
+            tid = str(rec.get("turn_id") or "")
+            if tid:
+                if tid in seen_turn:
+                    continue        # 同一轮已在别的文件出现过，不重复计
+                seen_turn.add(tid)
             yield rec
 
 def iter_log_records(conv_id=None):
@@ -6047,20 +6053,37 @@ def log_begin(api, target_conv, prompt_file, prompt_text):
     return turn_id, path
 
 def _migrate_pending(turn_id, begin_path, real_conv):
-    """把 pending 里的整轮搬到真实会话文件；搬完才删 pending（搬失败则保留）。"""
+    """把 pending 里的整轮搬到真实会话文件。
+
+    R374-02 幂等性：迁移可能在任意阶段崩溃（拷完 begin、拷完 end、删 pending 前），
+    重试时不得重复追加。以 (turn_id, phase) 为幂等键：目标文件已有同键则跳过；
+    只有目标文件**完整**落盘后才删 pending，否则保留可重试。
+    """
     cid = _safe_conv_id(real_conv)
     if not cid or not begin_path:
         return None
     if os.path.dirname(os.path.abspath(begin_path)) != os.path.abspath(log_pending_dir()):
         return None
     target = conversation_log_path(cid)
-    for rec in _read_jsonl(begin_path):
-        rec["conv_id"] = cid
-        _log_write(target, rec)
-    try:
-        os.remove(begin_path)
-    except OSError:
-        pass          # 删不掉不算失败：读取端按 turn_id 去重合并
+    existing = {(r.get("turn_id"), r.get("phase") or "turn") for r in _read_jsonl(target)}
+    source = _read_jsonl(begin_path)
+    complete = True
+    for rec in source:
+        key = (rec.get("turn_id"), rec.get("phase") or "turn")
+        if key in existing:
+            continue
+        try:
+            moved = dict(rec)
+            moved["conv_id"] = cid
+            _log_write(target, moved)
+        except Exception:
+            complete = False       # 没搬完 → 保留 pending，下次可重试
+            break
+    if complete:
+        try:
+            os.remove(begin_path)
+        except OSError:
+            pass      # 删不掉不算失败：读取端按 turn_id 去重合并
     return target
 
 def log_end(api, turn_id, begin_path, target_conv, real_conv, status, reply_path,
@@ -6083,6 +6106,7 @@ def log_end(api, turn_id, begin_path, target_conv, real_conv, status, reply_path
         "reply_chars": len(reply),
         "reply_sha256": hashlib.sha256(reply.encode("utf-8")).hexdigest() if reply else "",
         "reply_state": reply_state,
+        "reply_source": getattr(api, "reply_source", "api"),
         "reply_file": reply_file,
         "status": status,
         "error": error or "",
