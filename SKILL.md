@@ -436,6 +436,37 @@ python scripts/chatgpt_send.py --proxy-clear                # 清掉 proxy.json 
 >
 > 更坑的一层（同日 13:37）：**IP 量得通、目标站回 403**。`curl api.ipify.org` 一切正常，业务请求全 403，页面写 `Unable to load site … If you are using a VPN, try turning it off`（出口被按 VPN 封）。所以 `--proxy-check` 现在多打一次 `https://chatgpt.com/`，输出 `site.verdict`：`ok` / `challenge`（CF 挑战，浏览器能过）/ `blocked_vpn`（换节点）/ `forbidden` / `unreachable` / `http_<code>`；只有 `ok|challenge` 才算通过。
 
+## MCP 连接器资格管理
+
+`scripts/mcp_connector.py`：检查任意 MCP 端点，并判定某个 ChatGPT 身份有没有资格为它创建自定义连接器。
+
+```bash
+python scripts/mcp_connector.py inspect --url https://mcp.example.com/mcp
+python scripts/mcp_connector.py eligibility --account acct1
+python scripts/mcp_connector.py eligibility --accounts acct1,acct2,acct3,acct4,acct5,acct6
+```
+
+`inspect` 做四层检查：HTTPS 与 SSRF 防护（解析 DNS 后拒绝私网/回环/链路本地）、端点可达性与 401 探测、`resource_metadata` 与授权服务器元数据、匿名端点才做 `initialize` + `tools/list`。OAuth 端点会明确输出 `protocol handshake skipped`，不冒充客户端替用户完成授权。
+
+`eligibility` 读 `/backend-api/me` 与 `/backend-api/accounts/check/v4-2023-04-27`，按套餐判定：`business` / `enterprise` / `edu` 合格；`pro` 只有 `CUSTOM_MCP_READ_FETCH`；其余为 `PERMISSION_DENIED` + `PLAN_NOT_ELIGIBLE`。
+
+**连接器注册（用户裁定 2026-11-23，已更正）：**
+
+- **已废止**此前「Free 套餐不支持 MCP 连接器 / 六账号 OUT-OF-SCOPE / 批量验收目标为权限不足」的裁定——该判定错误。
+- 实测（2026-11-23）：access_token 可正常驱动 `/backend-api/aip/connectors/*`（`list_accessible` 返回 422 缺参数而非 403，`mfa_requirement` 返回 200 `not_required`），账号可对既有连接器走 OAuth 完成连接。
+- 注册路径：`links/oauth` **只对账号自己拥有的 connector 生效**。拿别人的私有 connector（如 acct1 的 `asdk_app_6b02f952…`，`status=ONLY_ME`）去 link，任何账号都返回 `403 Unauthorized`；这跟 session 无关（acct2 用 token+cookie+PoW 对自己的 connector 直接 200）。**403 的正确解读是「无权访问该 connector」，不是「缺 session」。**
+- `links/oauth` 需要 cookie + sentinel（PoW）。纯 Bearer 不带 PoW 会 403。直接用 `ChatGPTAPI.req()` 并附 `OpenAI-Sentinel-Chat-Requirements-Token` / `-Proof-Token` 即可；`scripts/mcp_link.py` 已实现完整链路（links/oauth → Keycloak 登录 → 回调 → list_accessible 校验）。
+- `list_accessible` 的 body 必须是 `{"principals": []}`；传 `[{"type":"USER","id":…}]` 会 422（枚举只认大写 USER/WORKSPACE/ORG/PROJECT/ENT_TENANT）。
+- **创建 connector 是硬约束**：`POST /aip/connectors/mcp` 只接受 `mcp_url`（不是 `base_url`），且后端会先用 UA `openai-mcp/1.0.0` 匿名探测 `POST {mcp_url}`。rmc-hub 强制凭据（`rmc-hub --help`：MCP HTTP requires a client credential），匿名必回 401 → 接口返回 `424 mcp_error upstream_status=401`。`auth_request` 传 `oauth_config` 结果、`API_KEY`、`BEARER`、`CUSTOM`、`NONE` 都一样 424——探测阶段不带任何凭据。
+- 同一 UA 的 401 也解释了 `MCP_ACTION_DISCOVERY_FAILED`（2026-11-22 `openai-mcp/1.0.0` 拉 tools 收到 401，nginx access.log 原文可查）。**actions 为空不是认证没走通**，是 ChatGPT 那次发现被 401 拒了之后不再重拉。
+- 判定认证是否真的通，用 `scripts/probe_mcp_cf.py`：走完整 PKCE 拿真 token → `initialize` → `tools/list`。注意必须用 Chromium 的请求上下文（`p.request.new_context`），urllib/curl 会被 Cloudflare 拦成 `1010 Access denied`（浏览器签名），那是探测工具的假阴性，不是服务端拒绝。
+- acct2–6 的 `session-token` 值为空串（只有 name 没有 value），浏览器里必然掉登录页。六个账号是六个不同邮箱、三种登录方式（acct3 = google-oauth2，acct4/5/6 = auth0，acct1/2 = 自有邮箱），无法用统一凭据批量登录。
+- 不要为绕过 424 而在 nginx 放行匿名 `initialize`/`tools/list`：虽只读，但会扩大匿名攻击面，与最小权限原则冲突（需用户明确裁定后才可做，且应返回空 tools 清单）。
+- 不修改 `account-rotation.json`，不读取其游标决定 Connect 任务顺序。
+- `ELIGIBILITY_UNKNOWN`（接口异常）不得当作最终结论，需结合实测 API 响应判定。
+
+退出码：`0` 全部检查完成、`1` 部分检查操作失败、`2` 参数或凭据缺失、`4` 资格无法确定。
+
 ## 故障速查
 
 | 症状 | 根因 | 处置 |
