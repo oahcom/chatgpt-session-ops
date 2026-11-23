@@ -51,14 +51,21 @@ class _LogCtx:
 JS_REPLY_SNAPSHOT = """(function(){
   var nodes = document.querySelectorAll('[data-message-author-role="assistant"]');
   var last = nodes.length ? (nodes[nodes.length - 1].innerText || '') : '';
-  var body = document.body.innerText || '';
+  var lastNode = nodes.length ? nodes[nodes.length - 1] : null;
+  var own = lastNode ? (lastNode.innerText || '') : '';
+  // 只认本次新增节点自身的错误提示，或页面级 role=alert。
+  // 旧版扫整页 innerText：正常回复里出现"网络错误"三个字就会被误判成出错。
+  var alerts = [...document.querySelectorAll('[role="alert"]')]
+      .map(function(e){ return (e.innerText || '').trim(); }).join(' ');
+  var hasError = /Something went wrong|出现错误|网络错误|重新生成/.test(own + ' ' + alerts)
+      && own.length < 200;   // 长正文里提到这些词不算
   return JSON.stringify({
     count: nodes.length,
     last: last.trim(),
     streaming: [...document.querySelectorAll('button')].some(function(b){
       return /停止生成|stop/i.test(b.getAttribute('aria-label') || '');
     }),
-    hasError: /Something went wrong|出现错误|网络错误/.test(body)
+    hasError: hasError
   });
 })()"""
 
@@ -85,34 +92,63 @@ def reply_snapshot(c):
     }
 
 
-def reply_after(c, baseline, settle_tries=8, settle_gap=1.5):
+def reply_after(c, baseline, settle_tries=8, settle_gap=1.5, stable_need=2):
     """拿本轮新增的回复，并判定 captured / partial / empty / unavailable。
 
-    R374-01 的三条判据：
+    R374-01 的判据：
       - 归属：条数必须比基线**多**，否则无法证明属于本轮 → unavailable
-      - 完整：仍在流式生成 → 等它停；停不下来就是 partial，不冒充完整
+      - 完整：仍在流式生成 → partial
       - 空：确认属于本轮且已完成、但正文为空 → empty
+
+    R375-01 的追加要求：**streaming=False 单次采样不足以证明完成**。
+    新消息节点可能刚创建、正文还没开始写，或流式状态有短暂间隙。因此要求
+    连续 stable_need 次采样"正文完全一致 且 streaming 均为 false"才算稳定；
+    超时仍不稳定 → partial，绝不升级为 captured。
+    另外 hasError（页面明确报错）不得当成正常 captured。
     """
     if baseline is None:
         return None, "unavailable"
     snap = None
-    for _ in range(settle_tries):
+    stable_run = 0
+    prev_text = None
+    # 预算按"轮数"控制（不是墙钟），否则 settle_gap=0 的测试会立刻过期，
+    # 真实运行时也不会因为单次 evaluate 慢就把本该拿到的回复判成 partial。
+    for _ in range(max(1, int(settle_tries))):
         snap = reply_snapshot(c)
         if snap is None:
             return None, "unavailable"
-        if snap["count"] > baseline["count"] and not snap["streaming"]:
+        if snap["count"] <= baseline["count"]:
+            stable_run = 0             # P1-4：跨过空档，稳定序列必须清零
+            prev_text = None
+            time.sleep(settle_gap)     # 还没出现新消息，继续等
+            continue
+        text = snap["last"]
+        if snap["streaming"]:
+            stable_run = 0             # 还在生成，稳定序列中断
+        elif prev_text is None or text != prev_text:
+            stable_run = 1             # 首次观测，或正文变了 → 从本次重新计
+        else:
+            stable_run += 1            # 与上次一致且已停 → 稳定序列 +1
+        prev_text = text
+        if stable_run >= stable_need:
             break
         time.sleep(settle_gap)
+
     if snap is None:
         return None, "unavailable"
     if snap["count"] <= baseline["count"]:
         return None, "unavailable"        # 没新增 = 本轮无可归属回复，旧回复不得顶替
+
     text = snap["last"]
-    if snap["streaming"]:
+    stable = (stable_run >= stable_need) and not snap["streaming"]
+
+    if snap["hasError"]:
+        # 页面明确报错：内容即使拿到了也只是残缺，绝不能报 captured。
+        # 没有正文 → unavailable（不是 partial：partial 意味着"拿到了部分"）。
         return (text or None), ("partial" if text else "unavailable")
     if not text:
-        return None, "empty"
-    return text, "captured"
+        return None, ("empty" if stable else "unavailable")
+    return (text, "captured") if stable else (text, "partial")
 
 JS_STATE = """(function(){
   var body = document.body.innerText || '';
