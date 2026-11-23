@@ -196,6 +196,8 @@ python scripts/chatgpt_send.py --account acct2 <conv_id> <prompt_file>
 
 **`reply_state` 语义（R373-05）**：`captured`（完整正文）/ `empty`（200 但明确空回复）/ `partial`（收割不完整，不得冒充完整）/ `unavailable`（无回复：413、非 200、异常）/ `quarantined`（落点不一致但正文已保全）/ `unrecorded`（只有 begin）。
 
+**`reply_source`（R374-01）**：`api`（SSE/mapping 收割）或 `dom`（P1 CDP 页面文本）。两者证据强度不同，检索时应可辨识。**P1 的 DOM 证据必须先在发送前取 assistant 消息条数作基线，只认新增的那条**——上一轮的回复会留在 DOM 里，本轮发送失败时最后一条仍是旧回复，直接取会把它记成本轮回复（内容真实但归属错误）。仍在流式生成记 `partial`，没有新增记 `unavailable`。
+
 | 命令 | 作用 |
 |---|---|
 | `--log-list` | 三桶文件数、每份日志的轮次与 `reply_states`、`incomplete` 列表 |
