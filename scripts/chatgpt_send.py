@@ -13,6 +13,9 @@
     python chatgpt_send.py --rotation-enable  nologin  # 清除不可用标记，下次重新尝试该身份
     python chatgpt_send.py --rotation-disable nologin  # 手动把身份移出轮转
     python chatgpt_send.py --owner <conv_id>           # 查会话归属账号
+    python chatgpt_send.py --log-list                  # 会话日志：有留存记录的会话一览
+    python chatgpt_send.py --log-show <conv_id>        # 会话日志：读某会话的全部交互（全文）
+    python chatgpt_send.py --log-search <词> [--conv <id>] [--limit N] [--json]  # 会话日志：检索
     python chatgpt_send.py --anon-list                 # 匿名会话 id 对照表（留存记录）
     python chatgpt_send.py --anon-read <conv_id>       # 按 id 读取匿名会话全文（API，标签页丢了也能读）
     python chatgpt_send.py --anon-send <conv_id> <prompt_file>  # 按 id 启用匿名通道续聊
@@ -486,7 +489,8 @@ READONLY_VERBS = ("查看", "列出", "收割", "校验", "盘点", "巡检", "�
 WRITE_VERBS = ("投递", "新建", "写入", "切换", "重置", "删除", "归档", "修复",
                "设置", "处置", "执行", "补采")
 READONLY_ARGV = ("--list", "--tail", "--owner", "--anon-list", "--anon-devices",
-                 "--proxy-show", "--rotation", "--list-all")
+                 "--proxy-show", "--rotation", "--list-all",
+                 "--log-search", "--log-list", "--log-show")
 
 
 class ScheduleError(Exception):
@@ -4941,6 +4945,7 @@ class ChatGPTAPI:
 
         需要控制体积时设 CHATGPT_REPLY_MAX_CHARS（>0 才生效，保留开头并在头部注明）。
         """
+        self._last_reply_text = text or ""
         if not text:
             return None
         short = id8(conv_id)
@@ -5742,6 +5747,10 @@ def _quarantine_reply(api, target_conv, actual_conv, reply, resp, status, pfile)
       （F-18/F-25：WARN 不是状态，机器调用方要能判定）。
     """
     base = getattr(api, "base_dir", BASE)
+    try:
+        api._last_reply_text = reply or ""     # 隔离件也要进会话日志，别留空白轮次
+    except Exception:
+        pass
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     prefix = "quarantine-reply-%s-%s-%s" % (id8(target_conv), id8(actual_conv), stamp)
     # F-21：用内核级 O_EXCL 独占创建占名，**不再**「先检查不存在再写」——
@@ -5848,8 +5857,128 @@ def _quarantine_reply(api, target_conv, actual_conv, reply, resp, status, pfile)
               "不得报告为完整隔离保全" % (resp_ok, claimed), flush=True)
     return path, evidence_complete
 
+# ---------- 会话日志（每条交互全文留存，按会话拆分，可检索） ----------
+# 目的：任何一次经本插件发出的提示词与 ChatGPT 回复正文都要能在本地找回。
+# prompts/ 会被覆盖或清理，replies/ 是扁平命名、按会话归集得靠猜；
+# 这里以 conv_id 为维度落 JSONL：一行 = 一轮交互（prompt 全文 + reply 全文）。
+# 目录含私有对话内容，与 replies/ 同等级：已由 .gitignore 排除，绝不入库。
 
-def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
+def log_dir():
+    """会话日志根目录。按 BASE 惰性解析——测试把 BASE 指到临时目录时自动隔离。"""
+    return os.path.join(BASE, "logs", "conversations")
+
+def conversation_log_path(conv_id):
+    """会话 -> 日志文件。非法/缺失 id 归入 _unassigned.jsonl（宁可归错也不丢内容）。"""
+    cid = str(conv_id or "")
+    if not _ID_RE.match(cid):
+        cid = "_unassigned"
+    return os.path.join(log_dir(), cid + ".jsonl")
+
+def _log_append(conv_id, record):
+    path = conversation_log_path(conv_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    # ponytail: 单次追加写，未加锁。投递本身是串行编排（A15 单 GET、会话间 >=60s），
+    # 同会话真并发时再套 _file_lock(path) —— 现在加锁只会给每次投递平白加延迟。
+    with open(path, "a", encoding="utf-8", newline="\n") as f:
+        f.write(line)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    return path
+
+def iter_log_records(conv_id=None):
+    """遍历日志记录（新 -> 旧）。conv_id 为空时扫全部会话；坏行跳过不炸。"""
+    root = log_dir()
+    if conv_id:
+        files = [conversation_log_path(conv_id)]
+    else:
+        try:
+            files = [os.path.join(root, n) for n in sorted(os.listdir(root))
+                     if n.endswith(".jsonl")]
+        except OSError:
+            files = []
+    for fp in files:
+        try:
+            with open(fp, encoding="utf-8") as f:
+                lines = f.readlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict):
+                yield rec
+
+def _log_turn(api, target_conv, prompt_file, status, path, conv, error=""):
+    """把一轮交互（提示词全文 + 回复全文）追加进会话日志。失败只 WARN，绝不影响投递。"""
+    try:
+        try:
+            with open(prompt_file, encoding="utf-8") as f:
+                ptext = f.read()
+            perr = ""
+        except OSError as e:
+            ptext, perr = "", "%s: %s" % (type(e).__name__, e)
+        real = str(conv or "")
+        reply = getattr(api, "_last_reply_text", "") or ""
+        reply_file = ""
+        if path:
+            try:
+                reply_file = os.path.relpath(path, BASE).replace("\\", "/")
+            except ValueError:      # Windows 跨盘符无法求相对路径
+                reply_file = str(path).replace("\\", "/")
+        rec = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "conv_id": real or (target_conv or ""),
+            "target_conv": target_conv or "",
+            "account": getattr(api, "account", ""),
+            "prompt_file": os.path.basename(prompt_file or ""),
+            "prompt": ptext,
+            "prompt_chars": len(ptext),
+            "prompt_sha256": hashlib.sha256(ptext.encode("utf-8")).hexdigest() if ptext else "",
+            "reply": reply,
+            "reply_chars": len(reply),
+            "reply_sha256": hashlib.sha256(reply.encode("utf-8")).hexdigest() if reply else "",
+            "reply_file": reply_file,
+            "status": status,
+            "error": error or perr,
+        }
+        _log_append(rec["conv_id"], rec)
+    except Exception as e:
+        print("WARN: 会话日志留存失败（%s）——不影响投递结果" % e, flush=True)
+
+def search_logs(term, conv_id=None, limit=20):
+    """在会话日志里按子串检索（大小写不敏感），返回命中记录（新 -> 旧）。"""
+    needle = (term or "").lower()
+    hits = []
+    for rec in iter_log_records(conv_id):
+        blob = ((rec.get("prompt") or "") + "\n" + (rec.get("reply") or "")).lower()
+        if needle in blob:
+            hits.append(rec)
+            if limit and len(hits) >= limit:
+                break
+    return hits
+
+def _log_excerpt(text, term, width=80):
+    """命中位置前后各取半个窗口做摘要（换行压成空格，便于单行显示）。"""
+    text = text or ""
+    i = text.lower().find((term or "").lower())
+    if i < 0:
+        return text[:width].replace("\n", " ")
+    a = max(0, i - width // 2)
+    b = min(len(text), i + len(term) + width // 2)
+    return (("…" if a else "") + text[a:b].replace("\n", " ") +
+            ("…" if b < len(text) else ""))
+
+
+def _send_prompt_impl(api, conv_id, prompt_file, new_chat=False, thinking=None):
     """完整投递流程：tail → requirements+PoW → POST → 收割 → 落盘。
 
     返回 (status, reply_path, real_conv_id)；real_conv_id 用于登记会话归属。
@@ -6117,6 +6246,28 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
     archived = (completeness_note + reply) if completeness_note else reply
     path = api.save_reply(real_conv, pfile, archived)
     return st, path, ConvRef(real_conv, reply_complete=reply_complete)
+
+
+def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
+    """完整投递流程（外层）：调 _send_prompt_impl 并留存会话日志。
+
+    日志是全量留存（提示词 + 回复正文），留存失败只 WARN、绝不改变投递结果——
+    日志的价值在于可回溯，让它反向影响发送就成了新的故障源。
+    """
+    try:
+        api._last_reply_text = ""
+    except Exception:
+        pass
+    try:
+        result = _send_prompt_impl(api, conv_id, prompt_file, new_chat, thinking)
+    except BaseException as e:
+        # 抛异常也要留痕：这是「提示词已被使用」的唯一记录，否则出事只剩用户记忆。
+        _log_turn(api, conv_id, prompt_file, None, None, None,
+                  error="%s: %s" % (type(e).__name__, e))
+        raise
+    status, path, conv = (tuple(result) + (None, None, None))[:3]
+    _log_turn(api, conv_id, prompt_file, status, path, conv)
+    return result
 
 
 def _attempt_create(st, name, prompt_file, attempts, thinking=None):
@@ -6996,6 +7147,94 @@ def main():
         return 0
     if args and args[0] == "--anon-devices":
         print(json.dumps(device_summary(), ensure_ascii=False, indent=2))
+        return 0
+    # ---- 会话日志检索（纯本地，不触网）----
+    if args and args[0] in ("--log-search", "--log-list", "--log-show"):
+        conv = None
+        limit = 20
+        as_json = "--json" in args
+        rest, term = [], None
+        i = 1
+        while i < len(args):
+            a = args[i]
+            if a == "--conv" and i + 1 < len(args):
+                conv = args[i + 1]
+                i += 2
+            elif a == "--limit" and i + 1 < len(args):
+                limit = _as_int(args[i + 1], 20) or 20
+                i += 2
+            elif a == "--json":
+                i += 1
+            else:
+                if term is None:
+                    term = a
+                i += 1
+        if args[0] == "--log-list":
+            root = log_dir()
+            rows = []
+            try:
+                names = [n for n in sorted(os.listdir(root)) if n.endswith(".jsonl")]
+            except OSError:
+                names = []
+            for n in names:
+                recs = list(iter_log_records(n[:-6]))
+                if not recs:
+                    continue
+                rows.append({
+                    "conv_id": n[:-6],
+                    "turns": len(recs),
+                    "last_ts": recs[0].get("ts"),
+                    "first_ts": recs[-1].get("ts"),
+                    "accounts": sorted({r.get("account") or "-" for r in recs}),
+                    "last_prompt_file": recs[0].get("prompt_file"),
+                })
+            print(json.dumps({"dir": root.replace("\\", "/"), "count": len(rows),
+                              "conversations": rows}, ensure_ascii=False, indent=2))
+            return 0
+        if args[0] == "--log-show":
+            if not term:
+                print("usage: --log-show <conv_id> [--json]", flush=True)
+                return 1
+            recs = list(iter_log_records(term))
+            if as_json:
+                print(json.dumps({"conv_id": term, "turns": len(recs), "records": recs},
+                                 ensure_ascii=False, indent=2))
+                return 0
+            if not recs:
+                print("没有该会话的日志：%s（%s）" % (term, log_dir()), flush=True)
+                return 1
+            for r in reversed(recs):
+                print("[%s] %s | %s | status=%s" %
+                      (r.get("ts"), r.get("account") or "-", r.get("prompt_file"), r.get("status")))
+                print("--- prompt (%d chars) ---" % (r.get("prompt_chars") or 0))
+                print(r.get("prompt") or "")
+                print("--- reply (%d chars) ---" % (r.get("reply_chars") or 0))
+                print(r.get("reply") or "")
+                if r.get("error"):
+                    print("--- error ---")
+                    print(r["error"])
+                print()
+            return 0
+        if not term:
+            print("usage: --log-search <关键词> [--conv <id>] [--limit N] [--json]", flush=True)
+            return 1
+        hits = search_logs(term, conv, limit)
+        if as_json:
+            print(json.dumps({"term": term, "conv_id": conv, "count": len(hits),
+                              "hits": hits}, ensure_ascii=False, indent=2))
+            return 0
+        if not hits:
+            print("未命中：%r（目录 %s）" % (term, log_dir()), flush=True)
+            return 1
+        for r in hits:
+            low = (term or "").lower()
+            in_prompt = low in (r.get("prompt") or "").lower()
+            where = "prompt" if in_prompt else "reply"
+            text = r.get("prompt") if in_prompt else r.get("reply")
+            print("%s  %s  %s  [%s]"
+                  % (r.get("ts"), (r.get("conv_id") or "-")[:8],
+                     r.get("prompt_file") or "-", where))
+            print("    " + _log_excerpt(text, term))
         return 0
     if len(args) == 3 and args[0] == "--anon-relink":
         cid = cli_id(args[1])

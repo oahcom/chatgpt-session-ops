@@ -34,6 +34,8 @@ _q*.txt
 replies/
 prompts/
 quarantine/
+# 会话日志（提示词 + 回复全文，按会话拆分）：含私有对话内容，与 replies/ 同等级
+logs/
 pending-claims.jsonl
 conv-api/
 *.lock

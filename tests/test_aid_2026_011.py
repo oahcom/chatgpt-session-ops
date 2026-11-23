@@ -83,6 +83,10 @@ class AID2026011Tests(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="aid-2026-011-")
         self._rot = m.ROTATION_FILE
         self._conv = m.CONV_MAP_FILE
+        self._base = m.BASE
+
+        # 会话日志按 BASE 落盘：不隔离就会把测试提示词写进真实运行目录
+        m.BASE = self.tmp
 
         m.ROTATION_FILE = os.path.join(
             self.tmp, "account-rotation.json"
@@ -94,6 +98,7 @@ class AID2026011Tests(unittest.TestCase):
         self.write_rotation(initial_rotation_state())
 
     def tearDown(self):
+        m.BASE = self._base
         m.ROTATION_FILE = self._rot
         m.CONV_MAP_FILE = self._conv
 
