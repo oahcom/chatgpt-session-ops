@@ -30,6 +30,42 @@ from cdp import CDPClient  # noqa: E402
 BASE = os.path.dirname(os.path.abspath(__file__))
 MAP = os.path.join(BASE, "newchat-map.json")
 
+# R373-01：P1 通道也必须进同一套会话日志。这里复用 chatgpt_send 的日志实现，
+# 不另行造一套——两套实现必然漂移，漂移之后"全量留存"就不成立了。
+import importlib.util as _ilu
+
+_send_spec = _ilu.spec_from_file_location(
+    "chatgpt_send_for_log", os.path.join(BASE, "chatgpt_send.py"))
+_cs = _ilu.module_from_spec(_send_spec)
+_send_spec.loader.exec_module(_cs)
+
+
+class _LogCtx:
+    """把 api 该有的两个属性（account / _last_reply_text）凑出来，供日志层使用。"""
+
+    def __init__(self, account="cdp"):
+        self.account = account
+        self._last_reply_text = None
+
+
+JS_LAST_REPLY = """(function(){
+  var nodes = document.querySelectorAll('[data-message-author-role="assistant"]');
+  if (!nodes.length) return '';
+  var n = nodes[nodes.length - 1];
+  return (n.innerText || n.textContent || '').trim();
+})()"""
+
+
+def last_reply_text(c):
+    """从页面取最后一条 assistant 正文。取不到返回 None（≠ 空回复）。"""
+    try:
+        v = c.evaluate(JS_LAST_REPLY).get("value")
+    except Exception:
+        return None
+    if not isinstance(v, str):
+        return None
+    return v
+
 JS_STATE = """(function(){
   var body = document.body.innerText || '';
   var ta = document.querySelector('.ProseMirror[contenteditable=true]') || document.querySelector('#prompt-textarea') || document.querySelector('textarea');
@@ -167,11 +203,31 @@ def main():
     except OSError as e:
         print("ERROR: 读不到提示词文件 %s：%s" % (prompt_file, e), flush=True)
         return 2
-    lines = [l for l in prompt.splitlines() if not l.strip().startswith("#")]
-    prompt = "\n".join(lines).strip()
+    # 与 chatgpt_send 同口径：**不再按 `#` 删行**。旧版把 Rust 属性
+    # `#[derive]`/`#[test]`/`#[cfg]` 和 markdown 标题一起当注释删掉，正文被静默截断
+    # （2026-11-21 r1d/r1e 实证）。P1 当时漏改，等于同一条 bug 在第二条通道上复现。
+    prompt = prompt.strip()
     if not prompt:
-        print("ERROR: 提示词没有正文（只有注释行）：%s" % prompt_file, flush=True)
+        print("ERROR: 提示词没有正文：%s" % prompt_file, flush=True)
         return 2
+
+    # R373-02/07：发送前先固化本轮提示词；留不住就不发送。
+    logctx = _LogCtx()
+    try:
+        turn_id, begin_path = _cs.log_begin(logctx, old_id, prompt_file, prompt)
+    except Exception as e:
+        print("FAIL: 提示词无法留存（%s）——按纪律不发送" % e, flush=True)
+        return 2
+
+    def _finish(status, conv_id, reply_state, error="", reply=None):
+        """每条退出路径都必须留下终态，不允许"发了但不知道结果"。"""
+        logctx._last_reply_text = reply
+        try:
+            _cs.log_end(logctx, turn_id, begin_path, old_id, conv_id,
+                        status, None, reply_state, error=error)
+        except Exception as le:
+            print("FAIL: 回复留存失败（%s）——本轮只有 begin，读取时显示未完成" % le,
+                  flush=True)
 
     port = int(os.environ.get("CHATGPT_CDP_PORT") or 9222)
     c = CDPClient(host="127.0.0.1", port=port, timeout=30)
@@ -182,6 +238,7 @@ def main():
     except Exception as e:
         print("ERROR: CDP 端口 %d 不可用或页面打不开：%s" % (port, e), flush=True)
         print("提示：先 python start_chrome.py --port %d，并确认已登录" % port, flush=True)
+        _finish(None, old_id, "unavailable", error="cdp_unavailable: %s" % e)
         return 2
     time.sleep(6)
 
@@ -189,6 +246,7 @@ def main():
     print("state:", st, flush=True)
     if not st:
         print("ERROR: 读不到页面状态（页面白屏或 JS 异常），不继续盲点", flush=True)
+        _finish(None, old_id, "unavailable", error="page_state_unreadable")
         return 2
 
     # 先开思考模式（幂等；关闭后才填词，避免切换模型把输入框里的内容吃掉）
@@ -204,6 +262,9 @@ def main():
 
     if not (st.get("ctxLimit") or st.get("hasFup")):
         print("已发送或无需续接，退出")
+        rp = last_reply_text(c)
+        cur = conv_id_from_url(state(c).get("url", "")) or old_id
+        _finish(200, cur, "captured" if rp else "empty", reply=rp)
         return 0
 
     # 点「开始新聊天」续接（真实鼠标）
@@ -221,6 +282,8 @@ def main():
     print("new conv:", new_id, flush=True)
     if not new_id:
         print("FAIL: 未拿到新会话 id")
+        _finish(None, None, "unavailable", error="new_conv_id_unresolved",
+                reply=last_reply_text(c))
         return 2
 
     # 记录映射（原子写：满员续接的映射丢了就只能靠人工回忆旧 id）
@@ -257,6 +320,9 @@ def main():
     print("send2:", c.evaluate(JS_SEND).get("value"), flush=True)
     time.sleep(4)
     print("done ->", state(c), flush=True)
+    # 续接轮记在**新**会话下；旧会话只留 begin（它确实没收到这条）
+    rp = last_reply_text(c)
+    _finish(200, new_id, "captured" if rp else "empty", reply=rp)
     return 0
 
 

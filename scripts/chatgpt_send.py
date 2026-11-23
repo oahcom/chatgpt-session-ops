@@ -4945,7 +4945,7 @@ class ChatGPTAPI:
 
         需要控制体积时设 CHATGPT_REPLY_MAX_CHARS（>0 才生效，保留开头并在头部注明）。
         """
-        self._last_reply_text = text or ""
+        self._last_reply_text = text or ""   # ""=明确空回复；None=从未捕获（R373-05）
         if not text:
             return None
         short = id8(conv_id)
@@ -5859,106 +5859,261 @@ def _quarantine_reply(api, target_conv, actual_conv, reply, resp, status, pfile)
 
 # ---------- 会话日志（每条交互全文留存，按会话拆分，可检索） ----------
 # 目的：任何一次经本插件发出的提示词与 ChatGPT 回复正文都要能在本地找回。
-# prompts/ 会被覆盖或清理，replies/ 是扁平命名、按会话归集得靠猜；
-# 这里以 conv_id 为维度落 JSONL：一行 = 一轮交互（prompt 全文 + reply 全文）。
+# prompts/ 会被覆盖或清理，replies/ 是扁平命名、按会话归集得靠猜。
+#
+# 两阶段落盘（R373-02）：
+#   begin —— 发送**之前**写：本轮 turn_id + 提示词全文（此时失败则拒绝发送）
+#   end   —— 发送**之后**写：回复全文 + reply_state + 状态
+# 两行用 turn_id 关联，读取时合并成一"轮"。只有 begin 没有 end = 该轮未完成，
+# 对读取方是可见状态，不会被当成"看起来成功"。追加写、不改写历史行。
+#
 # 目录含私有对话内容，与 replies/ 同等级：已由 .gitignore 排除，绝不入库。
 
+def log_root():
+    return os.path.join(BASE, "logs")
+
 def log_dir():
-    """会话日志根目录。按 BASE 惰性解析——测试把 BASE 指到临时目录时自动隔离。"""
-    return os.path.join(BASE, "logs", "conversations")
+    """已确认 conv_id 的会话日志。按 BASE 惰性解析——测试改 BASE 即自动隔离。"""
+    return os.path.join(log_root(), "conversations")
+
+def log_pending_dir():
+    """新会话尚未拿到真实 conv_id 时的暂存区。取得真实 id 后整轮迁移过去。"""
+    return os.path.join(log_root(), "pending")
+
+def log_unassigned_dir():
+    """身份不可用且无法归属的轮次。按原始标识分文件，绝不合并到同一个桶。"""
+    return os.path.join(log_root(), "unassigned")
+
+def _safe_conv_id(conv_id):
+    cid = str(conv_id or "")
+    return cid if _ID_RE.match(cid) else ""
+
+def _sanitize_segment(raw):
+    """把任意原始标识压成可做文件名的片段（保留可辨识性，去掉路径字符）。"""
+    txt = str(raw or "")
+    keep = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in txt)[:48]
+    digest = hashlib.sha256(txt.encode("utf-8")).hexdigest()[:8]
+    return "%s-%s" % (keep or "empty", digest)
 
 def conversation_log_path(conv_id):
-    """会话 -> 日志文件。非法/缺失 id 归入 _unassigned.jsonl（宁可归错也不丢内容）。"""
-    cid = str(conv_id or "")
-    if not _ID_RE.match(cid):
-        cid = "_unassigned"
+    """合法 conv_id -> 日志文件。非法 id 一律抛错，由调用方走 unassigned 分文件。
+
+    R373-03：旧版把所有非法 id 塞进 _unassigned.jsonl，等于把互不相干的会话
+    合并成一个无法区分的桶，且丢失原始标识。现在非法即拒绝，绝不静默归并。
+    """
+    cid = _safe_conv_id(conv_id)
+    if not cid:
+        raise ValueError("会话日志只接受合法 conv_id：%r" % (conv_id,))
     return os.path.join(log_dir(), cid + ".jsonl")
 
-def _log_append(conv_id, record):
-    path = conversation_log_path(conv_id)
+def pending_log_path(turn_id):
+    return os.path.join(log_pending_dir(), _sanitize_segment(turn_id) + ".jsonl")
+
+def unassigned_log_path(raw_id):
+    return os.path.join(log_unassigned_dir(), _sanitize_segment(raw_id) + ".jsonl")
+
+def _log_write(path, record):
+    """追加一行并确保真正落盘。fsync 失败必须抛出，不得伪装成成功（R373-F5）。"""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     line = json.dumps(record, ensure_ascii=False) + "\n"
-    # ponytail: 单次追加写，未加锁。投递本身是串行编排（A15 单 GET、会话间 >=60s），
-    # 同会话真并发时再套 _file_lock(path) —— 现在加锁只会给每次投递平白加延迟。
-    with open(path, "a", encoding="utf-8", newline="\n") as f:
-        f.write(line)
-        f.flush()
-        try:
-            os.fsync(f.fileno())
+    # R373-04：按目标文件加进程内 + 跨进程锁；不同会话互不阻塞。
+    with _file_lock(path, timeout=max(LOCK_TIMEOUT_SEC, 5.0)):
+        with open(path, "a", encoding="utf-8", newline="\n") as f:
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())     # 失败即抛，交由调用方判定"未完成"
+        try:                          # R373-F8：日志是敏感数据，收紧为仅本用户可读写
+            os.chmod(path, 0o600)
         except OSError:
             pass
     return path
 
-def iter_log_records(conv_id=None):
-    """遍历日志记录（新 -> 旧）。conv_id 为空时扫全部会话；坏行跳过不炸。"""
-    root = log_dir()
+def _read_jsonl(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue          # 坏行跳过：不能让一行写坏导致整份不可读
+        if isinstance(rec, dict):
+            out.append(rec)
+    return out
+
+def _log_files(conv_id=None):
+    """日志文件集合。conv_id 给定时只读该会话。"""
     if conv_id:
-        files = [conversation_log_path(conv_id)]
-    else:
+        cid = _safe_conv_id(conv_id)
+        if cid:
+            return [os.path.join(log_dir(), cid + ".jsonl")]
+        return [unassigned_log_path(conv_id)]
+    files = []
+    for d in (log_dir(), log_pending_dir(), log_unassigned_dir()):
         try:
-            files = [os.path.join(root, n) for n in sorted(os.listdir(root))
-                     if n.endswith(".jsonl")]
-        except OSError:
-            files = []
-    for fp in files:
-        try:
-            with open(fp, encoding="utf-8") as f:
-                lines = f.readlines()
+            files += [os.path.join(d, n) for n in sorted(os.listdir(d))
+                      if n.endswith(".jsonl")]
         except OSError:
             continue
-        for line in reversed(lines):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(rec, dict):
-                yield rec
+    return files
 
-def _log_turn(api, target_conv, prompt_file, status, path, conv, error=""):
-    """把一轮交互（提示词全文 + 回复全文）追加进会话日志。失败只 WARN，绝不影响投递。"""
+def iter_turns(conv_id=None):
+    """把 begin/end 两行合并成一"轮"，新 -> 旧返回。
+
+    只有 begin 没有 end 的轮次：reply_state 保持 "unrecorded"、status 保持 None，
+    读取方据此可知"这轮发了、但结果没记上"，不会被当成完整留存。
+    """
+    for fp in _log_files(conv_id):
+        merged = {}
+        order = []
+        for rec in _read_jsonl(fp):
+            tid = str(rec.get("turn_id") or "")
+            key = tid or ("__noturn__%d" % len(order))
+            if key not in merged:
+                merged[key] = {"_file": fp}
+                order.append(key)
+            slot = merged[key]
+            phase = rec.get("phase") or "turn"     # 兼容旧版单行记录
+            if phase == "begin":
+                # begin 只贡献提示词侧字段：它自带的 reply="" 是占位，
+                # 若整行 update 会把后写入的 end 结果覆盖成空
+                # （pending 迁移恰好是 end 先落、begin 后拷，实测会踩到）。
+                for k, v in rec.items():
+                    if k not in ("reply", "reply_chars", "reply_sha256",
+                                 "reply_state", "reply_file", "status", "error"):
+                        slot[k] = v
+            elif phase == "end":
+                slot.update({k: v for k, v in rec.items()
+                             if k not in ("prompt", "prompt_chars", "prompt_sha256")})
+            else:
+                # 旧版单行记录（无 phase）：本身就是完整一轮，按内容推导状态，
+                # 不能一律标 unrecorded——那会把历史里的成功轮次误报成未完成。
+                slot.update(rec)
+                slot["reply_state"] = _reply_state_of(
+                    rec.get("status"), rec.get("reply"), None)
+            slot.setdefault("reply_state", "unrecorded")
+            slot.setdefault("status", None)      # 只有 begin 时也必须显式 None，不能缺字段
+            slot.setdefault("error", "")
+        for key in reversed(order):
+            rec = merged[key]
+            rec.pop("phase", None)
+            yield rec
+
+def iter_log_records(conv_id=None):
+    """兼容旧名：等价于 iter_turns（已合并两阶段）。"""
+    for rec in iter_turns(conv_id):
+        yield rec
+
+def log_begin(api, target_conv, prompt_file, prompt_text):
+    """发送**之前**固化本轮提示词。返回 (turn_id, path)。
+
+    调用方必须把抛出的异常当成"不许发送"——提示词没能落盘就发出去，
+    等于用户要求留存的内容已被使用却无任何记录（R373-02 A）。
+    """
+    turn_id = "%s-%s" % (datetime.now().strftime("%Y%m%d%H%M%S"), uuid.uuid4().hex[:8])
+    ptext = prompt_text or ""
+    rec = {
+        "turn_id": turn_id,
+        "phase": "begin",
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "target_conv": str(target_conv or ""),
+        "account": getattr(api, "account", "") or "",
+        "prompt_file": os.path.basename(prompt_file or ""),
+        "prompt": ptext,
+        "prompt_chars": len(ptext),
+        "prompt_sha256": hashlib.sha256(ptext.encode("utf-8")).hexdigest() if ptext else "",
+        "reply": "",
+        "reply_chars": 0,
+        "reply_sha256": "",
+        "reply_state": "unrecorded",
+        "reply_file": "",
+        "status": None,
+        "error": "",
+    }
+    cid = _safe_conv_id(target_conv)
+    if cid:
+        rec["conv_id"] = cid
+        path = _log_write(conversation_log_path(cid), rec)
+    else:
+        # 新会话此刻还不知道真实 id：先落 pending，拿到 id 后整轮迁移（R373-03）
+        rec["conv_id"] = ""
+        path = _log_write(pending_log_path(turn_id), rec)
+    return turn_id, path
+
+def _migrate_pending(turn_id, begin_path, real_conv):
+    """把 pending 里的整轮搬到真实会话文件；搬完才删 pending（搬失败则保留）。"""
+    cid = _safe_conv_id(real_conv)
+    if not cid or not begin_path:
+        return None
+    if os.path.dirname(os.path.abspath(begin_path)) != os.path.abspath(log_pending_dir()):
+        return None
+    target = conversation_log_path(cid)
+    for rec in _read_jsonl(begin_path):
+        rec["conv_id"] = cid
+        _log_write(target, rec)
     try:
+        os.remove(begin_path)
+    except OSError:
+        pass          # 删不掉不算失败：读取端按 turn_id 去重合并
+    return target
+
+def log_end(api, turn_id, begin_path, target_conv, real_conv, status, reply_path,
+            reply_state, error=""):
+    """发送之后补写回复。失败会抛出——调用方必须显式报告"回复未留存"。"""
+    reply = getattr(api, "_last_reply_text", None)
+    reply = "" if reply is None else reply
+    reply_file = ""
+    if reply_path:
         try:
-            with open(prompt_file, encoding="utf-8") as f:
-                ptext = f.read()
-            perr = ""
-        except OSError as e:
-            ptext, perr = "", "%s: %s" % (type(e).__name__, e)
-        real = str(conv or "")
-        reply = getattr(api, "_last_reply_text", "") or ""
-        reply_file = ""
-        if path:
-            try:
-                reply_file = os.path.relpath(path, BASE).replace("\\", "/")
-            except ValueError:      # Windows 跨盘符无法求相对路径
-                reply_file = str(path).replace("\\", "/")
-        rec = {
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "conv_id": real or (target_conv or ""),
-            "target_conv": target_conv or "",
-            "account": getattr(api, "account", ""),
-            "prompt_file": os.path.basename(prompt_file or ""),
-            "prompt": ptext,
-            "prompt_chars": len(ptext),
-            "prompt_sha256": hashlib.sha256(ptext.encode("utf-8")).hexdigest() if ptext else "",
-            "reply": reply,
-            "reply_chars": len(reply),
-            "reply_sha256": hashlib.sha256(reply.encode("utf-8")).hexdigest() if reply else "",
-            "reply_file": reply_file,
-            "status": status,
-            "error": error or perr,
-        }
-        _log_append(rec["conv_id"], rec)
-    except Exception as e:
-        print("WARN: 会话日志留存失败（%s）——不影响投递结果" % e, flush=True)
+            reply_file = os.path.relpath(reply_path, BASE).replace("\\", "/")
+        except ValueError:      # Windows 跨盘符
+            reply_file = str(reply_path).replace("\\", "/")
+    rec = {
+        "turn_id": turn_id,
+        "phase": "end",
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "conv_id": _safe_conv_id(real_conv),
+        "reply": reply,
+        "reply_chars": len(reply),
+        "reply_sha256": hashlib.sha256(reply.encode("utf-8")).hexdigest() if reply else "",
+        "reply_state": reply_state,
+        "reply_file": reply_file,
+        "status": status,
+        "error": error or "",
+    }
+    # 归属优先级：服务器实际落点 > 投递目标。
+    # 413/异常时 real_conv 为空，但 target_conv 是已知的——这一轮确实属于它，
+    # 落到 unassigned 反而会把已知身份的轮次丢掉（R373-03 的"不得伪装"不等于"一律丢弃"）。
+    cid = _safe_conv_id(real_conv) or _safe_conv_id(target_conv)
+    if cid:
+        rec["conv_id"] = cid
+        target = conversation_log_path(cid)
+        _log_write(target, rec)
+        _migrate_pending(turn_id, begin_path, cid)
+        return target
+    # 真实 id 与目标都不可用：按原始标识单独成文件，不与会话桶合并（R373-03）
+    target = unassigned_log_path(target_conv or turn_id)
+    rec["conv_id"] = ""
+    rec["raw_conv_id"] = str(target_conv or "")
+    _log_write(target, rec)
+    if begin_path:
+        try:
+            os.remove(begin_path)
+        except OSError:
+            pass
+    return target
 
 def search_logs(term, conv_id=None, limit=20):
     """在会话日志里按子串检索（大小写不敏感），返回命中记录（新 -> 旧）。"""
     needle = (term or "").lower()
     hits = []
-    for rec in iter_log_records(conv_id):
+    for rec in iter_turns(conv_id):
         blob = ((rec.get("prompt") or "") + "\n" + (rec.get("reply") or "")).lower()
         if needle in blob:
             hits.append(rec)
@@ -5978,14 +6133,12 @@ def _log_excerpt(text, term, width=80):
             ("…" if b < len(text) else ""))
 
 
-def _send_prompt_impl(api, conv_id, prompt_file, new_chat=False, thinking=None):
-    """完整投递流程：tail → requirements+PoW → POST → 收割 → 落盘。
+def load_prompt_text(prompt_file):
+    """读取并规整提示词，返回**实际会被发送**的正文。
 
-    返回 (status, reply_path, real_conv_id)；real_conv_id 用于登记会话归属。
-    thinking=True 时用思考模型（`-t-` 变体）；None = 读 CHATGPT_THINKING 环境变量。
+    R373-07：发送前由调用方取一次，之后整轮都用这一份不可变文本——
+    绝不允许"发送后重新读文件"来补写日志（文件可能已被改写或删除）。
     """
-    if conv_id:
-        conv_id = safe_id(conv_id, "conv_id")
     try:
         with open(prompt_file, encoding="utf-8") as f:
             text = f.read()
@@ -5993,16 +6146,31 @@ def _send_prompt_impl(api, conv_id, prompt_file, new_chat=False, thinking=None):
         raise RuntimeError("读不到提示词文件 %s：%s" % (prompt_file, e))
     if not text.strip():
         raise RuntimeError("提示词文件为空：%s" % prompt_file)
-    # ponytail: 只做空正文判定，不再删行。旧版 `[l for l in ... if not
-    # l.strip().startswith("#")]` 把 Rust 属性 `#[derive]`/`#[test]`/`#[cfg]`
-    # 和 markdown 标题一起当注释删掉，投递的代码正文被静默截断（2026-11-21
-    # r1d/r1e 实证：提示词 11 个 derive、26 个 test 到达会话时全部消失）。
-    # 若将来确实要支持注释头，改成显式标记（如 `//prompt-comment:`）再删。
     text = text.strip()
     if not text:
         raise RuntimeError("提示词没有正文：%s" % prompt_file)
     if not any(not l.strip().startswith("#") for l in text.splitlines()):
         raise RuntimeError("提示词没有正文（只有注释行）：%s" % prompt_file)
+    return text
+
+
+def _send_prompt_impl(api, conv_id, prompt_file, new_chat=False, thinking=None,
+                      text=None):
+    """完整投递流程：tail → requirements+PoW → POST → 收割 → 落盘。
+
+    返回 (status, reply_path, real_conv_id)；real_conv_id 用于登记会话归属。
+    thinking=True 时用思考模型（`-t-` 变体）；None = 读 CHATGPT_THINKING 环境变量。
+    text 已给定时**不再读文件**——保证发送内容与日志留存内容是同一份。
+    """
+    if conv_id:
+        conv_id = safe_id(conv_id, "conv_id")
+    if text is None:
+        text = load_prompt_text(prompt_file)
+    # ponytail: 只做空正文判定，不再删行。旧版 `[l for l in ... if not
+    # l.strip().startswith("#")]` 把 Rust 属性 `#[derive]`/`#[test]`/`#[cfg]`
+    # 和 markdown 标题一起当注释删掉，投递的代码正文被静默截断（2026-11-21
+    # r1d/r1e 实证：提示词 11 个 derive、26 个 test 到达会话时全部消失）。
+    # 若将来确实要支持注释头，改成显式标记（如 `//prompt-comment:`）再删。
     pfile = os.path.basename(prompt_file)
 
     if api.is_anon:
@@ -6248,25 +6416,66 @@ def _send_prompt_impl(api, conv_id, prompt_file, new_chat=False, thinking=None):
     return st, path, ConvRef(real_conv, reply_complete=reply_complete)
 
 
-def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
-    """完整投递流程（外层）：调 _send_prompt_impl 并留存会话日志。
+def _reply_state_of(status, reply, conv):
+    """把"这轮到底有没有拿到回复"显式化（R373-05）。
 
-    日志是全量留存（提示词 + 回复正文），留存失败只 WARN、绝不改变投递结果——
-    日志的价值在于可回溯，让它反向影响发送就成了新的故障源。
+    空字符串本身不能区分"没拿到"和"拿到了空回复"——那是两种完全不同的事实。
     """
+    if status is None:
+        return "unavailable"          # 未走到发送/异常中断
+    if status == 200:
+        if reply:
+            complete = getattr(conv, "reply_complete", None)
+            if complete is False:
+                return "partial"      # 收割不完整，不得冒充完整
+            return "captured"
+        return "empty"                # 200 但正文为空：明确记"空"，不记"没有"
+    if reply:
+        # 非 200 但确实收到了正文（落点不一致被隔离）：内容是拿到了，只是不算正常回复
+        return "quarantined"
+    return "unavailable"              # 413/非 200 且无正文：本来就没有回复
+
+
+def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
+    """完整投递流程（外层）：先固化提示词，再发送，最后补写回复。
+
+    R373-02 的核心：**提示词必须在发送前落盘**。留不住就不发送——
+    否则用户要求留存的内容已被使用却没有任何记录，且事后无法补救。
+
+    回复落盘失败无法撤销已发生的交互，因此不阻断返回；但该轮只有 begin 没有 end，
+    读取端（iter_turns）会把它显示成未完成（reply_state=unrecorded），不是成功。
+    """
+    # R373-07：一次读取、整轮复用，绝不在发送后重读文件补写日志
+    text = load_prompt_text(prompt_file)
+
+    turn_id, begin_path = log_begin(api, conv_id, prompt_file, text)   # 失败即抛：不许发送
+
     try:
-        api._last_reply_text = ""
-    except Exception:
-        pass
-    try:
-        result = _send_prompt_impl(api, conv_id, prompt_file, new_chat, thinking)
+        api._last_reply_text = None      # None=未捕获；""=明确空回复（R373-05）
+        reply_state = "unavailable"
+        result = _send_prompt_impl(api, conv_id, prompt_file, new_chat, thinking,
+                                   text=text)
     except BaseException as e:
-        # 抛异常也要留痕：这是「提示词已被使用」的唯一记录，否则出事只剩用户记忆。
-        _log_turn(api, conv_id, prompt_file, None, None, None,
-                  error="%s: %s" % (type(e).__name__, e))
+        # 抛异常也要补齐本轮：begin 已落盘，这里补 end 让状态可见
+        try:
+            log_end(api, turn_id, begin_path, conv_id, None, None, None,
+                    "unavailable", error="%s: %s" % (type(e).__name__, e))
+        except Exception as le:
+            print("FAIL: 异常轮次补写失败（%s）——该轮只有 begin，读取时会显示未完成"
+                  % le, flush=True)
         raise
+
     status, path, conv = (tuple(result) + (None, None, None))[:3]
-    _log_turn(api, conv_id, prompt_file, status, path, conv)
+    reply = getattr(api, "_last_reply_text", None)
+    reply_state = _reply_state_of(status, reply, conv)
+    try:
+        log_end(api, turn_id, begin_path, conv_id, conv, status, path,
+                reply_state)
+    except Exception as le:
+        # 回复已拿到但日志补写失败：明确报错，不静默。begin 行仍在，轮次可追溯。
+        print("FAIL: 回复留存失败（%s）——本轮只有 begin（提示词已存），"
+              "状态将显示 unrecorded；回复正文在 %s" % (le, path or "未落盘"),
+              flush=True)
     return result
 
 
@@ -7153,7 +7362,7 @@ def main():
         conv = None
         limit = 20
         as_json = "--json" in args
-        rest, term = [], None
+        term = None
         i = 1
         while i < len(args):
             a = args[i]
@@ -7169,43 +7378,107 @@ def main():
                 if term is None:
                     term = a
                 i += 1
+
+        def _bucket_of(fp):
+            parent = os.path.dirname(os.path.abspath(fp))
+            for label, d in (("conversations", log_dir()),
+                             ("pending", log_pending_dir()),
+                             ("unassigned", log_unassigned_dir())):
+                if parent == os.path.abspath(d):
+                    return label
+            return "other"
+
+        def _turns_in(fp):
+            """单文件的 begin/end 合并（与 iter_turns 同语义，但只读一个文件）。"""
+            merged, order = {}, []
+            for rec in _read_jsonl(fp):
+                tid = str(rec.get("turn_id") or "")
+                key = tid or ("__n%d" % len(order))
+                if key not in merged:
+                    merged[key] = {}
+                    order.append(key)
+                slot = merged[key]
+                phase = rec.get("phase") or "turn"
+                if phase == "begin":
+                    for k, v in rec.items():      # 同 iter_turns：begin 不覆盖回复侧
+                        if k not in ("reply", "reply_chars", "reply_sha256",
+                                     "reply_state", "reply_file", "status", "error"):
+                            slot[k] = v
+                elif phase == "end":
+                    slot.update({k: v for k, v in rec.items()
+                                 if k not in ("prompt", "prompt_chars", "prompt_sha256")})
+                else:
+                    slot.update(rec)
+                    slot["reply_state"] = _reply_state_of(
+                        rec.get("status"), rec.get("reply"), None)
+                slot.setdefault("reply_state", "unrecorded")
+                slot.setdefault("status", None)
+                slot.setdefault("error", "")
+            slot.setdefault("status", None)      # 只有 begin 时也必须显式 None，不能缺字段
+            slot.setdefault("error", "")
+            return [merged[k] for k in order]
+
         if args[0] == "--log-list":
-            root = log_dir()
-            rows = []
-            try:
-                names = [n for n in sorted(os.listdir(root)) if n.endswith(".jsonl")]
-            except OSError:
-                names = []
-            for n in names:
-                recs = list(iter_log_records(n[:-6]))
+            rows, incomplete, files = [], [], {}
+            for fp in _log_files():
+                bucket = _bucket_of(fp)
+                files[bucket] = files.get(bucket, 0) + 1
+                recs = _turns_in(fp)
                 if not recs:
                     continue
-                rows.append({
-                    "conv_id": n[:-6],
+                states = sorted({r.get("reply_state") or "unrecorded" for r in recs})
+                row = {
+                    "bucket": bucket,
+                    "conv_id": next((r.get("conv_id") for r in recs if r.get("conv_id")), ""),
+                    "file": os.path.basename(fp),
                     "turns": len(recs),
-                    "last_ts": recs[0].get("ts"),
-                    "first_ts": recs[-1].get("ts"),
+                    "last_ts": recs[-1].get("ts"),
+                    "first_ts": recs[0].get("ts"),
                     "accounts": sorted({r.get("account") or "-" for r in recs}),
-                    "last_prompt_file": recs[0].get("prompt_file"),
-                })
-            print(json.dumps({"dir": root.replace("\\", "/"), "count": len(rows),
-                              "conversations": rows}, ensure_ascii=False, indent=2))
+                    "last_prompt_file": recs[-1].get("prompt_file"),
+                    "reply_states": states,
+                }
+                rows.append(row)
+                if states != ["captured"]:
+                    incomplete.append(row["conv_id"] or row["file"])
+            print(json.dumps({
+                "root": log_root().replace("\\", "/"),
+                "dirs": {"conversations": log_dir().replace("\\", "/"),
+                         "pending": log_pending_dir().replace("\\", "/"),
+                         "unassigned": log_unassigned_dir().replace("\\", "/")},
+                "files": files,
+                "count": len(rows),
+                "logs": rows,
+                "incomplete": incomplete,
+                "note": ("pending=新会话尚未确认 conv_id 的暂存轮次；"
+                         "unassigned=身份不可用且无法归属（按原始标识分文件，不合并）；"
+                         "incomplete=存在非 captured 回复状态的记录（含只有 begin 的未完成轮）"),
+            }, ensure_ascii=False, indent=2))
             return 0
+
         if args[0] == "--log-show":
             if not term:
                 print("usage: --log-show <conv_id> [--json]", flush=True)
                 return 1
-            recs = list(iter_log_records(term))
+            recs = list(iter_turns(term))
+            if not recs:      # 也接受 pending/unassigned 的文件基名
+                for d in (log_pending_dir(), log_unassigned_dir()):
+                    cand = os.path.join(d, term + ".jsonl")
+                    if os.path.exists(cand):
+                        recs = _turns_in(cand)
+                        break
             if as_json:
                 print(json.dumps({"conv_id": term, "turns": len(recs), "records": recs},
                                  ensure_ascii=False, indent=2))
                 return 0
             if not recs:
-                print("没有该会话的日志：%s（%s）" % (term, log_dir()), flush=True)
+                print("没有该会话的日志：%s（%s）" % (term, log_root()), flush=True)
                 return 1
             for r in reversed(recs):
-                print("[%s] %s | %s | status=%s" %
-                      (r.get("ts"), r.get("account") or "-", r.get("prompt_file"), r.get("status")))
+                state = r.get("reply_state") or "unrecorded"
+                print("[%s] %s | %s | status=%s | reply_state=%s"
+                      % (r.get("ts"), r.get("account") or "-",
+                         r.get("prompt_file"), r.get("status"), state))
                 print("--- prompt (%d chars) ---" % (r.get("prompt_chars") or 0))
                 print(r.get("prompt") or "")
                 print("--- reply (%d chars) ---" % (r.get("reply_chars") or 0))
@@ -7213,8 +7486,12 @@ def main():
                 if r.get("error"):
                     print("--- error ---")
                     print(r["error"])
+                if state == "unrecorded":
+                    print("--- 注意 ---")
+                    print("本轮只有 begin：回复未被留存（发送可能已发生），不得当成功")
                 print()
             return 0
+
         if not term:
             print("usage: --log-search <关键词> [--conv <id>] [--limit N] [--json]", flush=True)
             return 1
@@ -7224,16 +7501,18 @@ def main():
                               "hits": hits}, ensure_ascii=False, indent=2))
             return 0
         if not hits:
-            print("未命中：%r（目录 %s）" % (term, log_dir()), flush=True)
+            print("未命中：%r（目录 %s）" % (term, log_root()), flush=True)
             return 1
         for r in hits:
             low = (term or "").lower()
             in_prompt = low in (r.get("prompt") or "").lower()
             where = "prompt" if in_prompt else "reply"
             text = r.get("prompt") if in_prompt else r.get("reply")
-            print("%s  %s  %s  [%s]"
+            state = r.get("reply_state") or "unrecorded"
+            print("%s  %s  %s  [%s]%s"
                   % (r.get("ts"), (r.get("conv_id") or "-")[:8],
-                     r.get("prompt_file") or "-", where))
+                     r.get("prompt_file") or "-", where,
+                     "" if state == "captured" else "  reply_state=%s" % state))
             print("    " + _log_excerpt(text, term))
         return 0
     if len(args) == 3 and args[0] == "--anon-relink":

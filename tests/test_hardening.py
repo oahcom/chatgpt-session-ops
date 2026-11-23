@@ -5479,8 +5479,12 @@ class TestBatchAddedCountSemantics(TmpBase):
 class TestConversationLog(TmpBase):
     """会话日志：提示词与回复全文按会话拆分留存，并可检索。
 
-    核心是「不留日志就等于没发生」：投递本身成功、但日志缺失时，事后完全无法
-    复原当时发了什么、回了什么。所以断言必须落在**落盘内容**上，不能只断言文件存在。
+    R373 返修后钉住的是**契约**，不是实现细节：
+      - 提示词必须在发送前落盘，落不了盘就不许发（R373-02 A）
+      - 回复状态必须区分 captured/empty/unavailable/partial/quarantined/unrecorded
+      - 未知身份不得合并成一个桶（R373-03）
+      - 同会话并发追加不得交错（R373-04）
+      - 日志正文必须是**实际发送**的那份，不是事后重读文件（R373-07）
     """
 
     def _prompt(self, body, name="p.md"):
@@ -5496,18 +5500,17 @@ class TestConversationLog(TmpBase):
             "data: [DONE]",
         ])
 
+    # ---------- 基本留存 ----------
+
     def test_prompt_and_reply_are_logged_per_conversation(self):
-        """一轮交互必须落成「按 conv_id 命名」的一行，且含提示词与回复全文。"""
         cid = "11111111-2222-4333-8444-555555555555"
         api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "回复正文ABC"))
         body = "提示词正文XYZ"
         status, path, conv = m.send_prompt(api, cid, self._prompt(body))
         self.assertEqual(status, 200)
 
-        log = os.path.join(m.log_dir(), cid + ".jsonl")
-        self.assertTrue(os.path.exists(log), "必须按会话维度落一个日志文件")
-        recs = list(m.iter_log_records(cid))
-        self.assertEqual(len(recs), 1)
+        recs = list(m.iter_turns(cid))
+        self.assertEqual(len(recs), 1, "一轮 = 一行合并结果")
         r = recs[0]
         self.assertEqual(r["conv_id"], cid)
         self.assertEqual(r["prompt"], body, "提示词全文必须留存")
@@ -5516,35 +5519,162 @@ class TestConversationLog(TmpBase):
                          hashlib.sha256(body.encode("utf-8")).hexdigest())
         self.assertEqual(r["reply_sha256"],
                          hashlib.sha256("回复正文ABC".encode("utf-8")).hexdigest())
+        self.assertEqual(r["reply_state"], "captured")
         self.assertEqual(r["status"], 200)
 
-    def test_new_chat_logs_under_real_conversation_id(self):
-        """新会话必须记在**服务器实际返回**的 id 下，不能记到 None/目标 id。"""
+    def test_new_chat_migrates_from_pending_to_real_id(self):
+        """新会话先落 pending，拿到真实 id 后整轮迁移，pending 不留残骸（R373-03）。"""
         real = "9f8e7d6c-1111-4222-8333-444455556666"
         api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(real, "hi"))
         status, path, conv = m.send_prompt(api, None, self._prompt("新会话提示词"),
                                           new_chat=True)
         self.assertEqual(status, 200)
-        self.assertTrue(os.path.exists(os.path.join(m.log_dir(), real + ".jsonl")),
-                        "日志文件名必须是真实 conv_id")
-        self.assertEqual(os.listdir(m.log_dir()), [real + ".jsonl"],
-                         "不得产生 _unassigned 之类的杂物")
-        self.assertEqual(list(m.iter_log_records(real))[0]["prompt"], "新会话提示词")
+        recs = list(m.iter_turns(real))
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["prompt"], "新会话提示词")
+        self.assertEqual(recs[0]["reply"], "hi")
+        # pending 里必须已经没有这一轮
+        pending = []
+        try:
+            pending = [n for n in os.listdir(m.log_pending_dir()) if n.endswith(".jsonl")]
+        except OSError:
+            pass
+        self.assertEqual(pending, [], "迁移后 pending 不得留残骸")
+
+    # ---------- R373-02：提示词先落盘 ----------
+
+    def test_send_refused_when_prompt_cannot_be_persisted(self):
+        """提示词落不了盘时**不许发送**——否则内容已被使用却无任何记录。"""
+        cid = "22222222-3333-4444-8555-666666666666"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "不该发生"))
+        blocker = os.path.join(self.tmp, "logs")
+        with open(blocker, "w", encoding="utf-8") as f:   # 用文件占住 logs 目录
+            f.write("x")
+        with self.assertRaises(Exception):
+            m.send_prompt(api, cid, self._prompt("这条不许发出去"))
+        self.assertEqual(api.sent, [], "提示词没落盘就绝不能发送")
+
+    def test_reply_log_failure_is_visible_not_silent(self):
+        """回复补写失败时：投递结果照常返回，但该轮必须表现为未完成。"""
+        cid = "33333333-4444-4555-8666-777777777777"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "有回复"))
+        status, path, conv = m.send_prompt(api, cid, self._prompt("提示词"))
+
+        # 删掉 begin 里的 reply_state，并把 end 行抹掉，模拟「end 没写成」
+        log = os.path.join(m.log_dir(), cid + ".jsonl")
+        lines = [l for l in open(log, encoding="utf-8") if l.strip()]
+        self.assertEqual(len(lines), 2, "应当是 begin + end 两行")
+        with open(log, "w", encoding="utf-8") as f:
+            f.write(lines[0])          # 只留 begin
+        recs = list(m.iter_turns(cid))
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["reply_state"], "unrecorded",
+                         "只有 begin 时必须显式标记未完成")
+        self.assertIsNone(recs[0]["status"], "未完成轮次不得有成功状态")
+        self.assertEqual(recs[0]["prompt"], "提示词", "提示词仍在，可追溯")
+
+    # ---------- R373-05：回复状态 ----------
+
+    def test_reply_state_distinguishes_empty_from_unavailable(self):
+        """200 但空正文 = empty；413 = unavailable。两者绝不能都记成空串。"""
+        cid_ok = "44444444-5555-4666-8777-888888888888"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid_ok, ""))
+        m.send_prompt(api, cid_ok, self._prompt("空回复场景"))
+        self.assertEqual(list(m.iter_turns(cid_ok))[0]["reply_state"], "empty")
+
+        api2 = FakeAPI(os.path.join(self.tmp, "auth"), send_status=413)
+        st, _p, _c = m.send_prompt(api2, cid_ok, self._prompt("413 场景", name="q.md"))
+        self.assertEqual(st, 413)
+        recs = list(m.iter_turns(cid_ok))
+        self.assertEqual(recs[0]["reply_state"], "unavailable", "413 不得记成 empty")
+        self.assertEqual(recs[0]["status"], 413)
+
+    def test_partial_reply_is_marked_partial(self):
+        """收割不完整不得冒充 captured——否则下游会把残缺当定稿。"""
+        cid = "55555555-6666-4777-8888-999999999999"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "半截"))
+        real = api.extract_reply_sse_checked
+        api.extract_reply_sse_checked = lambda raw: (real(raw)[0], False, "no_done")
+        api.get_status = 500      # 让 GET 补全走不通，保持不完整
+        m.send_prompt(api, cid, self._prompt("部分流"))
+        self.assertEqual(list(m.iter_turns(cid))[0]["reply_state"], "partial")
+
+    # ---------- R373-03：未知身份不合并 ----------
+
+    def test_invalid_conv_id_goes_to_its_own_file(self):
+        """两个不同的非法 id 不能被合并成同一个桶，原始标识要保留。"""
+        with self.assertRaises(ValueError):
+            m.conversation_log_path("../../evil")
+        p1 = m.unassigned_log_path("../../evil-a")
+        p2 = m.unassigned_log_path("../../evil-b")
+        self.assertNotEqual(p1, p2, "不同原始标识必须落到不同文件")
+        for p in (p1, p2):
+            self.assertTrue(p.startswith(m.log_unassigned_dir()), "不得逃出日志目录")
+            self.assertNotIn("..", os.path.basename(p))
+
+    # ---------- R373-04：并发追加 ----------
+
+    def test_concurrent_appends_are_not_interleaved(self):
+        """同会话并发追加：每条都是完整可解析的 JSON 行，不交错不丢。"""
+        cid = "66666666-7777-4888-8999-aaaaaaaaaaaa"
+        path = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        big = "长" * 2000          # 单行远超一次 write 的典型缓冲
+        def worker(n):
+            for i in range(10):
+                m._log_write(path, {"turn_id": "%s-%d" % (n, i), "phase": "begin",
+                                    "conv_id": cid, "prompt": big, "seq": i})
+        ts = [threading.Thread(target=worker, args=(n,)) for n in range(4)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        recs = m._read_jsonl(path)
+        self.assertEqual(len(recs), 40, "40 条不得丢")
+        self.assertEqual(len({r["turn_id"] for r in recs}), 40, "不得重复")
+        for r in recs:
+            self.assertEqual(r["prompt"], big, "正文不得被截断或交错")
+
+    # ---------- R373-07：提示词快照 ----------
+
+    def test_logged_prompt_is_the_sent_text_not_reread(self):
+        """日志正文必须是**发送那一刻**的快照，不是事后重读文件。"""
+        cid = "77777777-8888-4999-8aaa-bbbbbbbbbbbb"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "ok"))
+        pf = self._prompt("原始正文AAA")
+
+        # 关键：在**发送过程中**改写并删除原文件，模拟长耗时投递期间被改。
+        # 若实现是「发送后重新读文件补日志」，这里就会记到 B 内容或记空。
+        real_send = api.send
+        def send_and_mutate(*a, **k):
+            with open(pf, "w", encoding="utf-8") as f:
+                f.write("发送途中被改成了BBB")
+            os.remove(pf)
+            return real_send(*a, **k)
+        api.send = send_and_mutate
+
+        m.send_prompt(api, cid, pf)
+        rec = list(m.iter_turns(cid))[0]
+        self.assertEqual(rec["prompt"], "原始正文AAA", "日志必须是发送时的快照")
+        self.assertEqual(rec["prompt_chars"], len("原始正文AAA"))
+        self.assertEqual(api.sent[0]["text"], "原始正文AAA")
+
+    # ---------- 异常留痕 ----------
 
     def test_exception_still_leaves_a_trace(self):
-        """投递抛异常也必须留痕——否则「发过什么」彻底无法复原。"""
-        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse("x", "y"))
-        api.requirements = lambda: (None, None)   # 强制走失败分支
+        cid = "88888888-9999-4aaa-8bbb-cccccccccccc"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "y"))
+        api.requirements = lambda: (None, None)
         with self.assertRaises(Exception):
-            m.send_prompt(api, None, self._prompt("异常前提示词"), new_chat=True)
-        recs = list(m.iter_log_records())
-        self.assertEqual(len(recs), 1, "抛异常也要落一条")
+            m.send_prompt(api, cid, self._prompt("异常前提示词"))
+        recs = list(m.iter_turns(cid))
+        self.assertEqual(len(recs), 1)
         self.assertEqual(recs[0]["prompt"], "异常前提示词")
-        self.assertIsNone(recs[0]["status"], "未完成时必须显式记 None，不能伪装成功")
-        self.assertTrue(recs[0]["error"], "错误原因必须可读")
+        self.assertIsNone(recs[0]["status"])
+        self.assertEqual(recs[0]["reply_state"], "unavailable")
+        self.assertTrue(recs[0]["error"])
+
+    # ---------- 检索 ----------
 
     def test_search_scoped_and_global(self):
-        """检索必须能命中提示词或回复，且 --conv 能限定到单一会话。"""
         cid1 = "aaaaaaaa-1111-4111-8111-111111111111"
         cid2 = "bbbbbbbb-2222-4222-8222-222222222222"
         for cid, ptext, rtext in ((cid1, "关键词在提示词里", "无关回复"),
@@ -5563,37 +5693,49 @@ class TestConversationLog(TmpBase):
         api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "TokenAlpha"))
         m.send_prompt(api, cid, self._prompt("tokenalpha 在提示词"))
         self.assertEqual(len(m.search_logs("TOKENALPHA")), 1)
-        self.assertEqual(len(m.search_logs("tokenalpha", limit=0)), 1, "limit=0 表示不限制")
+        self.assertEqual(len(m.search_logs("tokenalpha", limit=0)), 1)
 
-    def test_illegal_conv_id_never_escapes_directory(self):
-        """非法 id 不得拼出 ../ 路径——这是 id 白名单的同一类风险。"""
-        p = m.conversation_log_path("../../evil")
-        self.assertTrue(p.startswith(m.log_dir()), "日志路径必须落在日志目录内")
-        self.assertTrue(p.endswith("_unassigned.jsonl"))
+    def test_legacy_single_line_record_still_readable(self):
+        """升级前写下的单行记录（无 phase/turn_id）必须仍能读出，且状态不误报。"""
+        cid = "99999999-aaaa-4bbb-8ccc-dddddddddddd"
+        d = m.log_dir()
+        os.makedirs(d, exist_ok=True)
+        legacy = {"ts": "2026-11-23T21:57:02", "conv_id": cid, "target_conv": cid,
+                  "account": "acct6", "prompt_file": "old.md",
+                  "prompt": "旧格式提示词", "prompt_chars": 7, "prompt_sha256": "",
+                  "reply": "旧格式回复", "reply_chars": 6, "reply_sha256": "",
+                  "reply_file": "replies/x.md", "status": 200, "error": ""}
+        with open(os.path.join(d, cid + ".jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps(legacy, ensure_ascii=False) + "\n")
+        recs = list(m.iter_turns(cid))
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["prompt"], "旧格式提示词")
+        self.assertEqual(recs[0]["reply"], "旧格式回复")
+        self.assertEqual(recs[0]["reply_state"], "captured",
+                         "历史成功轮次不得被误标成 unrecorded")
 
     def test_corrupt_log_line_does_not_break_retrieval(self):
-        """日志被写坏（半行/非法 JSON）时，检索要跳过坏行而不是整体不可用。"""
         cid = "dddddddd-4444-4444-8444-444444444444"
         d = m.log_dir()
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, cid + ".jsonl"), "w", encoding="utf-8") as f:
-            f.write('{"conv_id": "%s", "prompt": "好行", "reply": ""}\n' % cid)
+            f.write('{"turn_id": "t1", "phase": "begin", "conv_id": "%s", "prompt": "好行"}\n' % cid)
             f.write("{半截坏行\n")
             f.write("\n")
-        recs = list(m.iter_log_records(cid))
+        recs = list(m.iter_turns(cid))
         self.assertEqual(len(recs), 1, "坏行必须被跳过")
         self.assertEqual(recs[0]["prompt"], "好行")
 
-    def test_log_failure_never_breaks_sending(self):
-        """日志写不进去时投递必须照常成功——留痕失败不能变成新的故障源。"""
-        cid = "eeeeeeee-5555-4555-8555-555555555555"
-        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "照常回复"))
-        blocker = os.path.join(self.tmp, "logs")
-        with open(blocker, "w", encoding="utf-8") as f:   # 用同名文件占住目录
-            f.write("x")
-        status, path, conv = m.send_prompt(api, cid, self._prompt("提示词照发"))
-        self.assertEqual(status, 200, "日志失败不得影响投递结论")
-        self.assertIn("照常回复", _read(path))
+    # ---------- P1 通道 ----------
+
+    def test_p1_channel_has_logging_hooks(self):
+        """P1（continue_full.py）必须接入同一套日志——它曾是零留存的漏记通道。"""
+        p1 = os.path.join(HERE, "..", "scripts", "continue_full.py")
+        src = _read(p1)
+        self.assertIn("log_begin", src, "P1 发送前必须固化提示词")
+        self.assertIn("log_end", src, "P1 必须补写回复与终态")
+        self.assertNotIn("lines = [l for l in prompt.splitlines()", src,
+                         "P1 不得再按注释行删正文（会静默截断）")
 
 
 if __name__ == "__main__":
