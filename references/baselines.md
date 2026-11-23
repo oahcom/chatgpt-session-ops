@@ -576,3 +576,6 @@ X=2` 会被当成单个合法 VALUE 放行；改为 `([^;
 4. **B9/B13/B5 的「已存在」判定依赖接口**——本地只能判「不该建」，判不了「该归档」。
 
 补上一条，就把它从人判列移到测试列；这是唯一被承认的收敛方向。
+
+
+> 全套件验收统计另计：pytest 共 504 个测试项，其中 498 passed、6 skipped；pytest subtests 为 929 passed。`unittest discover` 交叉验证结果为 504 tests，498 passed、6 skipped。

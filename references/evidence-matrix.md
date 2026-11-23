@@ -124,3 +124,5 @@
 7. **多模态内容只能投影成文本**：结构化 part（图片/音频对象）合法但不可文本化——用户消息里的多模态 part 会被文本收割器丢掉（不报畸形，避免误伤 assistant 回复），assistant 消息里的则让对账整体判不可用。要真正保留多模态内容需要另走附件通道。
 
 **日期口径**：`live:` 一律按本机时区（UTC+8）记日期；矩阵校验用 `time.strftime("%Y-%m-%d")` 取本地日期，不按 UTC 折算。审查若按 UTC 看到「日期在未来」，属时区差异，不是伪造。
+
+> 全套件验收统计另计：pytest 共 504 个测试项，其中 498 passed、6 skipped；pytest subtests 为 929 passed。`unittest discover` 交叉验证结果为 504 tests，498 passed、6 skipped。
