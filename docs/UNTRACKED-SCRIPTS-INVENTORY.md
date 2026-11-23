@@ -70,10 +70,17 @@
 | 文件名 | 实际用途 / 入口行为 | 主要副作用或访问对象 | 分类 | 分类依据 |
 |---|---|---|---|---|
 | audit_rmc.py | 遍历指定账号（未传入账号参数时使用脚本内默认账号列表），通过 ChatGPTAPI 查询各账号可访问的 connector，筛选固定 RMC MCP endpoint，并输出 connector 名称、认证方式及 action 数量 | 通过本机 chatgpt_send.ChatGPTAPI 使用账号 cookies/token；访问 ChatGPT backend API 的 connector links/list_accessible 和 connector detail 接口；匹配固定 MCP endpoint `mcp.oachom0831.xyz` | 本机运维 | 2026-11-23 检查完整源码确认：脚本依赖本机账号认证状态及本机特定 MCP 域名，访问对象和运行环境均具有本机专属性，不属于通用正式发布功能 |
+| cleanup_connectors.py | 按 `asdk_app_*` connector id 枚举当前账号的 connector 详情，并按内嵌 STALE 表逐条 `DELETE /backend-api/aip/connectors/<id>`，删除后复查 `GET` 应为 404 | 通过本机账号凭据访问 ChatGPT backend API；删除该账号下的 connector 关联（不可逆） | 本机运维 | #95 快照将其列为"待核验"；2026-11-23 检查完整源码后确认为一次性清理脚本，内嵌特定账号与本机 connector id，属本机专属，不发布 |
+| link_once.py | 对单个账号执行"创建/复用 connector → `links/oauth` 取授权 URL → Keycloak 登录取 `code` → 提交 `links/oauth/callback` → `list_accessible` 校验"四步链路 | 使用本机账号 cookies/token 与 sentinel PoW；写 Keycloak 会话；在账号下新建或刷新 connector 关联 | 本机运维 | 2026-11-23 新增；依赖本机账号与本机特定 MCP endpoint，不具备通用性 |
+| mcp_create_ui.py | 以正确 body 形状（`auth_request.supported_auth[]` + `logo_url`）创建 MCP connector，并打印返回的 `supported_auth` | 使用本机账号凭据；在账号下创建 connector（可能产生需清理的残留） | 本机运维 | 2026-11-23 新增；创建动作有服务端副作用且绑定本机账号 |
+| probe_all_ids.py | 把历史 transcript 中出现过的 `asdk_app_*` id 逐个按账号 GET，输出 connector 名称与 auth 状态 | 使用本机账号凭据只读访问 connector detail 接口；读取本机 transcript 文件 | 本机运维 | #95 快照将其列为"待核验"；2026-11-23 检查完整源码后确认依赖本机 transcript 与账号上下文，属本机运维 |
 
 ### 3. 快照与增量的适用范围
 
 - #95 的 49 行记录继续作为原始历史快照，不因文件删除或新增而改写。
-- 本增量记录反映 2026-11-23 实测的两项变化：`mcp_link.py` 当前已不存在，`audit_rmc.py` 为新增脚本。
-- 除上述两项外，不重新分类或改写 #95 快照中的其他文件。
+- 本增量只记录**当前** A/scripts 的状态变化：`mcp_link.py` 已不存在，上表 5 个文件新增或经源码确认。
+  其中 `cleanup_connectors.py` 与 `probe_all_ids.py` 在 #95 快照中已存在（原分类"待核验"），此处是源码核验后的分类确认，不是新增文件。
+- 本轮删除的脚本属于历史事件，不记入本清单，见 `docs/UNTRACKED-SCRIPTS-HISTORY.md`。
+  两份文件语义不同：本清单描述「现在有什么」，HISTORY 描述「过去出现过什么、何时删除」。
+- 除上述范围外，不重新分类或改写 #95 快照中的其他文件。
 - 本记录中的分类沿用既有五类枚举：`本机运维`、`正式候选`、`重复`、`已废弃`、`待核验`。
