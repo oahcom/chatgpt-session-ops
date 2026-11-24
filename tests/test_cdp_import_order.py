@@ -213,6 +213,35 @@ class TestCliSurface(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertIn("usage:", proc.stdout.decode("utf-8", "replace"))
 
+    def test_extract_auth_bad_port_still_returns_2(self):
+        """退出码契约：用法/参数错误仍是 2，不得被归入「缺依赖」的 3。"""
+        import subprocess
+        proc = subprocess.run(
+            [sys.executable, os.path.join(SCRIPTS, "extract_auth.py"),
+             "--port", "abc"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("--port", proc.stdout.decode("utf-8", "replace"))
+
+    def test_continue_full_missing_prompt_returns_2(self):
+        import subprocess
+        proc = subprocess.run(
+            [sys.executable, os.path.join(SCRIPTS, "continue_full.py"),
+             "9f8e7d6c-1111-4222-8333-444455556666",
+             os.path.join(SCRIPTS, "no-such-prompt-file.txt")],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("读不到提示词文件", proc.stdout.decode("utf-8", "replace"))
+
+    def test_continue_full_invalid_conv_id_returns_2(self):
+        import subprocess
+        proc = subprocess.run(
+            [sys.executable, os.path.join(SCRIPTS, "continue_full.py"),
+             "../../etc/passwd", os.path.join(SCRIPTS, "SKILL.md")],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("非法", proc.stdout.decode("utf-8", "replace"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
