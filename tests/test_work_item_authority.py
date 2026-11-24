@@ -391,6 +391,45 @@ class LandingEvidenceTests(Base):
         with self.assertRaises(QuarantineNotCleared):
             self.store.link_session(self.alice, sid, item.work_item_id, fake)
 
+    def test_caller_supplied_evidence_is_rejected_even_with_valid_landing(
+        self,
+    ) -> None:
+        item = self.store.create_work_item(self.alice)
+        sid = conversation_id()
+        self.record_landing(sid)
+        fake = {
+            "conversation_id": sid,
+            "match": "confirmed",
+            "quarantine_evidence_complete": True,
+        }
+
+        with self.assertRaises(QuarantineNotCleared):
+            self.store.link_session(
+                self.alice, sid, item.work_item_id, fake
+            )
+
+        conn = self.store._connect()
+        try:
+            landing = conn.execute(
+                "SELECT consumed_at FROM authority_landing_events "
+                "WHERE session_id = ? AND consumed_at IS NULL",
+                (sid,),
+            ).fetchone()
+            link_count = conn.execute(
+                "SELECT count(*) FROM session_links WHERE session_id = ?",
+                (sid,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        self.assertIsNotNone(landing)
+        self.assertIsNone(landing["consumed_at"])
+        self.assertEqual(link_count, 0)
+
+        # The same trusted landing event must be usable without caller evidence.
+        link = self.store.link_session(self.alice, sid, item.work_item_id)
+        self.assertEqual(link.session_id, sid)
+
     def test_link_requires_server_recorded_landing(self) -> None:
         item = self.store.create_work_item(self.alice)
         with self.assertRaises(QuarantineNotCleared):
