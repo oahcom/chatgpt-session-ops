@@ -29,7 +29,7 @@ class TestSecurityMatrix(unittest.TestCase):
     EXPECTED_ROW_IDS = (
         "1", "2", "3", "4", "4b", "5", "6", "7", "8", "9", "10",
         "11", "12", "13", "14", "15", "16", "17", "18", "19", "20",
-        "21",
+        "21", "22",
     )
 
     ALLOWED_STATUSES = {
@@ -326,6 +326,8 @@ class TestSecurityMatrix(unittest.TestCase):
                 "test_mcp_transport",
             "test_health_and_protected_resource_metadata_remain_public":
                 "test_mcp_transport",
+            "test_real_tools_call_rejects_missing_request_authentication":
+                "test_mcp_sdk_integration",
         }
 
         self.assertEqual(
