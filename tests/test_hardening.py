@@ -6274,7 +6274,7 @@ class TestConversationLog(TmpBase):
         """新会话投递异常时，begin+end 必须同留在 pending，prompt 原文可读。
 
         这是 R381 确认的生产缺陷：旧实现把 end 写进 unassigned、再删掉 begin
-        （唯一一份 prompt），9 轮提示词已因此永久丢失。
+        （唯一一份 prompt），多轮提示词已因此永久丢失（见 docs/incidents/）。
         """
         prompt = "这段提示词绝不能丢"
         api = FakeAPI(os.path.join(self.tmp, "auth"))

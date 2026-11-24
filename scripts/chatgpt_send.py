@@ -5864,7 +5864,7 @@ def _quarantine_reply(api, target_conv, actual_conv, reply, resp, status, pfile)
 # 任何删除 / 替换 / 迁移 / 覆盖 begin 文件的路径，都必须先证明 prompt 已在另一个
 # 持久化位置完整落盘。审计范围：_migrate_pending、log_end、pending 清理、
 # conversations 迁移、turn 去重、异常恢复与重命名。
-# 违反它的直接后果见 logs/INCIDENT-prompt-lost-20261124.md（10 轮 prompt 已丢失）。
+# 违反它的直接后果见 docs/incidents/R381-prompt-loss-incident.md。
 # 现存删除点只有一处：_migrate_pending 末尾——它前面已回读确认目标含 begin+end
 # 且 payload/conv_id 一致。新增删除点前请先满足上面这条。
 #
