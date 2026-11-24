@@ -6135,7 +6135,8 @@ def _migrate_pending(turn_id, begin_path, real_conv):
     # R377-02：不能只校验"键存在"，必须校验**内容一致**。
     # 反例：同键被静默写坏 → 键集合完整、missing 为空 → pending 被删，内容却已损坏。
     # A. 归属校验（R378-01）：目标里任何一条记录的 conv_id 都必须是本次迁移的会话。
-    #    这一条同时覆盖两种情形：同键挂到了别的会话、以及目标里混入了别会话的记录。
+    #    同时覆盖：同键挂到了别的会话、目标里混入别会话的记录。
+    #    空 conv_id 的历史记录**允许存在**（不要求补齐），但它不是本次迁移的凭据。
     for r in verify_rows:
         rid = _safe_conv_id(r.get("conv_id"))
         if rid and rid != cid:
@@ -6143,16 +6144,24 @@ def _migrate_pending(turn_id, begin_path, real_conv):
                   % ((r.get("turn_id"), r.get("phase") or "turn"), cid, rid), flush=True)
             return None
 
-    # C-1. 同键多条：彼此 payload 必须一致，否则无法确定哪份可信
+    # C-1. 同键多条：彼此 payload 必须一致；且优先选"带本次 cid"的那条作为凭据
+    #      （R379：不能因为空身份记录排在前面就选中它）。
     verified = {}
     for r in verify_rows:
         k = (r.get("turn_id"), r.get("phase") or "turn")
-        if k in verified and _turn_payload(verified[k]) != _turn_payload(r):
-            print("FAIL: 目标存在重复键且内容冲突 %r——pending 保留" % (k,), flush=True)
-            return None
-        verified.setdefault(k, r)
+        rid = _safe_conv_id(r.get("conv_id"))
+        if k in verified:
+            prev = verified[k]
+            if _turn_payload(prev) != _turn_payload(r):
+                print("FAIL: 目标存在重复键且内容冲突 %r——pending 保留" % (k,), flush=True)
+                return None
+            # 已有记录身份不对（空或别人），但本条是本次 cid → 换成它
+            if _safe_conv_id(prev.get("conv_id")) != cid and rid == cid:
+                verified[k] = r
+            continue
+        verified[k] = r
 
-    # B + C-2. 每条 source 都必须在目标里存在，且内容一致
+    # B + C-2. 每条 source 都必须存在、内容一致，且**归属就是本次 cid**
     for rec in source:
         key = (rec.get("turn_id"), rec.get("phase") or "turn")
         actual = verified.get(key)
@@ -6161,6 +6170,12 @@ def _migrate_pending(turn_id, begin_path, real_conv):
             return None
         if _turn_payload(actual) != _turn_payload(rec):
             print("FAIL: 迁移后内容不一致 %r——pending 保留" % (key,), flush=True)
+            return None
+        # R379：内容相同还不够——必须能证明这条记录属于本次迁移。
+        # 空 conv_id 是历史遗留，不得当作迁移成功的凭据。
+        if _safe_conv_id(actual.get("conv_id")) != cid:
+            print("FAIL: 迁移凭据身份不明 %r（期望 %s，实际 %r）——空/异会话记录不得冒充"
+                  % (key, cid, actual.get("conv_id")), flush=True)
             return None
 
     try:

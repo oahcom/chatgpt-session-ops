@@ -6203,6 +6203,71 @@ class TestConversationLog(TmpBase):
         self.assertIsNone(m._migrate_pending("t-idmis", begin, cid))
         self.assertTrue(os.path.exists(begin))
 
+    def test_legacy_empty_conv_id_cannot_satisfy_migrated_source_identity(self):
+        """空 conv_id 的历史记录不得作为本次迁移的凭据（R379 唯一阻断）。
+
+        构造：target 同键、同 payload、但 conv_id 为空。
+        内容完全一致，只有身份缺失——必须拒绝。
+        """
+        cid = "11112222-3333-4444-8555-666677778888"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-emptyid")
+        rec = {"turn_id": "t-emptyid", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            # 同键、同 payload，但没有身份
+            f.write(json.dumps(dict(rec, conv_id=""), ensure_ascii=False) + "\n")
+        out = m._migrate_pending("t-emptyid", begin, cid)
+        self.assertIsNone(out, "空 conv_id 不得冒充迁移凭据")
+        self.assertTrue(os.path.exists(begin), "pending 必须保留")
+
+    def test_empty_and_correct_id_both_present_prefers_correct(self):
+        """同键既有空身份记录、也有带正确 cid 的记录 → 应选中正确的那条并成功。"""
+        cid = "22223333-4444-4555-8666-777788889999"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-mixed")
+        rec = {"turn_id": "t-mixed", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(json.dumps(dict(rec, conv_id=""), ensure_ascii=False) + "\n")   # 空身份在前
+            f.write(json.dumps(dict(rec, conv_id=cid), ensure_ascii=False) + "\n")  # 正确身份在后
+        out = m._migrate_pending("t-mixed", begin, cid)
+        self.assertIsNotNone(out, "有正确 cid 的记录时应成功，不能被前面的空身份记录挡住")
+        self.assertFalse(os.path.exists(begin), "成功后应清理 pending")
+
+    def test_duplicate_order_reversal_consistent(self):
+        """同键记录顺序反转，结果必须一致（不得依赖遍历顺序）。"""
+        for order in ("empty_first", "correct_first"):
+            cid = ("33334444-5555-4666-8777-88889999000%d" % (0 if order == "empty_first" else 1))
+            os.makedirs(m.log_pending_dir(), exist_ok=True)
+            os.makedirs(m.log_dir(), exist_ok=True)
+            tid = "t-order-" + order
+            begin = m.pending_log_path(tid)
+            rec = {"turn_id": tid, "phase": "begin", "conv_id": "",
+                   "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+            with open(begin, "w", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            target = m.conversation_log_path(cid)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            rows = [dict(rec, conv_id=""), dict(rec, conv_id=cid)]
+            if order == "correct_first":
+                rows.reverse()
+            with open(target, "w", encoding="utf-8") as f:
+                for r in rows:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            out = m._migrate_pending(tid, begin, cid)
+            self.assertIsNotNone(out, "顺序不应影响结果：%s" % order)
+
     # ---------- R377-01：正文错误判定必须整条匹配 ----------
 
     def test_judge_error_multiline_error_with_extra_text_is_not_error(self):
