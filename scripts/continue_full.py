@@ -22,10 +22,44 @@ import re
 import sys
 import time
 
-_CDP_DIR = os.environ.get("CHATGPT_CDP_DIR") or os.path.join(
-    os.path.expanduser("~"), ".workbuddy", "skills", "browser-automation-cdp", "scripts")
-sys.path.insert(0, _CDP_DIR)
-from cdp import CDPClient  # noqa: E402
+# P2-CDP：CDP 适配器延迟加载。
+# 模块级 `from cdp import CDPClient` 会把「解析参数」「judge_error」这类纯逻辑
+# 一并绑上浏览器依赖——无 CDP 的环境（CI、Linux 服务器）连 --help 都起不来。
+# 这里保留 `CDPClient` 这个名字：它是模块级可替换点（tests/test_hardening.py
+# 用 p1.CDPClient 对 CDP 打桩），默认 None 表示「尚未解析」。
+CDPClient = None
+
+
+class CdpUnavailable(RuntimeError):
+    """CDP 浏览器适配器不可用——延迟到真正需要浏览器时才判定。"""
+
+
+_CDP_HINT = (
+    "CDP_UNAVAILABLE\n"
+    "本操作需要 CDP 浏览器适配器。\n"
+    "cdp 模块未安装，或运行路径未配置（CHATGPT_CDP_DIR）。\n"
+    "未执行任何浏览器操作。"
+)
+
+
+def _cdp_client():
+    """按需导入 cdp.CDPClient。只有真正要连浏览器时才可能失败。"""
+    cdp_dir = os.environ.get("CHATGPT_CDP_DIR") or os.path.join(
+        os.path.expanduser("~"), ".workbuddy", "skills", "browser-automation-cdp", "scripts")
+    if cdp_dir not in sys.path:
+        sys.path.insert(0, cdp_dir)
+    try:
+        from cdp import CDPClient as _client
+    except ModuleNotFoundError as e:
+        # 区分「cdp 本身不存在」与「cdp 内部依赖损坏」：否则后者会被误报成
+        # 未安装，排查方向直接错。
+        if e.name == "cdp":
+            raise CdpUnavailable("%s（查找路径：%s）" % (_CDP_HINT, cdp_dir)) from e
+        raise CdpUnavailable("CDP 模块内部依赖缺失：%s" % e.name) from e
+    except Exception as e:
+        raise CdpUnavailable(
+            "CDP 模块初始化失败：%s: %s" % (type(e).__name__, e)) from e
+    return _client
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 MAP = os.path.join(BASE, "newchat-map.json")
@@ -357,7 +391,8 @@ def main():
             return False
 
     port = int(os.environ.get("CHATGPT_CDP_PORT") or 9222)
-    c = CDPClient(host="127.0.0.1", port=port, timeout=30)
+    client_cls = CDPClient or _cdp_client()
+    c = client_cls(host="127.0.0.1", port=port, timeout=30)
     try:
         c.ensure_page(url_contains="chatgpt.com")
         # 注意：navigate 的参数名是 timeout，不是 wait（写错直接 TypeError）
@@ -463,4 +498,10 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # 缺 CDP 是「环境未就绪」，不是崩溃：给出可执行的提示，退出码 3
+    # 与用法错误（2）区分开，便于上层脚本判断是否值得重试。
+    try:
+        sys.exit(main())
+    except CdpUnavailable as e:
+        print(str(e), file=sys.stderr, flush=True)
+        sys.exit(3)
