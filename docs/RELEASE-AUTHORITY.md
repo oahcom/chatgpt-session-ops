@@ -36,18 +36,42 @@ incorporated into B, tested, and committed.
 
 ## 2. Explicit B → A publication allowlist
 
-The following seven files are the complete allowlist for the current release
-baseline:
+The allowlist contains nine files in two categories: eight runtime publication
+files and one validation asset. Together they are the complete allowlist for
+the current release baseline.
+
+### 2.1 Runtime publication allowlist
 
 | B-relative path | A-relative path | Purpose |
 |---|---|---|
 | `SKILL.md` | `SKILL.md` | Skill instructions |
 | `references/baselines.md` | `references/baselines.md` | Baseline reference |
 | `references/evidence-matrix.md` | `references/evidence-matrix.md` | Evidence reference |
-| `scripts/chatgpt_send.py` | `scripts/chatgpt_send.py` | Reviewed conversation-send utility |
-| `scripts/mcp_connector.py` | `scripts/mcp_connector.py` | Reviewed MCP connector eligibility utility |
-| `tests/test_hardening.py` | `tests/test_hardening.py` | Reviewed hardening tests |
 | `references/mcp-oauth-connector-contract.md` | `references/mcp-oauth-connector-contract.md` | Connector/OAuth contract that `SKILL.md` cites |
+| `scripts/chatgpt_send.py` | `scripts/chatgpt_send.py` | Reviewed conversation-send utility |
+| `scripts/extract_auth.py` | `scripts/extract_auth.py` | Reviewed credential-extraction utility (lazy CDP import) |
+| `scripts/continue_full.py` | `scripts/continue_full.py` | Reviewed P1 continuation utility (lazy CDP import) |
+| `scripts/mcp_connector.py` | `scripts/mcp_connector.py` | Reviewed MCP connector eligibility utility |
+
+### 2.2 Validation asset allowlist
+
+| B-relative path | A-relative path | Purpose |
+|---|---|---|
+| `tests/test_hardening.py` | `tests/test_hardening.py` | Reviewed hardening tests, published for local verification |
+
+Validation assets are published so that A can verify behavior; they are not
+runtime code and must never be imported by the Skill's runtime path.
+
+`tests/test_cdp_import_order.py` is **not** on either list. A has no test
+execution procedure, so new test files stay in B until such a procedure exists
+and the specific files are added here through a separately reviewed change.
+
+### 2.3 Scope: publication, not development
+
+This allowlist governs only the B → A publication procedure. It does not
+restrict development, modification, testing, or pull-request creation within
+repository B. Such activities remain subject to the repository's development
+and review requirements.
 
 This is an explicit file allowlist, not permission to synchronize the containing
 directories.
@@ -83,7 +107,7 @@ MUST NOT be overwritten, deleted, mirrored, or replaced by a B-side release:
 This list is a minimum explicit exclusion list, not an exhaustive inventory
 of every possible runtime artifact.
 
-The release operator MUST preserve all A-side paths outside the six-file
+The release operator MUST preserve all A-side paths outside the nine-file
 allowlist. The operator MUST NOT use directory mirroring or whole-directory
 replacement to achieve a release.
 
@@ -102,12 +126,12 @@ Before copying any file:
 1. Confirm that B is the intended repository and that the intended release
    commit is present.
 2. Inspect `git status --short` and the release diff in B.
-3. Confirm that the seven allowlisted source files exist in B.
+3. Confirm that the nine allowlisted source files exist in B.
 4. Confirm that the corresponding target directories and files in A are
    present where required.
 5. Inspect the A-side runtime state and confirm that the release will not
    touch excluded paths.
-6. Confirm that the release consists only of the six explicit file paths.
+6. Confirm that the release consists only of the nine explicit file paths.
 7. Record the source commit and the release time in the execution record.
 
 If any source file is missing, any required target is unexpectedly missing,
@@ -128,12 +152,12 @@ The operator MUST NOT:
 - Treat an untracked A-side file as disposable merely because B does not
   contain it.
 
-A release is a controlled seven-file publication, not a synchronization of
+A release is a controlled nine-file publication, not a synchronization of
 the two directory trees.
 
 ## 6. SHA-256 verification
 
-For each of the six allowlisted files, calculate SHA-256 for both the B source
+For each of the nine allowlisted files, calculate SHA-256 for both the B source
 and the A destination after copying.
 
 The release passes file-integrity verification only when:
