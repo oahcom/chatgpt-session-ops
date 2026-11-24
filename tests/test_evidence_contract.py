@@ -37,6 +37,10 @@ class TestEvidenceClaimDeclarationCount(unittest.TestCase):
             contract, dict,
             "F01 契约格式错误：根对象必须是 JSON object"
         )
+        self.assertIs(
+            type(contract.get("schema_version")), int,
+            "F01 契约错误：schema_version 必须是整数"
+        )
         self.assertEqual(
             contract.get("schema_version"), 1,
             "F01 契约版本错误：schema_version 必须为 1"
