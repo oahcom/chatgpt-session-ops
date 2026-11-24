@@ -5946,20 +5946,46 @@ def unassigned_log_path(raw_id):
     return os.path.join(log_unassigned_dir(), _sanitize_segment(raw_id) + ".jsonl")
 
 def _log_write(path, record):
-    """追加一行并确保真正落盘。fsync 失败必须抛出，不得伪装成成功（R373-F5）。"""
+    """追加一行并确保落盘；隔离历史上的不完整尾行（R388-A1）。
+
+    JSONL 的一条记录必须以 ``\n`` 收尾。若上一次写入被截断（崩溃/短写残留），
+    直接 append 会把新记录**拼进残行**，整行变成非法 JSON —— 该文件中从残行起
+    的所有记录（含这条 begin 的 prompt）在读取视图里全部消失。
+    所以写前先看最后一个字节：不是换行就先补一个，把旧残行隔离出去。
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    line = json.dumps(record, ensure_ascii=False) + "\n"
-    # R373-04：按目标文件加进程内 + 跨进程锁；不同会话互不阻塞。
+    line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+
     with _file_lock(path, timeout=max(LOCK_TIMEOUT_SEC, 5.0)):
-        with open(path, "a", encoding="utf-8", newline="\n") as f:
+        with open(path, "a+b") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+
+            if size:
+                f.seek(-1, os.SEEK_END)
+                last = f.read(1)
+                if last != b"\n":
+                    # 隔离旧的不完整尾行，绝不与新 JSON 拼接。
+                    f.seek(0, os.SEEK_END)
+                    f.write(b"\n")
+                    print(
+                        "WARN: JSONL 尾部缺少换行，已隔离旧残行：%s" % path,
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+            f.seek(0, os.SEEK_END)
             f.write(line)
             f.flush()
-            os.fsync(f.fileno())     # 失败即抛，交由调用方判定"未完成"
-        try:                          # R373-F8：日志是敏感数据，收紧为仅本用户可读写
+            os.fsync(f.fileno())
+
+        try:
             os.chmod(path, 0o600)
         except OSError:
             pass
+
     return path
+
 
 def _read_jsonl(path):
     """读 JSONL。**读失败返回 None**，与「文件不存在/确实是空」区分开（R376-04）。
@@ -5979,90 +6005,166 @@ def _read_jsonl(path):
     except (OSError, UnicodeDecodeError):
         return None
     out = []
-    for line in lines:
-        line = line.strip()
+    for lineno, raw in enumerate(lines, 1):
+        terminated = raw.endswith("\n")
+        line = raw.strip()
         if not line:
             continue
         try:
             rec = json.loads(line)
         except ValueError:
-            continue          # 坏行跳过：不能让一行写坏导致整份不可读
+            # R388-A1：末行未换行且解析失败 = 被截断的残行；其余 = 中间坏行。
+            # 两者都不静默——损坏证据必须可见，否则"读不到"会被误当"没有"。
+            kind = ("truncated tail"
+                    if lineno == len(lines) and not terminated
+                    else "corrupt line")
+            print("WARN: JSONL %s: %s:%d" % (kind, path, lineno),
+                  file=sys.stderr, flush=True)
+            continue
         if isinstance(rec, dict):
             out.append(rec)
+        else:
+            print("WARN: JSONL non-object record: %s:%d" % (path, lineno),
+                  file=sys.stderr, flush=True)
     return out
 
-def _log_files(conv_id=None):
-    """日志文件集合。conv_id 给定时只读该会话。"""
-    if conv_id:
-        cid = _safe_conv_id(conv_id)
-        if cid:
-            return [os.path.join(log_dir(), cid + ".jsonl")]
-        return [unassigned_log_path(conv_id)]   # 缺失或畸形都按原始标识去找
+def _all_log_files():
+    """三个桶的全部日志文件（枚举失败只告警，不炸）。"""
     files = []
     for d in (log_dir(), log_pending_dir(), log_unassigned_dir()):
         try:
             files += [os.path.join(d, n) for n in sorted(os.listdir(d))
                       if n.endswith(".jsonl")]
-        except OSError:
+        except OSError as e:
+            print("WARN: 无法枚举日志目录 %s: %s" % (d, e),
+                  file=sys.stderr, flush=True)
             continue
     return files
 
-def iter_turns(conv_id=None):
-    """把 begin/end 两行合并成一"轮"，新 -> 旧返回。
 
-    只有 begin 没有 end 的轮次：reply_state 保持 "unrecorded"、status 保持 None，
-    读取方据此可知"这轮发了、但结果没记上"，不会被当成完整留存。
+def _merge_scalar(slot, key, value):
+    """把 value 合并进 slot[key]，遵循 R389-02/R389-03 的身份规则。
+
+    - 空值（""/None）不能覆盖已有有效值；
+    - 两个不同有效值 → 打 WARN 标冲突，保留先到的，不静默采用最后一个。
     """
-    seen_turn = set()      # R374-02：跨文件去重——pending 未删时同一轮可能出现两份
-    for fp in _log_files(conv_id):
-        merged = {}
-        order = []
+    old = slot.get(key)
+    old_empty = old is None or old == ""
+    new_empty = value is None or value == ""
+
+    if new_empty and not old_empty:
+        return                      # R389-02：空不能覆盖有效
+    if old_empty and not new_empty:
+        slot[key] = value
+        return
+    if old_empty and new_empty:
+        slot.setdefault(key, value)
+        return
+    if old == value:
+        return
+    # R389-03：两个不同有效值
+    if key == "conv_id":
+        slot["_conv_id_conflict"] = True
+        print("WARN: 同一轮出现不同 conv_id（%r vs %r）——保留先到者，冲突可见"
+              % (old, value), file=sys.stderr, flush=True)
+        return
+    slot[key] = value               # 非身份字段：后到者优先（如 end 的 reply）
+
+
+_TURN_PROMPT_KEYS = ("prompt", "prompt_chars", "prompt_sha256")
+_TURN_REPLY_KEYS = ("reply", "reply_chars", "reply_sha256", "reply_state",
+                    "reply_file", "status", "error")
+
+
+def _aggregate_turns(files):
+    """把若干日志文件按 turn_id 聚合；返回 (merged, order)。"""
+    merged = {}
+    order = []
+
+    for file_index, fp in enumerate(files):
         rows = _read_jsonl(fp)
-        if rows is None:          # 读不出来：跳过该文件，不当成空
-            print("WARN: 会话日志读不出来（%s）——本次跳过", fp, flush=True)
+        if rows is None:
+            print("WARN: 会话日志读不出来（%s）——本次跳过" % fp,
+                  file=sys.stderr, flush=True)
             continue
-        for rec in rows:
+
+        for row_index, rec in enumerate(rows):
             tid = str(rec.get("turn_id") or "")
-            key = tid or ("__noturn__%d" % len(order))
+            # 没有 turn_id 的历史记录不能意外合并。
+            key = tid or "__legacy__%d_%d" % (file_index, row_index)
+
             if key not in merged:
-                merged[key] = {"_file": fp}
+                merged[key] = {"_file": fp, "_files": [fp]}
                 order.append(key)
-            slot = merged[key]
-            phase = rec.get("phase") or "turn"     # 兼容旧版单行记录
-            if phase == "begin":
-                # begin 只贡献提示词侧字段：它自带的 reply="" 是占位，
-                # 若整行 update 会把后写入的 end 结果覆盖成空
-                # （pending 迁移恰好是 end 先落、begin 后拷，实测会踩到）。
-                for k, v in rec.items():
-                    if k not in ("reply", "reply_chars", "reply_sha256",
-                                 "reply_state", "reply_file", "status", "error"):
-                        slot[k] = v
-            elif phase == "end":
-                slot.update({k: v for k, v in rec.items()
-                             if k not in ("prompt", "prompt_chars", "prompt_sha256")})
             else:
-                # 旧版单行记录（无 phase）：本身就是完整一轮，按内容推导状态，
-                # 不能一律标 unrecorded——那会把历史里的成功轮次误报成未完成。
-                slot.update(rec)
+                srcs = merged[key]["_files"]
+                if fp not in srcs:
+                    srcs.append(fp)     # R389-04：记录全部来源
+
+            slot = merged[key]
+            phase = rec.get("phase") or "turn"
+
+            if phase == "begin":
+                for k, v in rec.items():
+                    if k in _TURN_REPLY_KEYS or k in ("_file", "_files"):
+                        continue
+                    _merge_scalar(slot, k, v)
+
+            elif phase == "end":
+                for k, v in rec.items():
+                    if k in _TURN_PROMPT_KEYS or k in ("_file", "_files"):
+                        continue
+                    _merge_scalar(slot, k, v)
+
+            else:
+                # 兼容历史单行格式。
+                for k, v in rec.items():
+                    if k in ("_file", "_files"):
+                        continue
+                    _merge_scalar(slot, k, v)
                 slot["reply_state"] = _reply_state_of(
                     rec.get("status"), rec.get("reply"), None)
+
             slot.setdefault("reply_state", "unrecorded")
-            slot.setdefault("status", None)      # 只有 begin 时也必须显式 None，不能缺字段
+            if slot.get("status", "__missing__") == "__missing__":
+                slot["status"] = None
             slot.setdefault("error", "")
-        for key in reversed(order):
-            rec = merged[key]
-            rec.pop("phase", None)
-            tid = str(rec.get("turn_id") or "")
-            if tid:
-                if tid in seen_turn:
-                    continue        # 同一轮已在别的文件出现过，不重复计
-                seen_turn.add(tid)
-            yield rec
+
+    return merged, order
+
+
+def iter_turns(conv_id=None):
+    """按 turn_id 聚合后输出；可按 conv_id 或 turn_id 过滤（R389-01）。
+
+    旧版先到先胜 + 只查单个桶，会让迁移中间态丢 prompt（pending 有 begin、
+    conversations 有 end）。现在先跨全部文件聚合，再按入口 ID 过滤——
+    两种入口都能找全同一轮的所有片段。
+    """
+    merged, order = _aggregate_turns(_all_log_files())
+
+    if conv_id:
+        cid = _safe_conv_id(conv_id)
+        if cid:
+            # UUID 入口：聚合后按 conv_id 匹配（pending 的 begin conv_id 为空，
+            # 但合并后该轮已从 end 取得 cid，所以能命中）。
+            keys = [k for k in order if merged[k].get("conv_id") == cid]
+        else:
+            # turn_id 入口：按 turn_id 精确匹配（含 conversations 里的同 turn）。
+            keys = [k for k in order if k == str(conv_id)]
+    else:
+        keys = order
+
+    for key in reversed(keys):
+        rec = merged[key]
+        rec.pop("phase", None)
+        yield rec
+
 
 def iter_log_records(conv_id=None):
-    """兼容旧名：等价于 iter_turns（已合并两阶段）。"""
+    """兼容旧名：等价于 iter_turns（已跨文件聚合）。"""
     for rec in iter_turns(conv_id):
         yield rec
+
 
 def log_begin(api, target_conv, prompt_file, prompt_text):
     """发送**之前**固化本轮提示词。返回 (turn_id, path)。
@@ -7792,7 +7894,12 @@ def main():
         def _turns_in(fp):
             """单文件的 begin/end 合并（与 iter_turns 同语义，但只读一个文件）。"""
             merged, order = {}, []
-            for rec in _read_jsonl(fp):
+            rows = _read_jsonl(fp)
+            if rows is None:
+                print("WARN: 会话日志读不出来（%s）——本文件跳过" % fp,
+                      file=sys.stderr, flush=True)
+                return []
+            for rec in rows:
                 tid = str(rec.get("turn_id") or "")
                 key = tid or ("__n%d" % len(order))
                 if key not in merged:
@@ -7830,7 +7937,7 @@ def main():
                 want = None      # 默认：全部三桶（行为与之前一致）
 
             rows, incomplete, files = [], [], {}
-            for fp in _log_files():
+            for fp in _all_log_files():
                 bucket = _bucket_of(fp)
                 if want is not None and bucket not in want:
                     continue
