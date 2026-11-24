@@ -85,8 +85,11 @@ def judge_error(own, alert_text):
     own = (own or "").strip()
     text_err = False
     if own and len(own) < 200:
-        core = own.splitlines()[0] if own.splitlines() else ""
-        core = core.strip().rstrip("\t\r\n .。！!")
+        # R377-01：必须拿**整条正文**匹配，不能只看第一行。
+        # 反例：own = "Something went wrong\nPlease try again later."
+        # 只看第一行会误判成错误提示——它带了额外说明，不是纯错误。
+        # 规范化：合并空白 + 去掉首尾标点，再与错误提示整体相等。
+        core = " ".join(own.split()).strip().rstrip(".。!！ ")
         text_err = core in ERROR_PATTERNS
     return (structural or text_err), structural, text_err
 
@@ -315,6 +318,13 @@ def main():
     # 与 chatgpt_send 同口径：**不再按 `#` 删行**。旧版把 Rust 属性
     # `#[derive]`/`#[test]`/`#[cfg]` 和 markdown 标题一起当注释删掉，正文被静默截断
     # （2026-11-21 r1d/r1e 实证）。P1 当时漏改，等于同一条 bug 在第二条通道上复现。
+    # R377-03：NUL / 控制字符 / 无可见正文必须拒绝——两条通道同一口径，
+    # 否则损坏文件从 P1 溜进去，等于校验白做。
+    try:
+        _cs.validate_prompt_text(prompt, prompt_file)
+    except RuntimeError as e:
+        print("ERROR: %s" % e, flush=True)
+        return 2
     prompt = prompt.strip()
     if not prompt:
         print("ERROR: 提示词没有正文：%s" % prompt_file, flush=True)

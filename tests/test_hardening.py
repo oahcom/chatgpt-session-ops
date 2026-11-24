@@ -6110,6 +6110,169 @@ class TestConversationLog(TmpBase):
         self.assertFalse(struct)
         self.assertFalse(text)
 
+    def test_verify_catches_silent_corruption_during_write(self):
+        """回读必须能发现"写进去的内容被悄悄改坏"——这是校验层的独立职责。
+
+        前置的冲突检查只比对迁移前的内容；若写入环节本身损坏，只有回读校验能抓。
+        """
+        cid = "88889999-aaaa-4bbb-8ccc-ddddeeeeffff"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-corrupt")
+        rec = {"turn_id": "t-corrupt", "phase": "begin", "conv_id": "",
+               "prompt": "原始正文", "prompt_chars": 4, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        real = m._log_write
+        def corrupt(path, record):
+            bad = dict(record)
+            if bad.get("phase") == "begin" and "prompt" in bad:
+                bad["prompt"] = "被写坏的正文"      # 静默篡改，不抛错
+            return real(path, bad)
+        m._log_write = corrupt
+        try:
+            out = m._migrate_pending("t-corrupt", begin, cid)
+        finally:
+            m._log_write = real
+        self.assertIsNone(out, "回读必须发现内容不一致")
+        self.assertTrue(os.path.exists(begin), "内容不一致时 pending 必须保留")
+
+    def test_verify_catches_conflicting_duplicates_when_source_matches_one(self):
+        """目标有同键冲突，且 source 正好等于其中一条 → 冲突检查放行，回读必须拦下。"""
+        cid = "9999aaaa-bbbb-4ccc-8ddd-eeeeffff0000"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-dup3")
+        rec = {"turn_id": "t-dup3", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            # 三行同键：首行与末行都等于 source，中间夹一条坏值。
+            #  - 前置冲突检查取**末行**（dict 覆盖）= source → 放行
+            #  - 回读的 payload 校验取**首行**（setdefault）= source → 放行
+            #  - 只有"重复键内部一致性检查"能发现中间那条坏值
+            f.write(json.dumps(dict(rec, conv_id=cid), ensure_ascii=False) + "\n")
+            f.write(json.dumps(dict(rec, conv_id=cid, prompt="中间的坏值"), ensure_ascii=False) + "\n")
+            f.write(json.dumps(dict(rec, conv_id=cid), ensure_ascii=False) + "\n")
+        out = m._migrate_pending("t-dup3", begin, cid)
+        self.assertIsNone(out, "目标存在互相冲突的重复键，不得删 pending")
+        self.assertTrue(os.path.exists(begin))
+
+    # ---------- R377-01：正文错误判定必须整条匹配 ----------
+
+    def test_judge_error_multiline_error_with_extra_text_is_not_error(self):
+        """反例：第一行是错误提示、但整条带了额外说明 → 不算错误提示。"""
+        p1 = _load_p1()
+        own = "Something went wrong\nPlease try again later."
+        has, _struct, text_err = p1.judge_error(own, "")
+        self.assertFalse(text_err, "不能只看第一行就判错")
+        self.assertFalse(has)
+
+    def test_judge_error_whole_body_error_is_error(self):
+        """整条正文就是一句错误提示 → 判错。"""
+        p1 = _load_p1()
+        for own in ("Something went wrong.", "出现错误！", "  网络错误  "):
+            has, _s, text_err = p1.judge_error(own, "")
+            self.assertTrue(text_err, own)
+            self.assertTrue(has)
+
+    # ---------- R377-02：回读必须校验内容一致性 ----------
+
+    def test_migration_verify_detects_payload_mismatch(self):
+        """目标里同键但内容被写坏：即使键齐全也不得删 pending。"""
+        cid = "55556666-7777-4888-8999-aaaabbbbcccc"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-payload")
+        rows = [
+            {"turn_id": "t-payload", "phase": "begin", "conv_id": "",
+             "prompt": "正确提示词", "prompt_chars": 5, "status": None, "reply": ""},
+            {"turn_id": "t-payload", "phase": "end", "conv_id": "", "reply": "正确回复",
+             "reply_chars": 4, "reply_state": "captured", "status": 200},
+        ]
+        with open(begin, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+        bad = [dict(rows[0], conv_id=cid, prompt="被写坏的提示词"),
+               dict(rows[1], conv_id=cid, reply="被写坏的回复")]
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            for r in bad:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+        out = m._migrate_pending("t-payload", begin, cid)
+        self.assertIsNone(out, "内容不一致必须报未完成")
+        self.assertTrue(os.path.exists(begin), "内容不一致时 pending 必须保留")
+
+    def test_migration_verify_rejects_conflicting_duplicate_keys(self):
+        """目标里同一键出现两条且内容不同：拒绝迁移、保留 pending。"""
+        cid = "66667777-8888-4999-8aaa-bbbbccccdddd"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-dup2")
+        rec = {"turn_id": "t-dup2", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(json.dumps(dict(rec, conv_id=cid, prompt="A"), ensure_ascii=False) + "\n")
+            f.write(json.dumps(dict(rec, conv_id=cid, prompt="B"), ensure_ascii=False) + "\n")
+        self.assertIsNone(m._migrate_pending("t-dup2", begin, cid))
+        self.assertTrue(os.path.exists(begin))
+
+    # ---------- R377-03：提示词校验 ----------
+
+    def test_validate_prompt_rejects_nul(self):
+        """8141 个 NUL 必须被拒——这是真实事故（10:26 写入崩溃）。"""
+        with self.assertRaises(RuntimeError):
+            m.validate_prompt_text(chr(0) * 8141, "p.md")
+
+    def test_validate_prompt_rejects_single_nul_in_body(self):
+        """正常正文里混一个 NUL 同样可疑，必须拒。"""
+        with self.assertRaises(RuntimeError):
+            m.validate_prompt_text("正常正文" + chr(0) + "继续", "p.md")
+
+    def test_validate_prompt_rejects_control_chars(self):
+        """除 CR/LF/TAB 外的 Cc 控制字符一律拒。"""
+        with self.assertRaises(RuntimeError):
+            m.validate_prompt_text("正文" + chr(7) + "响铃", "p.md")
+
+    def test_validate_prompt_rejects_whitespace_only(self):
+        """纯空白/换行没有可见正文，必须拒。"""
+        with self.assertRaises(RuntimeError):
+            m.validate_prompt_text("   \n\n \t \n", "p.md")
+
+    def test_validate_prompt_accepts_normal_text(self):
+        """正常中文/英文 Markdown（含 Tab、CRLF）必须通过。"""
+        m.validate_prompt_text("# 标题\n\n正文 with tab\tand CRLF\r\n", "p.md")
+        m.validate_prompt_text("English markdown body", "p.md")
+
+    def test_nul_prompt_creates_no_begin_record(self):
+        """校验失败时不得留下 begin——那一轮根本没发生。"""
+        cid = "77778888-9999-4aaa-8bbb-ccccddddeeee"
+        pf = os.path.join(self.tmp, "nul.md")
+        with open(pf, "wb") as f:
+            f.write(bytes([0]) * 100)
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "x"))
+        with self.assertRaises(RuntimeError):
+            m.send_prompt(api, cid, pf)
+        self.assertEqual(api.sent, [], "校验失败绝不能发送")
+        self.assertEqual(list(m.iter_turns(cid)), [], "校验失败不得留下 begin")
+        pend = []
+        try:
+            pend = [n for n in os.listdir(m.log_pending_dir()) if n.endswith(".jsonl")]
+        except OSError:
+            pass
+        self.assertEqual(pend, [], "也不得留下 pending")
+
     # ---------- R375-01：DOM 完成状态的稳定性证据 ----------
 
     def test_p1_new_node_without_streaming_flag_not_captured(self):

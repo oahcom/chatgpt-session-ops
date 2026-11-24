@@ -118,6 +118,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import unicodedata
 import tempfile
 import threading
 import time
@@ -6131,13 +6132,25 @@ def _migrate_pending(turn_id, begin_path, real_conv):
     if verify_rows is None:
         print("FAIL: 迁移后回读目标失败（%s）——pending 保留" % target, flush=True)
         return None
-    have = {(r.get("turn_id"), r.get("phase") or "turn") for r in verify_rows}
-    need = {(rec.get("turn_id"), rec.get("phase") or "turn") for rec in source}
-    missing = need - have
-    if missing:
-        print("FAIL: 迁移后校验缺行 %r——pending 保留，可重试" % (sorted(missing),),
-              flush=True)
-        return None
+    # R377-02：不能只校验"键存在"，必须校验**内容一致**。
+    # 反例：同键被静默写坏 → 键集合完整、missing 为空 → pending 被删，内容却已损坏。
+    verified = {}
+    for r in verify_rows:
+        k = (r.get("turn_id"), r.get("phase") or "turn")
+        if k in verified and _turn_payload(verified[k]) != _turn_payload(r):
+            # 同一键在目标里出现多条且内容不一致：无法确定哪份可信，拒绝迁移
+            print("FAIL: 目标存在重复键且内容冲突 %r——pending 保留" % (k,), flush=True)
+            return None
+        verified.setdefault(k, r)
+    for rec in source:
+        key = (rec.get("turn_id"), rec.get("phase") or "turn")
+        actual = verified.get(key)
+        if actual is None:
+            print("FAIL: 迁移后缺行 %r——pending 保留，可重试" % (key,), flush=True)
+            return None
+        if _turn_payload(actual) != _turn_payload(rec):
+            print("FAIL: 迁移后内容不一致 %r——pending 保留" % (key,), flush=True)
+            return None
 
     try:
         os.remove(begin_path)
@@ -6239,19 +6252,41 @@ def _log_excerpt(text, term, width=80):
             ("…" if b < len(text) else ""))
 
 
+def validate_prompt_text(text, prompt_file):
+    """校验提示词正文。拒绝损坏/无实质内容，避免把垃圾当指令发出去（R377-03）。
+
+    为什么必须显式拒绝：`"\x00".strip()` 仍等于 `"\x00"`，
+    旧版 `if not text.strip()` 拦不住纯 NUL 文件——8141 个 NUL 会直接发送，
+    还会在日志里留下"正常提示词"的 sha256，事后看不出是损坏。
+
+    判据（Owner 口径）：拒绝任何 NUL；拒绝除 \r\n\t 外的 Cc 控制字符；
+    并要求至少存在一个可见非空白字符。
+    """
+    if not text:
+        raise RuntimeError("提示词文件为空：%s" % prompt_file)
+    if "\x00" in text:
+        raise RuntimeError("提示词文件含 NUL 字符，疑似损坏：%s" % prompt_file)
+    for ch in text:
+        if unicodedata.category(ch) == "Cc" and ch not in "\r\n\t":
+            raise RuntimeError("提示词文件含非法控制字符：%s" % prompt_file)
+    if not any(ch.isprintable() and not ch.isspace() for ch in text):
+        raise RuntimeError("提示词文件不含可见正文：%s" % prompt_file)
+    return text
+
+
 def load_prompt_text(prompt_file):
-    """读取并规整提示词，返回**实际会被发送**的正文。
+    """读取、校验并规整提示词，返回**实际会被发送**的正文。
 
     R373-07：发送前由调用方取一次，之后整轮都用这一份不可变文本——
     绝不允许"发送后重新读文件"来补写日志（文件可能已被改写或删除）。
+    R377-03：校验必须在写 begin **之前**完成；校验失败不产生 begin 记录。
     """
     try:
         with open(prompt_file, encoding="utf-8") as f:
             text = f.read()
     except OSError as e:
         raise RuntimeError("读不到提示词文件 %s：%s" % (prompt_file, e))
-    if not text.strip():
-        raise RuntimeError("提示词文件为空：%s" % prompt_file)
+    validate_prompt_text(text, prompt_file)
     text = text.strip()
     if not text:
         raise RuntimeError("提示词没有正文：%s" % prompt_file)
