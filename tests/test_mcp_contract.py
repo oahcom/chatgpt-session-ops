@@ -1,0 +1,645 @@
+"""SDK-independent contract tests for the Session Ops MCP service.
+
+Run in a bare environment:
+    python -m unittest discover -s tests
+
+These tests deliberately do not import or require the MCP SDK.
+Authentication is injected as a verified AuthContext. No JWKS network access
+or real Memory Adapter subprocess is used.
+"""
+
+import importlib
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from src.session_ops.authority import (
+    Page,
+    Principal,
+    SecureWorkItemStore,
+)
+from src.session_ops.mcp_auth import (
+    AuthContext,
+    principal_from_claims,
+)
+from src.session_ops.mcp_server import (
+    MAX_CONTEXT_ENTRIES,
+    MAX_CURSOR_CHARS,
+    MAX_PAGE_SIZE,
+    MAX_STRUCTURED_CONTENT_BYTES,
+    MCPToolService,
+)
+
+
+TENANT = "tenant-a"
+OWNER = "realm-a:owner"
+OTHER = "realm-b:other"
+
+WORK_ITEM_ID = "wi_12345678-1234-4234-8234-123456789abc"
+SESSION_ID = "12345678-1234-4234-8234-123456789abc"
+LINK_ID = "sl_12345678-1234-4234-8234-123456789abc"
+
+ALL_SCOPES = (
+    "session_ops.work_item.read",
+    "session_ops.work_item.write",
+    "session_ops.session.read",
+    "session_ops.session.write",
+    "session_ops.context.read",
+)
+
+
+def make_auth(
+    tenant=TENANT,
+    principal_id=OWNER,
+    scopes=ALL_SCOPES,
+):
+    """Inject an already-verified identity; never perform network auth."""
+    return AuthContext(
+        principal=Principal(
+            tenant_id=tenant,
+            principal_id=principal_id,
+        ),
+        scopes=scopes,
+        issuer="https://identity.example.test/realms/test",
+        subject=principal_id,
+        realm_namespace="test",
+    )
+
+
+class FakeStore:
+    """Deterministic authority double for dispatch contract tests."""
+
+    def __init__(self):
+        self.calls = []
+        self.created = []
+
+    def create_work_item(self, principal):
+        self.calls.append(("create", principal))
+        item = {
+            "work_item_id": WORK_ITEM_ID,
+            "status": "active",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+        }
+        self.created.append(item)
+        return item
+
+    def get_work_item(self, principal, work_item_id):
+        self.calls.append(("get", principal, work_item_id))
+        return {
+            "work_item_id": work_item_id,
+            "status": "active",
+        }
+
+    def list_work_items(
+        self, principal, *, status=None, page_size=25, cursor=None
+    ):
+        self.calls.append(
+            ("list_work_items", principal, status, page_size, cursor)
+        )
+        return Page(
+            [{"work_item_id": WORK_ITEM_ID}],
+            next_cursor="work-items-next" if cursor is None else None,
+        )
+
+    def set_status(
+        self, principal, work_item_id, status,
+        expected_updated_at=None, request_id=None,
+    ):
+        self.calls.append(
+            ("update", principal, work_item_id, status)
+        )
+        return {
+            "work_item_id": work_item_id,
+            "status": status,
+        }
+
+    def grant(
+        self, principal, work_item_id, target_principal_id,
+        scope, request_id=None,
+    ):
+        self.calls.append(("grant", principal, target_principal_id, scope))
+
+    def revoke(
+        self, principal, work_item_id, target_principal_id,
+        scope, request_id=None,
+    ):
+        self.calls.append(("revoke", principal, target_principal_id, scope))
+
+    def link_session(
+        self, principal, session_id, work_item_id,
+        evidence=None, request_id=None,
+    ):
+        self.calls.append(("link", principal, session_id, work_item_id))
+        return {
+            "link_id": LINK_ID,
+            "session_id": session_id,
+            "work_item_id": work_item_id,
+        }
+
+    def unlink_session(
+        self, principal, session_id,
+        expected_link_id=None, request_id=None,
+    ):
+        self.calls.append(("unlink", principal, session_id))
+        return SimpleNamespace(
+            link_id=LINK_ID,
+            session_id=session_id,
+            work_item_id=WORK_ITEM_ID,
+            linked_at="2026-01-01T00:00:00Z",
+            unlinked_at="2026-01-02T00:00:00Z",
+        )
+
+    def list_sessions(
+        self, principal, work_item_id, *,
+        include_unlinked=False, page_size=25, cursor=None,
+    ):
+        self.calls.append(
+            ("list_sessions", principal, work_item_id,
+             page_size, cursor)
+        )
+        return Page(
+            [{
+                "link_id": LINK_ID,
+                "session_id": SESSION_ID,
+                "work_item_id": work_item_id,
+            }],
+            next_cursor="sessions-next" if cursor is None else None,
+        )
+
+    def get_active_link(self, principal, session_id):
+        self.calls.append(("get_active_link", principal, session_id))
+        return SimpleNamespace(
+            link_id=LINK_ID,
+            session_id=session_id,
+            work_item_id=WORK_ITEM_ID,
+        )
+
+
+class FakeMemoryAdapterClient:
+    """In-process replacement: no executable or subprocess is started."""
+
+    instances = []
+
+    def __init__(self, command, timeout_seconds):
+        self.command = command
+        self.timeout_seconds = timeout_seconds
+        self.instances.append(self)
+
+    def retrieve(self, *, work_item_id, session_id, query, limit):
+        return SimpleNamespace(
+            entries=[
+                SimpleNamespace(
+                    memory_id="memory-1",
+                    session_id=session_id,
+                    content="test memory",
+                    provenance={"source": "test"},
+                    created_at="2026-01-01T00:00:00Z",
+                    score=0.9,
+                )
+            ][:limit]
+        )
+
+
+class MCPContractTests(unittest.TestCase):
+
+    def setUp(self):
+        self.store = FakeStore()
+        self.service = MCPToolService(self.store)
+        self.auth = make_auth()
+
+    def dispatch(self, name, arguments=None, service=None):
+        return (service or self.service).dispatch(
+            name,
+            arguments or {},
+            self.auth,
+            request_id="test-request",
+        )
+
+    def assert_success(self, result):
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["meta"]["contract_version"], "0.1")
+        self.assertEqual(result["meta"]["request_id"], "test-request")
+        self.assertIn("data", result)
+
+    def assert_error(self, result, code):
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["error"]["code"], code)
+        self.assertIn("message", result["error"])
+        self.assertIn("retryable", result["error"])
+        self.assertIn("details", result["error"])
+
+    # --------------------------------------------------------------
+    # Ten tools: one successful dispatch each
+    # --------------------------------------------------------------
+
+    def test_work_item_create(self):
+        result = self.dispatch("work_item.create")
+        self.assert_success(result)
+        self.assertEqual(result["data"]["work_item_id"], WORK_ITEM_ID)
+
+    def test_work_item_get(self):
+        result = self.dispatch(
+            "work_item.get", {"work_item_id": WORK_ITEM_ID}
+        )
+        self.assert_success(result)
+        self.assertEqual(result["data"]["status"], "active")
+
+    def test_work_item_list(self):
+        result = self.dispatch("work_item.list", {"page_size": 10})
+        self.assert_success(result)
+        self.assertEqual(len(result["data"]["items"]), 1)
+
+    def test_work_item_update(self):
+        result = self.dispatch(
+            "work_item.update",
+            {"work_item_id": WORK_ITEM_ID, "status": "paused"},
+        )
+        self.assert_success(result)
+        self.assertEqual(result["data"]["status"], "paused")
+
+    def test_work_item_grant(self):
+        result = self.dispatch(
+            "work_item.grant",
+            {
+                "work_item_id": WORK_ITEM_ID,
+                "target_principal_id": "realm-a:reader",
+                "scope": "read",
+            },
+        )
+        self.assert_success(result)
+        self.assertTrue(result["data"]["granted"])
+
+    def test_work_item_revoke(self):
+        result = self.dispatch(
+            "work_item.revoke",
+            {
+                "work_item_id": WORK_ITEM_ID,
+                "target_principal_id": "realm-a:reader",
+                "scope": "read",
+            },
+        )
+        self.assert_success(result)
+        self.assertTrue(result["data"]["revoked"])
+
+    def test_session_link(self):
+        result = self.dispatch(
+            "session.link",
+            {
+                "session_id": SESSION_ID,
+                "work_item_id": WORK_ITEM_ID,
+            },
+        )
+        self.assert_success(result)
+        self.assertEqual(result["data"]["session_id"], SESSION_ID)
+
+    def test_session_unlink(self):
+        result = self.dispatch(
+            "session.unlink", {"session_id": SESSION_ID}
+        )
+        self.assert_success(result)
+        self.assertTrue(result["data"]["unlinked"])
+
+    def test_session_list(self):
+        result = self.dispatch(
+            "session.list", {"work_item_id": WORK_ITEM_ID}
+        )
+        self.assert_success(result)
+        self.assertEqual(len(result["data"]["items"]), 1)
+
+    def test_session_context_with_injected_adapter(self):
+        adapter_module = importlib.import_module(
+            "src.session_ops.memory_adapter_client"
+        )
+        FakeMemoryAdapterClient.instances.clear()
+
+        with patch.object(
+            adapter_module,
+            "MemoryAdapterClient",
+            FakeMemoryAdapterClient,
+        ):
+            configured = MCPToolService(
+                self.store,
+                memory_adapter=["python", "-m", "memory_adapter"],
+            )
+            result = self.dispatch(
+                "session.context",
+                {
+                    "session_id": SESSION_ID,
+                    "query": "test query",
+                    "limit": 1,
+                },
+                service=configured,
+            )
+
+        self.assert_success(result)
+        self.assertEqual(len(result["data"]["entries"]), 1)
+        self.assertEqual(
+            result["data"]["entries"][0]["trust"],
+            "untrusted_historical_context",
+        )
+        self.assertEqual(len(FakeMemoryAdapterClient.instances), 1)
+
+    # --------------------------------------------------------------
+    # Authentication and identity isolation
+    # --------------------------------------------------------------
+
+    def test_identity_cannot_be_injected_through_arguments(self):
+        for identity_field in ("principal_id", "tenant_id"):
+            with self.subTest(field=identity_field):
+                result = self.dispatch(
+                    "work_item.create",
+                    {identity_field: "attacker-controlled"},
+                )
+                self.assert_error(result, "INVALID_ARGUMENT")
+
+        self.assertEqual(
+            [call[0] for call in self.store.calls],
+            [],
+        )
+
+    def test_missing_auth_context_is_unauthenticated(self):
+        result = self.service.dispatch(
+            "work_item.create",
+            {},
+            None,
+            request_id="test-request",
+        )
+        self.assert_error(result, "UNAUTHENTICATED")
+
+    def test_insufficient_scope_is_permission_denied(self):
+        auth = make_auth(scopes=("session_ops.work_item.read",))
+        result = self.service.dispatch(
+            "work_item.create", {}, auth,
+            request_id="test-request",
+        )
+        self.assert_error(result, "PERMISSION_DENIED")
+
+    # --------------------------------------------------------------
+    # Pagination and bounds
+    # --------------------------------------------------------------
+
+    def test_work_item_list_pagination(self):
+        first = self.dispatch(
+            "work_item.list", {"page_size": 10}
+        )
+        self.assert_success(first)
+        cursor = first["data"]["next_cursor"]
+        self.assertEqual(cursor, "work-items-next")
+
+        second = self.dispatch(
+            "work_item.list",
+            {"page_size": 10, "cursor": cursor},
+        )
+        self.assert_success(second)
+        self.assertIsNone(second["data"]["next_cursor"])
+
+        calls = [
+            call for call in self.store.calls
+            if call[0] == "list_work_items"
+        ]
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][4], cursor)
+
+    def test_session_list_pagination(self):
+        first = self.dispatch(
+            "session.list",
+            {"work_item_id": WORK_ITEM_ID, "page_size": 10},
+        )
+        self.assert_success(first)
+        cursor = first["data"]["next_cursor"]
+        self.assertEqual(cursor, "sessions-next")
+
+        second = self.dispatch(
+            "session.list",
+            {
+                "work_item_id": WORK_ITEM_ID,
+                "page_size": 10,
+                "cursor": cursor,
+            },
+        )
+        self.assert_success(second)
+        self.assertIsNone(second["data"]["next_cursor"])
+
+        calls = [
+            call for call in self.store.calls
+            if call[0] == "list_sessions"
+        ]
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[1][4], cursor)
+
+    def test_page_size_upper_bound(self):
+        self.assertEqual(MAX_PAGE_SIZE, 50)
+
+        for tool, arguments in (
+            ("work_item.list", {"page_size": MAX_PAGE_SIZE + 1}),
+            (
+                "session.list",
+                {
+                    "work_item_id": WORK_ITEM_ID,
+                    "page_size": MAX_PAGE_SIZE + 1,
+                },
+            ),
+        ):
+            with self.subTest(tool=tool):
+                result = self.dispatch(tool, arguments)
+                self.assert_error(result, "INVALID_ARGUMENT")
+
+    def test_cursor_upper_bound(self):
+        self.assertEqual(MAX_CURSOR_CHARS, 2048)
+
+        for tool, arguments in (
+            ("work_item.list", {"cursor": "x" * 2049}),
+            (
+                "session.list",
+                {
+                    "work_item_id": WORK_ITEM_ID,
+                    "cursor": "x" * 2049,
+                },
+            ),
+        ):
+            with self.subTest(tool=tool):
+                result = self.dispatch(tool, arguments)
+                self.assert_error(result, "INVALID_ARGUMENT")
+
+    def test_context_limit_upper_bound(self):
+        result = self.dispatch(
+            "session.context",
+            {
+                "session_id": SESSION_ID,
+                "query": "query",
+                "limit": MAX_CONTEXT_ENTRIES + 1,
+            },
+        )
+        self.assert_error(result, "INVALID_ARGUMENT")
+
+    # --------------------------------------------------------------
+    # Non-disclosure and trusted evidence
+    # --------------------------------------------------------------
+
+    def test_cross_tenant_and_missing_resource_are_indistinguishable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SecureWorkItemStore(
+                Path(directory) / "authority.sqlite3"
+            )
+            store.initialize()
+
+            owner = Principal(TENANT, OWNER)
+            foreign = Principal("tenant-b", "realm-b:other")
+            created = store.create_work_item(owner)
+
+            service = MCPToolService(store)
+            auth = make_auth(
+                tenant=foreign.tenant_id,
+                principal_id=foreign.principal_id,
+            )
+
+            cross_tenant = service.dispatch(
+                "work_item.get",
+                {"work_item_id": created.work_item_id},
+                auth,
+                request_id="same-request",
+            )
+
+            nonexistent = service.dispatch(
+                "work_item.get",
+                {"work_item_id": WORK_ITEM_ID},
+                auth,
+                request_id="same-request",
+            )
+
+            self.assert_error(cross_tenant, "NOT_FOUND")
+            self.assert_error(nonexistent, "NOT_FOUND")
+            self.assertEqual(
+                cross_tenant["error"],
+                nonexistent["error"],
+            )
+
+    def test_unconfirmed_f13_evidence_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SecureWorkItemStore(
+                Path(directory) / "authority.sqlite3"
+            )
+            store.initialize()
+            principal = Principal(TENANT, OWNER)
+            item = store.create_work_item(principal)
+
+            service = MCPToolService(store)
+            result = service.dispatch(
+                "session.link",
+                {
+                    "session_id": SESSION_ID,
+                    "work_item_id": item.work_item_id,
+                },
+                self.auth,
+                request_id="test-request",
+            )
+
+            self.assert_error(result, "QUARANTINED_SESSION")
+
+    def test_caller_supplied_evidence_is_rejected_by_authority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SecureWorkItemStore(
+                Path(directory) / "authority.sqlite3"
+            )
+            store.initialize()
+            principal = Principal(TENANT, OWNER)
+            item = store.create_work_item(principal)
+
+            with self.assertRaises(Exception) as caught:
+                store.link_session(
+                    principal,
+                    SESSION_ID,
+                    item.work_item_id,
+                    evidence={"confirmed": True, "evidence_complete": True},
+                )
+
+            self.assertEqual(
+                caught.exception.__class__.__name__,
+                "QuarantineNotCleared",
+            )
+
+    # --------------------------------------------------------------
+    # Dependency and response limits
+    # --------------------------------------------------------------
+
+    def test_context_without_adapter_is_dependency_unavailable(self):
+        service = MCPToolService(self.store)
+        result = service.dispatch(
+            "session.context",
+            {
+                "session_id": SESSION_ID,
+                "query": "test",
+            },
+            self.auth,
+            request_id="test-request",
+        )
+        self.assert_error(result, "DEPENDENCY_UNAVAILABLE")
+        self.assertEqual(self.store.calls, [])
+
+    def test_oversized_response_becomes_resource_exhausted(self):
+        class OversizedStore(FakeStore):
+            def create_work_item(self, principal):
+                return {"content": "x" * MAX_STRUCTURED_CONTENT_BYTES}
+
+        service = MCPToolService(OversizedStore())
+        result = service.dispatch(
+            "work_item.create",
+            {},
+            self.auth,
+            request_id="test-request",
+        )
+        self.assert_error(result, "RESOURCE_EXHAUSTED")
+
+    # --------------------------------------------------------------
+    # Pure mcp_auth claim-to-principal mapping
+    # --------------------------------------------------------------
+
+    def test_verified_claims_map_to_namespaced_principal(self):
+        claims = {
+            "iss": "https://identity.example.test/realms/test",
+            "aud": "https://mcp.example.test/mcp",
+            "sub": "subject-123",
+            "tenant_id": TENANT,
+            "scope": "session_ops.work_item.read session_ops.session.read",
+        }
+
+        auth = principal_from_claims(
+            claims,
+            expected_issuer=claims["iss"],
+            expected_audience=claims["aud"],
+            realm_namespace="realm-a",
+        )
+
+        self.assertEqual(auth.principal.tenant_id, TENANT)
+        self.assertEqual(
+            auth.principal.principal_id,
+            "realm-a:subject-123",
+        )
+        self.assertIn("session_ops.work_item.read", auth.scopes)
+        self.assertNotIn("session_ops.work_item.write", auth.scopes)
+
+    def test_claim_mapping_rejects_wrong_audience(self):
+        claims = {
+            "iss": "https://identity.example.test/realms/test",
+            "aud": "https://wrong.example.test/mcp",
+            "sub": "subject-123",
+            "tenant_id": TENANT,
+            "scope": "session_ops.work_item.read",
+        }
+
+        from src.session_ops.mcp_auth import AuthenticationError
+
+        with self.assertRaises(AuthenticationError):
+            principal_from_claims(
+                claims,
+                expected_issuer=claims["iss"],
+                expected_audience="https://mcp.example.test/mcp",
+                realm_namespace="realm-a",
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
