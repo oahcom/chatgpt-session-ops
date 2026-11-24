@@ -28,7 +28,9 @@ python -m unittest tests.test_send_prompt_for_work_item  # 6
 python -m unittest tests.test_mcp_transport              # 11
 python -m unittest tests.test_mcp_alg_confusion          # 7
 python -m unittest tests.test_mcp_rs256                  # 8
-python -m pytest -q                                      # 719 passed, 6 skipped
+python -m unittest tests.test_mcp_sdk_integration        # 4 (skips without mcp)
+python -m pytest -q                                      # 723 passed, 6 skipped
+                                                         # 719 passed, 10 skipped without mcp
 ```
 
 **What PROVEN means here, and what it does not.** PROVEN means the named case
@@ -220,6 +222,24 @@ was already running.
 | 19 | An unauthenticated caller sends many random `kid` values to amplify JWKS fetches | Fresh-cache misses fail without fetching. Expired-cache refresh is single-flight and backs off after failure. The lock is never held across network I/O. | `test:test_fresh_cache_unknown_kid_never_downloads` `test:test_expired_cache_concurrent_refresh_is_single_flight` `test:test_failed_refresh_is_not_retried_inside_backoff_window` `test:test_refresh_can_retry_after_backoff_expires` (test_mcp_transport) | PROVEN |
 | 20 | An attacker-influenced issuer points discovery at an internal address | Redirects refused. HTTPS destinations resolved; any non-global answer rejects the whole URL. | `test:test_non_override_discovery_rejects_different_jwks_origin` `test:test_default_fetcher_does_not_follow_redirects` `test:test_https_jwks_rejects_loopback_link_local_and_private_ips` `test:test_jwks_rejects_all_dns_answers_if_any_is_non_global` (test_mcp_transport) | PROVEN, **partial** |
 | 21 | A request targets the MCP endpoint's subpaths | Authenticated. Health and protected-resource metadata stay public. | `test:test_mcp_subpath_is_authenticated` `test:test_mcp_endpoint_itself_is_authenticated` `test:test_health_and_protected_resource_metadata_remain_public` (test_mcp_transport) | PROVEN |
+| 22 | The pinned SDK's API drifts from what `build_mcp_server` assumes | Build fails at CI, not at deploy. `Server`, `on_list_tools`, `on_call_tool`, `streamable_http_app` keywords and `CallToolResult.structured_content` are all exercised against the real `mcp==2.3.0`. | `test:test_builds_real_starlette_app_at_verifier_audience_path` `test:test_real_sdk_registers_list_and_call_handlers` `test:test_real_tools_list_returns_the_frozen_tool_surface` `test:test_real_tools_call_rejects_missing_request_authentication` (test_mcp_sdk_integration) | PROVEN `mutation-checked` |
+
+**Row 22 note — the assumption we shipped on.** Before this row existed, every
+claim `build_mcp_server` makes about `mcp==2.3.0` was verified by hand once.
+`test_mcp_transport` builds the app against hand-written `ModuleType` stubs, so
+CI validated our *belief* about the SDK, not the SDK. Renaming a keyword in
+`streamable_http_app` would have shipped green and failed at first deploy.
+
+An earlier draft of this work recorded a wrong conclusion: the PyPI README shows
+`from mcp.server import MCPServer`, which was read as "`Server` was removed".
+Reading the wheel settles it — `mcp/server/__init__.py` still exports `Server`
+from `.lowlevel`, and `MCPServer` is an added high-level wrapper, not a
+replacement. **README is the marketing surface; `__init__.py` is the contract.**
+
+One mutation was deliberately left green: renaming `structured_content` to
+`structuredContent` changes nothing, because the SDK sets
+`alias_generator=to_camel` with `populate_by_name=True`. That is an equivalent
+mutant. Recorded so it is not mistaken for a weak case on a re-run.
 
 **Row 20 is partial on purpose.** The address check and the HTTP connection
 perform *separate* DNS resolutions, so a rebinding attacker can answer
@@ -239,7 +259,7 @@ These are gaps, stated so nobody reads the eighteen rows above as completeness.
 | Landing event bound to a WorkItem | `authority_landing_events` stores `session_id` but not `work_item_id`. | If signing succeeds and linking fails, the unconsumed event can be claimed by another WorkItem that holds `write` on that conversation. Bounded, accepted, recorded. |
 | DNS rebinding | Rows 20's validation lookup and the client's connection lookup are separate resolutions. | The SSRF defense is real but incomplete. Requires IP pinning. Recorded at the call site. |
 | Mutation coverage is not uniform | Five rows are `mutation-checked`; the rest are not. | Treat every unmarked PROVEN as "asserts the behaviour", not "proven necessary" — that is exactly how row 12 stayed PROVEN for three commits. |
-| Security tests can skip to green | `test_mcp_rs256` skips as a unit without `cryptography`. The unit job now installs `requirements-mcp.txt` and fails if the rs256 skip reason appears anyway. | Before that guard, the whole signature path could be skipped and the log still read green. Any future optional dependency must get the same treatment. |
+| Security tests can skip to green | `test_mcp_rs256` and `test_mcp_sdk_integration` both skip as units when their optional dependency is absent. The unit job installs `requirements-mcp.txt` and asserts the skip count is unchanged, printing every skip reason on failure; the `sdk` job asserts its four cases executed. | Before those guards, the signature path and the SDK compatibility surface could both be skipped and the log still read green. Any future optional dependency needs the same treatment. |
 | `unlink_session` `rowcount` guard is unreachable | `BEGIN IMMEDIATE` precedes the SELECT and the SELECT filters `unlinked_at IS NULL`, so SQLite's single-writer rule makes `rowcount != 1` impossible. | Defence in depth, not evidence. It cannot be tested, and pretending otherwise would be worse than saying so. |
 | `aud` is checked twice, once unheld | Deleting the `validate_registered_claims` check changes no test outcome. | Redundant layer. Harmless, but not a second proof. |
 | Real thread-level races | No test interleaves two connections. | Row 16 proves the guard, not the race. |
@@ -281,6 +301,11 @@ the row was downgraded.
 | `verify(signature, signing_input, ...)` arguments swapped | 1 failed — the positive control | Row 4b. |
 | `PKCS1v15()` replaced with `PSS(...)` | 1 failed — the positive control | Row 4b. |
 | adapter oversize condition short-circuited to `False` | 1 failed — the `session.context` oversize case; the payload returned verbatim | Row 18 adapter half was unheld. Closed. |
+| `streamable_http_path=endpoint_path` → `"/wrong"` | 1 failed — the audience-path case | Row 22 route claim is held. |
+| `is_error=not envelope["ok"]` → `is_error=False` | 1 failed — the unauthenticated `tools/call` case | Row 22 envelope claim is held. |
+| `structured_content=envelope` → `structuredResult=envelope` | 1 failed — pydantic rejects the unknown field | Row 22 field-name claim is held. |
+| `for name in TOOL_SCHEMAS` → `list(TOOL_SCHEMAS)[:-1]` | 1 failed — the tool-surface case | Row 22 surface claim is held. |
+| `structured_content` → `structuredContent` | **all 4 green** | Equivalent mutant: SDK sets `alias_generator=to_camel` with `populate_by_name=True`. Both spellings are valid. Not a gap. |
 
 The two lines that still read "all green" are the residue, and they are not the
 same kind of thing. The `aud` one is a redundant second layer with the behaviour
