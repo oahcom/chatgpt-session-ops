@@ -13,6 +13,7 @@ import base64
 import ipaddress
 import json
 import re
+import socket
 import threading
 import time
 import urllib.error
@@ -459,6 +460,56 @@ def _validate_https_url(value: Any, description: str) -> str:
     return value
 
 
+def _validate_public_https_url(value: Any, description: str) -> str:
+    """Require HTTPS and reject destinations resolving to non-public IPs."""
+    value = _validate_https_url(value, description)
+    parsed = urlparse(value)
+    host = parsed.hostname
+    if not host:
+        raise AuthenticationError("%s URL has no hostname" % description)
+
+    try:
+        literal = ipaddress.ip_address(host)
+        addresses = [literal]
+    except ValueError:
+        try:
+            # Residual DNS-rebinding risk: this validation lookup is separate from
+            # the HTTP client's later connection lookup, so DNS can return a
+            # different address at connect time. This check is not a complete
+            # SSRF defense. A stronger mitigation pins the validated IP for the
+            # connection while preserving TLS SNI and certificate-hostname
+            # verification (or equivalently verifies the connected peer against
+            # the validated address and certificate identity).
+            records = socket.getaddrinfo(
+                host,
+                parsed.port or 443,
+                type=socket.SOCK_STREAM,
+            )
+        except OSError as exc:
+            raise AuthenticationError(
+                "%s hostname could not be resolved" % description
+            ) from exc
+        addresses = []
+        for record in records:
+            try:
+                addresses.append(ipaddress.ip_address(record[4][0]))
+            except ValueError as exc:
+                raise AuthenticationError(
+                    "%s hostname resolved to an invalid address" % description
+                ) from exc
+
+    if not addresses:
+        raise AuthenticationError("%s hostname has no addresses" % description)
+
+    # Fail closed if even one DNS answer is private, loopback, link-local,
+    # reserved, multicast, unspecified, or otherwise non-global.
+    if any(not address.is_global for address in addresses):
+        raise AuthenticationError(
+            "%s URL resolves to a non-public network address" % description
+        )
+    return value
+
+
 def _validate_discovery_override_url(value: Any) -> str:
     """Validate an explicit discovery URL.
 
@@ -538,6 +589,8 @@ def _default_json_fetcher(url: str, timeout: float, max_bytes: int) -> Dict[str,
     path onto the local Keycloak listener.
     """
     _validate_fetch_url(url, "request")
+    if urlparse(url).scheme == "https":
+        _validate_public_https_url(url, "request")
 
     request = urllib.request.Request(
         url,
@@ -548,10 +601,20 @@ def _default_json_fetcher(url: str, timeout: float, max_bytes: int) -> Dict[str,
         method="GET",
     )
 
+    class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(
+            self, req, fp, code, msg, headers, newurl
+        ):
+            return None
+
+    opener = urllib.request.build_opener(_NoRedirectHandler)
+
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with opener.open(request, timeout=timeout) as response:
             final_url = response.geturl()
             _validate_fetch_url(final_url, "response")
+            if urlparse(final_url).scheme == "https":
+                _validate_public_https_url(final_url, "response")
 
             original = urlparse(url)
             final = urlparse(final_url)
@@ -633,6 +696,11 @@ class JWKSProvider:
         self._jwks_uri = None
         self._jwks = None
         self._expires_at = 0.0
+        # A single refresh may run at a time, but the network operation must
+        # never run while _lock is held.
+        self._refresh_in_progress = False
+        self._refresh_retry_at = 0.0
+        self._refresh_backoff_seconds = 5.0
 
     def _fetch_document(self, url: str, max_bytes: int) -> Dict[str, Any]:
         try:
@@ -659,13 +727,10 @@ class JWKSProvider:
         if document.get("issuer") != self.issuer:
             raise AuthenticationError("OIDC discovery issuer mismatch")
 
-        public_jwks_uri = _validate_https_url(
+        public_jwks_uri = _validate_public_https_url(
             document.get("jwks_uri"),
             "JWKS",
         )
-
-        if not self._discovery_override:
-            return public_jwks_uri
 
         issuer_parts = urlparse(self.issuer)
         jwks_parts = urlparse(public_jwks_uri)
@@ -678,11 +743,14 @@ class JWKSProvider:
                 "discovered JWKS origin does not match configured issuer"
             )
 
+        if not self._discovery_override:
+            return public_jwks_uri
+
         internal_parts = urlparse(self.discovery_url)
 
         # Preserve the Keycloak JWKS path and query, changing only the network
         # origin to the explicitly configured internal discovery origin.
-        return urlunparse(
+        internal_jwks_uri = urlunparse(
             (
                 internal_parts.scheme,
                 internal_parts.netloc,
@@ -692,6 +760,9 @@ class JWKSProvider:
                 "",
             )
         )
+        if urlparse(internal_jwks_uri).scheme == "https":
+            _validate_public_https_url(internal_jwks_uri, "internal JWKS")
+        return internal_jwks_uri
 
     def _download_jwks(self) -> Dict[str, Any]:
         if self._jwks_uri is None:
@@ -711,7 +782,12 @@ class JWKSProvider:
         return document
 
     def get_jwk(self, kid: str) -> Dict[str, Any]:
-        """Return a matching JWK; an unknown kid triggers at most one refresh."""
+        """Return a matching JWK without allowing attacker-controlled kid
+        values to trigger refreshes against a fresh cache.
+
+        Refresh coordination is protected by _lock; discovery/JWKS network
+        I/O is deliberately performed after releasing it.
+        """
         if not isinstance(kid, str) or not kid:
             raise AuthenticationError("JWT kid header is required")
 
@@ -719,21 +795,36 @@ class JWKSProvider:
             now = time.monotonic()
             cache_is_fresh = self._jwks is not None and now < self._expires_at
 
-            if not cache_is_fresh:
-                self._jwks = self._download_jwks()
-                self._expires_at = time.monotonic() + self.cache_seconds
-
-            try:
+            if cache_is_fresh:
+                # A miss on a fresh cache is an invalid/unknown kid, not a
+                # signal to perform attacker-triggered network I/O.
                 return select_jwk(self._jwks, kid)
-            except AuthenticationError as first_error:
-                # A kid miss on a fresh cache can indicate key rotation.
-                # Refresh exactly once; never loop or repeatedly fetch.
-                if "no matching" not in str(first_error):
-                    raise
 
-                self._jwks = self._download_jwks()
-                self._expires_at = time.monotonic() + self.cache_seconds
-                return select_jwk(self._jwks, kid)
+            if self._refresh_in_progress:
+                raise JWKSFetchError("JWKS refresh is already in progress")
+
+            if now < self._refresh_retry_at:
+                raise JWKSFetchError("JWKS refresh is in backoff")
+
+            self._refresh_in_progress = True
+
+        # Never hold _lock across discovery or JWKS network I/O.
+        try:
+            refreshed = self._download_jwks()
+        except Exception:
+            with self._lock:
+                self._refresh_in_progress = False
+                self._refresh_retry_at = (
+                    time.monotonic() + self._refresh_backoff_seconds
+                )
+            raise
+
+        with self._lock:
+            self._jwks = refreshed
+            self._expires_at = time.monotonic() + self.cache_seconds
+            self._refresh_retry_at = 0.0
+            self._refresh_in_progress = False
+            return select_jwk(self._jwks, kid)
 
 
 def _rsa_public_key_from_jwk(jwk: Mapping[str, Any]) -> Any:
