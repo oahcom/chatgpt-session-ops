@@ -84,8 +84,7 @@ MUST NOT be overwritten, deleted, mirrored, or replaced by a B-side release:
 This list is a minimum explicit exclusion list, not an exhaustive inventory
 of every possible runtime artifact.
 
-The release operator MUST preserve all A-side paths outside the eight-file
-allowlist. The operator MUST NOT use directory mirroring or whole-directory
+The release operator MUST preserve all A-side paths outside the allowlist. The operator MUST NOT use directory mirroring or whole-directory
 replacement to achieve a release.
 
 In particular, the following are prohibited:
@@ -103,12 +102,13 @@ Before copying any file:
 1. Confirm that B is the intended repository and that the intended release
    commit is present.
 2. Inspect `git status --short` and the release diff in B.
-3. Confirm that the eight allowlisted source files exist in B.
+3. Confirm that every allowlisted source file in §2 exists in B.
 4. Confirm that the corresponding target directories and files in A are
    present where required.
 5. Inspect the A-side runtime state and confirm that the release will not
    touch excluded paths.
-6. Confirm that the release consists only of the six explicit file paths.
+6. Confirm that the release consists only of the explicit file paths
+   in the §2 allowlist.
 7. Record the source commit and the release time in the execution record.
 
 If any source file is missing, any required target is unexpectedly missing,
@@ -129,12 +129,12 @@ The operator MUST NOT:
 - Treat an untracked A-side file as disposable merely because B does not
   contain it.
 
-A release is a controlled eight-file publication, not a synchronization of
+A release is a controlled allowlist publication, not a synchronization of
 the two directory trees.
 
 ## 6. SHA-256 verification
 
-For each of the six allowlisted files, calculate SHA-256 for both the B source
+For each allowlisted file, calculate SHA-256 for both the B source
 and the A destination after copying.
 
 The release passes file-integrity verification only when:
