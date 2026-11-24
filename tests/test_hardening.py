@@ -5932,7 +5932,9 @@ class TestConversationLog(TmpBase):
         target = m.conversation_log_path(cid)
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "w", encoding="utf-8") as f:
-            f.write(json.dumps(rows[0], ensure_ascii=False) + "\n")   # 只落了 begin
+            # 真实迁移写入时会把 conv_id 改写成目标会话 id，预置数据必须一致，
+            # 否则模拟的就不是"begin 已进目标"这个状态（R378-01 会正确拒绝）。
+            f.write(json.dumps(dict(rows[0], conv_id=cid), ensure_ascii=False) + "\n")
 
         m._migrate_pending("t-crash1", begin, cid)   # 模拟恢复
         got = m._read_jsonl(target)
@@ -6162,6 +6164,45 @@ class TestConversationLog(TmpBase):
         self.assertIsNone(out, "目标存在互相冲突的重复键，不得删 pending")
         self.assertTrue(os.path.exists(begin))
 
+    def test_same_key_same_payload_different_conv_id_rejected(self):
+        """同 turn_id + 同 payload 但 conv_id 不同：不得当成一致（R378-01 核心）。"""
+        cid = "aaaabbbb-1111-4222-8333-444455556666"
+        other = "ccccdddd-2222-4333-8444-555566667777"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-idconf")
+        rec = {"turn_id": "t-idconf", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        # 目标里已有同键、同 payload，但归属另一个会话
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(json.dumps(dict(rec, conv_id=other), ensure_ascii=False) + "\n")
+        out = m._migrate_pending("t-idconf", begin, cid)
+        self.assertIsNone(out, "conv_id 不符必须拒绝，不能凭 payload 相同就认作一致")
+        self.assertTrue(os.path.exists(begin), "pending 必须保留")
+
+    def test_target_conv_id_mismatch_rejected(self):
+        """目标记录的 conv_id 必须是本次迁移的预期 id。"""
+        cid = "bbbbcccc-3333-4444-8555-666677778888"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-idmis")
+        rec = {"turn_id": "t-idmis", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            # 内容完全相同，但挂在错误的会话下
+            f.write(json.dumps(dict(rec, conv_id="dddddddd-4444-4555-8666-777788889999"),
+                               ensure_ascii=False) + "\n")
+        self.assertIsNone(m._migrate_pending("t-idmis", begin, cid))
+        self.assertTrue(os.path.exists(begin))
+
     # ---------- R377-01：正文错误判定必须整条匹配 ----------
 
     def test_judge_error_multiline_error_with_extra_text_is_not_error(self):
@@ -6175,7 +6216,8 @@ class TestConversationLog(TmpBase):
     def test_judge_error_whole_body_error_is_error(self):
         """整条正文就是一句错误提示 → 判错。"""
         p1 = _load_p1()
-        for own in ("Something went wrong.", "出现错误！", "  网络错误  "):
+        for own in ("Something went wrong.", "出现错误！", "  网络错误  ",
+                    "Something went wrong?", "出现错误？"):
             has, _s, text_err = p1.judge_error(own, "")
             self.assertTrue(text_err, own)
             self.assertTrue(has)

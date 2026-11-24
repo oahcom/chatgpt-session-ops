@@ -89,7 +89,7 @@ def judge_error(own, alert_text):
         # 反例：own = "Something went wrong\nPlease try again later."
         # 只看第一行会误判成错误提示——它带了额外说明，不是纯错误。
         # 规范化：合并空白 + 去掉首尾标点，再与错误提示整体相等。
-        core = " ".join(own.split()).strip().rstrip(".。!！ ")
+        core = " ".join(own.split()).strip().rstrip(".。!！?？ ")
         text_err = core in ERROR_PATTERNS
     return (structural or text_err), structural, text_err
 

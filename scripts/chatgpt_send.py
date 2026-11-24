@@ -6134,14 +6134,25 @@ def _migrate_pending(turn_id, begin_path, real_conv):
         return None
     # R377-02：不能只校验"键存在"，必须校验**内容一致**。
     # 反例：同键被静默写坏 → 键集合完整、missing 为空 → pending 被删，内容却已损坏。
+    # A. 归属校验（R378-01）：目标里任何一条记录的 conv_id 都必须是本次迁移的会话。
+    #    这一条同时覆盖两种情形：同键挂到了别的会话、以及目标里混入了别会话的记录。
+    for r in verify_rows:
+        rid = _safe_conv_id(r.get("conv_id"))
+        if rid and rid != cid:
+            print("FAIL: 目标记录 conv_id 与本次迁移不符 %r（期望 %s，实际 %s）——pending 保留"
+                  % ((r.get("turn_id"), r.get("phase") or "turn"), cid, rid), flush=True)
+            return None
+
+    # C-1. 同键多条：彼此 payload 必须一致，否则无法确定哪份可信
     verified = {}
     for r in verify_rows:
         k = (r.get("turn_id"), r.get("phase") or "turn")
         if k in verified and _turn_payload(verified[k]) != _turn_payload(r):
-            # 同一键在目标里出现多条且内容不一致：无法确定哪份可信，拒绝迁移
             print("FAIL: 目标存在重复键且内容冲突 %r——pending 保留" % (k,), flush=True)
             return None
         verified.setdefault(k, r)
+
+    # B + C-2. 每条 source 都必须在目标里存在，且内容一致
     for rec in source:
         key = (rec.get("turn_id"), rec.get("phase") or "turn")
         actual = verified.get(key)
