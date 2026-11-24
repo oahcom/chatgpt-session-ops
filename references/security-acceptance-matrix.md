@@ -24,13 +24,13 @@ not a feature list.
 ```
 python -m unittest tests.test_work_item_authority        # 50
 python -m unittest tests.test_mcp_contract               # 28
-python -m unittest tests.test_send_prompt_for_work_item  # 6
+python -m unittest tests.test_send_prompt_for_work_item  # 7
 python -m unittest tests.test_mcp_transport              # 18
 python -m unittest tests.test_mcp_alg_confusion          # 7
 python -m unittest tests.test_mcp_rs256                  # 8
 python -m unittest tests.test_mcp_sdk_integration        # 4 (skips without mcp)
-python -m pytest -q                                      # 740 passed, 6 skipped
-                                                         # 736 passed, 10 skipped without mcp
+python -m pytest -q                                      # 745 passed, 6 skipped
+                                                         # 741 passed, 10 skipped without mcp
 ```
 
 **What PROVEN means here, and what it does not.** PROVEN means the named case
@@ -55,15 +55,23 @@ the `mutation-checked` mark in the status column, which is the only thing that
 means `mutation-checked`. Per-row status in the table below is authoritative,
 and restating a derivable count in prose is what produced this erratum.
 
+What is worth stating instead is that a row can pass its deletion for the
+wrong reason, and two did. The pinned-connection tunnel case went green when its
+guard was deleted, because the real network dial failed with the same
+exception type the case expected; and six of the eight conjuncts in the
+landing-confirmation expression cannot fail at all, because earlier
+early-returns already guarantee them. Neither is visible in a green run, and
+neither would have been found by counting marks.
+
 ---
 
 ## A. Identity and authentication (1–4)
 
 | # | Scenario | Expected | Evidence | Status |
 |---|---|---|---|---|
-| 1 | A caller passes a principal, tenant or scope **as a tool argument** | Rejected. Identity comes from the verified token only. | `test:test_identity_cannot_be_injected_through_arguments` (test_mcp_contract) | PROVEN |
-| 2 | No `Authorization` header, or a header the middleware cannot read | `UNAUTHENTICATED`. No tool dispatch. | `test:test_missing_auth_context_is_unauthenticated` | PROVEN |
-| 3 | A structurally valid JWT whose `aud` is another service | Rejected at claim validation, and again in `principal_from_claims`. | `test:test_claim_mapping_rejects_wrong_audience` | PROVEN, second layer unproven |
+| 1 | A caller passes a principal, tenant or scope **as a tool argument** | Rejected. Identity comes from the verified token only. | `test:test_identity_cannot_be_injected_through_arguments` (test_mcp_contract) | PROVEN `mutation-checked` |
+| 2 | No `Authorization` header, or a header the middleware cannot read | `UNAUTHENTICATED`. No tool dispatch. | `test:test_missing_auth_context_is_unauthenticated` | PROVEN `mutation-checked` |
+| 3 | A structurally valid JWT whose `aud` is another service | Rejected at claim validation, and again in `principal_from_claims`. | `test:test_claim_mapping_rejects_wrong_audience` | PROVEN `mutation-checked` for the claiming layer; see note |
 | 4 | `alg: none`, `alg: HS256`, or a `crit` header | Rejected before key lookup. Algorithm confusion is not reachable. | `test:test_none_algorithm_with_forged_signature` `test:test_hs256_using_rsa_public_modulus_as_hmac_key` `test:test_lowercase_rs256_is_rejected` `test:test_missing_alg_is_rejected` `test:test_crit_header_is_rejected_before_key_lookup` `test:test_unexpected_typ_is_rejected_before_key_lookup` (test_mcp_alg_confusion) | PROVEN `mutation-checked` |
 | 4b | The signature itself: forged, wrong key, wrong hash, undersized or malformed key material | Rejected at verification. A genuine RS256 token is accepted and maps to the right principal. | `test:test_valid_rs256_signature_returns_claim_mapped_auth_context` `test:test_one_byte_signature_tampering_is_rejected` `test:test_signature_from_another_rsa_key_is_rejected` `test:test_sha1_signature_is_not_accepted_as_rs256` `test:test_1024_bit_rsa_modulus_is_rejected` `test:test_even_rsa_public_exponent_is_rejected` `test:test_rsa_public_exponent_one_is_rejected` `test:test_missing_cryptography_is_classified_as_dependency_unavailable` (test_mcp_rs256) | PROVEN `mutation-checked` |
 
@@ -102,23 +110,29 @@ current.
 
 | # | Scenario | Expected | Evidence | Status |
 |---|---|---|---|---|
-| 5 | Authenticated principal lacks a required scope for the tool | `PERMISSION_DENIED`, distinct from `UNAUTHENTICATED`. | `test:test_insufficient_scope_is_permission_denied` | PROVEN |
+| 5 | Authenticated principal lacks a required scope for the tool | `PERMISSION_DENIED`, distinct from `UNAUTHENTICATED`. | `test:test_insufficient_scope_is_permission_denied` | PROVEN `mutation-checked` |
 | 6 | `work_item.grant` / `work_item.revoke` called with only `work_item.write` | Denied. Delegation administration needs `session_ops.access.manage`. | `test:test_work_item_grant_requires_access_manage` `test:test_work_item_revoke_requires_access_manage` | PROVEN `mutation-checked` |
 
 **Row 3 note.** `aud` is checked twice: once in `validate_registered_claims`
 and again in `principal_from_claims`. The cited test exercises
 `principal_from_claims`. Deleting the `aud` check there fails it; deleting the
-one in `validate_registered_claims` leaves the suite green. The behaviour is
-covered once, which is enough for the behaviour, but the row previously named
-the wrong layer as the proof.
+one in `validate_registered_claims` leaves the suite green, confirmed again in
+this pass. The behaviour is covered once, which is enough for the behaviour, but
+the row previously named the wrong layer as the proof. The mark therefore reads
+"for the claiming layer": the layer that is actually observed.
+
+The duplicate is not dead code and it is not a defect. It is the same shape as
+row 16's `rowcount` guard — a second check that no test can distinguish, kept
+because the cost of keeping it is one comparison and the cost of being wrong
+about the first layer is an accepted token from another service.
 
 **Row 6 note.** The grant half was already held. The revoke half was not: the
 cited case only ever called `work_item.grant`, so deleting
 `session_ops.access.manage` from `TOOL_REQUIRED_SCOPES["work_item.revoke"]`
 left all cases green. A symmetric revoke case now exists and goes red on that
 deletion.
-| 7 | A `write` grantee tries to grant to a third party, or revoke another principal's grant | Denied. `write` never implies grant administration. | `test:test_write_grantee_cannot_grant_or_revoke` | PROVEN |
-| 8 | Owner grants to a target that is unknown, disabled, or in another tenant | Refused **before** the grant row is written; cross-tenant attempts leave no row. | `test:test_unknown_target_is_rejected_by_default_directory` `test:test_same_tenant_unregistered_target_is_rejected` `test:test_target_must_exist_be_enabled_and_be_same_tenant` `test:test_cross_tenant_target_is_rejected_before_grant_is_written` | PROVEN |
+| 7 | A `write` grantee tries to grant to a third party, or revoke another principal's grant | Denied. `write` never implies grant administration. | `test:test_write_grantee_cannot_grant_or_revoke` | PROVEN `mutation-checked` |
+| 8 | Owner grants to a target that is unknown, disabled, or in another tenant | Refused **before** the grant row is written; cross-tenant attempts leave no row. | `test:test_unknown_target_is_rejected_by_default_directory` `test:test_same_tenant_unregistered_target_is_rejected` `test:test_target_must_exist_be_enabled_and_be_same_tenant` `test:test_cross_tenant_target_is_rejected_before_grant_is_written` | PROVEN `mutation-checked` |
 
 ---
 
@@ -126,9 +140,9 @@ deletion.
 
 | # | Scenario | Expected | Evidence | Status |
 |---|---|---|---|---|
-| 9 | Same-tenant principal with no grant reads another's WorkItem | Denied. | `test:test_same_tenant_stranger_cannot_read` | PROVEN |
-| 10 | Another tenant reads, and separately: the WorkItem does not exist | **Indistinguishable.** A caller must not be able to probe for existence. | `test:test_other_tenant_cannot_read` `test:test_missing_cross_tenant_and_no_grant_are_identical` `test:test_cross_tenant_and_missing_resource_are_indistinguishable` `code:NotAuthorized()` (empty message) | PROVEN |
-| 11 | A `read` grant tries to update status | Denied; `read` does not imply `write`. | `test:test_read_grant_allows_read_but_not_write` `test:test_write_grant_allows_status_update` | PROVEN |
+| 9 | Same-tenant principal with no grant reads another's WorkItem | Denied. | `test:test_same_tenant_stranger_cannot_read` | PROVEN `mutation-checked` |
+| 10 | Another tenant reads, and separately: the WorkItem does not exist | **Indistinguishable.** A caller must not be able to probe for existence. | `test:test_other_tenant_cannot_read` `test:test_missing_cross_tenant_and_no_grant_are_identical` `test:test_cross_tenant_and_missing_resource_are_indistinguishable` `code:NotAuthorized()` (empty message) | PROVEN `mutation-checked` |
+| 11 | A `read` grant tries to update status | Denied; `read` does not imply `write`. | `test:test_read_grant_allows_read_but_not_write` `test:test_write_grant_allows_status_update` | PROVEN `mutation-checked` |
 
 ---
 
@@ -149,9 +163,36 @@ refusal, asserts the event is still unconsumed and no `session_links` row was
 written, and then links the same session without evidence to prove the seeded
 event was usable. Mutation check: with the guard deleted, the old case stays
 green and only the new one fails.
-| 13 | No server-recorded landing event exists for the conversation | `QuarantineNotCleared`. Nothing is written. | `test:test_link_requires_server_recorded_landing` `test:test_unconfirmed_f13_evidence_is_rejected` | PROVEN |
-| 14 | A confirmed event is consumed, then replayed | Second attempt fails. Consumption and link creation happen in one transaction. | `test:test_confirmed_complete_landing_can_be_consumed_once` `test:test_event_replay_cannot_create_a_second_link` `code:link_session` (`consumed_at IS NULL` → `UPDATE consumed_at` → `INSERT session_links`) | PROVEN |
-| 15 | Landing is `mismatch`, `ambiguous`, or evidence incomplete; or the send returned 409 | No event recorded, no link. Fail closed. | `test:test_mismatch_ambiguous_and_incomplete_landing_fail_closed` `test:test_mismatch_409_does_not_record_or_link` `test:test_ambiguous_multiple_ids_do_not_record_or_link` `test:test_incomplete_reply_does_not_record_or_link` | PROVEN |
+| 13 | No server-recorded landing event exists for the conversation | `QuarantineNotCleared`. Nothing is written. | `test:test_link_requires_server_recorded_landing` `test:test_unconfirmed_f13_evidence_is_rejected` | PROVEN `mutation-checked` |
+| 14 | A confirmed event is consumed, then replayed | Second attempt fails. Consumption and link creation happen in one transaction. | `test:test_confirmed_complete_landing_can_be_consumed_once` `test:test_event_replay_cannot_create_a_second_link` `code:link_session` (`consumed_at IS NULL` → `UPDATE consumed_at` → `INSERT session_links`) | PROVEN `mutation-checked` |
+| 15 | Landing is `mismatch`, `ambiguous`, or evidence incomplete; or the send returned 409 | No event recorded, no link. Fail closed. | `test:test_mismatch_ambiguous_and_incomplete_landing_fail_closed` `test:test_mismatch_409_does_not_record_or_link` `test:test_ambiguous_multiple_ids_do_not_record_or_link` `test:test_incomplete_reply_does_not_record_or_link` `test:test_missing_archive_file_does_not_record_a_landing_event` | PROVEN `mutation-checked` |
+
+**Row 15 note — eight conjuncts, two of them load-bearing.** The landing
+decision in `scripts/chatgpt_send.py` is a conjunction of eight conditions.
+Deleting them one at a time: six leave the file green, and only
+`reply_complete is True` and `os.path.isfile(path)` change the outcome.
+
+The six that cannot fail are not a testing gap — they are guaranteed by earlier
+early-returns in the same function, so the condition can never be reached with
+them false. `st == 200` because `st != 200` returned above; `len(all_cids) == 1`
+because a longer list returned above; `not mismatch` for the same reason;
+`first_cid == real_conv` because `real_conv` *is* `first_cid`; `all_cids[0] ==
+real_conv` because the list has one element by then; `bool(path)` because
+`isfile` implies it. They are defence in depth, and deleting them is an
+equivalent mutant.
+
+The one real gap this exposed: `os.path.isfile(path)` had **no** case behind it.
+`FakeAPI.save_reply` always writes the file, so "a path was returned" and "a
+file exists" were the same thing in every test. They are not the same thing in
+production — `_atomic_write` can fail after the path is computed. A case now
+returns a path that was never written and asserts no event is recorded and the
+session cannot be linked.
+
+| Deleted conjunct | Result |
+|---|---|
+| `reply_complete is True` | `test_incomplete_reply_does_not_record_or_link` red |
+| `os.path.isfile(path)` | `test_missing_archive_file_does_not_record_a_landing_event` red |
+| the other six | green — equivalent mutants, each guaranteed by an earlier return |
 
 ---
 
@@ -178,15 +219,15 @@ single-writer rule no concurrent write can land between them and `rowcount` is
 always 1. It is defence in depth, not evidence. No test can fail when it is
 deleted because no execution can reach it. Recorded as dead code rather than
 counted as a proof.
-| 17 | The audit write fails partway through a mutation | The business change rolls back too. No unaudited mutation survives. | `test:test_audit_failure_rolls_back_work_item_and_owner` `test:test_audit_failure_rolls_back_status_mutation` `test:test_all_successful_mutations_are_audited` `test:test_audit_rows_are_append_only` | PROVEN |
+| 17 | The audit write fails partway through a mutation | The business change rolls back too. No unaudited mutation survives. | `test:test_audit_failure_rolls_back_work_item_and_owner` `test:test_audit_failure_rolls_back_status_mutation` `test:test_all_successful_mutations_are_audited` `test:test_audit_rows_are_append_only` | PROVEN `mutation-checked` |
 
-**Row 16 note.** The offline cases prove the *precondition* mechanism (a stale
-`expected_link_id` or `expected_updated_at` is refused) and read the code to
-confirm the transaction shape. They do **not** interleave two real threads and
-observe the race. A true concurrency test would need two connections and a
-deliberate pause; there is none. What is proven is "the mutation is guarded and
-the guard is evaluated inside the same transaction", not "the race was
-reproduced".
+**Row 16 note — what the cases prove, and what they do not.** The offline cases
+prove the *precondition* mechanism (a stale `expected_link_id` or
+`expected_updated_at` is refused) and read the code to confirm the transaction
+shape. They do **not** interleave two real threads and observe the race. A true
+concurrency test would need two connections and a deliberate pause; there is
+none. What is proven is "the mutation is guarded and the guard is evaluated
+inside the same transaction", not "the race was reproduced".
 
 ---
 
@@ -227,11 +268,18 @@ was already running.
 
 | # | Scenario | Expected | Evidence | Status |
 |---|---|---|---|---|
-| 19 | An unauthenticated caller sends many random `kid` values to amplify JWKS fetches | Fresh-cache misses fail without fetching. Expired-cache refresh is single-flight and backs off after failure. The lock is never held across network I/O. | `test:test_fresh_cache_unknown_kid_never_downloads` `test:test_expired_cache_concurrent_refresh_is_single_flight` `test:test_failed_refresh_is_not_retried_inside_backoff_window` `test:test_refresh_can_retry_after_backoff_expires` (test_mcp_transport) | PROVEN |
+| 19 | An unauthenticated caller sends many random `kid` values to amplify JWKS fetches | Fresh-cache misses fail without fetching. Expired-cache refresh is single-flight and backs off after failure. The lock is never held across network I/O. | `test:test_fresh_cache_unknown_kid_never_downloads` `test:test_expired_cache_concurrent_refresh_is_single_flight` `test:test_failed_refresh_is_not_retried_inside_backoff_window` `test:test_refresh_can_retry_after_backoff_expires` (test_mcp_transport) | PROVEN `mutation-checked` |
+
 | 20 | An attacker-influenced issuer points discovery at an internal address | Redirects refused. HTTPS destinations resolved once; any non-global answer rejects the whole URL. The connection then dials the answer that was validated, keeps the hostname for SNI and certificate verification, and does not consult a system proxy. | `test:test_non_override_discovery_rejects_different_jwks_origin` `test:test_default_fetcher_does_not_follow_redirects` `test:test_https_jwks_rejects_loopback_link_local_and_private_ips` `test:test_jwks_rejects_all_dns_answers_if_any_is_non_global` `test:test_resolve_validated_address_returns_the_pinned_answer` `test:test_resolve_validated_address_rejects_mixed_answers` `test:test_validate_public_https_url_still_returns_the_url` `test:test_pinned_connection_dials_the_ip_and_keeps_the_hostname_for_sni` `test:test_pinned_connection_refuses_a_proxy_tunnel` `test:test_default_fetcher_installs_no_proxy_handler` `test:test_default_fetcher_pins_the_validated_address` (test_mcp_transport) | PROVEN `mutation-checked` |
-| 21 | A request targets the MCP endpoint's subpaths | Authenticated. Health and protected-resource metadata stay public. | `test:test_mcp_subpath_is_authenticated` `test:test_mcp_endpoint_itself_is_authenticated` `test:test_health_and_protected_resource_metadata_remain_public` (test_mcp_transport) | PROVEN |
+| 21 | A request targets the MCP endpoint's subpaths | Authenticated. Health and protected-resource metadata stay public. | `test:test_mcp_subpath_is_authenticated` `test:test_mcp_endpoint_itself_is_authenticated` `test:test_health_and_protected_resource_metadata_remain_public` (test_mcp_transport) | PROVEN `mutation-checked` |
 | 22 | The pinned SDK's API drifts from what `build_mcp_server` assumes | Build fails at CI, not at deploy. `Server`, `on_list_tools`, `on_call_tool`, `streamable_http_app` keywords and `CallToolResult.structured_content` are all exercised against the real `mcp==2.3.0`. | `test:test_builds_real_starlette_app_at_verifier_audience_path` `test:test_real_sdk_registers_list_and_call_handlers` `test:test_real_tools_list_returns_the_frozen_tool_surface` `test:test_real_tools_call_rejects_missing_request_authentication` (test_mcp_sdk_integration) | PROVEN `mutation-checked` |
 
+**Row 19 note — three guards, three deletions.** Fresh-cache miss
+(`test_fresh_cache_unknown_kid_never_downloads`), single-flight
+(`test_expired_cache_concurrent_refresh_is_single_flight`) and the backoff
+window (`test_failed_refresh_is_not_retried_inside_backoff_window`) each go red
+on their own deletion. The fourth claim — the lock is never held across network
+I/O — is asserted by reading the code, not by a case, so it is not counted.
 **Row 22 note — the assumption we shipped on.** Before this row existed, every
 claim `build_mcp_server` makes about `mcp==2.3.0` was verified by hand once.
 `test_mcp_transport` builds the app against hand-written `ModuleType` stubs, so
@@ -300,7 +348,8 @@ These are gaps, stated so nobody reads the eighteen rows above as completeness.
 | Landing event bound to a WorkItem | `authority_landing_events` stores `session_id` but not `work_item_id`. | If signing succeeds and linking fails, the unconsumed event can be claimed by another WorkItem that holds `write` on that conversation. Bounded, accepted, recorded. |
 | A mandatory corporate proxy | `ProxyHandler({})` is passed unconditionally, so a deployment that can only reach the identity provider through a proxy fails to fetch JWKS. | Fail closed, deliberately: the alternative is an address check describing a host the process never contacts. Stated here rather than solved. |
 | The pinned address has no failover | Only the first validated answer is dialled. A host with several public addresses loses the rest if the first one is down. | Availability, not security. Retrying a second answer would reintroduce the resolution the pin exists to remove. |
-| Mutation coverage is not uniform | Seven rows carry the mark outright and an eighth only for its lock; the rest do not. | Treat every unmarked PROVEN as "asserts the behaviour", not "proven necessary" — that is exactly how row 12 stayed PROVEN for three commits. |
+| Mutation coverage is not uniform | Row 16 carries the mark for its lock only, and row 3 for the layer its case actually observes. Every other row carries it outright. | The two that do not are named individually with a reason. Treat an unmarked claim as "asserts the behaviour", not "proven necessary" — that is exactly how row 12 stayed PROVEN for three commits. |
+| Six landing conjuncts cannot fail | Row 15's landing expression has eight conjuncts; six are already guaranteed by earlier early-returns, so deleting them changes nothing. | Equivalent mutants, listed one by one in the row 15 note rather than counted as coverage. The two load-bearing ones each have a deletion behind them. |
 | Security tests can skip to green | `test_mcp_rs256` and `test_mcp_sdk_integration` both skip as units when their optional dependency is absent. The unit job installs `requirements-mcp.txt` and asserts the skip count is unchanged, printing every skip reason on failure; the `sdk` job asserts its four cases executed. | Before those guards, the signature path and the SDK compatibility surface could both be skipped and the log still read green. Any future optional dependency needs the same treatment. |
 | `unlink_session` `rowcount` guard is unreachable | `BEGIN IMMEDIATE` precedes the SELECT and the SELECT filters `unlinked_at IS NULL`, so SQLite's single-writer rule makes `rowcount != 1` impossible. | Defence in depth, not evidence. It cannot be tested, and pretending otherwise would be worse than saying so. |
 | `aud` is checked twice, once unheld | Deleting the `validate_registered_claims` check changes no test outcome. | Redundant layer. Harmless, but not a second proof. |
