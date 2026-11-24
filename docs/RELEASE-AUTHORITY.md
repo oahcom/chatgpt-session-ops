@@ -36,7 +36,7 @@ incorporated into B, tested, and committed.
 
 ## 2. Explicit B → A publication allowlist
 
-The following six files are the complete allowlist for the current release
+The following seven files are the complete allowlist for the current release
 baseline:
 
 | B-relative path | A-relative path | Purpose |
@@ -47,6 +47,7 @@ baseline:
 | `scripts/chatgpt_send.py` | `scripts/chatgpt_send.py` | Reviewed conversation-send utility |
 | `scripts/mcp_connector.py` | `scripts/mcp_connector.py` | Reviewed MCP connector eligibility utility |
 | `tests/test_hardening.py` | `tests/test_hardening.py` | Reviewed hardening tests |
+| `references/mcp-oauth-connector-contract.md` | `references/mcp-oauth-connector-contract.md` | Connector/OAuth contract that `SKILL.md` cites |
 
 This is an explicit file allowlist, not permission to synchronize the containing
 directories.
@@ -101,7 +102,7 @@ Before copying any file:
 1. Confirm that B is the intended repository and that the intended release
    commit is present.
 2. Inspect `git status --short` and the release diff in B.
-3. Confirm that the six allowlisted source files exist in B.
+3. Confirm that the seven allowlisted source files exist in B.
 4. Confirm that the corresponding target directories and files in A are
    present where required.
 5. Inspect the A-side runtime state and confirm that the release will not
@@ -127,7 +128,7 @@ The operator MUST NOT:
 - Treat an untracked A-side file as disposable merely because B does not
   contain it.
 
-A release is a controlled six-file publication, not a synchronization of
+A release is a controlled seven-file publication, not a synchronization of
 the two directory trees.
 
 ## 6. SHA-256 verification
