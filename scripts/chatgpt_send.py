@@ -5859,6 +5859,15 @@ def _quarantine_reply(api, target_conv, actual_conv, reply, resp, status, pfile)
     return path, evidence_complete
 
 # ---------- 会话日志（每条交互全文留存，按会话拆分，可检索） ----------
+#
+# 【全局不变量 · R381-03】begin 里的 prompt 是本轮提示词的**唯一**持久化副本。
+# 任何删除 / 替换 / 迁移 / 覆盖 begin 文件的路径，都必须先证明 prompt 已在另一个
+# 持久化位置完整落盘。审计范围：_migrate_pending、log_end、pending 清理、
+# conversations 迁移、turn 去重、异常恢复与重命名。
+# 违反它的直接后果见 docs/incidents/R381-prompt-loss-incident.md。
+# 现存删除点只有一处：_migrate_pending 末尾——它前面已回读确认目标含 begin+end
+# 且 payload/conv_id 一致。新增删除点前请先满足上面这条。
+#
 # 目的：任何一次经本插件发出的提示词与 ChatGPT 回复正文都要能在本地找回。
 # prompts/ 会被覆盖或清理，replies/ 是扁平命名、按会话归集得靠猜。
 #
@@ -5885,9 +5894,30 @@ def log_unassigned_dir():
     """身份不可用且无法归属的轮次。按原始标识分文件，绝不合并到同一个桶。"""
     return os.path.join(log_root(), "unassigned")
 
-def _safe_conv_id(conv_id):
-    cid = str(conv_id or "")
-    return cid if _ID_RE.match(cid) else ""
+# R382-01：conv_id 必须有独立的严格判据（小写、带连字符的 UUID）。
+# 不复用 _ID_RE——那个正则还管 device id / baseline id，放宽是为了它们；
+# 而 conv_id 是会话身份，`"abc"` 这种"合法标签"不能成为可信身份。
+_CONV_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+def _safe_conv_id(value):
+    """规范化会话 id，三态返回（R381-02）：
+
+    - ``""``  历史缺失（None 或空串）
+    - ``str`` 合法会话 id
+    - ``None`` 畸形身份（非空但不合法、或非字符串）
+
+    旧版把"畸形"也归一成 ``""``，于是它与"历史缺失"完全不可区分——
+    A 层会把它当历史空值放行，诊断信息丢失。审计这类问题必须能分辨
+    "没有身份"和"身份是坏的"。
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return None
+    if value == "":
+        return ""
+    return value if _CONV_ID_RE.fullmatch(value) else None
 
 def _sanitize_segment(raw):
     """把任意原始标识压成可做文件名的片段（保留可辨识性，去掉路径字符）。"""
@@ -5903,8 +5933,10 @@ def conversation_log_path(conv_id):
     合并成一个无法区分的桶，且丢失原始标识。现在非法即拒绝，绝不静默归并。
     """
     cid = _safe_conv_id(conv_id)
+    if cid is None:
+        raise ValueError("会话日志收到畸形 conv_id：%r" % (conv_id,))
     if not cid:
-        raise ValueError("会话日志只接受合法 conv_id：%r" % (conv_id,))
+        raise ValueError("会话日志缺少 conv_id：%r" % (conv_id,))
     return os.path.join(log_dir(), cid + ".jsonl")
 
 def pending_log_path(turn_id):
@@ -5965,7 +5997,7 @@ def _log_files(conv_id=None):
         cid = _safe_conv_id(conv_id)
         if cid:
             return [os.path.join(log_dir(), cid + ".jsonl")]
-        return [unassigned_log_path(conv_id)]
+        return [unassigned_log_path(conv_id)]   # 缺失或畸形都按原始标识去找
     files = []
     for d in (log_dir(), log_pending_dir(), log_unassigned_dir()):
         try:
@@ -6085,7 +6117,13 @@ def _migrate_pending(turn_id, begin_path, real_conv):
     读不出来一律中止且不删，绝不把"读不到"当成"没有"。
     """
     cid = _safe_conv_id(real_conv)
-    if not cid or not begin_path:
+    if cid is None:
+        print("FAIL: 迁移目标 conv_id 畸形（%r）——pending 保留" % (real_conv,), flush=True)
+        return None
+    if not begin_path:
+        return None
+    if not cid:
+        print("FAIL: 迁移目标 conv_id 缺失——pending 保留", flush=True)
         return None
     if os.path.dirname(os.path.abspath(begin_path)) != os.path.abspath(log_pending_dir()):
         return None
@@ -6139,6 +6177,10 @@ def _migrate_pending(turn_id, begin_path, real_conv):
     #    空 conv_id 的历史记录**允许存在**（不要求补齐），但它不是本次迁移的凭据。
     for r in verify_rows:
         rid = _safe_conv_id(r.get("conv_id"))
+        if rid is None:
+            print("FAIL: 目标记录 conv_id 畸形 %r——pending 保留"
+                  % ((r.get("turn_id"), r.get("phase") or "turn"),), flush=True)
+            return None
         if rid and rid != cid:
             print("FAIL: 目标记录 conv_id 与本次迁移不符 %r（期望 %s，实际 %s）——pending 保留"
                   % ((r.get("turn_id"), r.get("phase") or "turn"), cid, rid), flush=True)
@@ -6150,6 +6192,10 @@ def _migrate_pending(turn_id, begin_path, real_conv):
     for r in verify_rows:
         k = (r.get("turn_id"), r.get("phase") or "turn")
         rid = _safe_conv_id(r.get("conv_id"))
+        if rid is None:
+            print("FAIL: 目标记录 conv_id 畸形 %r——pending 保留"
+                  % ((r.get("turn_id"), r.get("phase") or "turn"),), flush=True)
+            return None
         if k in verified:
             prev = verified[k]
             if _turn_payload(prev) != _turn_payload(r):
@@ -6173,7 +6219,12 @@ def _migrate_pending(turn_id, begin_path, real_conv):
             return None
         # R379：内容相同还不够——必须能证明这条记录属于本次迁移。
         # 空 conv_id 是历史遗留，不得当作迁移成功的凭据。
-        if _safe_conv_id(actual.get("conv_id")) != cid:
+        _aid = _safe_conv_id(actual.get("conv_id"))
+        if _aid is None:
+            print("FAIL: 迁移凭据身份畸形 %r——空/畸形/异会话记录不得冒充"
+                  % (key,), flush=True)
+            return None
+        if _aid != cid:
             print("FAIL: 迁移凭据身份不明 %r（期望 %s，实际 %r）——空/异会话记录不得冒充"
                   % (key, cid, actual.get("conv_id")), flush=True)
             return None
@@ -6206,7 +6257,7 @@ def log_end(api, turn_id, begin_path, target_conv, real_conv, status, reply_path
         "turn_id": turn_id,
         "phase": "end",
         "ts": datetime.now().isoformat(timespec="seconds"),
-        "conv_id": _safe_conv_id(real_conv),
+        "conv_id": _safe_conv_id(real_conv) or "",
         "reply": reply,
         "reply_chars": len(reply),
         "reply_sha256": hashlib.sha256(reply.encode("utf-8")).hexdigest() if reply else "",
@@ -6219,7 +6270,13 @@ def log_end(api, turn_id, begin_path, target_conv, real_conv, status, reply_path
     # 归属优先级：服务器实际落点 > 投递目标。
     # 413/异常时 real_conv 为空，但 target_conv 是已知的——这一轮确实属于它，
     # 落到 unassigned 反而会把已知身份的轮次丢掉（R373-03 的"不得伪装"不等于"一律丢弃"）。
-    cid = _safe_conv_id(real_conv) or _safe_conv_id(target_conv)
+    _rid, _tid = _safe_conv_id(real_conv), _safe_conv_id(target_conv)
+    if _rid is None or _tid is None:
+        # 畸形身份不能当成"没有身份"往下走——那会把这一轮错误归到 unassigned。
+        print("FAIL: conv_id 畸形（real=%r target=%r）——不归属，保留原有记录"
+              % (real_conv, target_conv), flush=True)
+        return None
+    cid = _rid or _tid
     from_pending = bool(begin_path) and (
         os.path.dirname(os.path.abspath(begin_path)) == os.path.abspath(log_pending_dir()))
     if cid:
@@ -6241,16 +6298,24 @@ def log_end(api, turn_id, begin_path, target_conv, real_conv, status, reply_path
             return moved
         _log_write(target, rec)      # 非 pending：直接追加，天然是一轮
         return target
-    # 真实 id 与目标都不可用：按原始标识单独成文件，不与会话桶合并（R373-03）
+    # 真实 id 与目标都不可用：按原始标识单独成文件（R373-03）。
+    # 如果本轮 begin 已在 pending，必须保留唯一的 prompt 副本（R381-01）。
+    if from_pending and begin_path:
+        rec["conv_id"] = ""
+        rec["raw_conv_id"] = str(target_conv or "")
+
+        # begin 和 end 必须留在同一个 pending 文件中。
+        # _log_write 失败时异常向上传播，原 begin 不受影响。
+        _log_write(begin_path, rec)
+        return begin_path
+
     target = unassigned_log_path(target_conv or turn_id)
     rec["conv_id"] = ""
     rec["raw_conv_id"] = str(target_conv or "")
     _log_write(target, rec)
-    if begin_path:
-        try:
-            os.remove(begin_path)
-        except OSError:
-            pass
+
+    # 不允许在没有确认 prompt 已安全保存到其他位置时删除 begin。
+    # 本分支不再删除 begin_path。
     return target
 
 
@@ -7530,6 +7595,13 @@ def main():
         limit = 20
         as_json = "--json" in args
         term = None
+        only_pending = "--pending" in args
+        only_unassigned = "--unassigned" in args
+        only_unresolved = "--unresolved" in args
+        if only_pending and only_unassigned:
+            print("ERROR: --pending 与 --unassigned 不能同时指定（要两者用 --unresolved）",
+                  flush=True)
+            return 2
         i = 1
         while i < len(args):
             a = args[i]
@@ -7539,7 +7611,7 @@ def main():
             elif a == "--limit" and i + 1 < len(args):
                 limit = _as_int(args[i + 1], 20) or 20
                 i += 2
-            elif a == "--json":
+            elif a in ("--json", "--pending", "--unassigned", "--unresolved"):
                 i += 1
             else:
                 if term is None:
@@ -7586,9 +7658,20 @@ def main():
             return [merged[k] for k in order]
 
         if args[0] == "--log-list":
+            if only_pending:
+                want = ("pending",)
+            elif only_unassigned:
+                want = ("unassigned",)
+            elif only_unresolved:
+                want = ("pending", "unassigned")
+            else:
+                want = None      # 默认：全部三桶（行为与之前一致）
+
             rows, incomplete, files = [], [], {}
             for fp in _log_files():
                 bucket = _bucket_of(fp)
+                if want is not None and bucket not in want:
+                    continue
                 files[bucket] = files.get(bucket, 0) + 1
                 recs = _turns_in(fp)
                 if not recs:
@@ -7617,6 +7700,9 @@ def main():
                 "count": len(rows),
                 "logs": rows,
                 "incomplete": incomplete,
+                "filter": ("pending" if only_pending else
+                           "unassigned" if only_unassigned else
+                           "unresolved" if only_unresolved else "all"),
                 "note": ("pending=新会话尚未确认 conv_id 的暂存轮次；"
                          "unassigned=身份不可用且无法归属（按原始标识分文件，不合并）；"
                          "incomplete=存在非 captured 回复状态的记录（含只有 begin 的未完成轮）"),
