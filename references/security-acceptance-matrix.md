@@ -27,7 +27,8 @@ python -m unittest tests.test_mcp_contract               # 28
 python -m unittest tests.test_send_prompt_for_work_item  # 6
 python -m unittest tests.test_mcp_transport              # 11
 python -m unittest tests.test_mcp_alg_confusion          # 7
-python -m pytest -q                                      # 711 passed, 6 skipped
+python -m unittest tests.test_mcp_rs256                  # 8
+python -m pytest -q                                      # 719 passed, 6 skipped
 ```
 
 **What PROVEN means here, and what it does not.** PROVEN means the named case
@@ -51,7 +52,24 @@ is recorded per row rather than averaged away.
 | 1 | A caller passes a principal, tenant or scope **as a tool argument** | Rejected. Identity comes from the verified token only. | `test:test_identity_cannot_be_injected_through_arguments` (test_mcp_contract) | PROVEN |
 | 2 | No `Authorization` header, or a header the middleware cannot read | `UNAUTHENTICATED`. No tool dispatch. | `test:test_missing_auth_context_is_unauthenticated` | PROVEN |
 | 3 | A structurally valid JWT whose `aud` is another service | Rejected at claim validation, and again in `principal_from_claims`. | `test:test_claim_mapping_rejects_wrong_audience` | PROVEN, second layer unproven |
-| 4 | `alg: none`, `alg: HS256`, or a `crit` header | Rejected before key lookup. Algorithm confusion is not reachable. | `test:test_none_algorithm_with_forged_signature` `test:test_hs256_using_rsa_public_modulus_as_hmac_key` `test:test_lowercase_rs256_is_rejected` `test:test_missing_alg_is_rejected` `test:test_crit_header_is_rejected_before_key_lookup` `test:test_unexpected_typ_is_rejected_before_key_lookup` (test_mcp_alg_confusion) `code:JWTVerifier.verify` | PROVEN `mutation-checked` |
+| 4 | `alg: none`, `alg: HS256`, or a `crit` header | Rejected before key lookup. Algorithm confusion is not reachable. | `test:test_none_algorithm_with_forged_signature` `test:test_hs256_using_rsa_public_modulus_as_hmac_key` `test:test_lowercase_rs256_is_rejected` `test:test_missing_alg_is_rejected` `test:test_crit_header_is_rejected_before_key_lookup` `test:test_unexpected_typ_is_rejected_before_key_lookup` (test_mcp_alg_confusion) | PROVEN `mutation-checked` |
+| 4b | The signature itself: forged, wrong key, wrong hash, undersized or malformed key material | Rejected at verification. A genuine RS256 token is accepted and maps to the right principal. | `test:test_valid_rs256_signature_returns_claim_mapped_auth_context` `test:test_one_byte_signature_tampering_is_rejected` `test:test_signature_from_another_rsa_key_is_rejected` `test:test_sha1_signature_is_not_accepted_as_rs256` `test:test_1024_bit_rsa_modulus_is_rejected` `test:test_even_rsa_public_exponent_is_rejected` `test:test_rsa_public_exponent_one_is_rejected` `test:test_missing_cryptography_is_classified_as_dependency_unavailable` (test_mcp_rs256) | PROVEN `mutation-checked` |
+
+**Row 4b note — the largest gap this pass found.** Row 4 covered the algorithm
+guards, and every one of its cases rejects *before a key is fetched*. So the
+one step that decides whether a token is genuine was never executed by any test
+in the repository. Deleting the entire `public_key.verify(...)` call left the
+suite at 711 green.
+
+That is not a coverage percentage, it is a category error: signature
+verification was code, not behaviour. Row 4 and row 4b are separate rows because
+they answer separate questions — "is this the right algorithm" and "did the
+holder of the private key actually sign this".
+
+Mutation-checked four ways: deleting the verify call fails the three forgery
+cases; swapping its two arguments fails the positive control; replacing
+PKCS1v15 with PSS fails the positive control. The positive control matters as
+much as the rejections: without it, a rejection could come from anywhere.
 
 **Row 4 note.** `alg` rejection is code-reviewed but there is no offline case
 that feeds a forged `alg: none` token through `verify()`. The check is the
@@ -210,7 +228,8 @@ These are gaps, stated so nobody reads the eighteen rows above as completeness.
 | In-process code execution | Python privacy is not a boundary. `_record_trusted_landing` is a plain method; anything running in the SO process can call it and can also write the SQLite file directly. | B1 is closed against a **remote** caller only. Requires deployment isolation. |
 | Landing event bound to a WorkItem | `authority_landing_events` stores `session_id` but not `work_item_id`. | If signing succeeds and linking fails, the unconsumed event can be claimed by another WorkItem that holds `write` on that conversation. Bounded, accepted, recorded. |
 | DNS rebinding | Rows 20's validation lookup and the client's connection lookup are separate resolutions. | The SSRF defense is real but incomplete. Requires IP pinning. Recorded at the call site. |
-| Mutation coverage is not uniform | Four rows are `mutation-checked`; the rest are not. | Treat every unmarked PROVEN as "asserts the behaviour", not "proven necessary" — that is exactly how row 12 stayed PROVEN for three commits. |
+| Mutation coverage is not uniform | Five rows are `mutation-checked`; the rest are not. | Treat every unmarked PROVEN as "asserts the behaviour", not "proven necessary" — that is exactly how row 12 stayed PROVEN for three commits. |
+| Security tests can skip to green | `test_mcp_rs256` skips as a unit without `cryptography`. The unit job now installs `requirements-mcp.txt` and fails if the rs256 skip reason appears anyway. | Before that guard, the whole signature path could be skipped and the log still read green. Any future optional dependency must get the same treatment. |
 | `unlink_session` `rowcount` guard is unreachable | `BEGIN IMMEDIATE` precedes the SELECT and the SELECT filters `unlinked_at IS NULL`, so SQLite's single-writer rule makes `rowcount != 1` impossible. | Defence in depth, not evidence. It cannot be tested, and pretending otherwise would be worse than saying so. |
 | `aud` is checked twice, once unheld | Deleting the `validate_registered_claims` check changes no test outcome. | Redundant layer. Harmless, but not a second proof. |
 | Real thread-level races | No test interleaves two connections. | Row 16 proves the guard, not the race. |
@@ -248,6 +267,9 @@ the row was downgraded.
 | `aud` check in `validate_registered_claims` | **all 707 green** | Second `aud` layer unheld. Noted on row 3. |
 | all 7 `BEGIN IMMEDIATE` → `BEGIN` | **all 707 green** at the time; now 1 failed — the two-connection case, with five extra statements traced | Row 16 lock claim was unheld. Closed. |
 | `if changed != 1: raise` in `unlink_session` | **all 707 green** | Unreachable, not unheld. Dead code; cannot be tested. |
+| `public_key.verify(...)` call deleted from `verify_rs256_signature` | **all 711 green** at the time; now 3 failed — tampered, wrong key, SHA-1 | Signature verification was executed by nothing. Row 4b added. |
+| `verify(signature, signing_input, ...)` arguments swapped | 1 failed — the positive control | Row 4b. |
+| `PKCS1v15()` replaced with `PSS(...)` | 1 failed — the positive control | Row 4b. |
 | adapter oversize condition short-circuited to `False` | 1 failed — the `session.context` oversize case; the payload returned verbatim | Row 18 adapter half was unheld. Closed. |
 
 The two lines that still read "all green" are the residue, and they are not the
