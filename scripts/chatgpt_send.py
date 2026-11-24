@@ -6387,7 +6387,8 @@ def load_prompt_text(prompt_file):
 
 
 def _send_prompt_impl(api, conv_id, prompt_file, new_chat=False, thinking=None,
-                      text=None):
+                      text=None, _landing_store=None,
+                      _landing_work_item_id=None):
     """完整投递流程：tail → requirements+PoW → POST → 收割 → 落盘。
 
     返回 (status, reply_path, real_conv_id)；real_conv_id 用于登记会话归属。
@@ -6645,6 +6646,41 @@ def _send_prompt_impl(api, conv_id, prompt_file, new_chat=False, thinking=None,
     # 下游看到这个标记就知道「这不是定稿」，不会把它当完整回复继续操作。
     archived = (completeness_note + reply) if completeness_note else reply
     path = api.save_reply(real_conv, pfile, archived)
+
+    # D7: only the real successful send path may create a consumable landing
+    # event. All evidence is derived here, not accepted from caller arguments.
+    # Failure to record must not turn an already-sent-and-archived message into
+    # a send failure. The caller will observe link failure separately.
+    if _landing_store is not None:
+        try:
+            from src.session_ops.authority import (
+                validate_conversation_id,
+                validate_work_item_id,
+            )
+
+            validate_work_item_id(_landing_work_item_id)
+            validate_conversation_id(real_conv)
+            landing_confirmed = (
+                st == 200
+                and first_cid == real_conv
+                and len(all_cids) == 1
+                and all_cids[0] == real_conv
+                and (not conv_id or conv_id == real_conv)
+                and not mismatch
+                and reply_complete is True
+                and bool(path)
+                and os.path.isfile(path)
+            )
+            if landing_confirmed:
+                _landing_store._record_trusted_landing(
+                    real_conv, "confirmed", True
+                )
+        except Exception as exc:
+            print(
+                "WARN: trusted landing event was not recorded (%s); "
+                "the sent message remains archived and unchanged" % exc,
+                flush=True,
+            )
     return st, path, ConvRef(real_conv, reply_complete=reply_complete)
 
 
@@ -6667,6 +6703,115 @@ def _reply_state_of(status, reply, conv):
         return "quarantined"
     return "unavailable"              # 413/非 200 且无正文：本来就没有回复
 
+
+def send_prompt_for_work_item(
+    api,
+    store,
+    principal,
+    work_item_id,
+    conv_id,
+    prompt_file,
+    new_chat=False,
+    thinking=None,
+):
+    """Send, record confirmed landing evidence, then atomically link a WorkItem.
+
+    Return (send_result, link_or_none, link_error_or_none). A link failure is
+    reported separately and never rewrites the result of an already-sent turn.
+    """
+    from src.session_ops.authority import (
+        Principal,
+        SecureWorkItemStore,
+        validate_work_item_id,
+    )
+
+    if not isinstance(store, SecureWorkItemStore):
+        raise TypeError("store must be SecureWorkItemStore")
+    if not isinstance(principal, Principal):
+        raise TypeError("principal must be a verified Principal")
+    validate_work_item_id(work_item_id)
+    if getattr(api, "is_anon", False):
+        raise ValueError("anonymous sends cannot establish trusted landing evidence")
+
+    # Match main's R373-07 flow: read and validate once, before logging or sending.
+    text = load_prompt_text(prompt_file)
+    turn_id, begin_path = log_begin(api, conv_id, prompt_file, text)
+
+    api._last_reply_text = None
+    try:
+        result = _send_prompt_impl(
+            api,
+            conv_id,
+            prompt_file,
+            new_chat,
+            thinking,
+            text=text,
+            _landing_store=store,
+            _landing_work_item_id=work_item_id,
+        )
+    except BaseException as exc:
+        try:
+            log_end(
+                api,
+                turn_id,
+                begin_path,
+                conv_id,
+                None,
+                None,
+                None,
+                "unavailable",
+                error="%s: %s" % (type(exc).__name__, exc),
+            )
+        except Exception as log_exc:
+            print(
+                "FAIL: 异常轮次补写失败（%s）——该轮只有 begin，读取时会显示未完成"
+                % log_exc,
+                flush=True,
+            )
+        raise
+
+    status, path, conv = (tuple(result) + (None, None, None))[:3]
+    reply = getattr(api, "_last_reply_text", None)
+    reply_state = _reply_state_of(status, reply, conv)
+
+    try:
+        log_end(
+            api,
+            turn_id,
+            begin_path,
+            conv_id,
+            conv,
+            status,
+            path,
+            reply_state,
+        )
+    except Exception as log_exc:
+        print(
+            "FAIL: 回复留存失败（%s）——本轮只有 begin（提示词已存），"
+            "状态将显示 unrecorded；回复正文在 %s"
+            % (log_exc, path or "未落盘"),
+            flush=True,
+        )
+
+    if (
+        status != 200
+        or not isinstance(conv, ConvRef)
+        or conv.mismatch
+        or conv.reply_complete is not True
+    ):
+        return result, None, None
+
+    try:
+        link = store.link_session(
+            principal,
+            str(conv),
+            work_item_id,
+        )
+        return result, link, None
+    except Exception as exc:
+        # link_session consumes the event and creates the link in one
+        # transaction; on failure its transaction rolls back both effects.
+        return result, None, exc
 
 def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
     """完整投递流程（外层）：先固化提示词，再发送，最后补写回复。
