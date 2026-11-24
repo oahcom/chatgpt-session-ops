@@ -110,7 +110,7 @@ class TestSecurityMatrix(unittest.TestCase):
 
                 if kind == "test":
                     suffix_match = re.match(
-                        r"\s*\((test_[A-Za-z0-9_]+)\)",
+                        r"`\s*\((test_[A-Za-z0-9_]+)\)",
                         evidence[match.end():],
                     )
                     if suffix_match:
@@ -299,6 +299,41 @@ class TestSecurityMatrix(unittest.TestCase):
                         "矩阵第 %s 行引用了不存在的测试 %s"
                         % (ref["row"], name),
                     )
+
+    def test_test_citation_module_suffixes_are_parsed(self):
+        """六处显式 test: 模块后缀必须被识别并准确绑定。"""
+        references = [
+            ref for ref in self._references()
+            if ref["kind"] == "test"
+        ]
+
+        actual = {
+            ref["value"]: ref["module"]
+            for ref in references
+            if ref["module"] is not None
+        }
+
+        expected = {
+            "test_identity_cannot_be_injected_through_arguments":
+                "test_mcp_contract",
+            "test_unexpected_typ_is_rejected_before_key_lookup":
+                "test_mcp_alg_confusion",
+            "test_missing_cryptography_is_classified_as_dependency_unavailable":
+                "test_mcp_rs256",
+            "test_refresh_can_retry_after_backoff_expires":
+                "test_mcp_transport",
+            "test_jwks_rejects_all_dns_answers_if_any_is_non_global":
+                "test_mcp_transport",
+            "test_health_and_protected_resource_metadata_remain_public":
+                "test_mcp_transport",
+        }
+
+        self.assertEqual(
+            actual,
+            expected,
+            "安全矩阵 test: 模块后缀解析不完整或映射错误。"
+            "期望六处后缀均被识别；实际: %r" % actual,
+        )
 
     def test_code_citations_resolve_to_source_symbols(self):
         """code: 必须解析到 src/ 中真实存在的 Python 符号。
