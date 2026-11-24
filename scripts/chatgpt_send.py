@@ -6343,6 +6343,16 @@ def _log_excerpt(text, term, width=80):
             ("…" if b < len(text) else ""))
 
 
+# R381-06：只拒绝会改变文本视觉顺序、可用于审计欺骗的 Bidi 控制符，
+# 不整类拒绝 Cf——ZWJ/ZWNJ/ZWSP 等是正常排版需要（Owner R381 §4 口径）。
+_BIDI_CONTROL_CODEPOINTS = frozenset(
+    list(range(0x202A, 0x202F)) + list(range(0x2066, 0x206A)))
+
+
+def _bidi_name(cp):
+    return "U+%04X" % cp
+
+
 def validate_prompt_text(text, prompt_file):
     """校验提示词正文。拒绝损坏/无实质内容，避免把垃圾当指令发出去（R377-03）。
 
@@ -6362,6 +6372,13 @@ def validate_prompt_text(text, prompt_file):
             raise RuntimeError("提示词文件含非法控制字符：%s" % prompt_file)
     if not any(ch.isprintable() and not ch.isspace() for ch in text):
         raise RuntimeError("提示词文件不含可见正文：%s" % prompt_file)
+    # R381-06：Bidi 控制符可改变文本视觉顺序（审计欺骗），逐个码点拒绝并报出位置。
+    for i, ch in enumerate(text):
+        cp = ord(ch)
+        if cp in _BIDI_CONTROL_CODEPOINTS:
+            raise RuntimeError(
+                "提示词含双向控制字符 %s（位置 %d），疑似审计欺骗：%s"
+                % (_bidi_name(cp), i, prompt_file))
     return text
 
 

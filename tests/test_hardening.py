@@ -6359,14 +6359,17 @@ class TestConversationLog(TmpBase):
 
     def test_log_files_malformed_id_has_no_path_traversal(self):
         """畸形 id 的只读查找必须落在 unassigned 目录内（R382-02）。"""
+        base = os.path.abspath(m.log_unassigned_dir())
         for bad in ("../../evil", "../x", "a/b", "..", "x" * 300):
             files = m._log_files(bad)
             self.assertTrue(files, "畸形 id 应能定位到记录（只读）")
             for fp in files:
-                self.assertTrue(
-                    os.path.abspath(fp).startswith(os.path.abspath(m.log_unassigned_dir())),
+                actual = os.path.abspath(fp)
+                # R384：用 commonpath 精确校验目录归属，而不是 startswith 前缀匹配
+                self.assertEqual(
+                    os.path.commonpath([base, actual]), base,
                     "畸形 id 不得逃出 unassigned：%r -> %r" % (bad, fp))
-                self.assertNotIn("..", os.path.abspath(fp))
+                self.assertNotIn("..", actual)
 
     def test_malformed_conv_id_rejected_at_migration_entry(self):
         """畸形 cid 进迁移入口必须立即拒绝，不能当历史空值。"""
@@ -6444,6 +6447,52 @@ class TestConversationLog(TmpBase):
         self.assertTrue(os.path.exists(begin), "不得删除含 prompt 的 begin 文件")
         rows = m._read_jsonl(begin)
         self.assertEqual(rows[0]["prompt"], "不许删我")
+
+    # ---------- R381-06：Bidi 控制符按码点拒绝 ----------
+
+    def test_bidi_embedding_codepoints_rejected_individually(self):
+        """U+202A–U+202E 逐个拒绝（逐码点，不是整类 Cf）。"""
+        for cp in range(0x202A, 0x202F):
+            with self.assertRaises(RuntimeError, msg="U+%04X 应被拒" % cp):
+                m.validate_prompt_text("正常正文" + chr(cp) + "后续", "p.md")
+
+    def test_bidi_isolate_codepoints_rejected_individually(self):
+        """U+2066–U+2069 逐个拒绝。"""
+        for cp in range(0x2066, 0x206A):
+            with self.assertRaises(RuntimeError, msg="U+%04X 应被拒" % cp):
+                m.validate_prompt_text("正常正文" + chr(cp) + "后续", "p.md")
+
+    def test_benign_format_chars_are_kept(self):
+        """ZWSP/ZWNJ/ZWJ/WJ/LRM/RLM/ALM 是正常排版字符，必须放行。"""
+        keep = (0x200B, 0x200C, 0x200D, 0x2060, 0x200E, 0x200F, 0x061C)
+        for cp in keep:
+            m.validate_prompt_text("正常正文" + chr(cp) + "后续", "p.md")
+
+    def test_bidi_error_message_names_codepoint_and_position(self):
+        """错误提示必须报出码点与位置，便于定位（Owner 要求错误提示测试）。"""
+        text = "前缀" + chr(0x202E) + "后缀"
+        try:
+            m.validate_prompt_text(text, "p.md")
+            self.fail("应当抛出")
+        except RuntimeError as e:
+            msg = str(e)
+            self.assertIn("U+202E", msg, "必须报出具体码点")
+            self.assertIn("2", msg, "必须报出位置（0-based 第 2 位）")
+            self.assertIn("p.md", msg)
+
+    def test_multilingual_text_with_legit_format_chars_passes(self):
+        """多语言正常文本（含 ZWJ 等）必须通过，不能误杀。"""
+        samples = [
+            "中文正文，含标点。「引号」【方括号】",
+            "English body with emoji \U0001F600 and ZWJ \u200d inside",
+            "العربية نص عادي",                 # 阿拉伯语
+            "עברית טקסט רגיל",                 # 希伯来语
+            "ไทย ข้อความปกติ",                 # 泰语
+            "日本語のテキスト、改行あり\r\n二行目",
+            "# Markdown\n\n- 列表\t`code`\n",
+        ]
+        for s in samples:
+            m.validate_prompt_text(s, "p.md")
 
     # ---------- R377-01：正文错误判定必须整条匹配 ----------
 
