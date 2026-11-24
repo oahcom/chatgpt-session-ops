@@ -5894,6 +5894,12 @@ def log_unassigned_dir():
     """身份不可用且无法归属的轮次。按原始标识分文件，绝不合并到同一个桶。"""
     return os.path.join(log_root(), "unassigned")
 
+# R382-01：conv_id 必须有独立的严格判据（小写、带连字符的 UUID）。
+# 不复用 _ID_RE——那个正则还管 device id / baseline id，放宽是为了它们；
+# 而 conv_id 是会话身份，`"abc"` 这种"合法标签"不能成为可信身份。
+_CONV_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
 def _safe_conv_id(value):
     """规范化会话 id，三态返回（R381-02）：
 
@@ -5911,7 +5917,7 @@ def _safe_conv_id(value):
         return None
     if value == "":
         return ""
-    return value if _ID_RE.match(value) else None
+    return value if _CONV_ID_RE.fullmatch(value) else None
 
 def _sanitize_segment(raw):
     """把任意原始标识压成可做文件名的片段（保留可辨识性，去掉路径字符）。"""

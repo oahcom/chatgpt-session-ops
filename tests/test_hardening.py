@@ -6343,15 +6343,30 @@ class TestConversationLog(TmpBase):
     # ---------- R381-02：_safe_conv_id 三态 ----------
 
     def test_safe_conv_id_three_states(self):
-        """""=历史缺失 / 原值=合法 / None=畸形，三者必须可区分。"""
+        """""=历史缺失 / 原值=合法 / None=畸形，三者必须可区分（R382-01 严格 UUID）。"""
         self.assertEqual(m._safe_conv_id(None), "")
         self.assertEqual(m._safe_conv_id(""), "")
         good = "9f8e7d6c-1111-4222-8333-444455556666"
         self.assertEqual(m._safe_conv_id(good), good)
+        # 必须是规范的小写、带连字符 UUID
+        self.assertIsNone(m._safe_conv_id(good.upper()), "大写 UUID 不是可信身份")
+        self.assertIsNone(m._safe_conv_id(good.replace("-", "")), "无连字符不是 UUID")
+        self.assertIsNone(m._safe_conv_id("abc"), "宽松标签不是会话身份")
         for bad in ("abc/../x", "a" * 200, "   ", "../evil", "a b"):
             self.assertIsNone(m._safe_conv_id(bad), bad)
         for bad in (123, [], {}, True):
             self.assertIsNone(m._safe_conv_id(bad), bad)
+
+    def test_log_files_malformed_id_has_no_path_traversal(self):
+        """畸形 id 的只读查找必须落在 unassigned 目录内（R382-02）。"""
+        for bad in ("../../evil", "../x", "a/b", "..", "x" * 300):
+            files = m._log_files(bad)
+            self.assertTrue(files, "畸形 id 应能定位到记录（只读）")
+            for fp in files:
+                self.assertTrue(
+                    os.path.abspath(fp).startswith(os.path.abspath(m.log_unassigned_dir())),
+                    "畸形 id 不得逃出 unassigned：%r -> %r" % (bad, fp))
+                self.assertNotIn("..", os.path.abspath(fp))
 
     def test_malformed_conv_id_rejected_at_migration_entry(self):
         """畸形 cid 进迁移入口必须立即拒绝，不能当历史空值。"""
