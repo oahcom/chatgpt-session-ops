@@ -108,6 +108,7 @@ CREATE TABLE IF NOT EXISTS authority_audit_events (
     action TEXT NOT NULL,
     work_item_id TEXT,
     session_id TEXT,
+    link_id TEXT,
     target_principal_id TEXT,
     scope TEXT,
     outcome TEXT NOT NULL,
@@ -366,6 +367,54 @@ class SecureWorkItemStore:
         conn = self._connect()
         try:
             conn.executescript(AUTHZ_DDL)
+            audit_columns = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(authority_audit_events)"
+                ).fetchall()
+            }
+            if "link_id" not in audit_columns:
+                conn.execute(
+                    "ALTER TABLE authority_audit_events ADD COLUMN link_id TEXT"
+                )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_authority_audit_link "
+                "ON authority_audit_events(link_id, action, created_at)"
+            )
+            conn.execute("BEGIN IMMEDIATE")
+            stale_links = conn.execute(
+                "SELECT s.link_id, s.session_id, s.work_item_id "
+                "FROM session_links AS s "
+                "JOIN work_items AS w ON w.work_item_id = s.work_item_id "
+                "WHERE w.status IN ('completed', 'cancelled') "
+                "AND s.unlinked_at IS NULL "
+                "ORDER BY s.work_item_id, s.linked_at, s.link_id"
+            ).fetchall()
+            for link in stale_links:
+                changed_at = _utc_now()
+                changed = conn.execute(
+                    "UPDATE session_links SET unlinked_at = ? "
+                    "WHERE link_id = ? AND unlinked_at IS NULL",
+                    (changed_at, link["link_id"]),
+                ).rowcount
+                if changed != 1:
+                    raise AuthorityError(
+                        "active link changed during terminal-link reconciliation"
+                    )
+                self._audit(
+                    conn,
+                    Principal("system", "system:terminal-link-reconciler"),
+                    "session.auto_unlink_terminal",
+                    work_item_id=link["work_item_id"],
+                    session_id=link["session_id"],
+                    link_id=link["link_id"],
+                    request_id="terminal-link-backfill",
+                )
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
         finally:
             conn.close()
 
@@ -402,6 +451,7 @@ class SecureWorkItemStore:
         action: str,
         work_item_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        link_id: Optional[str] = None,
         target_principal_id: Optional[str] = None,
         scope: Optional[str] = None,
         request_id: Optional[str] = None,
@@ -409,8 +459,8 @@ class SecureWorkItemStore:
         conn.execute(
             "INSERT INTO authority_audit_events "
             "(audit_id, tenant_id, principal_id, action, work_item_id, "
-            "session_id, target_principal_id, scope, outcome, request_id, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'success', ?, ?)",
+            "session_id, link_id, target_principal_id, scope, outcome, request_id, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'success', ?, ?)",
             (
                 "ae_" + str(uuid.uuid4()),
                 principal.tenant_id,
@@ -418,6 +468,7 @@ class SecureWorkItemStore:
                 action,
                 work_item_id,
                 session_id,
+                link_id,
                 target_principal_id,
                 scope,
                 request_id,
@@ -432,7 +483,7 @@ class SecureWorkItemStore:
         try:
             rows = conn.execute(
                 "SELECT audit_id, tenant_id, principal_id, action, work_item_id, "
-                "session_id, target_principal_id, scope, outcome, request_id, created_at "
+                "session_id, link_id, target_principal_id, scope, outcome, request_id, created_at "
                 "FROM authority_audit_events WHERE work_item_id = ? "
                 "ORDER BY created_at, audit_id",
                 (work_item_id,),
@@ -637,11 +688,36 @@ class SecureWorkItemStore:
                     raise InvalidTransition(
                         "transition %s -> %s is not allowed" % (current, status)
                     )
+                changed_at = _utc_now()
                 conn.execute(
                     "UPDATE work_items SET status = ?, updated_at = ? "
                     "WHERE work_item_id = ?",
-                    (status, _utc_now(), work_item_id),
+                    (status, changed_at, work_item_id),
                 )
+                if status in TERMINAL_STATUSES:
+                    active_links = conn.execute(
+                        "SELECT link_id, session_id FROM session_links "
+                        "WHERE work_item_id = ? AND unlinked_at IS NULL "
+                        "ORDER BY linked_at, link_id",
+                        (work_item_id,),
+                    ).fetchall()
+                    for link in active_links:
+                        changed = conn.execute(
+                            "UPDATE session_links SET unlinked_at = ? "
+                            "WHERE link_id = ? AND unlinked_at IS NULL",
+                            (changed_at, link["link_id"]),
+                        ).rowcount
+                        if changed != 1:
+                            raise AuthorityError(
+                                "active link changed during terminal transition"
+                            )
+                        self._audit(
+                            conn, principal, "session.auto_unlink_terminal",
+                            work_item_id=work_item_id,
+                            session_id=link["session_id"],
+                            link_id=link["link_id"],
+                            request_id=request_id,
+                        )
             self._audit(
                 conn, principal, "work_item.update", work_item_id=work_item_id,
                 request_id=request_id,
@@ -828,7 +904,7 @@ class SecureWorkItemStore:
             )
             self._audit(
                 conn, principal, "session.link", work_item_id=work_item_id,
-                session_id=session_id, request_id=request_id,
+                session_id=session_id, link_id=link_id, request_id=request_id,
             )
             conn.execute("COMMIT")
         except sqlite3.IntegrityError as exc:
@@ -884,7 +960,7 @@ class SecureWorkItemStore:
             self._audit(
                 conn, principal, "session.unlink",
                 work_item_id=row["work_item_id"], session_id=session_id,
-                request_id=request_id,
+                link_id=row["link_id"], request_id=request_id,
             )
             conn.execute("COMMIT")
             return SessionLink(
@@ -920,18 +996,25 @@ class SecureWorkItemStore:
             conn.execute("BEGIN")
             self._require(conn, principal, work_item_id, "read")
             sql = (
-                "SELECT link_id, session_id, work_item_id, linked_at, unlinked_at "
-                "FROM session_links WHERE work_item_id = ?"
+                "SELECT s.link_id, s.session_id, s.work_item_id, "
+                "s.linked_at, s.unlinked_at "
+                "FROM session_links AS s "
+                "JOIN work_items AS w ON w.work_item_id = s.work_item_id "
+                "WHERE s.work_item_id = ?"
             )
             params: List[Any] = [work_item_id]
             if not include_unlinked:
-                sql += " AND unlinked_at IS NULL"
+                sql += " AND s.unlinked_at IS NULL "
+                sql += "AND w.status NOT IN ('completed', 'cancelled')"
             if decoded is not None:
-                sql += " AND (linked_at > ? OR (linked_at = ? AND link_id > ?))"
+                sql += (
+                    " AND (s.linked_at > ? "
+                    "OR (s.linked_at = ? AND s.link_id > ?))"
+                )
                 params.extend(
                     [decoded["linked_at"], decoded["linked_at"], decoded["link_id"]]
                 )
-            sql += " ORDER BY linked_at ASC, link_id ASC LIMIT ?"
+            sql += " ORDER BY s.linked_at ASC, s.link_id ASC LIMIT ?"
             params.append(limit + 1)
             rows = conn.execute(sql, params).fetchall()
             conn.execute("COMMIT")
@@ -964,8 +1047,12 @@ class SecureWorkItemStore:
         try:
             conn.execute("BEGIN")
             row = conn.execute(
-                "SELECT link_id, session_id, work_item_id, linked_at, unlinked_at "
-                "FROM session_links WHERE session_id = ? AND unlinked_at IS NULL",
+                "SELECT s.link_id, s.session_id, s.work_item_id, "
+                "s.linked_at, s.unlinked_at "
+                "FROM session_links AS s "
+                "JOIN work_items AS w ON w.work_item_id = s.work_item_id "
+                "WHERE s.session_id = ? AND s.unlinked_at IS NULL "
+                "AND w.status NOT IN ('completed', 'cancelled')",
                 (session_id,),
             ).fetchone()
             if row is None:
