@@ -7457,6 +7457,65 @@ def main():
     thinking_flag = "--thinking" in args
     if thinking_flag:
         args = [a for a in args if a != "--thinking"]
+
+    # D10：可信 WorkItem 发送参数。只摘出明确支持的旗标；
+    # 其他未知旗标保留在 args 中，由原有参数数量/命令校验拒绝。
+    work_item_options = {}
+    work_item_flags = {
+        "--work-item": "work_item_id",
+        "--principal": "principal_id",
+        "--tenant": "tenant_id",
+        "--db": "database_path",
+    }
+    parsed_args = []
+    i = 0
+    while i < len(args):
+        flag = args[i]
+        if flag not in work_item_flags:
+            parsed_args.append(flag)
+            i += 1
+            continue
+        key = work_item_flags[flag]
+        if key in work_item_options or i + 1 >= len(args):
+            print(
+                json.dumps(
+                    {"result": "error", "error": "invalid or duplicate %s" % flag},
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            return 2
+        value = args[i + 1]
+        if not value or value.startswith("--"):
+            print(
+                json.dumps(
+                    {"result": "error", "error": "%s requires a value" % flag},
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            return 2
+        work_item_options[key] = value
+        i += 2
+    args = parsed_args
+
+    work_item_id = work_item_options.get("work_item_id")
+    if work_item_id is None and any(
+        key in work_item_options
+        for key in ("principal_id", "tenant_id", "database_path")
+    ):
+        print(
+            json.dumps(
+                {
+                    "result": "error",
+                    "error": "--principal, --tenant and --db require --work-item",
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return 2
+
     account, explicit_account = "default", False
     if args and args[0] in ("--help", "-h"):
         print(__doc__)
@@ -8209,10 +8268,190 @@ def main():
             print("FAIL: account auth unavailable: %s" % e, flush=True)
             return None
 
+    # D10a/D10b：本地 CLI 操作者权威，不是 IdP 认证身份。
+    # 预检在创建 API 和发送消息之前完成。
+    work_item_store = None
+    work_item_principal = None
+    if work_item_id is not None:
+        from src.session_ops.authority import (
+            DenyAllPrincipalDirectory,
+            Principal,
+            SecureWorkItemStore,
+            validate_work_item_id,
+        )
+
+        principal_id = (
+            work_item_options.get("principal_id")
+            or os.environ.get("SO_MCP_PRINCIPAL")
+        )
+        tenant_id = (
+            work_item_options.get("tenant_id")
+            or os.environ.get("SO_MCP_TENANT")
+        )
+        database_path = (
+            work_item_options.get("database_path")
+            or os.environ.get("SO_MCP_DB")
+        )
+        if not principal_id or not tenant_id or not database_path:
+            print(
+                json.dumps(
+                    {
+                        "result": "error",
+                        "error": (
+                            "--work-item requires --principal/ SO_MCP_PRINCIPAL, "
+                            "--tenant/ SO_MCP_TENANT and --db/ SO_MCP_DB"
+                        ),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            return 2
+        if database_path == ":memory:":
+            print(
+                json.dumps(
+                    {
+                        "result": "error",
+                        "error": "--db must name a persistent database file",
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            return 2
+        try:
+            validate_work_item_id(work_item_id)
+            work_item_principal = Principal(tenant_id, principal_id)
+            work_item_store = SecureWorkItemStore(
+                database_path,
+                principal_directory=DenyAllPrincipalDirectory(),
+            )
+            work_item_store.initialize()
+
+            # 发送前验证 write 权限，避免对无权 WorkItem 先发消息再失败。
+            conn = work_item_store._connect()
+            try:
+                work_item_store._require(
+                    conn, work_item_principal, work_item_id, "write"
+                )
+            finally:
+                conn.close()
+        except Exception as e:
+            print(
+                json.dumps(
+                    {"result": "error", "error": "WorkItem preflight failed: %s" % e},
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            return 2
+
+    def send_work_item(api, target_conv_id, prompt_file, new_chat=False):
+        """可信发送入口；保留既有会话归属登记，并单独报告 link 结果。"""
+        try:
+            result, link, link_error = send_prompt_for_work_item(
+                api,
+                work_item_store,
+                work_item_principal,
+                work_item_id,
+                target_conv_id,
+                prompt_file,
+                new_chat=new_chat,
+                thinking=True if thinking_flag else None,
+            )
+        except Exception as e:
+            print(
+                json.dumps(
+                    {
+                        "result": "error",
+                        "status": None,
+                        "work_item_id": work_item_id,
+                        "link": None,
+                        "link_error": str(e),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            return 1
+
+        status, path, conv = (tuple(result) + (None, None, None))[:3]
+
+        # 保留既有 record_conv 行为：
+        # --new 使用实际创建的会话 ID；续聊使用原目标 ID。
+        if status == 200:
+            if new_chat and conv:
+                record_conv(str(conv), account, prompt_file)
+            elif not new_chat:
+                record_conv(target_conv_id, account, prompt_file)
+
+        link_value = None
+        if link is not None:
+            link_value = {
+                "link_id": link.link_id,
+                "session_id": link.session_id,
+            }
+
+        if link_error is None and status == 200 and link is None:
+            link_error = (
+                "trusted landing was not confirmed; no link was created"
+            )
+
+        output = {
+            "result": "ok" if status == 200 and link is not None else "error",
+            "status": status,
+            "work_item_id": work_item_id,
+            "link": link_value,
+            "link_error": str(link_error) if link_error is not None else None,
+        }
+        if getattr(conv, "mismatch", False):
+            # 保留原 mismatch 分支的所有诊断字段。
+            output.update({
+                "landing_mismatch": True,
+                "target_conv_id": getattr(
+                    conv, "target_conv_id", target_conv_id or ""
+                ),
+                "actual_conv_id": getattr(conv, "actual_conv_id", ""),
+                "reason": getattr(conv, "reason", ""),
+                "quarantine_path": path,
+                "candidate_conv_ids": list(
+                    getattr(conv, "candidate_ids", []) or []
+                ),
+            })
+        elif getattr(conv, "candidate_ids", None):
+            output["candidate_conv_ids"] = list(conv.candidate_ids)
+
+        if link_error is not None and status == 200:
+            output["message"] = (
+                "The message was sent and archived, but linking failed; "
+                "manual linking is required."
+            )
+
+        print(json.dumps(output, ensure_ascii=False), flush=True)
+        return 0 if status == 200 and link is not None else 1
+
     # ---- 开新会话 ----
     if args[0] == "--new":
         if len(args) != 2:
             print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin|auto] [--thinking] --new <prompt_file>", flush=True)
+            return 2
+        if work_item_id is not None and (
+            not explicit_account or account in ("auto", "nologin")
+        ):
+            print(
+                json.dumps(
+                    {
+                        "result": "error",
+                        "error": (
+                            "--work-item --new requires an explicit logged-in "
+                            "--account acct1..acct6; automatic rotation and "
+                            "anonymous fallback cannot issue trusted landing evidence"
+                        ),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
             return 2
         if explicit_account and account != "auto":
             api = build(account)
@@ -8222,6 +8461,10 @@ def main():
                 print("nologin：走匿名浏览器通道（需 CDP 端口 %s 的未登录浏览器）"
                       % os.environ.get("CHATGPT_ANON_CDP_PORT", "9333"), flush=True)
             try:
+                if work_item_id is not None:
+                    return send_work_item(
+                        api, None, args[1], new_chat=True
+                    )
                 status, _path, conv = send_prompt(api, None, args[1], new_chat=True,
                                                   thinking=True if thinking_flag else None)
 
@@ -8310,6 +8553,46 @@ def main():
         elif ownership_status == "known":
             account = resolution["account"]
 
+    # D10c: reject caller-supplied landing evidence before credentials,
+    # account state, or any other external action is touched.
+    # Keep this as a narrow denylist: main() also serves legacy non-send
+    # commands whose flag semantics must not be changed by a global whitelist.
+    forbidden_evidence_flags = {
+        "--evidence",
+        "--match",
+        "--confirmed",
+    }
+    forbidden_evidence_prefixes = (
+        "--evidence-",
+        "--match-",
+        "--confirmed-",
+    )
+    supplied_forbidden = []
+    for arg in args:
+        flag = arg.split("=", 1)[0]
+        if (
+            flag in forbidden_evidence_flags
+            or flag.startswith(forbidden_evidence_prefixes)
+        ):
+            supplied_forbidden.append(flag)
+    if supplied_forbidden:
+        print(
+            "usage: --work-item <work-item-id> [options]",
+            flush=True,
+        )
+        print(
+            json.dumps(
+                {
+                    "result": "error",
+                    "error": "caller-supplied evidence flags are forbidden",
+                    "flags": sorted(set(supplied_forbidden)),
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return 2
+
     api = build(account)
     if api is None:
         return 2
@@ -8329,6 +8612,20 @@ def main():
     if len(args) != 2:
         print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin] <conv_id> <prompt_file>", flush=True)
         return 2
+    if work_item_id is not None:
+        if account == "nologin":
+            print(
+                json.dumps(
+                    {
+                        "result": "error",
+                        "error": "--work-item does not support anonymous sends",
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            return 2
+        return send_work_item(api, conv_id, args[1], new_chat=False)
     try:
         status, _path, conv = send_prompt(api, conv_id, args[1],
                                           thinking=True if thinking_flag else None)
