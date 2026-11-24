@@ -50,7 +50,7 @@ is recorded per row rather than averaged away.
 |---|---|---|---|---|
 | 1 | A caller passes a principal, tenant or scope **as a tool argument** | Rejected. Identity comes from the verified token only. | `test:test_identity_cannot_be_injected_through_arguments` (test_mcp_contract) | PROVEN |
 | 2 | No `Authorization` header, or a header the middleware cannot read | `UNAUTHENTICATED`. No tool dispatch. | `test:test_missing_auth_context_is_unauthenticated` | PROVEN |
-| 3 | A structurally valid JWT whose `aud` is another service | Rejected before any key lookup for `alg`, and at claim validation for `aud`. | `test:test_claim_mapping_rejects_wrong_audience` `code:validate_registered_claims` | PROVEN |
+| 3 | A structurally valid JWT whose `aud` is another service | Rejected at claim validation, and again in `principal_from_claims`. | `test:test_claim_mapping_rejects_wrong_audience` | PROVEN, second layer unproven |
 | 4 | `alg: none`, `alg: HS256`, or a `crit` header | Rejected before key lookup. Algorithm confusion is not reachable. | `test:test_none_algorithm_with_forged_signature` `test:test_hs256_using_rsa_public_modulus_as_hmac_key` `test:test_lowercase_rs256_is_rejected` `test:test_missing_alg_is_rejected` `test:test_crit_header_is_rejected_before_key_lookup` `test:test_unexpected_typ_is_rejected_before_key_lookup` (test_mcp_alg_confusion) `code:JWTVerifier.verify` | PROVEN `mutation-checked` |
 
 **Row 4 note.** `alg` rejection is code-reviewed but there is no offline case
@@ -65,7 +65,20 @@ is not tested. Marked CODE_ONLY rather than PROVEN deliberately.
 | # | Scenario | Expected | Evidence | Status |
 |---|---|---|---|---|
 | 5 | Authenticated principal lacks a required scope for the tool | `PERMISSION_DENIED`, distinct from `UNAUTHENTICATED`. | `test:test_insufficient_scope_is_permission_denied` | PROVEN |
-| 6 | `work_item.grant` / `work_item.revoke` called with only `work_item.write` | Denied. Delegation administration needs `session_ops.access.manage`. | `test:test_work_item_grant_requires_access_manage` | PROVEN |
+| 6 | `work_item.grant` / `work_item.revoke` called with only `work_item.write` | Denied. Delegation administration needs `session_ops.access.manage`. | `test:test_work_item_grant_requires_access_manage` (covers `grant` only) | **WEAK** — `revoke` half unproven |
+
+**Row 3 note.** `aud` is checked twice: once in `validate_registered_claims`
+and again in `principal_from_claims`. The cited test exercises
+`principal_from_claims`. Deleting the `aud` check there fails it; deleting the
+one in `validate_registered_claims` leaves the suite green. The behaviour is
+covered once, which is enough for the behaviour, but the row previously named
+the wrong layer as the proof.
+
+**Row 6 note — this one is a real hole in the ledger, not a citation slip.**
+The test calls `work_item.grant` and never `work_item.revoke`. Deleting
+`session_ops.access.manage` from `TOOL_REQUIRED_SCOPES["work_item.revoke"]`
+leaves all 707 cases green. The code is currently correct; nothing holds it
+that way. Row 6 must stay WEAK until a `revoke` case exists.
 | 7 | A `write` grantee tries to grant to a third party, or revoke another principal's grant | Denied. `write` never implies grant administration. | `test:test_write_grantee_cannot_grant_or_revoke` | PROVEN |
 | 8 | Owner grants to a target that is unknown, disabled, or in another tenant | Refused **before** the grant row is written; cross-tenant attempts leave no row. | `test:test_unknown_target_is_rejected_by_default_directory` `test:test_same_tenant_unregistered_target_is_rejected` `test:test_target_must_exist_be_enabled_and_be_same_tenant` `test:test_cross_tenant_target_is_rejected_before_grant_is_written` | PROVEN |
 
@@ -108,7 +121,20 @@ green and only the new one fails.
 
 | # | Scenario | Expected | Evidence | Status |
 |---|---|---|---|---|
-| 16 | A concurrent revoke lands between the authorization check and the mutation; or a relink moves the session between the unlink check and the delete | Both fail closed. Check and mutation share one `BEGIN IMMEDIATE` on one connection; `unlink_session` re-checks `expected_link_id` and asserts `rowcount == 1`. | `test:test_stale_expected_link_id_does_not_unlink` `test:test_expected_updated_at_is_compare_and_swap` `code:set_status` `code:unlink_session` | PROVEN |
+| 16 | A concurrent revoke lands between the authorization check and the mutation; or a relink moves the session between the unlink check and the delete | Both fail closed. Check and mutation share one `BEGIN IMMEDIATE` on one connection; `unlink_session` re-checks `expected_link_id` and asserts `rowcount == 1`. | `test:test_stale_expected_link_id_does_not_unlink` `test:test_expected_updated_at_is_compare_and_swap` | **WEAK** — the two guards that make the claim are unproven |
+
+**Row 16 note — the worst of the mislabels.** The cited cases prove the
+*preconditions* (`expected_link_id`, `expected_updated_at` are compared), which
+is a different statement from the one the row makes. Two deletions, both
+leaving 707 green:
+
+- rewriting all seven `BEGIN IMMEDIATE` to `BEGIN` — the lock is gone and no
+  case notices;
+- deleting the `if changed != 1: raise` guard in `unlink_session` — the
+  `rowcount` assertion the row names as its evidence is never exercised.
+
+So B3 is closed in the code and held by nothing. This needs a real two
+connection case, not another assertion on a single one.
 | 17 | The audit write fails partway through a mutation | The business change rolls back too. No unaudited mutation survives. | `test:test_audit_failure_rolls_back_work_item_and_owner` `test:test_audit_failure_rolls_back_status_mutation` `test:test_all_successful_mutations_are_audited` `test:test_audit_rows_are_append_only` | PROVEN |
 
 **Row 16 note.** The offline cases prove the *precondition* mechanism (a stale
@@ -125,7 +151,23 @@ reproduced".
 
 | # | Scenario | Expected | Evidence | Status |
 |---|---|---|---|---|
-| 18 | Memory adapter is unconfigured; or it returns an oversized response | `DEPENDENCY_UNAVAILABLE` and `RESOURCE_EXHAUSTED` respectively. A degraded dependency must not be reported as an empty success, and an oversized payload must not be silently truncated. | `test:test_context_without_adapter_is_dependency_unavailable` `test:test_oversized_response_becomes_resource_exhausted` `test:test_session_context_with_injected_adapter` | PROVEN `mutation-checked` |
+| 18 | Memory adapter is unconfigured; or it returns an oversized response | `DEPENDENCY_UNAVAILABLE` and `RESOURCE_EXHAUSTED` respectively. A degraded dependency must not be reported as an empty success, and an oversized payload must not be silently truncated. | `test:test_context_without_adapter_is_dependency_unavailable` `test:test_oversized_response_becomes_resource_exhausted` `test:test_session_context_with_injected_adapter` | **WEAK** — two different oversize paths, only one is tested |
+
+**Row 18 note.** The row bundles two independent oversize situations and the
+cited test covers neither of the ones it names.
+
+`test_oversized_response_becomes_resource_exhausted` drives `work_item.create`
+through a fake store that returns a huge `content` field. That exercises the
+envelope-size check at the end of `dispatch`, not the adapter path.
+
+The adapter path has its own check — `_session_context` raises when
+`len(content) > MAX_CONTEXT_CONTENT_CHARS` — and no case reaches it. Deleting
+that `raise` leaves the suite green.
+
+The unconfigured half is genuine: `test_context_without_adapter_is_dependency_unavailable`
+goes red when the `memory_adapter_command is None` guard is deleted. So this row
+is half proven and half asserted, which is not what a single PROVEN column can
+express.
 
 **Row 18 note.** `test_session_context_with_injected_adapter` is the happy path
 and does not prove the fail-closed branch. That branch is
@@ -135,7 +177,7 @@ and does not prove the fail-closed branch. That branch is
 
 ---
 
-## G. Transport and discovery (19–22)
+## G. Transport and discovery (19–21)
 
 These were absent from v1. An independent review of the deployed surface found
 the three holes below; they are not new features, they are repairs to code that
@@ -146,7 +188,6 @@ was already running.
 | 19 | An unauthenticated caller sends many random `kid` values to amplify JWKS fetches | Fresh-cache misses fail without fetching. Expired-cache refresh is single-flight and backs off after failure. The lock is never held across network I/O. | `test:test_fresh_cache_unknown_kid_never_downloads` `test:test_expired_cache_concurrent_refresh_is_single_flight` `test:test_failed_refresh_is_not_retried_inside_backoff_window` `test:test_refresh_can_retry_after_backoff_expires` (test_mcp_transport) | PROVEN |
 | 20 | An attacker-influenced issuer points discovery at an internal address | Redirects refused. HTTPS destinations resolved; any non-global answer rejects the whole URL. | `test:test_non_override_discovery_rejects_different_jwks_origin` `test:test_default_fetcher_does_not_follow_redirects` `test:test_https_jwks_rejects_loopback_link_local_and_private_ips` `test:test_jwks_rejects_all_dns_answers_if_any_is_non_global` (test_mcp_transport) | PROVEN, **partial** |
 | 21 | A request targets the MCP endpoint's subpaths | Authenticated. Health and protected-resource metadata stay public. | `test:test_mcp_subpath_is_authenticated` `test:test_mcp_endpoint_itself_is_authenticated` `test:test_health_and_protected_resource_metadata_remain_public` (test_mcp_transport) | PROVEN |
-| 22 | The `aud` claim names another service | Rejected at claim validation. | `test:test_claim_mapping_rejects_wrong_audience` (test_mcp_contract) | PROVEN |
 
 **Row 20 is partial on purpose.** The address check and the HTTP connection
 perform *separate* DNS resolutions, so a rebinding attacker can answer
@@ -165,7 +206,9 @@ These are gaps, stated so nobody reads the eighteen rows above as completeness.
 | In-process code execution | Python privacy is not a boundary. `_record_trusted_landing` is a plain method; anything running in the SO process can call it and can also write the SQLite file directly. | B1 is closed against a **remote** caller only. Requires deployment isolation. |
 | Landing event bound to a WorkItem | `authority_landing_events` stores `session_id` but not `work_item_id`. | If signing succeeds and linking fails, the unconsumed event can be claimed by another WorkItem that holds `write` on that conversation. Bounded, accepted, recorded. |
 | DNS rebinding | Rows 20's validation lookup and the client's connection lookup are separate resolutions. | The SSRF defense is real but incomplete. Requires IP pinning. Recorded at the call site. |
-| Mutation coverage is not uniform | Two rows are `mutation-checked`; the rest are not. Nobody has yet deleted each guard and watched its row go red. | The non-marked rows could still contain cases that survive deletion of their subject. This is exactly how row 12 stayed PROVEN for three commits. Treat unmarked PROVEN as "asserts the behaviour", not "proven necessary". |
+| Mutation coverage is not uniform | Two rows are `mutation-checked`; the rest are not, and three of them are now known to stay green when their guard is deleted. | Rows 6, 16 and 18 are WEAK for that reason specifically. Treat every other unmarked PROVEN as "asserts the behaviour", not "proven necessary" — that is exactly how row 12 stayed PROVEN for three commits. |
+| The B3 lock is unheld | Deleting `BEGIN IMMEDIATE` or the `unlink_session` `rowcount` guard changes no test outcome. | TOCTOU is closed by code shape only. Two connections, one holding a write transaction, is the missing case. |
+| `revoke` scope is unheld | Row 6's case only exercises `grant`. | A future edit that drops `access.manage` from `work_item.revoke` would pass review and tests. |
 | Real thread-level races | No test interleaves two connections. | Row 16 proves the guard, not the race. |
 | Multi-user isolation | D4 fixes the first deployment at one principal, one tenant. | Cross-principal/cross-tenant behaviour is tested at the unit level only; it is not claimed for a multi-user deployment. |
 
@@ -181,3 +224,28 @@ A row may be marked `mutation-checked` only after the guard has actually been
 deleted and the row observed to go red. The deletion, the failing case names and
 the restored state must be in the commit message or the PR body. Asserting that
 a test "would" fail is not a mutation check.
+
+---
+
+## Mutation log — 2026-11-24
+
+Every deletion below was performed on this tree, the suite was run, and the tree
+was restored (`git diff --stat` clean afterwards). Where the suite stayed green,
+the row was downgraded.
+
+| Deleted / changed | Full suite | Consequence |
+|---|---|---|
+| `if evidence is not None: raise` in `link_session` | 1 failed — the new row 12 case only; the old case stayed green | Row 12 could not see its subject. Replaced. |
+| `if header.get("alg") != "RS256"` | 4 failed — none-forged, HS256, lowercase, missing | Row 4 was CODE_ONLY. Now PROVEN. |
+| `if "crit" in header:` | 1 failed — crit case | Row 4 crit half now covered. |
+| `memory_adapter_command is None` guard | 1 failed — `DEPENDENCY_UNAVAILABLE` became `INVALID_ARGUMENT` | Row 18 unconfigured half is genuine. |
+| `session_ops.access.manage` removed from `work_item.revoke` | **all 707 green** | Row 6 revoke half is unheld. Downgraded. |
+| `aud` check in `principal_from_claims` | 1 failed | Row 3 behaviour is covered here. |
+| `aud` check in `validate_registered_claims` | **all 707 green** | Second `aud` layer unheld. Noted on row 3. |
+| all 7 `BEGIN IMMEDIATE` → `BEGIN` | **all 707 green** | Row 16 lock claim unheld. Downgraded. |
+| `if changed != 1: raise` in `unlink_session` | **all 707 green** | Row 16 `rowcount` claim unheld. Downgraded. |
+| adapter `raise RuntimeError("oversized content")` | not run — the branch is unreachable in tests | Row 18 adapter half is unheld. Downgraded. |
+
+The three "all 707 green" lines are the point of this document. Each of them is
+a guard that is currently correct, is named by a PROVEN row, and is held in
+place by nothing but the fact that nobody deleted it yet.
