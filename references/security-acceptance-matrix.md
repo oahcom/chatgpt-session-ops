@@ -48,12 +48,12 @@ is recorded per row rather than averaged away.
 **Erratum — the #30 commit title overstates this.** Commit `cca106c` is titled
 "matrix v3 — every PROVEN row now has a deletion behind it". That is a commit
 message, it is not rewritten, and it should not be read as a description of the
-current table. At the time of writing **6 of 22 rows** have an actual deletion
-behind them (rows 4, 4b, 6, 12, 16, 18); the other PROVEN rows assert the
-behaviour but have not had the implementation deleted to watch them fail.
-`PROVEN` therefore must not be read as `mutation-checked` — the only thing that
-means `mutation-checked` is the mark itself. Per-row status in the table below
-is authoritative.
+current table. The claim was already false when it was made: at `f28561b`
+(2026-11-24) only 6 of the 22 rows then in the table had an actual deletion
+behind them. How many have one today is deliberately not restated here — read
+the `mutation-checked` mark in the status column, which is the only thing that
+means `mutation-checked`. Per-row status in the table below is authoritative,
+and restating a derivable count in prose is what produced this erratum.
 
 ---
 
