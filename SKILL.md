@@ -589,7 +589,7 @@ python scripts/mcp_connector.py eligibility --accounts acct1,acct2,acct3,acct4,a
 
 ### tests/
 
-- `test_hardening.py` — 离线回归（424 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW、设备身份留存与多设备回退、出口代理（含本地假 http/socks 代理真分流）。
+- `test_hardening.py` — 离线回归（432 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW、设备身份留存与多设备回退、出口代理（含本地假 http/socks 代理真分流）。
 
 ## 协议细节
 

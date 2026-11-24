@@ -6268,6 +6268,168 @@ class TestConversationLog(TmpBase):
             out = m._migrate_pending(tid, begin, cid)
             self.assertIsNotNone(out, "顺序不应影响结果：%s" % order)
 
+    # ---------- R381-01：新会话投递失败必须保住 prompt ----------
+
+    def test_new_chat_live_tail_failure_preserves_prompt(self):
+        """新会话投递异常时，begin+end 必须同留在 pending，prompt 原文可读。
+
+        这是 R381 确认的生产缺陷：旧实现把 end 写进 unassigned、再删掉 begin
+        （唯一一份 prompt），9 轮提示词已因此永久丢失。
+        """
+        prompt = "这段提示词绝不能丢"
+        api = FakeAPI(os.path.join(self.tmp, "auth"))
+        # 新会话路径不走 live_tail；用 requirements 失败注入真实的投递中断
+        api.requirements = lambda: (_ for _ in ()).throw(
+            RuntimeError("模拟 PoW/requirements 中断"))
+
+        with self.assertRaises(RuntimeError):
+            m.send_prompt(api, None, self._prompt(prompt), new_chat=True)
+
+        pend = [n for n in os.listdir(m.log_pending_dir()) if n.endswith(".jsonl")]
+        self.assertEqual(len(pend), 1, "整轮必须留在 pending")
+        begin_path = os.path.join(m.log_pending_dir(), pend[0])
+        rows = m._read_jsonl(begin_path)
+        self.assertEqual([r["phase"] for r in rows], ["begin", "end"])
+        self.assertEqual(rows[0]["prompt"], prompt, "prompt 必须原文完整")
+        self.assertEqual(rows[1]["reply_state"], "unavailable")
+        self.assertEqual(rows[1]["conv_id"], "", "无 cid 时不得编造身份")
+        self.assertTrue(os.path.exists(begin_path), "begin 不得被删")
+        un = []
+        try:
+            un = [n for n in os.listdir(m.log_unassigned_dir()) if n.endswith(".jsonl")]
+        except OSError:
+            pass
+        self.assertEqual(un, [], "不得再产生只有 end 的 unassigned 空壳")
+
+    def test_end_append_failure_keeps_prompt(self):
+        """end 追加进 pending 失败时，原 begin 仍必须存在、prompt 可读。"""
+        prompt = "追加失败也不许丢"
+        api = FakeAPI(os.path.join(self.tmp, "auth"))
+        api.requirements = lambda: (_ for _ in ()).throw(RuntimeError("中断"))
+
+        real = m._log_write
+        def fail_end(path, record):
+            if record.get("phase") == "end":
+                raise OSError("模拟 end 写失败")
+            return real(path, record)
+        m._log_write = fail_end
+        try:
+            with self.assertRaises(Exception):
+                m.send_prompt(api, None, self._prompt(prompt), new_chat=True)
+        finally:
+            m._log_write = real
+
+        pend = [n for n in os.listdir(m.log_pending_dir()) if n.endswith(".jsonl")]
+        self.assertEqual(len(pend), 1)
+        rows = m._read_jsonl(os.path.join(m.log_pending_dir(), pend[0]))
+        self.assertEqual([r["phase"] for r in rows], ["begin"], "只有 begin 也合法")
+        self.assertEqual(rows[0]["prompt"], prompt, "prompt 必须还在")
+
+    def test_existing_conv_failure_keeps_identity_behavior(self):
+        """已有会话投递异常：仍按目标 cid 归属，不进 pending（行为不变）。"""
+        cid = "aaa11111-2222-4333-8444-555566667777"
+        api = FakeAPI(os.path.join(self.tmp, "auth"))
+        def boom(*a, **k):
+            raise RuntimeError("中断")
+        api.live_tail = boom
+        with self.assertRaises(RuntimeError):
+            m.send_prompt(api, cid, self._prompt("既有会话"))
+        recs = list(m.iter_turns(cid))
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["conv_id"], cid)
+        self.assertEqual(recs[0]["reply_state"], "unavailable")
+        self.assertEqual(recs[0]["prompt"], "既有会话")
+
+    # ---------- R381-02：_safe_conv_id 三态 ----------
+
+    def test_safe_conv_id_three_states(self):
+        """""=历史缺失 / 原值=合法 / None=畸形，三者必须可区分。"""
+        self.assertEqual(m._safe_conv_id(None), "")
+        self.assertEqual(m._safe_conv_id(""), "")
+        good = "9f8e7d6c-1111-4222-8333-444455556666"
+        self.assertEqual(m._safe_conv_id(good), good)
+        for bad in ("abc/../x", "a" * 200, "   ", "../evil", "a b"):
+            self.assertIsNone(m._safe_conv_id(bad), bad)
+        for bad in (123, [], {}, True):
+            self.assertIsNone(m._safe_conv_id(bad), bad)
+
+    def test_malformed_conv_id_rejected_at_migration_entry(self):
+        """畸形 cid 进迁移入口必须立即拒绝，不能当历史空值。"""
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-mal")
+        rec = {"turn_id": "t-mal", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        self.assertIsNone(m._migrate_pending("t-mal", begin, "abc/../x"))
+        self.assertTrue(os.path.exists(begin), "畸形 id 不许动 pending")
+
+    def test_malformed_identity_in_target_record_rejected(self):
+        """目标记录身份畸形 → 拒绝迁移（不能当历史空值放行）。"""
+        cid = "bbb22222-3333-4444-8555-666677778888"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-mal2")
+        rec = {"turn_id": "t-mal2", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(json.dumps(dict(rec, conv_id="abc/../x"), ensure_ascii=False) + "\n")
+        self.assertIsNone(m._migrate_pending("t-mal2", begin, cid))
+        self.assertTrue(os.path.exists(begin))
+
+    def test_migration_entry_distinguishes_malformed_from_missing(self):
+        """畸形与缺失必须给出不同诊断（Owner §3.3：两种错误必须区分）。"""
+        import contextlib
+        import io as _io
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-diag")
+        rec = {"turn_id": "t-diag", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        buf = _io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            m._migrate_pending("t-diag", begin, "abc/../x")
+        malformed_msg = buf.getvalue()
+
+        buf2 = _io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            m._migrate_pending("t-diag", begin, "")
+        missing_msg = buf2.getvalue()
+
+        self.assertIn("畸形", malformed_msg, "畸形身份必须报畸形")
+        self.assertIn("缺失", missing_msg, "缺失身份必须报缺失")
+        self.assertNotEqual(malformed_msg, missing_msg, "两种错误不得同一句文案")
+
+    def test_log_end_never_deletes_begin_left_in_conversations(self):
+        """即使 begin 落在 conversations（非 pending），无 cid 时也不得删它。
+
+        当前调用方走不到这条路径，但「删掉含 prompt 的文件」是不该存在的兜底行为；
+        一旦将来有新调用方，删的是整个会话文件。
+        """
+        cid = "ccc33333-4444-4555-8666-777788889999"
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.conversation_log_path(cid)
+        rec = {"turn_id": "t-keep", "phase": "begin", "conv_id": cid,
+               "prompt": "不许删我", "prompt_chars": 5, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        class _Api:
+            account = "acct1"
+            _last_reply_text = None
+            reply_source = "api"
+        # 目标与落点都为空 → 走无 cid 分支
+        m.log_end(_Api(), "t-keep", begin, None, None, None, None, "unavailable")
+        self.assertTrue(os.path.exists(begin), "不得删除含 prompt 的 begin 文件")
+        rows = m._read_jsonl(begin)
+        self.assertEqual(rows[0]["prompt"], "不许删我")
+
     # ---------- R377-01：正文错误判定必须整条匹配 ----------
 
     def test_judge_error_multiline_error_with_extra_text_is_not_error(self):
