@@ -83,10 +83,18 @@ cases; swapping its two arguments fails the positive control; replacing
 PKCS1v15 with PSS fails the positive control. The positive control matters as
 much as the rejections: without it, a rejection could come from anywhere.
 
-**Row 4 note.** `alg` rejection is code-reviewed but there is no offline case
-that feeds a forged `alg: none` token through `verify()`. The check is the
-first statement in the method, so the risk of silent regression is low, but it
-is not tested. Marked CODE_ONLY rather than PROVEN deliberately.
+**Row 4 note — stale, corrected.** An earlier revision of this document said
+`alg` rejection was CODE_ONLY because no offline case fed a forged token
+through `verify()`. That was true when written and stopped being true when
+`test_mcp_alg_confusion` landed: seven cases now drive the header checks, and
+deleting the `alg` guard fails four of them.
+
+The stale sentence survived because the row's Status cell had already been
+updated while its note had not. A note that contradicts its own row is worse
+than no note: it is a false statement inside the document whose whole purpose
+is to not make false statements. Left here, struck through in substance, so the
+next reader knows the correction happened rather than assuming the note is
+current.
 
 ---
 
