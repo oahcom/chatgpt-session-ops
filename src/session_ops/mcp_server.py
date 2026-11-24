@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
@@ -72,6 +73,18 @@ MCP_SERVER_VERSION = "0.1.0"
 _DB_EXECUTOR = ThreadPoolExecutor(
     max_workers=8,
     thread_name_prefix="session-ops-db",
+)
+
+# Unauthenticated requests must not consume the event loop's shared default
+# executor. Bound both active and queued verification work independently.
+_AUTH_VERIFY_WORKERS = 4
+_AUTH_VERIFY_MAX_INFLIGHT = 8
+_AUTH_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_AUTH_VERIFY_WORKERS,
+    thread_name_prefix="session-ops-auth",
+)
+_AUTH_VERIFY_SLOTS = threading.BoundedSemaphore(
+    _AUTH_VERIFY_MAX_INFLIGHT
 )
 
 
@@ -872,7 +885,13 @@ def build_mcp_server(service: MCPToolService, token_provider: JWTVerifier) -> An
             )
 
         async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-            if scope.get("type") != "http" or scope.get("path") != endpoint_path:
+            path = scope.get("path", "")
+            endpoint_prefix = endpoint_path.rstrip("/")
+            is_endpoint_path = (
+                path == endpoint_path
+                or path.startswith(endpoint_prefix + "/")
+            )
+            if scope.get("type") != "http" or not is_endpoint_path:
                 await self.inner(scope, receive, send)
                 return
 
@@ -916,11 +935,33 @@ def build_mcp_server(service: MCPToolService, token_provider: JWTVerifier) -> An
 
             token = parts[1].strip()
             loop = asyncio.get_running_loop()
-            verify_future = loop.run_in_executor(
-                None,
-                token_provider.verify,
-                token,
-            )
+            if not _AUTH_VERIFY_SLOTS.acquire(blocking=False):
+                envelope = _error(
+                    "DEPENDENCY_UNAVAILABLE", str(uuid.uuid4())
+                )
+                await self._respond(send, 503, _json_bytes(envelope))
+                return
+
+            try:
+                # Use the dedicated bounded pool. Attach the release callback
+                # to the concurrent Future, not the asyncio wrapper: a timeout
+                # must not free capacity while its worker is still running.
+                verify_job = _AUTH_EXECUTOR.submit(
+                    token_provider.verify,
+                    token,
+                )
+                verify_job.add_done_callback(
+                    lambda _job: _AUTH_VERIFY_SLOTS.release()
+                )
+                verify_future = asyncio.wrap_future(
+                    verify_job,
+                    loop=loop,
+                )
+            except Exception:
+                _AUTH_VERIFY_SLOTS.release()
+                envelope = _error("INTERNAL", str(uuid.uuid4()))
+                await self._respond(send, 500, _json_bytes(envelope))
+                return
             try:
                 auth = await asyncio.wait_for(
                     verify_future,
