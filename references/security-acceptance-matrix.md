@@ -25,12 +25,12 @@ not a feature list.
 python -m unittest tests.test_work_item_authority        # 50
 python -m unittest tests.test_mcp_contract               # 28
 python -m unittest tests.test_send_prompt_for_work_item  # 6
-python -m unittest tests.test_mcp_transport              # 11
+python -m unittest tests.test_mcp_transport              # 18
 python -m unittest tests.test_mcp_alg_confusion          # 7
 python -m unittest tests.test_mcp_rs256                  # 8
 python -m unittest tests.test_mcp_sdk_integration        # 4 (skips without mcp)
-python -m pytest -q                                      # 723 passed, 6 skipped
-                                                         # 719 passed, 10 skipped without mcp
+python -m pytest -q                                      # 740 passed, 6 skipped
+                                                         # 736 passed, 10 skipped without mcp
 ```
 
 **What PROVEN means here, and what it does not.** PROVEN means the named case
@@ -228,7 +228,7 @@ was already running.
 | # | Scenario | Expected | Evidence | Status |
 |---|---|---|---|---|
 | 19 | An unauthenticated caller sends many random `kid` values to amplify JWKS fetches | Fresh-cache misses fail without fetching. Expired-cache refresh is single-flight and backs off after failure. The lock is never held across network I/O. | `test:test_fresh_cache_unknown_kid_never_downloads` `test:test_expired_cache_concurrent_refresh_is_single_flight` `test:test_failed_refresh_is_not_retried_inside_backoff_window` `test:test_refresh_can_retry_after_backoff_expires` (test_mcp_transport) | PROVEN |
-| 20 | An attacker-influenced issuer points discovery at an internal address | Redirects refused. HTTPS destinations resolved; any non-global answer rejects the whole URL. | `test:test_non_override_discovery_rejects_different_jwks_origin` `test:test_default_fetcher_does_not_follow_redirects` `test:test_https_jwks_rejects_loopback_link_local_and_private_ips` `test:test_jwks_rejects_all_dns_answers_if_any_is_non_global` (test_mcp_transport) | PROVEN, **partial** |
+| 20 | An attacker-influenced issuer points discovery at an internal address | Redirects refused. HTTPS destinations resolved once; any non-global answer rejects the whole URL. The connection then dials the answer that was validated, keeps the hostname for SNI and certificate verification, and does not consult a system proxy. | `test:test_non_override_discovery_rejects_different_jwks_origin` `test:test_default_fetcher_does_not_follow_redirects` `test:test_https_jwks_rejects_loopback_link_local_and_private_ips` `test:test_jwks_rejects_all_dns_answers_if_any_is_non_global` `test:test_resolve_validated_address_returns_the_pinned_answer` `test:test_resolve_validated_address_rejects_mixed_answers` `test:test_validate_public_https_url_still_returns_the_url` `test:test_pinned_connection_dials_the_ip_and_keeps_the_hostname_for_sni` `test:test_pinned_connection_refuses_a_proxy_tunnel` `test:test_default_fetcher_installs_no_proxy_handler` `test:test_default_fetcher_pins_the_validated_address` (test_mcp_transport) | PROVEN `mutation-checked` |
 | 21 | A request targets the MCP endpoint's subpaths | Authenticated. Health and protected-resource metadata stay public. | `test:test_mcp_subpath_is_authenticated` `test:test_mcp_endpoint_itself_is_authenticated` `test:test_health_and_protected_resource_metadata_remain_public` (test_mcp_transport) | PROVEN |
 | 22 | The pinned SDK's API drifts from what `build_mcp_server` assumes | Build fails at CI, not at deploy. `Server`, `on_list_tools`, `on_call_tool`, `streamable_http_app` keywords and `CallToolResult.structured_content` are all exercised against the real `mcp==2.3.0`. | `test:test_builds_real_starlette_app_at_verifier_audience_path` `test:test_real_sdk_registers_list_and_call_handlers` `test:test_real_tools_list_returns_the_frozen_tool_surface` `test:test_real_tools_call_rejects_missing_request_authentication` (test_mcp_sdk_integration) | PROVEN `mutation-checked` |
 
@@ -249,11 +249,44 @@ One mutation was deliberately left green: renaming `structured_content` to
 `alias_generator=to_camel` with `populate_by_name=True`. That is an equivalent
 mutant. Recorded so it is not mistaken for a weak case on a re-run.
 
-**Row 20 is partial on purpose.** The address check and the HTTP connection
-perform *separate* DNS resolutions, so a rebinding attacker can answer
-differently the second time. The gap is recorded at the call site and is only
-closed by pinning the validated IP to the connection while preserving TLS SNI
-and certificate-hostname verification. Do not read row 20 as "SSRF is fixed".
+**Row 20 note — "partial" was two gaps, and only one was written down.** The
+recorded gap was DNS rebinding: validation and connection were separate
+resolutions, so a hostile resolver could answer public the first time and
+private the second. Measuring it turned up a second, worse one. `build_opener`
+installs `ProxyHandler` by default and `urllib` reads the system proxy
+configuration; on Windows that lives in the registry, so not one environment
+variable hints at it. With a proxy configured the process never resolves the
+hostname — the proxy does — and the address check describes a host nothing ever
+contacts. Measured here with every proxy env var unset: `getproxies()` returned
+`http://127.0.0.1:7000`, validation resolved `issuer.example.test` once, and the
+connection went to `('CONNECT', ('127.0.0.1', 7000))`. The SSRF check was inert
+and the whole file was green. CI never sees that one; it sees only the
+rebinding gap, which is why the gap table never had a second row.
+
+Both are fixed in one place. `_resolve_validated_address` returns the address it
+checked, `_PinnedHTTPSConnection` dials that address and passes the original
+hostname to `wrap_socket` so SNI and certificate verification are unchanged,
+the proxy handler is replaced with an empty map, and proxy tunnels are refused
+outright. `_validate_public_https_url` still returns the URL because the
+discovery-origin comparison calls `urlparse()` on its return value; changing
+that contract to return an address would have crashed discovery.
+`test_validate_public_https_url_still_returns_the_url` now holds that line.
+
+Four mutations, four different named cases red, one failure each:
+
+| Deleted | Case that went red |
+|---|---|
+| `urllib.request.ProxyHandler({})` from the opener | `test_default_fetcher_installs_no_proxy_handler` |
+| `server_hostname=self.host`, replaced with the pinned IP | `test_pinned_connection_dials_the_ip_and_keeps_the_hostname_for_sni` |
+| pinning, replaced by validate-then-let-the-client-resolve | `test_default_fetcher_pins_the_validated_address` |
+| the tunnel refusal in `connect()` | `test_pinned_connection_refuses_a_proxy_tunnel` |
+
+The last one is worth a sentence because its first draft was a false positive.
+It asserted only `assertRaises(OSError)`. Delete the guard and the real dial to
+`93.184.216.34:443` fails with `OSError` too: green, for the wrong reason, 21
+seconds slow. It now asserts that nothing was dialled, which is the behaviour
+the guard actually provides. A test that passes when the guard is gone is worse
+than no test, because it occupies the slot where the real one belongs.
 
 ---
 
@@ -265,8 +298,9 @@ These are gaps, stated so nobody reads the eighteen rows above as completeness.
 |---|---|---|
 | In-process code execution | Python privacy is not a boundary. `_record_trusted_landing` is a plain method; anything running in the SO process can call it and can also write the SQLite file directly. | B1 is closed against a **remote** caller only. Requires deployment isolation. |
 | Landing event bound to a WorkItem | `authority_landing_events` stores `session_id` but not `work_item_id`. | If signing succeeds and linking fails, the unconsumed event can be claimed by another WorkItem that holds `write` on that conversation. Bounded, accepted, recorded. |
-| DNS rebinding | Rows 20's validation lookup and the client's connection lookup are separate resolutions. | The SSRF defense is real but incomplete. Requires IP pinning. Recorded at the call site. |
-| Mutation coverage is not uniform | Five rows are `mutation-checked`; the rest are not. | Treat every unmarked PROVEN as "asserts the behaviour", not "proven necessary" — that is exactly how row 12 stayed PROVEN for three commits. |
+| A mandatory corporate proxy | `ProxyHandler({})` is passed unconditionally, so a deployment that can only reach the identity provider through a proxy fails to fetch JWKS. | Fail closed, deliberately: the alternative is an address check describing a host the process never contacts. Stated here rather than solved. |
+| The pinned address has no failover | Only the first validated answer is dialled. A host with several public addresses loses the rest if the first one is down. | Availability, not security. Retrying a second answer would reintroduce the resolution the pin exists to remove. |
+| Mutation coverage is not uniform | Seven rows carry the mark outright and an eighth only for its lock; the rest do not. | Treat every unmarked PROVEN as "asserts the behaviour", not "proven necessary" — that is exactly how row 12 stayed PROVEN for three commits. |
 | Security tests can skip to green | `test_mcp_rs256` and `test_mcp_sdk_integration` both skip as units when their optional dependency is absent. The unit job installs `requirements-mcp.txt` and asserts the skip count is unchanged, printing every skip reason on failure; the `sdk` job asserts its four cases executed. | Before those guards, the signature path and the SDK compatibility surface could both be skipped and the log still read green. Any future optional dependency needs the same treatment. |
 | `unlink_session` `rowcount` guard is unreachable | `BEGIN IMMEDIATE` precedes the SELECT and the SELECT filters `unlinked_at IS NULL`, so SQLite's single-writer rule makes `rowcount != 1` impossible. | Defence in depth, not evidence. It cannot be tested, and pretending otherwise would be worse than saying so. |
 | `aud` is checked twice, once unheld | Deleting the `validate_registered_claims` check changes no test outcome. | Redundant layer. Harmless, but not a second proof. |

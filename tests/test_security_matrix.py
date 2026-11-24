@@ -301,7 +301,7 @@ class TestSecurityMatrix(unittest.TestCase):
                     )
 
     def test_test_citation_module_suffixes_are_parsed(self):
-        """六处显式 test: 模块后缀必须被识别并准确绑定。"""
+        """每处显式 test: 模块后缀必须被识别并准确绑定。"""
         references = [
             ref for ref in self._references()
             if ref["kind"] == "test"
@@ -322,7 +322,7 @@ class TestSecurityMatrix(unittest.TestCase):
                 "test_mcp_rs256",
             "test_refresh_can_retry_after_backoff_expires":
                 "test_mcp_transport",
-            "test_jwks_rejects_all_dns_answers_if_any_is_non_global":
+            "test_default_fetcher_pins_the_validated_address":
                 "test_mcp_transport",
             "test_health_and_protected_resource_metadata_remain_public":
                 "test_mcp_transport",
