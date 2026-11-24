@@ -1,19 +1,13 @@
 # -*- coding: utf-8 -*-
-"""SKILL.md 的 references/ 索引与发布白名单必须各自自洽。
+"""SKILL.md references/ 索引与发布白名单的 B 侧一致性检查。
 
-三起真实漂移，同一类根因——「同一事实写了两份」：
-  - #39 新增 `references/mcp-tools.md` 与 `mcp-oauth-connector-contract.md`，
-    文件进了仓库、`SKILL.md` 正文里也引用了，但 `### references/` 索引里没有。
-    读者按索引找文档，这两份等于不存在。
-  - #21 建立白名单时表格 7 行、正文两处写 `six`；#39 把表格加到 8 行、
-    正文只补了 6 处里的 4 处。按步骤 6 字面执行的运维会少发布两个文件。
-  - `security-acceptance-matrix.md` 被索引标为必读，却不在白名单，
-    A 侧没有这个文件——索引指向一个打不开的路径。
+检查三个边界：
+1. SKILL.md references/ 索引与仓库 references/*.md 双向一致。
+2. RELEASE-AUTHORITY.md 白名单中的路径在 B 侧仓库存在。
+3. 白名单引导句中的数量词与表格实际条目数一致。
 
-本文件只断言 B 侧可自证的部分：索引与 references/ 双向齐全、白名单表格
-与正文数量词一致。**A 侧实际有哪些文件 B 侧看不到**，因此「索引里的文件
-在 A 上是否存在」不在这里断言——那由发布时的 A 侧核验负责（见
-`docs/RELEASE-AUTHORITY.md` §6）。
+不检查 A 侧实际文件集合。A 侧发布内容由发布阶段独立核验；
+历史兼容文件不在白名单中，不代表它们在 A 侧不存在。
 """
 
 import re
@@ -26,65 +20,163 @@ REFERENCES = ROOT / "references"
 POLICY = ROOT / "docs" / "RELEASE-AUTHORITY.md"
 
 
+def _unique_heading(text, heading, description):
+    """返回唯一标题的位置；缺失或重复时给出明确错误。"""
+    matches = list(re.finditer(
+        r"^" + re.escape(heading) + r"[ \t]*$",
+        text,
+        re.MULTILINE,
+    ))
+    if len(matches) != 1:
+        raise AssertionError(
+            "%s 必须恰好出现一次，实际出现 %d 次"
+            % (description, len(matches))
+        )
+    return matches[0].start()
+
+
 def _index_entries():
-    """`### references/` 段内的索引条目：[(filename, line), ...]。"""
+    """返回 references/ 索引条目：[(filename, line), ...]。"""
     text = SKILL.read_text(encoding="utf-8")
-    start = text.index("### references/")
-    end = text.index("### tests/")
+
+    start = _unique_heading(
+        text, "### references/", "references/ 索引标题"
+    )
+    end = _unique_heading(
+        text, "### tests/", "tests/ 索引标题"
+    )
+
+    if start >= end:
+        raise AssertionError(
+            "references/ 索引标题必须位于 tests/ 索引标题之前"
+        )
+
+    section = text[start:end]
     entries = []
-    for line in text[start:end].splitlines():
-        m = re.match(r"^- `([A-Za-z0-9._\-]+\.md)`", line)
-        if m:
-            entries.append((m.group(1), line))
+
+    for line in section.splitlines():
+        if not line.startswith("- `"):
+            continue
+
+        match = re.match(
+            r"^- `([A-Za-z0-9._-]+\.md)`(?:[ \t]|$)",
+            line,
+        )
+        if match is None:
+            raise AssertionError(
+                "无法解析 references/ 索引条目：%s" % line
+            )
+
+        entries.append((match.group(1), line))
+
+    if not entries:
+        raise AssertionError(
+            "references/ 索引段没有解析到任何条目"
+        )
+
+    names = [name for name, _line in entries]
+    if len(names) != len(set(names)):
+        raise AssertionError(
+            "references/ 索引存在重复文件名"
+        )
+
     return entries
 
 
 def _allowlist():
+    """解析 RELEASE-AUTHORITY.md 中的三列白名单表格。"""
     text = POLICY.read_text(encoding="utf-8")
-    return set(re.findall(r"^\| `([^`]+)` \| `[^`]+` \|", text, re.M))
+
+    entries = re.findall(
+        r"^\| `([^`]+)` \| `[^`]+` \| [^|\r\n]+ \|[ \t]*$",
+        text,
+        re.MULTILINE,
+    )
+
+    if not entries:
+        raise AssertionError(
+            "RELEASE-AUTHORITY.md 三列白名单表格解析失败或为空"
+        )
+
+    if len(entries) != len(set(entries)):
+        raise AssertionError(
+            "RELEASE-AUTHORITY.md 白名单存在重复路径"
+        )
+
+    return set(entries)
 
 
 class TestSkillReferenceIndex(unittest.TestCase):
 
     def test_every_index_entry_names_an_existing_file(self):
         entries = _index_entries()
-        self.assertGreaterEqual(len(entries), 8, "索引解析失败，规则可能没匹配上")
+
         for name, _line in entries:
             with self.subTest(entry=name):
                 self.assertTrue(
                     (REFERENCES / name).is_file(),
                     "SKILL.md 索引了 references/%s，但该文件不存在"
-                    "（改名或删除后忘了改索引）" % name
+                    "（改名或删除后忘了改索引）" % name,
                 )
 
     def test_no_reference_file_is_unindexed(self):
-        indexed = {n for n, _ in _index_entries()}
-        on_disk = {p.name for p in REFERENCES.glob("*.md")}
+        indexed = {name for name, _line in _index_entries()}
+        on_disk = {
+            path.name for path in REFERENCES.glob("*.md")
+        }
+
         self.assertEqual(
-            set(), on_disk - indexed,
-            "references/ 下有文件没进 SKILL.md 索引，读者无从发现它们"
+            set(),
+            on_disk - indexed,
+            "references/ 下有文件没进 SKILL.md 索引，读者无从发现它们",
         )
 
     def test_every_allowlisted_path_exists(self):
-        """白名单里的条目必须真实存在，否则发布步骤会卡在「确认存在」却说不清。"""
         for path in _allowlist():
             with self.subTest(path=path):
                 self.assertTrue(
                     (ROOT / path).is_file(),
-                    "白名单列了 %s，仓库里没有这个文件" % path
+                    "白名单列了 %s，仓库里没有这个文件" % path,
                 )
 
     def test_policy_count_word_matches_table(self):
-        """§2「以下 N 个文件」的 N 必须等于表格行数——#21/#39 就是这里漂的。"""
         text = POLICY.read_text(encoding="utf-8")
-        words = {"six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
-        m = re.search(r"The following (\w+) files are the complete allowlist", text)
-        self.assertIsNotNone(m, "§2 的 allowlist 引导句解析失败")
-        claimed = words.get(m.group(1).lower())
-        self.assertIsNotNone(claimed, "无法识别的数量词：%s" % m.group(1))
+
+        words = {
+            "six": 6,
+            "seven": 7,
+            "eight": 8,
+            "nine": 9,
+            "ten": 10,
+        }
+
+        matches = list(re.finditer(
+            r"^The following (\w+) files are the complete allowlist",
+            text,
+            re.MULTILINE,
+        ))
+
         self.assertEqual(
-            claimed, len(_allowlist()),
-            "§2 声称 %s 个文件，表格实际 %d 行" % (m.group(1), len(_allowlist()))
+            1,
+            len(matches),
+            "§2 的 allowlist 引导句必须恰好出现一次",
+        )
+
+        word = matches[0].group(1).lower()
+        claimed = words.get(word)
+
+        self.assertIsNotNone(
+            claimed,
+            "无法识别的数量词：%s" % word,
+        )
+
+        actual = len(_allowlist())
+
+        self.assertEqual(
+            claimed,
+            actual,
+            "§2 声称 %s 个文件，表格实际 %d 行"
+            % (word, actual),
         )
 
 
