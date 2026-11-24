@@ -1,7 +1,7 @@
 # chatgpt-session-ops — Repository Authority and Runtime Release Policy
 
 **Status:** Active  
-**Effective date:** 2026-11-23  
+**Effective date:** 2026-11-24  
 **Authoritative repository:** B  
 **Runtime copy:** A  
 **Authorized release direction:** B → A only
@@ -36,7 +36,7 @@ incorporated into B, tested, and committed.
 
 ## 2. Explicit B → A publication allowlist
 
-The following seven files are the complete allowlist for the current release
+The following eight files are the complete allowlist for the current release
 baseline:
 
 | B-relative path | A-relative path | Purpose |
@@ -48,6 +48,7 @@ baseline:
 | `scripts/mcp_connector.py` | `scripts/mcp_connector.py` | Reviewed MCP connector eligibility utility |
 | `tests/test_hardening.py` | `tests/test_hardening.py` | Reviewed hardening tests |
 | `references/mcp-oauth-connector-contract.md` | `references/mcp-oauth-connector-contract.md` | Connector/OAuth contract that `SKILL.md` cites |
+| `references/mcp-tools.md` | `references/mcp-tools.md` | MCP tool operations contract for the ten exposed tools |
 
 This is an explicit file allowlist, not permission to synchronize the containing
 directories.
@@ -83,7 +84,7 @@ MUST NOT be overwritten, deleted, mirrored, or replaced by a B-side release:
 This list is a minimum explicit exclusion list, not an exhaustive inventory
 of every possible runtime artifact.
 
-The release operator MUST preserve all A-side paths outside the six-file
+The release operator MUST preserve all A-side paths outside the eight-file
 allowlist. The operator MUST NOT use directory mirroring or whole-directory
 replacement to achieve a release.
 
@@ -102,7 +103,7 @@ Before copying any file:
 1. Confirm that B is the intended repository and that the intended release
    commit is present.
 2. Inspect `git status --short` and the release diff in B.
-3. Confirm that the seven allowlisted source files exist in B.
+3. Confirm that the eight allowlisted source files exist in B.
 4. Confirm that the corresponding target directories and files in A are
    present where required.
 5. Inspect the A-side runtime state and confirm that the release will not
@@ -128,7 +129,7 @@ The operator MUST NOT:
 - Treat an untracked A-side file as disposable merely because B does not
   contain it.
 
-A release is a controlled seven-file publication, not a synchronization of
+A release is a controlled eight-file publication, not a synchronization of
 the two directory trees.
 
 ## 6. SHA-256 verification
