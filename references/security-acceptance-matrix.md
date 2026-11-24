@@ -29,8 +29,8 @@ python -m unittest tests.test_mcp_transport              # 18
 python -m unittest tests.test_mcp_alg_confusion          # 7
 python -m unittest tests.test_mcp_rs256                  # 8
 python -m unittest tests.test_mcp_sdk_integration        # 4 (skips without mcp)
-python -m pytest -q                                      # 745 passed, 6 skipped
-                                                         # 741 passed, 10 skipped without mcp
+python -m pytest -q                                      # 746 passed, 6 skipped
+                                                         # 742 passed, 10 skipped without mcp
 ```
 
 **What PROVEN means here, and what it does not.** PROVEN means the named case
@@ -75,6 +75,32 @@ neither would have been found by counting marks.
 | 4 | `alg: none`, `alg: HS256`, or a `crit` header | Rejected before key lookup. Algorithm confusion is not reachable. | `test:test_none_algorithm_with_forged_signature` `test:test_hs256_using_rsa_public_modulus_as_hmac_key` `test:test_lowercase_rs256_is_rejected` `test:test_missing_alg_is_rejected` `test:test_crit_header_is_rejected_before_key_lookup` `test:test_unexpected_typ_is_rejected_before_key_lookup` (test_mcp_alg_confusion) | PROVEN `mutation-checked` |
 | 4b | The signature itself: forged, wrong key, wrong hash, undersized or malformed key material | Rejected at verification. A genuine RS256 token is accepted and maps to the right principal. | `test:test_valid_rs256_signature_returns_claim_mapped_auth_context` `test:test_one_byte_signature_tampering_is_rejected` `test:test_signature_from_another_rsa_key_is_rejected` `test:test_sha1_signature_is_not_accepted_as_rs256` `test:test_1024_bit_rsa_modulus_is_rejected` `test:test_even_rsa_public_exponent_is_rejected` `test:test_rsa_public_exponent_one_is_rejected` `test:test_missing_cryptography_is_classified_as_dependency_unavailable` (test_mcp_rs256) | PROVEN `mutation-checked` |
 
+**Row 3 note.** `aud` is checked twice: once in `validate_registered_claims`
+and again in `principal_from_claims`. The cited test exercises
+`principal_from_claims`. Deleting the `aud` check there fails it; deleting the
+one in `validate_registered_claims` leaves the suite green, confirmed again in
+this pass. The behaviour is covered once, which is enough for the behaviour, but
+the row previously named the wrong layer as the proof. The mark therefore reads
+"for the claiming layer": the layer that is actually observed.
+
+The duplicate is not dead code and it is not a defect. It is the same shape as
+row 16's `rowcount` guard — a second check that no test can distinguish, kept
+because the cost of keeping it is one comparison and the cost of being wrong
+about the first layer is an accepted token from another service.
+
+**Row 4 note — stale, corrected.** An earlier revision of this document said
+`alg` rejection was CODE_ONLY because no offline case fed a forged token
+through `verify()`. That was true when written and stopped being true when
+`test_mcp_alg_confusion` landed: seven cases now drive the header checks, and
+deleting the `alg` guard fails four of them.
+
+The stale sentence survived because the row's Status cell had already been
+updated while its note had not. A note that contradicts its own row is worse
+than no note: it is a false statement inside the document whose whole purpose
+is to not make false statements. Left here, struck through in substance, so the
+next reader knows the correction happened rather than assuming the note is
+current.
+
 **Row 4b note — the largest gap this pass found.** Row 4 covered the algorithm
 guards, and every one of its cases rejects *before a key is fetched*. So the
 one step that decides whether a token is genuine was never executed by any test
@@ -91,19 +117,6 @@ cases; swapping its two arguments fails the positive control; replacing
 PKCS1v15 with PSS fails the positive control. The positive control matters as
 much as the rejections: without it, a rejection could come from anywhere.
 
-**Row 4 note — stale, corrected.** An earlier revision of this document said
-`alg` rejection was CODE_ONLY because no offline case fed a forged token
-through `verify()`. That was true when written and stopped being true when
-`test_mcp_alg_confusion` landed: seven cases now drive the header checks, and
-deleting the `alg` guard fails four of them.
-
-The stale sentence survived because the row's Status cell had already been
-updated while its note had not. A note that contradicts its own row is worse
-than no note: it is a false statement inside the document whose whole purpose
-is to not make false statements. Left here, struck through in substance, so the
-next reader knows the correction happened rather than assuming the note is
-current.
-
 ---
 
 ## B. Authorization (5–8)
@@ -112,27 +125,14 @@ current.
 |---|---|---|---|---|
 | 5 | Authenticated principal lacks a required scope for the tool | `PERMISSION_DENIED`, distinct from `UNAUTHENTICATED`. | `test:test_insufficient_scope_is_permission_denied` | PROVEN `mutation-checked` |
 | 6 | `work_item.grant` / `work_item.revoke` called with only `work_item.write` | Denied. Delegation administration needs `session_ops.access.manage`. | `test:test_work_item_grant_requires_access_manage` `test:test_work_item_revoke_requires_access_manage` | PROVEN `mutation-checked` |
-
-**Row 3 note.** `aud` is checked twice: once in `validate_registered_claims`
-and again in `principal_from_claims`. The cited test exercises
-`principal_from_claims`. Deleting the `aud` check there fails it; deleting the
-one in `validate_registered_claims` leaves the suite green, confirmed again in
-this pass. The behaviour is covered once, which is enough for the behaviour, but
-the row previously named the wrong layer as the proof. The mark therefore reads
-"for the claiming layer": the layer that is actually observed.
-
-The duplicate is not dead code and it is not a defect. It is the same shape as
-row 16's `rowcount` guard — a second check that no test can distinguish, kept
-because the cost of keeping it is one comparison and the cost of being wrong
-about the first layer is an accepted token from another service.
+| 7 | A `write` grantee tries to grant to a third party, or revoke another principal's grant | Denied. `write` never implies grant administration. | `test:test_write_grantee_cannot_grant_or_revoke` | PROVEN `mutation-checked` |
+| 8 | Owner grants to a target that is unknown, disabled, or in another tenant | Refused **before** the grant row is written; cross-tenant attempts leave no row. | `test:test_unknown_target_is_rejected_by_default_directory` `test:test_same_tenant_unregistered_target_is_rejected` `test:test_target_must_exist_be_enabled_and_be_same_tenant` `test:test_cross_tenant_target_is_rejected_before_grant_is_written` | PROVEN `mutation-checked` |
 
 **Row 6 note.** The grant half was already held. The revoke half was not: the
 cited case only ever called `work_item.grant`, so deleting
 `session_ops.access.manage` from `TOOL_REQUIRED_SCOPES["work_item.revoke"]`
 left all cases green. A symmetric revoke case now exists and goes red on that
 deletion.
-| 7 | A `write` grantee tries to grant to a third party, or revoke another principal's grant | Denied. `write` never implies grant administration. | `test:test_write_grantee_cannot_grant_or_revoke` | PROVEN `mutation-checked` |
-| 8 | Owner grants to a target that is unknown, disabled, or in another tenant | Refused **before** the grant row is written; cross-tenant attempts leave no row. | `test:test_unknown_target_is_rejected_by_default_directory` `test:test_same_tenant_unregistered_target_is_rejected` `test:test_target_must_exist_be_enabled_and_be_same_tenant` `test:test_cross_tenant_target_is_rejected_before_grant_is_written` | PROVEN `mutation-checked` |
 
 ---
 
@@ -151,6 +151,9 @@ deletion.
 | # | Scenario | Expected | Evidence | Status |
 |---|---|---|---|---|
 | 12 | Caller constructs its own landing evidence and passes it to `link_session` | Rejected outright **even when a valid unclaimed landing event exists**. `LandingEvidence` no longer exists in the source; any non-`None` `evidence` raises. | `test:test_caller_supplied_evidence_is_rejected_even_with_valid_landing` `test:test_caller_supplied_evidence_is_rejected` `test:test_caller_supplied_evidence_is_rejected_by_authority` `test:test_plain_ids_convref_and_booleans_are_not_evidence_inputs` `code:link_session` (`if evidence is not None: raise`) | PROVEN `mutation-checked` |
+| 13 | No server-recorded landing event exists for the conversation | `QuarantineNotCleared`. Nothing is written. | `test:test_link_requires_server_recorded_landing` `test:test_unconfirmed_f13_evidence_is_rejected` | PROVEN `mutation-checked` |
+| 14 | A confirmed event is consumed, then replayed | Second attempt fails. Consumption and link creation happen in one transaction. | `test:test_confirmed_complete_landing_can_be_consumed_once` `test:test_event_replay_cannot_create_a_second_link` `code:link_session` (`consumed_at IS NULL` → `UPDATE consumed_at` → `INSERT session_links`) | PROVEN `mutation-checked` |
+| 15 | Landing is `mismatch`, `ambiguous`, or evidence incomplete; or the send returned 409 | No event recorded, no link. Fail closed. | `test:test_mismatch_ambiguous_and_incomplete_landing_fail_closed` `test:test_mismatch_409_does_not_record_or_link` `test:test_ambiguous_multiple_ids_do_not_record_or_link` `test:test_incomplete_reply_does_not_record_or_link` `test:test_missing_archive_file_does_not_record_a_landing_event` | PROVEN `mutation-checked` |
 
 **Row 12 note.** The original evidence for this row was
 `test_caller_supplied_evidence_is_rejected`, which runs on a session with no
@@ -163,9 +166,6 @@ refusal, asserts the event is still unconsumed and no `session_links` row was
 written, and then links the same session without evidence to prove the seeded
 event was usable. Mutation check: with the guard deleted, the old case stays
 green and only the new one fails.
-| 13 | No server-recorded landing event exists for the conversation | `QuarantineNotCleared`. Nothing is written. | `test:test_link_requires_server_recorded_landing` `test:test_unconfirmed_f13_evidence_is_rejected` | PROVEN `mutation-checked` |
-| 14 | A confirmed event is consumed, then replayed | Second attempt fails. Consumption and link creation happen in one transaction. | `test:test_confirmed_complete_landing_can_be_consumed_once` `test:test_event_replay_cannot_create_a_second_link` `code:link_session` (`consumed_at IS NULL` → `UPDATE consumed_at` → `INSERT session_links`) | PROVEN `mutation-checked` |
-| 15 | Landing is `mismatch`, `ambiguous`, or evidence incomplete; or the send returned 409 | No event recorded, no link. Fail closed. | `test:test_mismatch_ambiguous_and_incomplete_landing_fail_closed` `test:test_mismatch_409_does_not_record_or_link` `test:test_ambiguous_multiple_ids_do_not_record_or_link` `test:test_incomplete_reply_does_not_record_or_link` `test:test_missing_archive_file_does_not_record_a_landing_event` | PROVEN `mutation-checked` |
 
 **Row 15 note — eight conjuncts, two of them load-bearing.** The landing
 decision in `scripts/chatgpt_send.py` is a conjunction of eight conditions.
@@ -201,8 +201,9 @@ session cannot be linked.
 | # | Scenario | Expected | Evidence | Status |
 |---|---|---|---|---|
 | 16 | A concurrent revoke lands between the authorization check and the mutation; or a relink moves the session between the unlink check and the delete | Both fail closed. Check and mutation share one `BEGIN IMMEDIATE` on one connection. | `test:test_begin_immediate_blocks_second_writer_before_it_reads` `test:test_stale_expected_link_id_does_not_unlink` `test:test_expected_updated_at_is_compare_and_swap` | PROVEN `mutation-checked` for the lock; see note |
+| 17 | The audit write fails partway through a mutation | The business change rolls back too. No unaudited mutation survives. | `test:test_audit_failure_rolls_back_work_item_and_owner` `test:test_audit_failure_rolls_back_status_mutation` `test:test_all_successful_mutations_are_audited` `test:test_audit_rows_are_append_only` | PROVEN `mutation-checked` |
 
-**Row 16 note.** Two claims, two different strengths.
+**Row 16 note — the lock is proven, the `rowcount` guard is not.** Two claims, two different strengths.
 
 The lock is now proven. `test_begin_immediate_blocks_second_writer_before_it_reads`
 holds a writer reservation on one connection and drives `link_session` on a
@@ -219,7 +220,6 @@ single-writer rule no concurrent write can land between them and `rowcount` is
 always 1. It is defence in depth, not evidence. No test can fail when it is
 deleted because no execution can reach it. Recorded as dead code rather than
 counted as a proof.
-| 17 | The audit write fails partway through a mutation | The business change rolls back too. No unaudited mutation survives. | `test:test_audit_failure_rolls_back_work_item_and_owner` `test:test_audit_failure_rolls_back_status_mutation` `test:test_all_successful_mutations_are_audited` `test:test_audit_rows_are_append_only` | PROVEN `mutation-checked` |
 
 **Row 16 note — what the cases prove, and what they do not.** The offline cases
 prove the *precondition* mechanism (a stale `expected_link_id` or
@@ -252,7 +252,7 @@ Now a dedicated `_ResourceExhausted` maps to `RESOURCE_EXHAUSTED`, and
 `session.context` itself. Short-circuiting the branch to `False` returns the
 oversized payload to the client verbatim and turns that case red.
 
-**Row 18 note.** `test_session_context_with_injected_adapter` is the happy path
+**Row 18 note — the happy path proves nothing about the failure branch.** `test_session_context_with_injected_adapter` is the happy path
 and does not prove the fail-closed branch. That branch is
 `test_context_without_adapter_is_dependency_unavailable`: deleting the
 `memory_adapter_command is None` guard turns its expected
@@ -260,16 +260,16 @@ and does not prove the fail-closed branch. That branch is
 
 ---
 
-## G. Transport and discovery (19–21)
+## G. Transport and discovery (19–22)
 
 These were absent from v1. An independent review of the deployed surface found
-the three holes below; they are not new features, they are repairs to code that
-was already running.
+the three holes in rows 19–21; they are not new features, they are repairs to
+code that was already running. Row 22 covers a different risk — an assumption
+about the pinned SDK, not a hole an attacker walks through.
 
 | # | Scenario | Expected | Evidence | Status |
 |---|---|---|---|---|
 | 19 | An unauthenticated caller sends many random `kid` values to amplify JWKS fetches | Fresh-cache misses fail without fetching. Expired-cache refresh is single-flight and backs off after failure. The lock is never held across network I/O. | `test:test_fresh_cache_unknown_kid_never_downloads` `test:test_expired_cache_concurrent_refresh_is_single_flight` `test:test_failed_refresh_is_not_retried_inside_backoff_window` `test:test_refresh_can_retry_after_backoff_expires` (test_mcp_transport) | PROVEN `mutation-checked` |
-
 | 20 | An attacker-influenced issuer points discovery at an internal address | Redirects refused. HTTPS destinations resolved once; any non-global answer rejects the whole URL. The connection then dials the answer that was validated, keeps the hostname for SNI and certificate verification, and does not consult a system proxy. | `test:test_non_override_discovery_rejects_different_jwks_origin` `test:test_default_fetcher_does_not_follow_redirects` `test:test_https_jwks_rejects_loopback_link_local_and_private_ips` `test:test_jwks_rejects_all_dns_answers_if_any_is_non_global` `test:test_resolve_validated_address_returns_the_pinned_answer` `test:test_resolve_validated_address_rejects_mixed_answers` `test:test_validate_public_https_url_still_returns_the_url` `test:test_pinned_connection_dials_the_ip_and_keeps_the_hostname_for_sni` `test:test_pinned_connection_refuses_a_proxy_tunnel` `test:test_default_fetcher_installs_no_proxy_handler` `test:test_default_fetcher_pins_the_validated_address` (test_mcp_transport) | PROVEN `mutation-checked` |
 | 21 | A request targets the MCP endpoint's subpaths | Authenticated. Health and protected-resource metadata stay public. | `test:test_mcp_subpath_is_authenticated` `test:test_mcp_endpoint_itself_is_authenticated` `test:test_health_and_protected_resource_metadata_remain_public` (test_mcp_transport) | PROVEN `mutation-checked` |
 | 22 | The pinned SDK's API drifts from what `build_mcp_server` assumes | Build fails at CI, not at deploy. `Server`, `on_list_tools`, `on_call_tool`, `streamable_http_app` keywords and `CallToolResult.structured_content` are all exercised against the real `mcp==2.3.0`. | `test:test_builds_real_starlette_app_at_verifier_audience_path` `test:test_real_sdk_registers_list_and_call_handlers` `test:test_real_tools_list_returns_the_frozen_tool_surface` `test:test_real_tools_call_rejects_missing_request_authentication` (test_mcp_sdk_integration) | PROVEN `mutation-checked` |
@@ -280,22 +280,6 @@ was already running.
 window (`test_failed_refresh_is_not_retried_inside_backoff_window`) each go red
 on their own deletion. The fourth claim — the lock is never held across network
 I/O — is asserted by reading the code, not by a case, so it is not counted.
-**Row 22 note — the assumption we shipped on.** Before this row existed, every
-claim `build_mcp_server` makes about `mcp==2.3.0` was verified by hand once.
-`test_mcp_transport` builds the app against hand-written `ModuleType` stubs, so
-CI validated our *belief* about the SDK, not the SDK. Renaming a keyword in
-`streamable_http_app` would have shipped green and failed at first deploy.
-
-An earlier draft of this work recorded a wrong conclusion: the PyPI README shows
-`from mcp.server import MCPServer`, which was read as "`Server` was removed".
-Reading the wheel settles it — `mcp/server/__init__.py` still exports `Server`
-from `.lowlevel`, and `MCPServer` is an added high-level wrapper, not a
-replacement. **README is the marketing surface; `__init__.py` is the contract.**
-
-One mutation was deliberately left green: renaming `structured_content` to
-`structuredContent` changes nothing, because the SDK sets
-`alias_generator=to_camel` with `populate_by_name=True`. That is an equivalent
-mutant. Recorded so it is not mistaken for a weak case on a re-run.
 
 **Row 20 note — "partial" was two gaps, and only one was written down.** The
 recorded gap was DNS rebinding: validation and connection were separate
@@ -336,11 +320,28 @@ seconds slow. It now asserts that nothing was dialled, which is the behaviour
 the guard actually provides. A test that passes when the guard is gone is worse
 than no test, because it occupies the slot where the real one belongs.
 
+**Row 22 note — the assumption we shipped on.** Before this row existed, every
+claim `build_mcp_server` makes about `mcp==2.3.0` was verified by hand once.
+`test_mcp_transport` builds the app against hand-written `ModuleType` stubs, so
+CI validated our *belief* about the SDK, not the SDK. Renaming a keyword in
+`streamable_http_app` would have shipped green and failed at first deploy.
+
+An earlier draft of this work recorded a wrong conclusion: the PyPI README shows
+`from mcp.server import MCPServer`, which was read as "`Server` was removed".
+Reading the wheel settles it — `mcp/server/__init__.py` still exports `Server`
+from `.lowlevel`, and `MCPServer` is an added high-level wrapper, not a
+replacement. **README is the marketing surface; `__init__.py` is the contract.**
+
+One mutation was deliberately left green: renaming `structured_content` to
+`structuredContent` changes nothing, because the SDK sets
+`alias_generator=to_camel` with `populate_by_name=True`. That is an equivalent
+mutant. Recorded so it is not mistaken for a weak case on a re-run.
+
 ---
 
 ## What this matrix does not cover
 
-These are gaps, stated so nobody reads the eighteen rows above as completeness.
+These are gaps, stated so nobody reads the rows above as completeness.
 
 | Gap | Why it is not covered | Consequence |
 |---|---|---|
@@ -368,6 +369,13 @@ A row may be marked `mutation-checked` only after the guard has actually been
 deleted and the row observed to go red. The deletion, the failing case names and
 the restored state must be in the commit message or the PR body. Asserting that
 a test "would" fail is not a mutation check.
+
+A note goes **below** its section's table, never between two rows. A blank line
+inside a table ends it: the rows after the note render as literal text while a
+line-scanning parser still reads them as rows, so the data checks stay green on
+a document that no longer displays. `test_every_row_stays_inside_a_real_table`
+holds that line; it is a document check, not a security row, which is why it is
+not cited from the table above.
 
 ---
 
