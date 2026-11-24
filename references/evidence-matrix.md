@@ -125,4 +125,4 @@
 
 **日期口径**：`live:` 一律按本机时区（UTC+8）记日期；矩阵校验用 `time.strftime("%Y-%m-%d")` 取本地日期，不按 UTC 折算。审查若按 UTC 看到「日期在未来」，属时区差异，不是伪造。
 
-> 全套件验收统计另计：pytest 共 504 个测试项，其中 498 passed、6 skipped；pytest subtests 为 929 passed。`unittest discover` 交叉验证结果为 504 tests，498 passed、6 skipped。
+> 全套件验收统计另计：pytest 共 689 个测试项，其中 683 passed、6 skipped；pytest subtests 为 954 passed。`unittest discover` 交叉验证结果为 689 tests，683 passed、6 skipped。

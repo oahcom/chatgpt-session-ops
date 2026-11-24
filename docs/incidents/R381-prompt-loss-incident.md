@@ -7,7 +7,7 @@
 | 发生窗口 | 2026-11-24 01:17:40 – 12:06:21（修复前；取自各文件首条 ts） |
 | 影响 | 10 轮提示词永久丢失（不可恢复） |
 | 修复提交 | `1546e93` |
-| 修复 PR | #18 |
+| 修复 PR | #18（本记录后续同步至 #20/#23/#24 的现状） |
 | 裁定来源 | ChatGPT R381：BUG CONFIRMED / DATA LOSS CONFIRMED，方案 A |
 
 ## 缺陷
@@ -57,4 +57,5 @@
 - 新增 10 条测试，覆盖「新会话异常保留 prompt」「end 追加失败保留 begin」「三态矩阵」
   「畸形入口拒绝」「诊断文案区分」「无 cid 不删 conversations 里的 begin」「畸形 id 无路径穿越」
 - 变异验证 5/5 定点命中
-- 全量 606 passed / 6 skipped / 928 subtests
+- 修复提交时的全量：606 passed / 6 skipped / 928 subtests
+- 当前（本记录同步时）：683 passed / 6 skipped / 954 subtests
