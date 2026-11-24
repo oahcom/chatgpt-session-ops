@@ -245,6 +245,45 @@ class TestSecurityMatrix(unittest.TestCase):
                     % (row["id"], row["line"]),
                 )
 
+    def test_every_row_stays_inside_a_real_table(self):
+        """数据行必须处在一条连续表格内，不能被行间说明文字截断。
+
+        说明文字插进表格中间会结束 Markdown 表格，其后的数据行渲染成字面
+        竖线；而按行扫描的解析器仍能读到它们，所以 _rows() 看不出问题。
+        """
+        header = ["#", "Scenario", "Expected", "Evidence", "Status"]
+
+        def cells(line):
+            return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+        def check(block):
+            if not block:
+                return
+            parsed = [cells(line) for _, line in block]
+            ids = [c[0] for c in parsed if re.fullmatch(r"\d+[a-z]?", c[0])]
+            if not ids:
+                return
+            with self.subTest(rows=ids, line=block[0][0]):
+                self.assertEqual(
+                    parsed[0],
+                    header,
+                    "文件第 %d 行起的表格没有表头，数据行 %s 被说明文字截断在"
+                    "表格之外" % (block[0][0], ids),
+                )
+                self.assertTrue(
+                    all(set(c.replace(":", "")) <= {"-"} for c in parsed[1]),
+                    "文件第 %d 行的表头缺少分隔行" % block[1][0],
+                )
+
+        block = []
+        for number, line in enumerate(self._matrix_text().splitlines(), 1):
+            if line.startswith("|"):
+                block.append((number, line))
+            else:
+                check(block)
+                block = []
+        check(block)
+
     def test_test_citations_resolve_and_file_suffix_matches(self):
         """test: 必须解析到真实测试定义；显式模块后缀必须准确。
 
