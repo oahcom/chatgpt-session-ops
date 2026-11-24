@@ -118,6 +118,7 @@ def main():
         print("usage: python extract_auth.py [--port 9222]", flush=True)
         print("  从已登录的调试浏览器里导出 ChatGPT cookies 与 access_token。", flush=True)
         print("  运行前需先启动调试端口：python start_chrome.py --port 9222", flush=True)
+        print("  退出码：0 成功 / 2 用法或参数错误 / 3 缺少 CDP 浏览器适配器", flush=True)
         return 0
     if "--port" in argv:
         i = argv.index("--port")
@@ -175,8 +176,10 @@ def main():
 
 
 if __name__ == "__main__":
-    # 缺 CDP 是「环境未就绪」，不是崩溃：给出可执行的提示，退出码 3
-    # 与用法错误（2）区分开，便于上层脚本判断是否值得重试。
+    # 退出码契约（不得扩大捕获范围）：
+    #   0 成功 / 2 用法或参数错误 / 3 缺少 CDP 浏览器适配器
+    # 只捕获 CdpUnavailable。其他异常一律按原语义抛出，不得被映射成 3——
+    # 否则真实的程序缺陷会被伪装成「环境没装好」，排查方向直接错。
     try:
         sys.exit(main())
     except CdpUnavailable as e:
