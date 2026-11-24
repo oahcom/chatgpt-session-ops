@@ -115,6 +115,16 @@ jobs:
           print("PASS: pinned checkout guard present and unique")
           PY
 
+      # The RS256 verification cases need cryptography. Without it they skip,
+      # and a skipped security test is indistinguishable from a passing one in
+      # a green log. Install the deployment dependency set so the step that
+      # decides whether a token is genuine actually executes on CI.
+      - name: Install MCP deployment dependencies
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pip install --disable-pip-version-check -r requirements-mcp.txt
+
       - name: Run unit tests
         shell: bash
         run: |
@@ -141,6 +151,11 @@ jobs:
           # On a base without the E2E suite the only legitimate skip is the
           # POSIX-only directory-fsync test. Once the E2E suite lands it adds
           # 5 conditional skips (1 gate test + 4 adapter tests).
+          #
+          # The RS256 suite skips as a unit when cryptography is missing. That
+          # is exactly the case this job must not tolerate: a skipped signature
+          # verification test reads as green. requirements-mcp.txt is installed
+          # above, so a nonzero rs256 skip means the install silently failed.
           e2e_present = os.path.isfile("tests/test_memory_adapter_e2e.py")
           expected = 6 if e2e_present else 1
 
@@ -155,6 +170,12 @@ jobs:
                   "(e2e suite present: %s). A non-E2E test silently stopped "
                   "running, or a new skip appeared without updating this check."
                   % (skipped, expected, e2e_present)
+              )
+
+          if "test_mcp_rs256" in text and "RS256 tests require the optional" in text:
+              sys.exit(
+                  "RS256 verification skipped despite requirements-mcp.txt "
+                  "being installed; signature verification did not run"
               )
           PY
 

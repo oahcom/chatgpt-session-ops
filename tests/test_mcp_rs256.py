@@ -20,10 +20,12 @@ try:
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding, rsa
 except ImportError:  # pragma: no cover - dependency gate
-    raise unittest.SkipTest(
-        "RS256 tests require the optional cryptography package"
-    )
-
+    # Mark the module skipped by returning early is not possible at module
+    # level, so the whole class is replaced by one explicit skip. A module-level
+    # raise aborts discovery with an error instead of a skip, which is a worse
+    # failure mode: the CI skip-count guard would report a broken run rather
+    # than a missing dependency.
+    hashes = padding = rsa = None
 from src.session_ops.mcp_auth import (
     AuthenticationError,
     JWTVerifier,
@@ -102,6 +104,10 @@ class StaticJWKSProvider:
 class RS256VerificationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        if rsa is None:
+            raise unittest.SkipTest(
+                "RS256 tests require the optional cryptography package"
+            )
         # Reuse the same keys across all cases. The small key exists only for
         # the explicit minimum-modulus-size rejection case.
         cls.private_key = rsa.generate_private_key(
