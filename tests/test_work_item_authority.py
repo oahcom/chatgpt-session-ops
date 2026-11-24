@@ -8,6 +8,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -489,6 +490,50 @@ class LandingEvidenceTests(Base):
 
 
 class UnlinkAndVisibilityTests(Base):
+    def test_begin_immediate_blocks_second_writer_before_it_reads(self) -> None:
+        item = self.store.create_work_item(self.alice)
+        sid = conversation_id()
+        self.record_landing(sid)
+
+        # Two independently-created SQLite connections are essential here.
+        # A holds the writer reservation during the simulated
+        # "authorization checked, mutation not committed" window.
+        conn_a = self.store._connect()
+        conn_b = self.store._connect()
+        self.addCleanup(conn_a.close)
+        self.addCleanup(conn_b.close)
+
+        conn_a.execute("BEGIN IMMEDIATE")
+        conn_a.execute(
+            "SELECT work_item_id FROM work_item_owners WHERE work_item_id = ?",
+            (item.work_item_id,),
+        ).fetchone()
+
+        # Keep the production timeout/busy_timeout (3 seconds). This is
+        # intentionally a slow lock test: shortening the timeout, or merely
+        # checking eventual failure, would not prove that BEGIN IMMEDIATE
+        # blocks B before it can read the pre-commit state.
+        statements = []
+        conn_b.set_trace_callback(statements.append)
+
+        try:
+            with patch.object(self.store, "_connect", return_value=conn_b):
+                with self.assertRaises(sqlite3.OperationalError) as caught:
+                    self.store.link_session(
+                        self.alice,
+                        sid,
+                        item.work_item_id,
+                    )
+
+            self.assertRegex(str(caught.exception).lower(), r"locked|busy")
+            # With BEGIN IMMEDIATE, B fails at transaction acquisition. A
+            # deferred BEGIN would allow SELECTs before its first write fails,
+            # so this also makes the BEGIN -> deferred mutation red.
+            self.assertEqual(statements, ["BEGIN IMMEDIATE"])
+        finally:
+            if conn_a.in_transaction:
+                conn_a.execute("ROLLBACK")
+
     def test_unlink_absent_and_unauthorized_are_indistinguishable(self) -> None:
         item = self.store.create_work_item(self.alice)
         sid = conversation_id()
