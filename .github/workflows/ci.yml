@@ -152,10 +152,12 @@ jobs:
           # POSIX-only directory-fsync test. Once the E2E suite lands it adds
           # 5 conditional skips (1 gate test + 4 adapter tests).
           #
-          # The RS256 suite skips as a unit when cryptography is missing. That
-          # is exactly the case this job must not tolerate: a skipped signature
-          # verification test reads as green. requirements-mcp.txt is installed
-          # above, so a nonzero rs256 skip means the install silently failed.
+          # This job installs requirements-mcp.txt above, so both the RS256
+          # suite and the real-SDK integration suite must execute here. If
+          # either dependency silently fails to install, its tests skip and
+          # this count moves. That is the whole assertion: a skipped security
+          # or compatibility test reads as green in a log, a wrong number does
+          # not. The reasons are printed so the failure names the culprit.
           e2e_present = os.path.isfile("tests/test_memory_adapter_e2e.py")
           expected = 6 if e2e_present else 1
 
@@ -165,18 +167,89 @@ jobs:
                 % (ran, skipped, expected, e2e_present))
 
           if skipped != expected:
+              reasons = sorted(
+                  set(re.findall(r"skipped '([^']+)'", text))
+              )
               sys.exit(
                   "unit job skipped %d tests but %d are expected on this base "
-                  "(e2e suite present: %s). A non-E2E test silently stopped "
-                  "running, or a new skip appeared without updating this check."
-                  % (skipped, expected, e2e_present)
+                  "(e2e suite present: %s). Reasons seen: %r. A dependency "
+                  "install failed and its tests skipped to green, or a new "
+                  "skip appeared without updating this check."
+                  % (skipped, expected, e2e_present, reasons)
               )
+          PY
 
-          if "test_mcp_rs256" in text and "RS256 tests require the optional" in text:
+  # The unit job proves the core package imports without the optional SDK.
+  # This job proves the opposite direction: that the deployment surface we
+  # actually ship is compatible with the SDK version we actually pin. Until
+  # this existed, build_mcp_server's assumptions about mcp==2.3.0 were checked
+  # by hand once and never again -- a renamed keyword or a changed context type
+  # would have shipped green and broken on the first real deployment.
+  sdk:
+    name: real MCP SDK integration
+    needs: unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install the pinned MCP SDK
+        run: |
+          python -m pip install --disable-pip-version-check -r requirements-mcp.txt pytest
+
+      - name: Run real MCP SDK integration tests
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_mcp_sdk_integration.py -v 2>&1 | tee sdk.log
+
+      # Same hazard as the RS256 skip: a skipped test reads as green. The SDK is
+      # installed above, so anything other than four executed cases means the
+      # dependency did not land or the import path moved underneath us.
+      - name: Require the SDK tests to execute
+        shell: bash
+        run: |
+          python - <<'PY'
+          import re
+          import sys
+
+          lines = [
+              line.strip()
+              for line in open("sdk.log", encoding="utf-8", errors="replace")
+              if line.strip()
+          ]
+          summary = lines[-1] if lines else ""
+
+          # pytest pads the summary with '=' on both sides, so the counts are
+          # neither at line start nor preceded by a comma. Anchoring on
+          # (?:^|,\s*) parsed "==== 4 passed ====" as zero passed and failed a
+          # good run; this version was checked against five real summary shapes.
+          def count(label):
+              match = re.search(r"(\d+)\s+" + label, summary)
+              return int(match.group(1)) if match else 0
+
+          passed = count("passed")
+          skipped = count("skipped")
+          failed = count("failed")
+          errors = count("error")
+          print("sdk integration: passed=%d skipped=%d failed=%d errors=%d"
+                % (passed, skipped, failed, errors))
+
+          if skipped:
               sys.exit(
-                  "RS256 verification skipped despite requirements-mcp.txt "
-                  "being installed; signature verification did not run"
+                  "SDK is installed but the integration tests were skipped; "
+                  "dependency install or import path is broken"
               )
+          if failed or errors:
+              sys.exit("SDK integration tests failed; see sdk.log")
+          if passed < 4:
+              sys.exit(
+                  "expected at least 4 SDK integration cases, %d ran" % passed
+              )
+          print("PASS: the pinned SDK was exercised, not skipped")
           PY
 
   e2e:
