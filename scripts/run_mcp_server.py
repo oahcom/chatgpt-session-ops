@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,14 @@ SUPPORTED_SCOPES = [
     "session_ops.access.manage",
 ]
 
+MEMORY_STDIO_ENV = "SO_MCP_MEMORY_STDIO"
+
+_SECRET_ARGUMENT_RE = re.compile(
+    r"(token|password|passwd|secret|credential|"
+    r"api[-_]?key|private[-_]?key|authorization)",
+    re.IGNORECASE,
+)
+
 
 def required_env(name: str) -> str:
     """Read a required non-empty environment variable."""
@@ -38,6 +47,162 @@ def required_env(name: str) -> str:
     if value is None or not value.strip():
         raise RuntimeError("required environment variable is missing: " + name)
     return value.strip()
+
+
+def _resolve_memory_executable(executable: str) -> str:
+    """Resolve argv[0] and fail early unless it is an executable file."""
+    if not executable or not executable.strip():
+        raise RuntimeError(
+            MEMORY_STDIO_ENV + " command has an empty executable path"
+        )
+
+    if "\x00" in executable:
+        raise RuntimeError(
+            MEMORY_STDIO_ENV + " executable path contains a NUL character"
+        )
+
+    # A path containing a separator is interpreted relative to the service
+    # working directory unless it is already absolute.
+    if os.path.isabs(executable) or os.path.dirname(executable):
+        candidate = Path(executable).expanduser()
+
+        if not candidate.exists():
+            raise RuntimeError(
+                "memory adapter executable does not exist: %s"
+                % candidate
+            )
+
+        if not candidate.is_file():
+            raise RuntimeError(
+                "memory adapter executable is not a regular file: %s"
+                % candidate
+            )
+
+        if not os.access(str(candidate), os.X_OK):
+            raise RuntimeError(
+                "memory adapter executable is not executable: %s"
+                % candidate
+            )
+
+        return str(candidate.resolve())
+
+    # A bare executable name is resolved using the service process PATH.
+    resolved = shutil.which(executable)
+    if resolved is not None:
+        candidate = Path(resolved)
+
+        if not candidate.is_file():
+            raise RuntimeError(
+                "memory adapter executable is not a regular file: %s"
+                % candidate
+            )
+
+        if not os.access(str(candidate), os.X_OK):
+            raise RuntimeError(
+                "memory adapter executable is not executable: %s"
+                % candidate
+            )
+
+        return str(candidate.resolve())
+
+    # Distinguish an existing but non-executable PATH entry from a missing
+    # executable so the startup error identifies the actual problem.
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        search_directory = directory or os.curdir
+        candidate = Path(search_directory) / executable
+
+        if candidate.exists():
+            if not candidate.is_file():
+                raise RuntimeError(
+                    "memory adapter executable is not a regular file: %s"
+                    % candidate
+                )
+
+            if not os.access(str(candidate), os.X_OK):
+                raise RuntimeError(
+                    "memory adapter executable is not executable: %s"
+                    % candidate
+                )
+
+    raise RuntimeError(
+        "memory adapter executable was not found on PATH: %s"
+        % executable
+    )
+
+
+def load_memory_adapter_command() -> Any:
+    """Load an optional JSON argv array for the Memory Adapter.
+
+    Unset environment variable:
+        Return None and leave session.context unavailable.
+
+    Set environment variable:
+        It must contain a non-empty JSON array of non-empty strings.
+        Invalid configuration is a startup error; it is never silently
+        converted to None.
+    """
+    raw = os.environ.get(MEMORY_STDIO_ENV)
+
+    if raw is None:
+        return None
+
+    try:
+        command = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            MEMORY_STDIO_ENV + " must contain a valid JSON array of strings"
+        ) from exc
+
+    if not isinstance(command, list) or not command:
+        raise RuntimeError(
+            MEMORY_STDIO_ENV
+            + " must be a non-empty JSON array of command arguments"
+        )
+
+    for index, part in enumerate(command):
+        if not isinstance(part, str) or not part:
+            raise RuntimeError(
+                MEMORY_STDIO_ENV
+                + " argument %d must be a non-empty string" % index
+            )
+        if "\x00" in part:
+            raise RuntimeError(
+                MEMORY_STDIO_ENV
+                + " argument %d contains a NUL character" % index
+            )
+
+    command[0] = _resolve_memory_executable(command[0])
+    return command
+
+
+def _redact_memory_command(command: Any) -> str:
+    """Render the effective argv for logs without exposing flagged secrets."""
+    if command is None:
+        return "disabled"
+
+    redacted = []
+    redact_next = False
+
+    for argument in command:
+        if redact_next:
+            redacted.append("<redacted>")
+            redact_next = False
+            continue
+
+        if argument.startswith("--") and "=" in argument:
+            option, value = argument.split("=", 1)
+            if _SECRET_ARGUMENT_RE.search(option):
+                redacted.append(option + "=<redacted>")
+            else:
+                redacted.append(argument)
+            continue
+
+        redacted.append(argument)
+
+        if argument.startswith("-") and _SECRET_ARGUMENT_RE.search(argument):
+            redact_next = True
+
+    return json.dumps(redacted, ensure_ascii=False)
 
 
 def _validate_https_url(name: str, value: str, *, require_path: bool) -> str:
@@ -131,6 +296,8 @@ def load_config() -> dict[str, Any]:
 
     discovery_url = os.environ.get("SO_MCP_DISCOVERY_URL", "").strip() or None
 
+    memory_adapter_command = load_memory_adapter_command()
+
     return {
         "issuer": issuer,
         "audience": audience,
@@ -141,6 +308,7 @@ def load_config() -> dict[str, Any]:
         "port": port,
         "log_level": log_level,
         "discovery_url": discovery_url,
+        "memory_adapter_command": memory_adapter_command,
     }
 
 
@@ -339,7 +507,10 @@ def create_application(config: dict[str, Any]) -> Any:
         discovery_url=config["discovery_url"],
     )
 
-    service = MCPToolService(store)
+    service = MCPToolService(
+        store,
+        memory_adapter=config.get("memory_adapter_command"),
+    )
     mcp_app = build_mcp_server(service, verifier)
 
     return DeploymentASGI(
@@ -373,6 +544,11 @@ def main() -> None:
         config["host"],
         config["port"],
         bool(config["discovery_url"]),
+    )
+
+    logger.info(
+        "Memory adapter command: %s",
+        _redact_memory_command(config["memory_adapter_command"]),
     )
 
     uvicorn.run(
