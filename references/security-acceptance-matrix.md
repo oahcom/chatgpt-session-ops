@@ -1,6 +1,6 @@
 # Security Acceptance Matrix — SO MCP surface (v1)
 
-**Scope:** the Session Ops MCP surface as it exists at `2c67d63` on `main`.
+**Scope:** the Session Ops MCP surface as it exists at `3839aeadf56cab4de3e477d28b477d1ae61f7cbc` on `main`.
 Every row names the test that proves it. A row without a test name is not
 evidence, it is an intention; any such row is marked `human:` and says why.
 
@@ -42,6 +42,16 @@ without the mark have a case that names and asserts the behaviour, but nobody
 has yet deleted the implementation to watch it fail. They are weaker than
 `mutation-checked` even though both currently read PROVEN, and the difference
 is recorded per row rather than averaged away.
+
+**Erratum — the #30 commit title overstates this.** Commit `cca106c` is titled
+"matrix v3 — every PROVEN row now has a deletion behind it". That is a commit
+message, it is not rewritten, and it should not be read as a description of the
+current table. At the time of writing **6 of 22 rows** have an actual deletion
+behind them (rows 4, 4b, 6, 12, 16, 18); the other PROVEN rows assert the
+behaviour but have not had the implementation deleted to watch them fail.
+`PROVEN` therefore must not be read as `mutation-checked` — the only thing that
+means `mutation-checked` is the mark itself. Per-row status in the table below
+is authoritative.
 
 ---
 
