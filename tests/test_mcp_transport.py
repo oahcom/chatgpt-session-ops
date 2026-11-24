@@ -7,10 +7,12 @@ deterministic fakes. Run with:
 
 import asyncio
 import socket
+import ssl
 import sys
 import types
 import unittest
 import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
@@ -19,6 +21,8 @@ from src.session_ops.mcp_auth import (
     JWKSFetchError,
     JWKSProvider,
     _default_json_fetcher,
+    _PinnedHTTPSConnection,
+    _resolve_validated_address,
     _validate_public_https_url,
 )
 from src.session_ops.mcp_server import MCPToolService, build_mcp_server
@@ -36,6 +40,30 @@ KNOWN_JWKS = {
         }
     ]
 }
+
+
+class _FakeTLSSocket:
+    def close(self):
+        pass
+
+
+class _FakeTLSContext:
+    """Just enough of ssl.SSLContext for http.client.HTTPSConnection.
+
+    HTTPSConnection.__init__ reads verify_mode and check_hostname to decide
+    whether hostname verification is on. It never wraps during __init__, so the
+    rest of the SSLContext surface can stay absent.
+    """
+
+    verify_mode = ssl.CERT_REQUIRED
+    check_hostname = True
+
+    def __init__(self):
+        self.server_hostnames = []
+
+    def wrap_socket(self, sock, *, server_hostname):
+        self.server_hostnames.append(server_hostname)
+        return sock
 
 
 def make_provider():
@@ -201,6 +229,216 @@ class DiscoverySSRFRegressionTests(unittest.TestCase):
 
         self.assertEqual(requested, [initial_url])
         old_urlopen.assert_not_called()
+
+    def test_resolve_validated_address_returns_the_pinned_answer(self):
+        """Validation must hand back the address it actually checked."""
+        with patch(
+            "src.session_ops.mcp_auth.socket.getaddrinfo",
+            return_value=self.public_dns_record("93.184.216.34"),
+        ):
+            pinned = _resolve_validated_address(
+                "https://issuer.example.test/keys",
+                "JWKS",
+            )
+
+        self.assertEqual(pinned, "93.184.216.34")
+
+    def test_resolve_validated_address_rejects_mixed_answers(self):
+        """One private answer condemns the whole hostname.
+
+        Filtering down to the public entry would be the tempting fix and the
+        wrong one: a resolver returning both is hostile, not unlucky.
+        """
+        answers = self.public_dns_record("93.184.216.34") + [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                6,
+                "",
+                ("10.0.0.7", 443),
+            )
+        ]
+
+        with patch(
+            "src.session_ops.mcp_auth.socket.getaddrinfo",
+            return_value=answers,
+        ):
+            with self.assertRaises(AuthenticationError):
+                _resolve_validated_address(
+                    "https://issuer.example.test/keys",
+                    "JWKS",
+                )
+
+    def test_validate_public_https_url_still_returns_the_url(self):
+        """Two call sites parse the return value as a URL.
+
+        Changing this function to return an address instead would break the
+        discovery-origin comparison in _discover_jwks_uri, which does
+        urlparse(public_jwks_uri) immediately afterwards.
+        """
+        with patch(
+            "src.session_ops.mcp_auth.socket.getaddrinfo",
+            return_value=self.public_dns_record("93.184.216.34"),
+        ):
+            returned = _validate_public_https_url(
+                "https://issuer.example.test/keys",
+                "JWKS",
+            )
+
+        self.assertEqual(returned, "https://issuer.example.test/keys")
+
+    def test_default_fetcher_pins_the_validated_address(self):
+        """The fetcher must hand the validated address to the connection.
+
+        Without this, _default_json_fetcher validates one DNS answer and
+        http.client resolves a second one -- the rebinding window stays open
+        while every other test in this class still passes.
+        """
+        captured = {}
+
+        real_build_opener = urllib.request.build_opener
+
+        def recording_build_opener(*handlers):
+            captured["handlers"] = handlers
+            return real_build_opener(*handlers)
+
+        with patch(
+            "src.session_ops.mcp_auth.socket.getaddrinfo",
+            return_value=self.public_dns_record("93.184.216.34"),
+        ), patch(
+            "src.session_ops.mcp_auth.urllib.request.build_opener",
+            side_effect=recording_build_opener,
+        ), patch(
+            "src.session_ops.mcp_auth.socket.create_connection",
+            side_effect=OSError("stop before any real I/O"),
+        ):
+            with self.assertRaises(JWKSFetchError):
+                _default_json_fetcher(
+                    "https://issuer.example.test/keys",
+                    1.0,
+                    1024,
+                )
+
+        pinning = [
+            h for h in captured["handlers"]
+            if getattr(h, "_pinned_ip", None) is not None
+        ]
+        self.assertEqual(
+            len(pinning),
+            1,
+            "exactly one handler must pin the connection address",
+        )
+        self.assertEqual(pinning[0]._pinned_ip, "93.184.216.34")
+
+    def test_pinned_connection_dials_the_ip_and_keeps_the_hostname_for_sni(self):
+        """The connection half of the rebinding fix, tested on its own.
+
+        Driving the whole opener through fake TLS would assert more about
+        http.client internals than about our behaviour. This asserts the two
+        properties that matter and nothing else.
+        """
+        dialled = []
+        context = _FakeTLSContext()
+
+        connection = _PinnedHTTPSConnection(
+            "issuer.example.test",
+            pinned_ip="93.184.216.34",
+            port=443,
+            context=context,
+        )
+
+        with patch(
+            "src.session_ops.mcp_auth.socket.create_connection",
+            side_effect=lambda address, timeout, source: (
+                dialled.append(address) or _FakeTLSSocket()
+            ),
+        ):
+            connection.connect()
+
+        self.assertEqual(
+            dialled,
+            [("93.184.216.34", 443)],
+            "the socket must go to the validated address",
+        )
+        self.assertEqual(
+            context.server_hostnames,
+            ["issuer.example.test"],
+            "server_hostname must remain the hostname so certificate "
+            "verification is performed against the certificate identity",
+        )
+
+    def test_pinned_connection_refuses_a_proxy_tunnel(self):
+        """A tunnel would hand the hostname to a proxy and undo the pin.
+
+        The refusal must happen before the dial. An earlier draft of this test
+        only asserted OSError, and when the guard was deleted the real dial
+        failed with OSError too: green, for the wrong reason, and 21 seconds
+        slow. Asserting the absence of a dial is what makes the mutation land.
+        """
+        dialled = []
+        connection = _PinnedHTTPSConnection(
+            "issuer.example.test",
+            pinned_ip="93.184.216.34",
+            port=443,
+            context=_FakeTLSContext(),
+        )
+        connection._tunnel_host = "issuer.example.test"
+
+        with patch(
+            "src.session_ops.mcp_auth.socket.create_connection",
+            side_effect=lambda address, timeout, source: dialled.append(address),
+        ):
+            with self.assertRaises(OSError):
+                connection.connect()
+
+        self.assertEqual(
+            dialled,
+            [],
+            "a tunnelled connection must be refused before it dials anything",
+        )
+
+    def test_default_fetcher_installs_no_proxy_handler(self):
+        """build_opener adds ProxyHandler unless it is explicitly overridden.
+
+        On Windows the system proxy lives in the registry, so no environment
+        variable reveals it. Measured here before the fix: validation resolved
+        the hostname once and the actual connection went to 127.0.0.1:7000.
+        """
+        captured = {}
+
+        real_build_opener = urllib.request.build_opener
+
+        def recording_build_opener(*handlers):
+            captured["handlers"] = handlers
+            return real_build_opener(*handlers)
+
+        with patch(
+            "src.session_ops.mcp_auth.socket.getaddrinfo",
+            return_value=self.public_dns_record("93.184.216.34"),
+        ), patch(
+            "src.session_ops.mcp_auth.urllib.request.build_opener",
+            side_effect=recording_build_opener,
+        ), patch(
+            "src.session_ops.mcp_auth.socket.create_connection",
+            side_effect=OSError("stop before any real I/O"),
+        ):
+            with self.assertRaises(JWKSFetchError):
+                _default_json_fetcher(
+                    "https://issuer.example.test/keys",
+                    1.0,
+                    1024,
+                )
+
+        proxy_handlers = [
+            h for h in captured["handlers"]
+            if isinstance(h, urllib.request.ProxyHandler)
+        ]
+        self.assertTrue(proxy_handlers, "an explicit ProxyHandler must be passed")
+        self.assertEqual(
+            proxy_handlers[0].proxies,
+            {},
+            "the proxy map must be empty, not merely absent",
+        )
 
     def test_https_jwks_rejects_loopback_link_local_and_private_ips(self):
         for address in (

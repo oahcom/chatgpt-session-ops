@@ -10,6 +10,7 @@ package. Network access is synchronous and injectable for deterministic tests.
 from __future__ import annotations
 
 import base64
+import http.client
 import ipaddress
 import json
 import re
@@ -460,8 +461,18 @@ def _validate_https_url(value: Any, description: str) -> str:
     return value
 
 
-def _validate_public_https_url(value: Any, description: str) -> str:
-    """Require HTTPS and reject destinations resolving to non-public IPs."""
+def _resolve_validated_address(value: Any, description: str) -> str:
+    """Validate an HTTPS URL and return the address the connection must use.
+
+    The returned address is the first entry of the set that was fully checked.
+    Returning it is the whole point: the caller pins the connection to this
+    address instead of letting the HTTP client resolve the hostname again, which
+    is what closes the rebinding window between validation and connect.
+
+    Every answer is still checked. A hostname that resolves to one public and one
+    private address is rejected, not silently filtered down to the public one,
+    because a mixed answer is evidence of a hostile resolver, not of bad luck.
+    """
     value = _validate_https_url(value, description)
     parsed = urlparse(value)
     host = parsed.hostname
@@ -473,13 +484,6 @@ def _validate_public_https_url(value: Any, description: str) -> str:
         addresses = [literal]
     except ValueError:
         try:
-            # Residual DNS-rebinding risk: this validation lookup is separate from
-            # the HTTP client's later connection lookup, so DNS can return a
-            # different address at connect time. This check is not a complete
-            # SSRF defense. A stronger mitigation pins the validated IP for the
-            # connection while preserving TLS SNI and certificate-hostname
-            # verification (or equivalently verifies the connected peer against
-            # the validated address and certificate identity).
             records = socket.getaddrinfo(
                 host,
                 parsed.port or 443,
@@ -507,6 +511,17 @@ def _validate_public_https_url(value: Any, description: str) -> str:
         raise AuthenticationError(
             "%s URL resolves to a non-public network address" % description
         )
+    return str(addresses[0])
+
+
+def _validate_public_https_url(value: Any, description: str) -> str:
+    """Require HTTPS and reject destinations resolving to non-public IPs.
+
+    Returns the URL unchanged. The address that was validated is discarded here;
+    a call site that is about to open a connection must use
+    _resolve_validated_address instead, so the check and the connect agree.
+    """
+    _resolve_validated_address(value, description)
     return value
 
 
@@ -581,6 +596,65 @@ def _validate_fetch_url(value: str, description: str) -> None:
         raise AuthenticationError("%s URL must not contain a fragment" % description)
 
 
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPS connection that dials a validated IP but keeps the host for TLS.
+
+    Two properties matter and both are asserted by tests:
+
+    - the socket is opened to the IP that was validated, so a second DNS answer
+      cannot redirect the connection;
+    - server_hostname stays the original hostname, so SNI and certificate
+      hostname verification still work. Pinning the address must not weaken TLS.
+    """
+
+    def __init__(self, host: str, *, pinned_ip: str, **kwargs: Any) -> None:
+        super().__init__(host, **kwargs)
+        self._pinned_ip = pinned_ip
+
+    def connect(self) -> None:
+        # A tunnel would hand the hostname to a proxy, which is exactly the
+        # bypass this class exists to prevent. Refuse rather than silently
+        # dial through it.
+        if self._tunnel_host:
+            raise OSError("HTTPS proxy tunnels are not supported")
+
+        sock = socket.create_connection(
+            (self._pinned_ip, self.port),
+            self.timeout,
+            self.source_address,
+        )
+        try:
+            self.sock = self._context.wrap_socket(
+                sock,
+                server_hostname=self.host,
+            )
+        except BaseException:
+            sock.close()
+            raise
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    """Build HTTPS connections that use one request's validated IP."""
+
+    def __init__(self, pinned_ip: str) -> None:
+        self._pinned_ip = pinned_ip
+        super().__init__()
+
+    def https_open(self, request: Any) -> Any:
+        pinned_ip = self._pinned_ip
+
+        class PinnedConnection(_PinnedHTTPSConnection):
+            def __init__(self, host: str, **kwargs: Any) -> None:
+                super().__init__(host, pinned_ip=pinned_ip, **kwargs)
+
+        return self.do_open(
+            PinnedConnection,
+            request,
+            context=self._context,
+            check_hostname=self._check_hostname,
+        )
+
+
 def _default_json_fetcher(url: str, timeout: float, max_bytes: int) -> Dict[str, Any]:
     """Fetch one bounded JSON document using the stdlib.
 
@@ -589,8 +663,12 @@ def _default_json_fetcher(url: str, timeout: float, max_bytes: int) -> Dict[str,
     path onto the local Keycloak listener.
     """
     _validate_fetch_url(url, "request")
-    if urlparse(url).scheme == "https":
-        _validate_public_https_url(url, "request")
+    original_scheme = urlparse(url).scheme
+    pinned_ip = None
+    if original_scheme == "https":
+        # Resolve once, here, and pin the connection to that answer. Validating
+        # and then letting the client resolve again leaves a rebinding window.
+        pinned_ip = _resolve_validated_address(url, "request")
 
     request = urllib.request.Request(
         url,
@@ -607,7 +685,21 @@ def _default_json_fetcher(url: str, timeout: float, max_bytes: int) -> Dict[str,
         ):
             return None
 
-    opener = urllib.request.build_opener(_NoRedirectHandler)
+    # ProxyHandler({}) is not decoration. build_opener installs a proxy handler
+    # by default and urllib consults the system proxy configuration, including
+    # the Windows registry where no environment variable exists. With a proxy in
+    # play the request never resolves the hostname locally at all -- the proxy
+    # does -- so the address check above would describe a host the process never
+    # contacts. Measured on this machine: validation resolved the hostname once,
+    # and the actual connection went to 127.0.0.1:7000.
+    handlers = [
+        urllib.request.ProxyHandler({}),
+        _NoRedirectHandler(),
+    ]
+    if pinned_ip is not None:
+        handlers.append(_PinnedHTTPSHandler(pinned_ip))
+
+    opener = urllib.request.build_opener(*handlers)
 
     try:
         with opener.open(request, timeout=timeout) as response:
