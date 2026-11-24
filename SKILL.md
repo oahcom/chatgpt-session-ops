@@ -173,22 +173,47 @@ python scripts/chatgpt_send.py --account acct2 <conv_id> <prompt_file>
 
 ##### 会话日志（提示词 + 回复全量留存，按会话拆分，可检索）
 
-**每一次经本插件发出的提示词与收割到的回复正文都会落一行到 `logs/conversations/<conv_id>.jsonl`**——投递成功、落点不一致被隔离、乃至中途抛异常，都会留痕（异常轮次 `status=null` 且带 `error` 原因）。目的是「事后能完整复原当时发了什么、回了什么」：`prompts/` 会被新编号覆盖，`replies/` 是扁平命名、要按会话归集得靠猜。
+**每一次经本插件发出的提示词与收割到的回复正文都会被留存**，以 `conv_id` 为维度拆分。目的是「事后能完整复原当时发了什么、回了什么」：`prompts/` 会被新编号覆盖，`replies/` 是扁平命名、要按会话归集得靠猜。
+
+**覆盖范围（R373-01）**：P0 API 通道（`send_prompt`：成功 / 落点不一致隔离 / 抛异常）、匿名通道（`send_anon`、`--anon-send`）、**P1 CDP 通道（`continue_full.py`）**。任何新增投递入口都必须接入同一套日志协议——漏一个入口，"全量留存"就不成立。
+
+**两阶段落盘（R373-02）**：
+
+| 阶段 | 时机 | 内容 |
+|---|---|---|
+| `begin` | **发送之前** | `turn_id` + 提示词全文。**这一步失败就拒绝发送**——内容已被使用却无记录，是不可补救的数据丢失 |
+| `end` | 发送之后 | 回复全文 + `reply_state` + `status` + `error` |
+
+两行用 `turn_id` 关联，读取时合并成一"轮"。**只有 `begin` 没有 `end` = 该轮未完成**，`reply_state` 保持 `unrecorded`、`status` 为 `null`——这是可查询的可见状态，不会被当成"看起来成功"。
+
+**目录（三桶，不合并）**：
+
+| 目录 | 含义 |
+|---|---|
+| `logs/conversations/<conv_id>.jsonl` | 已确认 `conv_id` 的会话 |
+| `logs/pending/` | 新会话尚未取得真实 id 的暂存轮次；拿到 id 后整轮迁移并删暂存 |
+| `logs/unassigned/` | 身份不可用且无法归属：**按原始标识分文件**，绝不合并成一个桶 |
+
+**`reply_state` 语义（R373-05）**：`captured`（完整正文）/ `empty`（200 但明确空回复）/ `partial`（收割不完整，不得冒充完整）/ `unavailable`（无回复：413、非 200、异常）/ `quarantined`（落点不一致但正文已保全）/ `unrecorded`（只有 begin）。
+
+**`reply_source`（R374-01）**：`api`（SSE/mapping 收割）或 `dom`（P1 CDP 页面文本）。两者证据强度不同，检索时应可辨识。**P1 的 DOM 证据必须先在发送前取 assistant 消息条数作基线，只认新增的那条**——上一轮的回复会留在 DOM 里，本轮发送失败时最后一条仍是旧回复，直接取会把它记成本轮回复（内容真实但归属错误）。仍在流式生成记 `partial`，没有新增记 `unavailable`。
 
 | 命令 | 作用 |
 |---|---|
-| `--log-list` | 有留存记录的会话一览（轮次、首末时间、涉及身份、最近提示词文件） |
+| `--log-list` | 三桶文件数、每份日志的轮次与 `reply_states`、`incomplete` 列表 |
 | `--log-show <conv_id>` | 读某会话全部交互（提示词与回复全文，按时间正序） |
 | `--log-search <关键词> [--conv <id>] [--limit N] [--json]` | 全库或按会话检索（大小写不敏感，匹配提示词或回复正文） |
 
-一行记录的形状：`ts / conv_id / target_conv / account / prompt_file / prompt(全文) / prompt_chars / prompt_sha256 / reply(全文) / reply_chars / reply_sha256 / reply_file / status / error`。
+轮次形状：`turn_id / ts / conv_id / target_conv / account / prompt_file / prompt(全文) / prompt_chars / prompt_sha256 / reply(全文) / reply_chars / reply_sha256 / reply_state / reply_file / status / error`。
 
 纪律：
-- **留存失败绝不改变投递结果**——只打 `WARN`。日志用于回溯，让它反向影响发送就成了新的故障源（有专门用例钉住）。
-- **日志含私密对话内容，与 `replies/` 同等级，`logs/` 已由 `.gitignore` 排除，绝不入库。**
-- 新会话记在**服务器实际返回**的 `conv_id` 下，不记到 `null`/目标 id；非法或不可解析的 id 归入 `_unassigned.jsonl`（宁可归错也不丢内容），且路径不会逃出日志目录。
-- 坏行（半行/非法 JSON）在读取时跳过，不影响其余记录检索。
-- 日志是追加写，未加锁：当前投递是串行编排（单 GET、会话间 ≥60s）；若将来同会话真并发，再加 `_file_lock`。
+- **提示词必须先落盘再发送**；回复补写失败无法撤销已发生的交互，因此不阻断返回，但该轮必须表现为未完成（`unrecorded`），并打 `FAIL`。
+- **正文必须是发送那一刻的快照**：一次读取、整轮复用，绝不在发送后重读文件补日志（文件可能已被改写或删除）。
+- **同会话追加按文件加锁**（进程内 + 跨进程）；不同会话互不阻塞。
+- **`fsync` 失败必须抛**，不得把持久化未确认伪装成成功。
+- **日志含私密对话内容，与 `replies/` 同等级，`logs/` 已由 `.gitignore` 排除，绝不入库**；文件权限收紧为仅本用户可读写。
+- 坏行（半行/非法 JSON）读取时跳过，不影响其余记录。
+- 旧版单行记录（无 `phase`/`turn_id`）仍可读，`reply_state` 按内容推导，历史成功轮次不会被误报。
 
 ##### Legacy conversation registry migration
 
@@ -404,7 +429,7 @@ python scripts/chatgpt_send.py --tail <conv_id>
 python -m unittest discover -s tests -v
 ```
 
-367 条，覆盖 id 校验与路径穿越、状态文件损坏隔离（语法坏与顶层类型坏同罪）与字段形状收敛（`_as_int` 等五件套，畸形字段一律「没有这个值」不抛异常）、原子写（tmp 名唯一，防同进程多线程互踩）与并发 80 次不丢更新、锁重入/stale 回收/持有者身份、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性、设备身份留存与多设备回退（含凭据剔除、429 停手、归属自愈），以及用离线桩跑通的投递主流程（含 413、空提示词、非法 id、发送异常时的孤儿会话登记）；出口代理（优先级、fail-closed、http/socks 真分流、死节点探测、出口判定、目标站探活、WebRTC 泄漏分类；坏端口＝配置非法在入口拒，探活对垃圾端口一律 False）；B8 六进程并发抢槽（抢不到锁即 QUEUED、半截槽位不回收）、B15 租约心跳与超时两档；交付正文托管（`--extract` 字节级、CRLF 不改、标记不唯一退 2、`--verify-copy` 单字节差异即拒）；调度口径（`--check-name` 12 条命名契约、`--check-schedule` 1 小时维度、`--check-oneshot` 一次性窗口）；证据矩阵自校验（条款与证据一一对应，引用不存在的用例即红）。**改锁、改落盘、改 id、改设备身份、改代理、改基线条款前先跑一遍。**
+ 条，覆盖 id 校验与路径穿越、状态文件损坏隔离（语法坏与顶层类型坏同罪）与字段形状收敛（`_as_int` 等五件套，畸形字段一律「没有这个值」不抛异常）、原子写（tmp 名唯一，防同进程多线程互踩）与并发 80 次不丢更新、锁重入/stale 回收/持有者身份、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性、设备身份留存与多设备回退（含凭据剔除、429 停手、归属自愈），以及用离线桩跑通的投递主流程（含 413、空提示词、非法 id、发送异常时的孤儿会话登记）；出口代理（优先级、fail-closed、http/socks 真分流、死节点探测、出口判定、目标站探活、WebRTC 泄漏分类；坏端口＝配置非法在入口拒，探活对垃圾端口一律 False）；B8 六进程并发抢槽（抢不到锁即 QUEUED、半截槽位不回收）、B15 租约心跳与超时两档；交付正文托管（`--extract` 字节级、CRLF 不改、标记不唯一退 2、`--verify-copy` 单字节差异即拒）；调度口径（`--check-name` 12 条命名契约、`--check-schedule` 1 小时维度、`--check-oneshot` 一次性窗口）；证据矩阵自校验（条款与证据一一对应，引用不存在的用例即红）。**改锁、改落盘、改 id、改设备身份、改代理、改基线条款前先跑一遍。**
 
 ### 交付正文与排程口径的机器闸口（v1.8）
 
@@ -564,7 +589,7 @@ python scripts/mcp_connector.py eligibility --accounts acct1,acct2,acct3,acct4,a
 
 ### tests/
 
-- `test_hardening.py` — 离线回归（367 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW、设备身份留存与多设备回退、出口代理（含本地假 http/socks 代理真分流）。
+- `test_hardening.py` — 离线回归（424 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW、设备身份留存与多设备回退、出口代理（含本地假 http/socks 代理真分流）。
 
 ## 协议细节
 

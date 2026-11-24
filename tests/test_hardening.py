@@ -5476,11 +5476,66 @@ class TestBatchAddedCountSemantics(TmpBase):
         self.assertEqual(m.register_conversations_batch.last_added_count, 1)
 
 
+def _load_p1():
+    """加载 continue_full.py（它 import cdp，测试里用桩顶掉）。"""
+    import types
+    fake_cdp = types.ModuleType("cdp")
+    class _C:
+        def __init__(self, *a, **k):
+            pass
+    fake_cdp.CDPClient = _C
+    spec = importlib.util.spec_from_file_location(
+        "continue_full_under_test", os.path.join(HERE, "..", "scripts", "continue_full.py"))
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault("cdp", fake_cdp)
+    saved = sys.modules.get("cdp")
+    sys.modules["cdp"] = fake_cdp
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        if saved is not None:
+            sys.modules["cdp"] = saved
+    return mod
+
+
+class _FakeCdp:
+    """按顺序吐出 reply_snapshot 的返回值，用于驱动 reply_after 的判定分支。
+
+    R375-01 之后 captured 需要连续两次"正文一致且 streaming=False"，
+    所以默认把同一帧重复吐（stable_repeat>=2），单次断言不被误伤。
+    """
+
+    def __init__(self, counts, last="未完成的正文", streaming=True,
+                 has_error=False, frames=None, alert_text=""):
+        self.counts = list(counts)
+        self.last = last
+        self.streaming = streaming
+        self.has_error = has_error
+        self.alert_text = alert_text
+        self.frames = list(frames) if frames else None
+
+    def evaluate(self, js):
+        if self.frames:
+            f = self.frames.pop(0) if len(self.frames) > 1 else self.frames[0]
+            return {"value": json.dumps(f)}
+        n = self.counts.pop(0) if len(self.counts) > 1 else self.counts[0]
+        alert = self.alert_text
+        if self.has_error and not alert:
+            alert = "Something went wrong"   # 注入结构错误（等价于页面有 alert）
+        return {"value": json.dumps({"count": n, "last": self.last,
+                                     "streaming": self.streaming,
+                                     "alert_text": alert})}
+
+
 class TestConversationLog(TmpBase):
     """会话日志：提示词与回复全文按会话拆分留存，并可检索。
 
-    核心是「不留日志就等于没发生」：投递本身成功、但日志缺失时，事后完全无法
-    复原当时发了什么、回了什么。所以断言必须落在**落盘内容**上，不能只断言文件存在。
+    R373 返修后钉住的是**契约**，不是实现细节：
+      - 提示词必须在发送前落盘，落不了盘就不许发（R373-02 A）
+      - 回复状态必须区分 captured/empty/unavailable/partial/quarantined/unrecorded
+      - 未知身份不得合并成一个桶（R373-03）
+      - 同会话并发追加不得交错（R373-04）
+      - 日志正文必须是**实际发送**的那份，不是事后重读文件（R373-07）
     """
 
     def _prompt(self, body, name="p.md"):
@@ -5496,18 +5551,17 @@ class TestConversationLog(TmpBase):
             "data: [DONE]",
         ])
 
+    # ---------- 基本留存 ----------
+
     def test_prompt_and_reply_are_logged_per_conversation(self):
-        """一轮交互必须落成「按 conv_id 命名」的一行，且含提示词与回复全文。"""
         cid = "11111111-2222-4333-8444-555555555555"
         api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "回复正文ABC"))
         body = "提示词正文XYZ"
         status, path, conv = m.send_prompt(api, cid, self._prompt(body))
         self.assertEqual(status, 200)
 
-        log = os.path.join(m.log_dir(), cid + ".jsonl")
-        self.assertTrue(os.path.exists(log), "必须按会话维度落一个日志文件")
-        recs = list(m.iter_log_records(cid))
-        self.assertEqual(len(recs), 1)
+        recs = list(m.iter_turns(cid))
+        self.assertEqual(len(recs), 1, "一轮 = 一行合并结果")
         r = recs[0]
         self.assertEqual(r["conv_id"], cid)
         self.assertEqual(r["prompt"], body, "提示词全文必须留存")
@@ -5516,35 +5570,162 @@ class TestConversationLog(TmpBase):
                          hashlib.sha256(body.encode("utf-8")).hexdigest())
         self.assertEqual(r["reply_sha256"],
                          hashlib.sha256("回复正文ABC".encode("utf-8")).hexdigest())
+        self.assertEqual(r["reply_state"], "captured")
         self.assertEqual(r["status"], 200)
 
-    def test_new_chat_logs_under_real_conversation_id(self):
-        """新会话必须记在**服务器实际返回**的 id 下，不能记到 None/目标 id。"""
+    def test_new_chat_migrates_from_pending_to_real_id(self):
+        """新会话先落 pending，拿到真实 id 后整轮迁移，pending 不留残骸（R373-03）。"""
         real = "9f8e7d6c-1111-4222-8333-444455556666"
         api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(real, "hi"))
         status, path, conv = m.send_prompt(api, None, self._prompt("新会话提示词"),
                                           new_chat=True)
         self.assertEqual(status, 200)
-        self.assertTrue(os.path.exists(os.path.join(m.log_dir(), real + ".jsonl")),
-                        "日志文件名必须是真实 conv_id")
-        self.assertEqual(os.listdir(m.log_dir()), [real + ".jsonl"],
-                         "不得产生 _unassigned 之类的杂物")
-        self.assertEqual(list(m.iter_log_records(real))[0]["prompt"], "新会话提示词")
+        recs = list(m.iter_turns(real))
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["prompt"], "新会话提示词")
+        self.assertEqual(recs[0]["reply"], "hi")
+        # pending 里必须已经没有这一轮
+        pending = []
+        try:
+            pending = [n for n in os.listdir(m.log_pending_dir()) if n.endswith(".jsonl")]
+        except OSError:
+            pass
+        self.assertEqual(pending, [], "迁移后 pending 不得留残骸")
+
+    # ---------- R373-02：提示词先落盘 ----------
+
+    def test_send_refused_when_prompt_cannot_be_persisted(self):
+        """提示词落不了盘时**不许发送**——否则内容已被使用却无任何记录。"""
+        cid = "22222222-3333-4444-8555-666666666666"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "不该发生"))
+        blocker = os.path.join(self.tmp, "logs")
+        with open(blocker, "w", encoding="utf-8") as f:   # 用文件占住 logs 目录
+            f.write("x")
+        with self.assertRaises(Exception):
+            m.send_prompt(api, cid, self._prompt("这条不许发出去"))
+        self.assertEqual(api.sent, [], "提示词没落盘就绝不能发送")
+
+    def test_reply_log_failure_is_visible_not_silent(self):
+        """回复补写失败时：投递结果照常返回，但该轮必须表现为未完成。"""
+        cid = "33333333-4444-4555-8666-777777777777"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "有回复"))
+        status, path, conv = m.send_prompt(api, cid, self._prompt("提示词"))
+
+        # 删掉 begin 里的 reply_state，并把 end 行抹掉，模拟「end 没写成」
+        log = os.path.join(m.log_dir(), cid + ".jsonl")
+        lines = [l for l in open(log, encoding="utf-8") if l.strip()]
+        self.assertEqual(len(lines), 2, "应当是 begin + end 两行")
+        with open(log, "w", encoding="utf-8") as f:
+            f.write(lines[0])          # 只留 begin
+        recs = list(m.iter_turns(cid))
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["reply_state"], "unrecorded",
+                         "只有 begin 时必须显式标记未完成")
+        self.assertIsNone(recs[0]["status"], "未完成轮次不得有成功状态")
+        self.assertEqual(recs[0]["prompt"], "提示词", "提示词仍在，可追溯")
+
+    # ---------- R373-05：回复状态 ----------
+
+    def test_reply_state_distinguishes_empty_from_unavailable(self):
+        """200 但空正文 = empty；413 = unavailable。两者绝不能都记成空串。"""
+        cid_ok = "44444444-5555-4666-8777-888888888888"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid_ok, ""))
+        m.send_prompt(api, cid_ok, self._prompt("空回复场景"))
+        self.assertEqual(list(m.iter_turns(cid_ok))[0]["reply_state"], "empty")
+
+        api2 = FakeAPI(os.path.join(self.tmp, "auth"), send_status=413)
+        st, _p, _c = m.send_prompt(api2, cid_ok, self._prompt("413 场景", name="q.md"))
+        self.assertEqual(st, 413)
+        recs = list(m.iter_turns(cid_ok))
+        self.assertEqual(recs[0]["reply_state"], "unavailable", "413 不得记成 empty")
+        self.assertEqual(recs[0]["status"], 413)
+
+    def test_partial_reply_is_marked_partial(self):
+        """收割不完整不得冒充 captured——否则下游会把残缺当定稿。"""
+        cid = "55555555-6666-4777-8888-999999999999"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "半截"))
+        real = api.extract_reply_sse_checked
+        api.extract_reply_sse_checked = lambda raw: (real(raw)[0], False, "no_done")
+        api.get_status = 500      # 让 GET 补全走不通，保持不完整
+        m.send_prompt(api, cid, self._prompt("部分流"))
+        self.assertEqual(list(m.iter_turns(cid))[0]["reply_state"], "partial")
+
+    # ---------- R373-03：未知身份不合并 ----------
+
+    def test_invalid_conv_id_goes_to_its_own_file(self):
+        """两个不同的非法 id 不能被合并成同一个桶，原始标识要保留。"""
+        with self.assertRaises(ValueError):
+            m.conversation_log_path("../../evil")
+        p1 = m.unassigned_log_path("../../evil-a")
+        p2 = m.unassigned_log_path("../../evil-b")
+        self.assertNotEqual(p1, p2, "不同原始标识必须落到不同文件")
+        for p in (p1, p2):
+            self.assertTrue(p.startswith(m.log_unassigned_dir()), "不得逃出日志目录")
+            self.assertNotIn("..", os.path.basename(p))
+
+    # ---------- R373-04：并发追加 ----------
+
+    def test_concurrent_appends_are_not_interleaved(self):
+        """同会话并发追加：每条都是完整可解析的 JSON 行，不交错不丢。"""
+        cid = "66666666-7777-4888-8999-aaaaaaaaaaaa"
+        path = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        big = "长" * 2000          # 单行远超一次 write 的典型缓冲
+        def worker(n):
+            for i in range(10):
+                m._log_write(path, {"turn_id": "%s-%d" % (n, i), "phase": "begin",
+                                    "conv_id": cid, "prompt": big, "seq": i})
+        ts = [threading.Thread(target=worker, args=(n,)) for n in range(4)]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        recs = m._read_jsonl(path)
+        self.assertEqual(len(recs), 40, "40 条不得丢")
+        self.assertEqual(len({r["turn_id"] for r in recs}), 40, "不得重复")
+        for r in recs:
+            self.assertEqual(r["prompt"], big, "正文不得被截断或交错")
+
+    # ---------- R373-07：提示词快照 ----------
+
+    def test_logged_prompt_is_the_sent_text_not_reread(self):
+        """日志正文必须是**发送那一刻**的快照，不是事后重读文件。"""
+        cid = "77777777-8888-4999-8aaa-bbbbbbbbbbbb"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "ok"))
+        pf = self._prompt("原始正文AAA")
+
+        # 关键：在**发送过程中**改写并删除原文件，模拟长耗时投递期间被改。
+        # 若实现是「发送后重新读文件补日志」，这里就会记到 B 内容或记空。
+        real_send = api.send
+        def send_and_mutate(*a, **k):
+            with open(pf, "w", encoding="utf-8") as f:
+                f.write("发送途中被改成了BBB")
+            os.remove(pf)
+            return real_send(*a, **k)
+        api.send = send_and_mutate
+
+        m.send_prompt(api, cid, pf)
+        rec = list(m.iter_turns(cid))[0]
+        self.assertEqual(rec["prompt"], "原始正文AAA", "日志必须是发送时的快照")
+        self.assertEqual(rec["prompt_chars"], len("原始正文AAA"))
+        self.assertEqual(api.sent[0]["text"], "原始正文AAA")
+
+    # ---------- 异常留痕 ----------
 
     def test_exception_still_leaves_a_trace(self):
-        """投递抛异常也必须留痕——否则「发过什么」彻底无法复原。"""
-        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse("x", "y"))
-        api.requirements = lambda: (None, None)   # 强制走失败分支
+        cid = "88888888-9999-4aaa-8bbb-cccccccccccc"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "y"))
+        api.requirements = lambda: (None, None)
         with self.assertRaises(Exception):
-            m.send_prompt(api, None, self._prompt("异常前提示词"), new_chat=True)
-        recs = list(m.iter_log_records())
-        self.assertEqual(len(recs), 1, "抛异常也要落一条")
+            m.send_prompt(api, cid, self._prompt("异常前提示词"))
+        recs = list(m.iter_turns(cid))
+        self.assertEqual(len(recs), 1)
         self.assertEqual(recs[0]["prompt"], "异常前提示词")
-        self.assertIsNone(recs[0]["status"], "未完成时必须显式记 None，不能伪装成功")
-        self.assertTrue(recs[0]["error"], "错误原因必须可读")
+        self.assertIsNone(recs[0]["status"])
+        self.assertEqual(recs[0]["reply_state"], "unavailable")
+        self.assertTrue(recs[0]["error"])
+
+    # ---------- 检索 ----------
 
     def test_search_scoped_and_global(self):
-        """检索必须能命中提示词或回复，且 --conv 能限定到单一会话。"""
         cid1 = "aaaaaaaa-1111-4111-8111-111111111111"
         cid2 = "bbbbbbbb-2222-4222-8222-222222222222"
         for cid, ptext, rtext in ((cid1, "关键词在提示词里", "无关回复"),
@@ -5563,37 +5744,818 @@ class TestConversationLog(TmpBase):
         api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "TokenAlpha"))
         m.send_prompt(api, cid, self._prompt("tokenalpha 在提示词"))
         self.assertEqual(len(m.search_logs("TOKENALPHA")), 1)
-        self.assertEqual(len(m.search_logs("tokenalpha", limit=0)), 1, "limit=0 表示不限制")
+        self.assertEqual(len(m.search_logs("tokenalpha", limit=0)), 1)
 
-    def test_illegal_conv_id_never_escapes_directory(self):
-        """非法 id 不得拼出 ../ 路径——这是 id 白名单的同一类风险。"""
-        p = m.conversation_log_path("../../evil")
-        self.assertTrue(p.startswith(m.log_dir()), "日志路径必须落在日志目录内")
-        self.assertTrue(p.endswith("_unassigned.jsonl"))
+    def test_legacy_single_line_record_still_readable(self):
+        """升级前写下的单行记录（无 phase/turn_id）必须仍能读出，且状态不误报。"""
+        cid = "99999999-aaaa-4bbb-8ccc-dddddddddddd"
+        d = m.log_dir()
+        os.makedirs(d, exist_ok=True)
+        legacy = {"ts": "2026-11-23T21:57:02", "conv_id": cid, "target_conv": cid,
+                  "account": "acct6", "prompt_file": "old.md",
+                  "prompt": "旧格式提示词", "prompt_chars": 7, "prompt_sha256": "",
+                  "reply": "旧格式回复", "reply_chars": 6, "reply_sha256": "",
+                  "reply_file": "replies/x.md", "status": 200, "error": ""}
+        with open(os.path.join(d, cid + ".jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps(legacy, ensure_ascii=False) + "\n")
+        recs = list(m.iter_turns(cid))
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["prompt"], "旧格式提示词")
+        self.assertEqual(recs[0]["reply"], "旧格式回复")
+        self.assertEqual(recs[0]["reply_state"], "captured",
+                         "历史成功轮次不得被误标成 unrecorded")
 
     def test_corrupt_log_line_does_not_break_retrieval(self):
-        """日志被写坏（半行/非法 JSON）时，检索要跳过坏行而不是整体不可用。"""
         cid = "dddddddd-4444-4444-8444-444444444444"
         d = m.log_dir()
         os.makedirs(d, exist_ok=True)
         with open(os.path.join(d, cid + ".jsonl"), "w", encoding="utf-8") as f:
-            f.write('{"conv_id": "%s", "prompt": "好行", "reply": ""}\n' % cid)
+            f.write('{"turn_id": "t1", "phase": "begin", "conv_id": "%s", "prompt": "好行"}\n' % cid)
             f.write("{半截坏行\n")
             f.write("\n")
-        recs = list(m.iter_log_records(cid))
+        recs = list(m.iter_turns(cid))
         self.assertEqual(len(recs), 1, "坏行必须被跳过")
         self.assertEqual(recs[0]["prompt"], "好行")
 
-    def test_log_failure_never_breaks_sending(self):
-        """日志写不进去时投递必须照常成功——留痕失败不能变成新的故障源。"""
-        cid = "eeeeeeee-5555-4555-8555-555555555555"
-        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "照常回复"))
-        blocker = os.path.join(self.tmp, "logs")
-        with open(blocker, "w", encoding="utf-8") as f:   # 用同名文件占住目录
-            f.write("x")
-        status, path, conv = m.send_prompt(api, cid, self._prompt("提示词照发"))
-        self.assertEqual(status, 200, "日志失败不得影响投递结论")
-        self.assertIn("照常回复", _read(path))
+    # ---------- P1 通道 ----------
+
+    def test_p1_channel_has_logging_hooks(self):
+        """P1（continue_full.py）必须接入同一套日志——它曾是零留存的漏记通道。"""
+        p1 = os.path.join(HERE, "..", "scripts", "continue_full.py")
+        src = _read(p1)
+        self.assertIn("log_begin", src, "P1 发送前必须固化提示词")
+        self.assertIn("log_end", src, "P1 必须补写回复与终态")
+        self.assertNotIn("lines = [l for l in prompt.splitlines()", src,
+                         "P1 不得再按注释行删正文（会静默截断）")
+
+    # ---------- R374-01：P1 DOM 证据的归属与完整性 ----------
+
+    def test_p1_old_reply_cannot_pass_as_this_turn(self):
+        """旧回复留在 DOM 里、本轮没有新增时，不得把旧回复记成本轮的 captured。"""
+        p1 = _load_p1()
+        # 基线 3 条；发送后仍是 3 条（本轮没产生新消息）
+        c = _FakeCdp([3, 3])
+        text, state = p1.reply_after(c, {"count": 3, "last": "旧回复", "streaming": False,
+                                        "hasError": False}, settle_tries=2, settle_gap=0)
+        self.assertIsNone(text, "不得取旧回复")
+        self.assertEqual(state, "unavailable", "无法证明属于本轮 → unavailable，绝不是 captured")
+
+    def test_p1_streaming_reply_is_partial_not_captured(self):
+        """本轮回复已出现但仍在流式生成：必须记 partial，不能冒充完整。"""
+        p1 = _load_p1()
+        c = _FakeCdp([4])          # 新增了 1 条，但 streaming=True 一直不结束
+        text, state = p1.reply_after(c, {"count": 3, "last": "旧", "streaming": False,
+                                        "hasError": False}, settle_tries=2, settle_gap=0)
+        self.assertEqual(state, "partial")
+        self.assertEqual(text, "未完成的正文")
+
+    def test_p1_empty_reply_confirmed_is_empty(self):
+        """确认属于本轮、已完成、且正文为空 → empty（不是 unavailable）。"""
+        p1 = _load_p1()
+        c = _FakeCdp([4], last="", streaming=False)
+        text, state = p1.reply_after(c, {"count": 3, "last": "旧", "streaming": False,
+                                        "hasError": False}, settle_tries=2, settle_gap=0)
+        self.assertIsNone(text)
+        self.assertEqual(state, "empty")
+
+    def test_p1_confirmed_new_reply_is_captured(self):
+        """新增且已完成 → captured。"""
+        p1 = _load_p1()
+        c = _FakeCdp([4], last="本轮回复", streaming=False)
+        text, state = p1.reply_after(c, {"count": 3, "last": "旧", "streaming": False,
+                                        "hasError": False}, settle_tries=2, settle_gap=0)
+        self.assertEqual((text, state), ("本轮回复", "captured"))
+
+    def test_p1_no_baseline_means_unavailable(self):
+        """取不到基线就无法证明归属，只能 unavailable。"""
+        p1 = _load_p1()
+        text, state = p1.reply_after(_FakeCdp([1]), None, settle_tries=1, settle_gap=0)
+        self.assertIsNone(text)
+        self.assertEqual(state, "unavailable")
+
+    def test_p1_main_flow_takes_baseline_before_send(self):
+        """P1 主流程必须在 fill/发送**之前**取基线，且判定要经过 reply_after。
+
+        否则「取最后一条 assistant」的归属错误会在真实流程里复活——
+        单测 reply_after 挡不住，因为漏的是调用点。
+        """
+        src = _read(os.path.join(HERE, "..", "scripts", "continue_full.py"))
+        i_base = src.index("baseline = reply_snapshot(c)")
+        i_send = src.index('print("send:", c.evaluate(JS_SEND)')
+        self.assertLess(i_base, i_send, "基线必须在发送之前取")
+
+        # 不能再有无基线的直接判定（旧写法：captured if rp else empty）
+        self.assertNotIn('"captured" if rp else "empty"', src,
+                         "必须用 reply_after 判定，不能按非空就 captured")
+        self.assertIn("reply_after(c, baseline)", src, "判定必须传入基线")
+        self.assertNotIn("last_reply_text(c)", src, "旧的取最后一条写法必须消失")
+
+    # ---------- 独立审计发现的三项（P1-1 / P1-2 / P2-7）----------
+
+    def test_pending_never_deleted_when_unreadable(self):
+        """pending 读不出来时绝不能删——那是唯一副本。"""
+        cid = "11112222-3333-4444-8555-666677778888"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-read-fail")
+        with open(begin, "wb") as f:
+            f.write(bytes([255, 254]) + b" not utf8 at all")   # 非法 UTF-8，读必失败
+        m._migrate_pending("t-read-fail", begin, cid)
+        self.assertTrue(os.path.exists(begin), "读失败必须保留 pending")
+
+    def test_migration_conflict_returns_none(self):
+        """冲突时返回 None，让调用方知道迁移未完成（不能返回看似成功的 target）。"""
+        cid = "22223333-4444-4555-8666-777788889999"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-conflict")
+        a = {"turn_id": "t-conflict", "phase": "begin", "conv_id": "",
+             "prompt": "A 版本", "prompt_chars": 4, "status": None, "reply": ""}
+        b = dict(a, prompt="B 版本")
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(a, ensure_ascii=False) + "\n")
+            f.write(json.dumps(b, ensure_ascii=False) + "\n")
+        self.assertIsNone(m._migrate_pending("t-conflict", begin, cid))
+        self.assertTrue(os.path.exists(begin))
+
+    def test_begin_migrated_before_end_written(self):
+        """新会话：必须先迁 begin，再写 end，避免崩溃后同一轮被拆成两半。"""
+        real = "33334444-5555-4666-8777-888899990000"
+        api = FakeAPI(os.path.join(self.tmp, "auth"),
+                      sse=self._sse(real, "回复内容"))
+        m.send_prompt(api, None, self._prompt("新会话"), new_chat=True)
+        path = m.conversation_log_path(real)
+        phases = [r.get("phase") for r in m._read_jsonl(path)]
+        self.assertEqual(phases, ["begin", "end"], "目标文件里 begin 必须在 end 之前")
+        self.assertFalse(os.path.exists(m.pending_log_path("x")), "不应残留暂存")
+        self.assertEqual(len(list(m.iter_turns(real))), 1)
+
+    def test_migration_failure_never_writes_end_alone(self):
+        """迁移失败时不得只写 end——那会造出「有 end 无 begin」的残轮。"""
+        cid = "44445555-6666-4777-8888-999900001111"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-half")
+        a = {"turn_id": "t-half", "phase": "begin", "conv_id": "",
+             "prompt": "A", "prompt_chars": 1, "status": None, "reply": ""}
+        b = dict(a, prompt="B")          # 同键冲突 → 迁移必然返回 None
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(a, ensure_ascii=False) + "\n")
+            f.write(json.dumps(b, ensure_ascii=False) + "\n")
+
+        class _Api:
+            account = "acct1"
+            _last_reply_text = None
+            reply_source = "api"
+        m.log_end(_Api(), "t-half", begin, None, cid, 200, None, "captured")
+
+        target = m.conversation_log_path(cid)
+        phases = [r.get("phase") for r in m._read_jsonl(target)]
+        self.assertNotIn("end", phases, "迁移失败时目标里绝不能单独出现 end")
+        self.assertTrue(os.path.exists(begin), "begin 与 end 都应留在 pending")
+
+    # ---------- R376 崩溃注入（审查要求：不能只靠总量通过）----------
+
+    def test_crash_after_begin_written_before_pending_deleted(self):
+        """begin 已进目标、pending 还没删时崩溃：重试必须补齐且不重复。"""
+        cid = "aaaabbbb-cccc-4ddd-8eee-ffff00001111"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-crash1")
+        rows = [
+            {"turn_id": "t-crash1", "phase": "begin", "conv_id": "", "prompt": "P",
+             "prompt_chars": 1, "status": None, "reply": ""},
+            {"turn_id": "t-crash1", "phase": "end", "conv_id": "", "reply": "R",
+             "reply_chars": 1, "reply_state": "captured", "status": 200},
+        ]
+        with open(begin, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            # 真实迁移写入时会把 conv_id 改写成目标会话 id，预置数据必须一致，
+            # 否则模拟的就不是"begin 已进目标"这个状态（R378-01 会正确拒绝）。
+            f.write(json.dumps(dict(rows[0], conv_id=cid), ensure_ascii=False) + "\n")
+
+        m._migrate_pending("t-crash1", begin, cid)   # 模拟恢复
+        got = m._read_jsonl(target)
+        self.assertEqual([r.get("phase") for r in got], ["begin", "end"])
+        self.assertFalse(os.path.exists(begin), "补齐后才删 pending")
+
+    def test_end_write_fails_pending_retained(self):
+        """end 写入 pending 失败时不得删除任何东西，且不能留下半轮。"""
+        cid = "bbbbcccc-dddd-4eee-8fff-000011112222"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-crash2")
+        rec = {"turn_id": "t-crash2", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        real = m._log_write
+        def boom(path, record):
+            if record.get("phase") == "end":
+                raise OSError("模拟 end 写失败")
+            return real(path, record)
+        m._log_write = boom
+        try:
+            class _A:
+                account = "acct1"
+                _last_reply_text = None
+                reply_source = "api"
+            out = m.log_end(_A(), "t-crash2", begin, None, cid, 200, None, "captured")
+        finally:
+            m._log_write = real
+        self.assertIsNone(out, "end 写不进 pending 时必须报未完成")
+        self.assertTrue(os.path.exists(begin), "pending 必须保留")
+        self.assertFalse(os.path.exists(m.conversation_log_path(cid)),
+                         "不得在目标里留下任何残缺行")
+
+    def test_target_unicode_error_keeps_pending(self):
+        """target 编码坏（读不出来）时必须中止迁移并保留 pending（R376-04）。"""
+        cid = "ccccdddd-eeee-4fff-8000-111122223333"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-crash3")
+        rec = {"turn_id": "t-crash3", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as f:
+            f.write(bytes([255, 254]) + b"broken")
+        self.assertIsNone(m._migrate_pending("t-crash3", begin, cid))
+        self.assertTrue(os.path.exists(begin), "target 读不出来时 pending 必须保留")
+
+    def test_pending_unicode_error_keeps_pending(self):
+        """pending 编码坏时必须保留（已覆盖，这里钉住返回 None）。"""
+        cid = "ddddeeee-ffff-4000-8111-222233334444"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-crash4")
+        with open(begin, "wb") as f:
+            f.write(bytes([255, 254]) + b"broken")
+        self.assertIsNone(m._migrate_pending("t-crash4", begin, cid))
+        self.assertTrue(os.path.exists(begin))
+
+    def test_long_body_with_error_word_is_not_error(self):
+        """500 字正文里提到"网络错误"（在讨论它）不算错误。"""
+        p1 = _load_p1()
+        body = ("网络错误" * 100) + "这一段是在讨论该错误，不是真的出错"
+        c = _FakeCdp([], frames=[
+            {"count": 4, "last": body, "streaming": False, "hasError": False},
+            {"count": 4, "last": body, "streaming": False, "hasError": False},
+        ])
+        text, state = p1.reply_after(c, {"count": 3, "last": "旧", "streaming": False,
+                                       "hasError": False}, settle_tries=2, settle_gap=0)
+        self.assertEqual(state, "captured", "长正文不应因含错误词被判错")
+
+    def test_structural_error_with_long_body_is_error(self):
+        """长正文 + 真实结构性错误：不得因正文长而漏判（R376-01 反例）。"""
+        p1 = _load_p1()
+        c = _FakeCdp([], frames=[
+            {"count": 4, "last": "很长很长的正文" * 50, "streaming": False,
+             "alert_text": "Something went wrong"},
+        ])
+        text, state = p1.reply_after(c, {"count": 3, "last": "旧", "streaming": False,
+                                       "hasError": False}, settle_tries=3, settle_gap=0)
+        self.assertEqual(state, "partial", "结构性错误不得被长正文屏蔽")
+
+    def test_no_new_message_ever_returns_unavailable(self):
+        """连续采样始终没有新增消息：必须 unavailable，且不能 NameError（R376-02）。"""
+        p1 = _load_p1()
+        c = _FakeCdp([3])        # 条数一直是基线
+        text, state = p1.reply_after(c, {"count": 3, "last": "旧", "streaming": False,
+                                       "hasError": False}, settle_tries=3, settle_gap=0)
+        self.assertIsNone(text)
+        self.assertEqual(state, "unavailable")
+
+    def test_unreadable_target_gets_no_appended_bytes(self):
+        """target 读不出来时绝不能往里追加——那会把坏文件进一步弄乱（R376-04）。"""
+        cid = "11113333-2222-4444-8555-666677778888"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-ro")
+        rec = {"turn_id": "t-ro", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        bad = bytes([255, 254]) + b"broken"
+        with open(target, "wb") as f:
+            f.write(bad)
+        m._migrate_pending("t-ro", begin, cid)
+        with open(target, "rb") as f:
+            after = f.read()
+        self.assertEqual(after, bad, "读不出来时不得追加任何字节")
+
+    def test_silently_lost_write_keeps_pending(self):
+        """end 写入静默丢失（不抛错但不落盘）：回读校验必须挡住，pending 保留。"""
+        cid = "22224444-3333-4555-8666-777788889999"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.log_pending_dir() + "/t-lost"
+        begin = m.pending_log_path("t-lost")
+        rows = [
+            {"turn_id": "t-lost", "phase": "begin", "conv_id": "", "prompt": "P",
+             "prompt_chars": 1, "status": None, "reply": ""},
+            {"turn_id": "t-lost", "phase": "end", "conv_id": "", "reply": "R",
+             "reply_chars": 1, "reply_state": "captured", "status": 200},
+        ]
+        with open(begin, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+        real = m._log_write
+        def swallow(path, record):
+            if record.get("phase") == "end" and path != begin:
+                return path      # 静默不写：既不抛错也不落盘
+            return real(path, record)
+        m._log_write = swallow
+        try:
+            out = m._migrate_pending("t-lost", begin, cid)
+        finally:
+            m._log_write = real
+        self.assertIsNone(out, "回读发现缺行时必须报未完成")
+        self.assertTrue(os.path.exists(begin), "end 没真正落盘时 pending 必须保留")
+
+    # ---------- R376-01：judge_error 是纯函数，直接单测 ----------
+
+    def test_judge_error_structural_independent_of_length(self):
+        """结构性错误不受正文长度影响（R376-01 的核心反例）。"""
+        p1 = _load_p1()
+        long_body = "很长正文" * 200
+        has, struct, text = p1.judge_error(long_body, "Something went wrong")
+        self.assertTrue(has, "长正文必须不能屏蔽结构性错误")
+        self.assertTrue(struct)
+
+    def test_judge_error_long_body_mentioning_error_is_not_error(self):
+        """长正文里提到"网络错误"（在讨论它）不算错。"""
+        p1 = _load_p1()
+        body = ("网络错误" * 5) + "这一段是在讨论该错误，并不是真的出错，请继续"
+        has, struct, _text = p1.judge_error(body, "")
+        self.assertFalse(has, "长正文提及错误词不得判错")
+        self.assertFalse(struct)
+
+    def test_judge_error_short_error_sentence_is_error(self):
+        """整条正文就是一句错误提示 → 判错。"""
+        p1 = _load_p1()
+        has, _s, text = p1.judge_error("Something went wrong.", "")
+        self.assertTrue(has)
+        self.assertTrue(text)
+
+    def test_judge_error_clean_reply_is_clean(self):
+        """正常回复不误判。"""
+        p1 = _load_p1()
+        has, struct, text = p1.judge_error("这是正常回复", "")
+        self.assertFalse(has)
+        self.assertFalse(struct)
+        self.assertFalse(text)
+
+    def test_verify_catches_silent_corruption_during_write(self):
+        """回读必须能发现"写进去的内容被悄悄改坏"——这是校验层的独立职责。
+
+        前置的冲突检查只比对迁移前的内容；若写入环节本身损坏，只有回读校验能抓。
+        """
+        cid = "88889999-aaaa-4bbb-8ccc-ddddeeeeffff"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-corrupt")
+        rec = {"turn_id": "t-corrupt", "phase": "begin", "conv_id": "",
+               "prompt": "原始正文", "prompt_chars": 4, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        real = m._log_write
+        def corrupt(path, record):
+            bad = dict(record)
+            if bad.get("phase") == "begin" and "prompt" in bad:
+                bad["prompt"] = "被写坏的正文"      # 静默篡改，不抛错
+            return real(path, bad)
+        m._log_write = corrupt
+        try:
+            out = m._migrate_pending("t-corrupt", begin, cid)
+        finally:
+            m._log_write = real
+        self.assertIsNone(out, "回读必须发现内容不一致")
+        self.assertTrue(os.path.exists(begin), "内容不一致时 pending 必须保留")
+
+    def test_verify_catches_conflicting_duplicates_when_source_matches_one(self):
+        """目标有同键冲突，且 source 正好等于其中一条 → 冲突检查放行，回读必须拦下。"""
+        cid = "9999aaaa-bbbb-4ccc-8ddd-eeeeffff0000"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-dup3")
+        rec = {"turn_id": "t-dup3", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            # 三行同键：首行与末行都等于 source，中间夹一条坏值。
+            #  - 前置冲突检查取**末行**（dict 覆盖）= source → 放行
+            #  - 回读的 payload 校验取**首行**（setdefault）= source → 放行
+            #  - 只有"重复键内部一致性检查"能发现中间那条坏值
+            f.write(json.dumps(dict(rec, conv_id=cid), ensure_ascii=False) + "\n")
+            f.write(json.dumps(dict(rec, conv_id=cid, prompt="中间的坏值"), ensure_ascii=False) + "\n")
+            f.write(json.dumps(dict(rec, conv_id=cid), ensure_ascii=False) + "\n")
+        out = m._migrate_pending("t-dup3", begin, cid)
+        self.assertIsNone(out, "目标存在互相冲突的重复键，不得删 pending")
+        self.assertTrue(os.path.exists(begin))
+
+    def test_same_key_same_payload_different_conv_id_rejected(self):
+        """同 turn_id + 同 payload 但 conv_id 不同：不得当成一致（R378-01 核心）。"""
+        cid = "aaaabbbb-1111-4222-8333-444455556666"
+        other = "ccccdddd-2222-4333-8444-555566667777"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-idconf")
+        rec = {"turn_id": "t-idconf", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        # 目标里已有同键、同 payload，但归属另一个会话
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(json.dumps(dict(rec, conv_id=other), ensure_ascii=False) + "\n")
+        out = m._migrate_pending("t-idconf", begin, cid)
+        self.assertIsNone(out, "conv_id 不符必须拒绝，不能凭 payload 相同就认作一致")
+        self.assertTrue(os.path.exists(begin), "pending 必须保留")
+
+    def test_target_conv_id_mismatch_rejected(self):
+        """目标记录的 conv_id 必须是本次迁移的预期 id。"""
+        cid = "bbbbcccc-3333-4444-8555-666677778888"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-idmis")
+        rec = {"turn_id": "t-idmis", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            # 内容完全相同，但挂在错误的会话下
+            f.write(json.dumps(dict(rec, conv_id="dddddddd-4444-4555-8666-777788889999"),
+                               ensure_ascii=False) + "\n")
+        self.assertIsNone(m._migrate_pending("t-idmis", begin, cid))
+        self.assertTrue(os.path.exists(begin))
+
+    def test_legacy_empty_conv_id_cannot_satisfy_migrated_source_identity(self):
+        """空 conv_id 的历史记录不得作为本次迁移的凭据（R379 唯一阻断）。
+
+        构造：target 同键、同 payload、但 conv_id 为空。
+        内容完全一致，只有身份缺失——必须拒绝。
+        """
+        cid = "11112222-3333-4444-8555-666677778888"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-emptyid")
+        rec = {"turn_id": "t-emptyid", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            # 同键、同 payload，但没有身份
+            f.write(json.dumps(dict(rec, conv_id=""), ensure_ascii=False) + "\n")
+        out = m._migrate_pending("t-emptyid", begin, cid)
+        self.assertIsNone(out, "空 conv_id 不得冒充迁移凭据")
+        self.assertTrue(os.path.exists(begin), "pending 必须保留")
+
+    def test_empty_and_correct_id_both_present_prefers_correct(self):
+        """同键既有空身份记录、也有带正确 cid 的记录 → 应选中正确的那条并成功。"""
+        cid = "22223333-4444-4555-8666-777788889999"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-mixed")
+        rec = {"turn_id": "t-mixed", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(json.dumps(dict(rec, conv_id=""), ensure_ascii=False) + "\n")   # 空身份在前
+            f.write(json.dumps(dict(rec, conv_id=cid), ensure_ascii=False) + "\n")  # 正确身份在后
+        out = m._migrate_pending("t-mixed", begin, cid)
+        self.assertIsNotNone(out, "有正确 cid 的记录时应成功，不能被前面的空身份记录挡住")
+        self.assertFalse(os.path.exists(begin), "成功后应清理 pending")
+
+    def test_duplicate_order_reversal_consistent(self):
+        """同键记录顺序反转，结果必须一致（不得依赖遍历顺序）。"""
+        for order in ("empty_first", "correct_first"):
+            cid = ("33334444-5555-4666-8777-88889999000%d" % (0 if order == "empty_first" else 1))
+            os.makedirs(m.log_pending_dir(), exist_ok=True)
+            os.makedirs(m.log_dir(), exist_ok=True)
+            tid = "t-order-" + order
+            begin = m.pending_log_path(tid)
+            rec = {"turn_id": tid, "phase": "begin", "conv_id": "",
+                   "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+            with open(begin, "w", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            target = m.conversation_log_path(cid)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            rows = [dict(rec, conv_id=""), dict(rec, conv_id=cid)]
+            if order == "correct_first":
+                rows.reverse()
+            with open(target, "w", encoding="utf-8") as f:
+                for r in rows:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            out = m._migrate_pending(tid, begin, cid)
+            self.assertIsNotNone(out, "顺序不应影响结果：%s" % order)
+
+    # ---------- R377-01：正文错误判定必须整条匹配 ----------
+
+    def test_judge_error_multiline_error_with_extra_text_is_not_error(self):
+        """反例：第一行是错误提示、但整条带了额外说明 → 不算错误提示。"""
+        p1 = _load_p1()
+        own = "Something went wrong\nPlease try again later."
+        has, _struct, text_err = p1.judge_error(own, "")
+        self.assertFalse(text_err, "不能只看第一行就判错")
+        self.assertFalse(has)
+
+    def test_judge_error_whole_body_error_is_error(self):
+        """整条正文就是一句错误提示 → 判错。"""
+        p1 = _load_p1()
+        for own in ("Something went wrong.", "出现错误！", "  网络错误  ",
+                    "Something went wrong?", "出现错误？"):
+            has, _s, text_err = p1.judge_error(own, "")
+            self.assertTrue(text_err, own)
+            self.assertTrue(has)
+
+    # ---------- R377-02：回读必须校验内容一致性 ----------
+
+    def test_migration_verify_detects_payload_mismatch(self):
+        """目标里同键但内容被写坏：即使键齐全也不得删 pending。"""
+        cid = "55556666-7777-4888-8999-aaaabbbbcccc"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-payload")
+        rows = [
+            {"turn_id": "t-payload", "phase": "begin", "conv_id": "",
+             "prompt": "正确提示词", "prompt_chars": 5, "status": None, "reply": ""},
+            {"turn_id": "t-payload", "phase": "end", "conv_id": "", "reply": "正确回复",
+             "reply_chars": 4, "reply_state": "captured", "status": 200},
+        ]
+        with open(begin, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+        bad = [dict(rows[0], conv_id=cid, prompt="被写坏的提示词"),
+               dict(rows[1], conv_id=cid, reply="被写坏的回复")]
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            for r in bad:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+        out = m._migrate_pending("t-payload", begin, cid)
+        self.assertIsNone(out, "内容不一致必须报未完成")
+        self.assertTrue(os.path.exists(begin), "内容不一致时 pending 必须保留")
+
+    def test_migration_verify_rejects_conflicting_duplicate_keys(self):
+        """目标里同一键出现两条且内容不同：拒绝迁移、保留 pending。"""
+        cid = "66667777-8888-4999-8aaa-bbbbccccdddd"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-dup2")
+        rec = {"turn_id": "t-dup2", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(json.dumps(dict(rec, conv_id=cid, prompt="A"), ensure_ascii=False) + "\n")
+            f.write(json.dumps(dict(rec, conv_id=cid, prompt="B"), ensure_ascii=False) + "\n")
+        self.assertIsNone(m._migrate_pending("t-dup2", begin, cid))
+        self.assertTrue(os.path.exists(begin))
+
+    # ---------- R377-03：提示词校验 ----------
+
+    def test_validate_prompt_rejects_nul(self):
+        """8141 个 NUL 必须被拒——这是真实事故（10:26 写入崩溃）。"""
+        with self.assertRaises(RuntimeError):
+            m.validate_prompt_text(chr(0) * 8141, "p.md")
+
+    def test_validate_prompt_rejects_single_nul_in_body(self):
+        """正常正文里混一个 NUL 同样可疑，必须拒。"""
+        with self.assertRaises(RuntimeError):
+            m.validate_prompt_text("正常正文" + chr(0) + "继续", "p.md")
+
+    def test_validate_prompt_rejects_control_chars(self):
+        """除 CR/LF/TAB 外的 Cc 控制字符一律拒。"""
+        with self.assertRaises(RuntimeError):
+            m.validate_prompt_text("正文" + chr(7) + "响铃", "p.md")
+
+    def test_validate_prompt_rejects_whitespace_only(self):
+        """纯空白/换行没有可见正文，必须拒。"""
+        with self.assertRaises(RuntimeError):
+            m.validate_prompt_text("   \n\n \t \n", "p.md")
+
+    def test_validate_prompt_accepts_normal_text(self):
+        """正常中文/英文 Markdown（含 Tab、CRLF）必须通过。"""
+        m.validate_prompt_text("# 标题\n\n正文 with tab\tand CRLF\r\n", "p.md")
+        m.validate_prompt_text("English markdown body", "p.md")
+
+    def test_nul_prompt_creates_no_begin_record(self):
+        """校验失败时不得留下 begin——那一轮根本没发生。"""
+        cid = "77778888-9999-4aaa-8bbb-ccccddddeeee"
+        pf = os.path.join(self.tmp, "nul.md")
+        with open(pf, "wb") as f:
+            f.write(bytes([0]) * 100)
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "x"))
+        with self.assertRaises(RuntimeError):
+            m.send_prompt(api, cid, pf)
+        self.assertEqual(api.sent, [], "校验失败绝不能发送")
+        self.assertEqual(list(m.iter_turns(cid)), [], "校验失败不得留下 begin")
+        pend = []
+        try:
+            pend = [n for n in os.listdir(m.log_pending_dir()) if n.endswith(".jsonl")]
+        except OSError:
+            pass
+        self.assertEqual(pend, [], "也不得留下 pending")
+
+    # ---------- R375-01：DOM 完成状态的稳定性证据 ----------
+
+    def test_p1_new_node_without_streaming_flag_not_captured(self):
+        """新增节点刚出现、streaming 恰好为 false，但正文还在变 → 不得 captured。
+
+        这是 R375-01 的核心：单次 streaming=False 不足以证明完成。
+        """
+        p1 = _load_p1()
+        c = _FakeCdp([], frames=[
+            {"count": 4, "last": "第一稿", "streaming": False, "hasError": False},
+            {"count": 4, "last": "第一稿还在长", "streaming": False, "hasError": False},
+        ])
+        text, state = p1.reply_after(c, {"count": 3, "last": "旧", "streaming": False,
+                                       "hasError": False}, settle_tries=2, settle_gap=0)
+        self.assertEqual(state, "partial", "正文仍在变，不能算完成")
+        self.assertEqual(text, "第一稿还在长")
+
+    def test_p1_stable_twice_is_captured(self):
+        """连续两次采样正文一致且 streaming=false → 才允许 captured。"""
+        p1 = _load_p1()
+        c = _FakeCdp([], frames=[
+            {"count": 4, "last": "定稿", "streaming": False, "hasError": False},
+            {"count": 4, "last": "定稿", "streaming": False, "hasError": False},
+        ])
+        text, state = p1.reply_after(c, {"count": 3, "last": "旧", "streaming": False,
+                                       "hasError": False}, settle_tries=2, settle_gap=0)
+        self.assertEqual((text, state), ("定稿", "captured"))
+
+    def test_p1_timeout_without_stability_is_partial(self):
+        """超时仍不稳定 → partial，绝不升级为 captured。"""
+        p1 = _load_p1()
+        frames = [{"count": 4, "last": "字数%d" % i, "streaming": False,
+                   "hasError": False} for i in range(6)]
+        c = _FakeCdp([], frames=frames)
+        text, state = p1.reply_after(c, {"count": 3, "last": "旧", "streaming": False,
+                                       "hasError": False}, settle_tries=4, settle_gap=0)
+        self.assertEqual(state, "partial")
+
+    def test_p1_error_page_not_captured(self):
+        """页面明确报错时，即使正文稳定也不得报 captured。"""
+        p1 = _load_p1()
+        c = _FakeCdp([], frames=[
+            {"count": 4, "last": "部分内容", "streaming": False,
+             "alert_text": "Something went wrong"},
+            {"count": 4, "last": "部分内容", "streaming": False,
+             "alert_text": "Something went wrong"},
+        ])
+        text, state = p1.reply_after(c, {"count": 3, "last": "旧", "streaming": False,
+                                       "hasError": False}, settle_tries=2, settle_gap=0)
+        self.assertEqual(state, "partial", "报错页面不得冒充正常完成")
+        self.assertEqual(text, "部分内容")
+
+    # ---------- R375-02：迁移批次内部幂等 ----------
+
+    def test_migration_batch_internal_duplicate_not_written_twice(self):
+        """源文件里同键记录出现两次，目标文件只能有一份。"""
+        cid = "dddddddd-eeee-4fff-8000-111111111111"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-3")
+        rec = {"turn_id": "t-3", "phase": "begin", "conv_id": "",
+               "prompt": "同一条", "prompt_chars": 3, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")   # 重复
+        m._migrate_pending("t-3", begin, cid)
+        got = m._read_jsonl(m.conversation_log_path(cid))
+        self.assertEqual(len(got), 1, "批次内部重复键必须去重")
+
+    def test_migration_conflicting_duplicate_keeps_pending(self):
+        """同键但内容冲突：不得静默挑一条，必须保留 pending。"""
+        cid = "eeeeeeee-ffff-4000-8111-222222222222"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-4")
+        a = {"turn_id": "t-4", "phase": "begin", "conv_id": "",
+             "prompt": "版本A", "prompt_chars": 3, "status": None, "reply": ""}
+        b = dict(a, prompt="版本B")
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(a, ensure_ascii=False) + "\n")
+            f.write(json.dumps(b, ensure_ascii=False) + "\n")
+        m._migrate_pending("t-4", begin, cid)
+        self.assertTrue(os.path.exists(begin), "冲突时必须保留 pending")
+        got = m._read_jsonl(m.conversation_log_path(cid))
+        self.assertEqual(len(got), 1, "只写入第一条，不静默追加冲突版本")
+
+    def test_migration_registers_after_successful_write(self):
+        """写成功后必须登记，否则同批次后续同键仍会重复写。"""
+        cid = "ffffffff-0000-4111-8222-333333333333"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-5")
+        rows = [
+            {"turn_id": "t-5", "phase": "begin", "conv_id": "", "prompt": "P",
+             "prompt_chars": 1, "status": None, "reply": ""},
+            {"turn_id": "t-5", "phase": "begin", "conv_id": "", "prompt": "P",
+             "prompt_chars": 1, "status": None, "reply": ""},
+            {"turn_id": "t-5", "phase": "end", "conv_id": "", "reply": "R",
+             "reply_chars": 1, "reply_state": "captured", "status": 200},
+        ]
+        with open(begin, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        m._migrate_pending("t-5", begin, cid)
+        got = m._read_jsonl(m.conversation_log_path(cid))
+        phases = [r.get("phase") for r in got]
+        self.assertEqual(phases, ["begin", "end"], "begin 只有一份，end 也在")
+
+    # ---------- R374-02：pending 迁移幂等 ----------
+
+    def test_pending_migration_is_idempotent(self):
+        """迁移重复执行不得产生两份记录（崩溃后重试必须安全）。"""
+        cid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-1")
+        rec = {"turn_id": "t-1", "phase": "begin", "conv_id": "",
+               "prompt": "提示词", "prompt_chars": 3, "status": None,
+               "reply": "", "reply_state": "unrecorded"}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        m._migrate_pending("t-1", begin, cid)
+        self.assertEqual(len(m._read_jsonl(m.conversation_log_path(cid))), 1)
+
+        # 模拟崩溃后重试：pending 若还在（或手工重建同一份），再迁一次
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        m._migrate_pending("t-1", begin, cid)
+        got = m._read_jsonl(m.conversation_log_path(cid))
+        self.assertEqual(len(got), 1, "已有同 turn_id+phase 不得重复追加")
+
+    def test_pending_kept_when_migration_incomplete(self):
+        """迁移没搬完时必须保留 pending，供下次重试；读取端不得重复计数。"""
+        cid = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-2")
+        recs = [
+            {"turn_id": "t-2", "phase": "begin", "conv_id": "", "prompt": "P",
+             "prompt_chars": 1, "status": None, "reply": ""},
+            {"turn_id": "t-2", "phase": "end", "conv_id": "", "reply": "R",
+             "reply_chars": 1, "reply_state": "captured", "status": 200},
+        ]
+        with open(begin, "w", encoding="utf-8") as f:
+            for r in recs:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+        real_write = m._log_write
+        calls = {"n": 0}
+        def flaky(path, record):
+            calls["n"] += 1
+            if calls["n"] == 2:          # 第二行（end）写失败
+                raise OSError("模拟磁盘写失败")
+            return real_write(path, record)
+        m._log_write = flaky
+        try:
+            m._migrate_pending("t-2", begin, cid)
+        finally:
+            m._log_write = real_write
+        self.assertTrue(os.path.exists(begin), "没搬完必须保留 pending")
+
+        # 恢复后再迁一次 → 补齐，且不重复
+        m._migrate_pending("t-2", begin, cid)
+        got = m._read_jsonl(m.conversation_log_path(cid))
+        self.assertEqual(len(got), 2, "begin+end 各一份")
+        self.assertFalse(os.path.exists(begin), "搬完后才删 pending")
+
+    def test_cross_file_same_turn_not_double_counted(self):
+        """pending 未删时同一轮可能出现在两个文件，读取必须按 turn_id 去重。"""
+        cid = "cccccccc-dddd-4eee-8fff-000000000000"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        rec = {"turn_id": "dup-1", "phase": "begin", "conv_id": cid,
+               "prompt": "同一轮", "prompt_chars": 3, "status": None, "reply": ""}
+        for p in (m.conversation_log_path(cid), m.pending_log_path("dup-1")):
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        turns = list(m.iter_turns())
+        self.assertEqual(len(turns), 1, "同一 turn_id 只能算一轮")
 
 
 if __name__ == "__main__":
