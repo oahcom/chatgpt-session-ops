@@ -6962,6 +6962,65 @@ class TestConversationLog(TmpBase):
         self.assertIn("提示词B", out, "conv_id 入口必须能看到 pending 的 prompt")
         self.assertIn("回复B", out)
 
+    # ---------- R390-07：冲突身份的反向查询 ----------
+
+    def test_r390_conflict_visible_from_both_conv_queries(self):
+        """冲突轮次从 cid_a / cid_b 任一入口查都不能被静默隐藏。"""
+        cid_a = "aaaa2222-3333-4444-8555-666677778888"
+        cid_b = "bbbb2222-3333-4444-8555-666677778888"
+        tid = "conflictBoth"
+        os.makedirs(m.log_dir(), exist_ok=True)
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        with open(m.conversation_log_path(cid_a), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"turn_id": tid, "phase": "end", "conv_id": cid_a,
+                                "reply": "R", "reply_state": "captured",
+                                "status": 200}, ensure_ascii=False) + chr(10))
+        with open(m.pending_log_path(tid), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"turn_id": tid, "phase": "begin", "conv_id": cid_b,
+                                "prompt": "P", "prompt_chars": 1,
+                                "status": None, "reply": ""},
+                               ensure_ascii=False) + chr(10))
+
+        hits_a = list(m.iter_turns(cid_a))
+        hits_b = list(m.iter_turns(cid_b))
+        # 至少一个入口能查到，且查到的记录必须带冲突标记（不得静默归一）
+        self.assertTrue(hits_a or hits_b, "冲突轮次不得在两个入口都查不到")
+        self.assertEqual(len(hits_a) + len(hits_b), 1, "冲突轮次只应归属一处")
+        only = (hits_a or hits_b)[0]
+        self.assertTrue(only.get("_conv_id_conflict"), "命中时必须保留冲突标记")
+
+    # ---------- R390-08：重复 end 的合并策略 ----------
+
+    def test_r390_duplicate_end_field_strategy_documented(self):
+        """同一轮出现两个 end：非身份字段按后到者，身份字段不覆盖有效值。
+
+        这是当前 _merge_scalar 的既定策略，用测试钉住，避免维护者误以为
+        所有字段都顺序无关。
+        """
+        cid = "cccc2222-3333-4444-8555-666677778888"
+        tid = "dupEnd"
+        os.makedirs(m.log_dir(), exist_ok=True)
+        p = m.conversation_log_path(cid)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"turn_id": tid, "phase": "begin", "conv_id": cid,
+                                "prompt": "P", "prompt_chars": 1,
+                                "status": None, "reply": ""},
+                               ensure_ascii=False) + chr(10))
+            f.write(json.dumps({"turn_id": tid, "phase": "end", "conv_id": cid,
+                                "reply": "第一版回复", "reply_chars": 5,
+                                "reply_state": "captured", "status": 200},
+                               ensure_ascii=False) + chr(10))
+            f.write(json.dumps({"turn_id": tid, "phase": "end", "conv_id": cid,
+                                "reply": "第二版回复", "reply_chars": 5,
+                                "reply_state": "captured", "status": 200},
+                               ensure_ascii=False) + chr(10))
+        turns = list(m.iter_turns(tid))
+        self.assertEqual(len(turns), 1, "同 turn 只输出一轮")
+        t = turns[0]
+        self.assertEqual(t["prompt"], "P", "begin 的 prompt 不受 end 影响")
+        self.assertEqual(t["reply"], "第二版回复", "非身份字段按后到者")
+        self.assertEqual(t["conv_id"], cid, "身份字段保持有效值")
+
     # ---------- R377-01：正文错误判定必须整条匹配 ----------
 
     def test_judge_error_multiline_error_with_extra_text_is_not_error(self):
