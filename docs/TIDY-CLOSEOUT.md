@@ -120,6 +120,11 @@ No force push was used.
 
 ## 6. B → A runtime publication
 
+> **Superseded (2026-11-25):** the current allowlist is nine files in two
+> categories — eight runtime publication files and one validation asset — per
+> `docs/RELEASE-AUTHORITY.md` §2.1/§2.2. The six-file list below records the
+> state at the time of this closeout and is deliberately **not** rewritten.
+
 The authorized six-file allowlist is:
 
 1. `SKILL.md`
