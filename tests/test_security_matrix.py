@@ -36,8 +36,7 @@ class TestSecurityMatrix(unittest.TestCase):
         "PROVEN",
         "PROVEN `mutation-checked`",
         "PROVEN `mutation-checked` for the lock; see note",
-        "PROVEN, second layer unproven",
-        "PROVEN, **partial**",
+        "PROVEN `mutation-checked` for the claiming layer; see note",
     }
 
     def _matrix_text(self):

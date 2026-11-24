@@ -119,6 +119,31 @@ class SendForWorkItemTests(unittest.TestCase):
         self.assertEqual(link.work_item_id, self.item.work_item_id)
         self.assertEqual(self.event_count(), 1)
 
+    def test_missing_archive_file_does_not_record_a_landing_event(self):
+        """save_reply returning a path is not the same as the file existing.
+
+        The landing event is the proof that a reply was archived, so a path
+        pointing at nothing must not become a consumable event. Deleting the
+        os.path.isfile conjunct leaves every other case here green.
+        """
+        session_id = cid()
+
+        class VanishingAPI(FakeAPI):
+            def save_reply(self, real_conv, prompt_file, archived):
+                return str(self.root / (real_conv + ".md"))  # never written
+
+        api = VanishingAPI([session_id], root=self.root)
+
+        result, link, _ = self.call_sender(api)
+
+        self.assertEqual(result[0], 200)
+        self.assertIsNone(link)
+        self.assertEqual(self.event_count(), 0)
+        with self.assertRaises(QuarantineNotCleared):
+            self.store.link_session(
+                self.principal, session_id, self.item.work_item_id
+            )
+
     def test_mismatch_409_does_not_record_or_link(self):
         target_id, actual_id = cid(), cid()
         api = FakeAPI([actual_id], root=self.root)
