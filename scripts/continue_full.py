@@ -339,15 +339,22 @@ def main():
         return 2
 
     def _finish(status, conv_id, reply_state, error="", reply=None):
-        """每条退出路径都必须留下终态，不允许"发了但不知道结果"。"""
+        """终态写入失败必须传递给 main，不能伪装成功（R388-A5）。"""
         logctx._last_reply_text = reply
         logctx.reply_source = "dom"     # R374-01：P1 只有 DOM 证据，标明来源
+
         try:
-            _cs.log_end(logctx, turn_id, begin_path, old_id, conv_id,
-                        status, None, reply_state, error=error)
+            result = _cs.log_end(logctx, turn_id, begin_path, old_id, conv_id,
+                                 status, None, reply_state, error=error)
+            if result is None:
+                print("FAIL: log_end 未确认终态留存——本轮不得报告成功",
+                      file=sys.stderr, flush=True)
+                return False
+            return True
         except Exception as le:
-            print("FAIL: 回复留存失败（%s）——本轮只有 begin，读取时显示未完成" % le,
-                  flush=True)
+            print("FAIL: 回复留存失败（%s）——本轮只有 begin，不得报告成功" % le,
+                  file=sys.stderr, flush=True)
+            return False
 
     port = int(os.environ.get("CHATGPT_CDP_PORT") or 9222)
     c = CDPClient(host="127.0.0.1", port=port, timeout=30)
@@ -389,7 +396,8 @@ def main():
         print("已发送或无需续接，退出")
         rp, rstate = reply_after(c, baseline)
         cur = conv_id_from_url(state(c).get("url", "")) or old_id
-        _finish(200, cur, rstate, reply=rp)
+        if not _finish(200, cur, rstate, reply=rp):
+            return 2
         return 0
 
     # 点「开始新聊天」续接（真实鼠标）
@@ -449,7 +457,8 @@ def main():
     print("done ->", state(c), flush=True)
     # 续接轮记在**新**会话下；旧会话只留 begin（它确实没收到这条）
     rp, rstate = reply_after(c, baseline)
-    _finish(200, new_id, rstate, reply=rp)
+    if not _finish(200, new_id, rstate, reply=rp):
+        return 2
     return 0
 
 

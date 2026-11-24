@@ -5946,20 +5946,46 @@ def unassigned_log_path(raw_id):
     return os.path.join(log_unassigned_dir(), _sanitize_segment(raw_id) + ".jsonl")
 
 def _log_write(path, record):
-    """追加一行并确保真正落盘。fsync 失败必须抛出，不得伪装成成功（R373-F5）。"""
+    """追加一行并确保落盘；隔离历史上的不完整尾行（R388-A1）。
+
+    JSONL 的一条记录必须以 ``\n`` 收尾。若上一次写入被截断（崩溃/短写残留），
+    直接 append 会把新记录**拼进残行**，整行变成非法 JSON —— 该文件中从残行起
+    的所有记录（含这条 begin 的 prompt）在读取视图里全部消失。
+    所以写前先看最后一个字节：不是换行就先补一个，把旧残行隔离出去。
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    line = json.dumps(record, ensure_ascii=False) + "\n"
-    # R373-04：按目标文件加进程内 + 跨进程锁；不同会话互不阻塞。
+    line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+
     with _file_lock(path, timeout=max(LOCK_TIMEOUT_SEC, 5.0)):
-        with open(path, "a", encoding="utf-8", newline="\n") as f:
+        with open(path, "a+b") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+
+            if size:
+                f.seek(-1, os.SEEK_END)
+                last = f.read(1)
+                if last != b"\n":
+                    # 隔离旧的不完整尾行，绝不与新 JSON 拼接。
+                    f.seek(0, os.SEEK_END)
+                    f.write(b"\n")
+                    print(
+                        "WARN: JSONL 尾部缺少换行，已隔离旧残行：%s" % path,
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
+            f.seek(0, os.SEEK_END)
             f.write(line)
             f.flush()
-            os.fsync(f.fileno())     # 失败即抛，交由调用方判定"未完成"
-        try:                          # R373-F8：日志是敏感数据，收紧为仅本用户可读写
+            os.fsync(f.fileno())
+
+        try:
             os.chmod(path, 0o600)
         except OSError:
             pass
+
     return path
+
 
 def _read_jsonl(path):
     """读 JSONL。**读失败返回 None**，与「文件不存在/确实是空」区分开（R376-04）。
@@ -5979,90 +6005,128 @@ def _read_jsonl(path):
     except (OSError, UnicodeDecodeError):
         return None
     out = []
-    for line in lines:
-        line = line.strip()
+    for lineno, raw in enumerate(lines, 1):
+        terminated = raw.endswith("\n")
+        line = raw.strip()
         if not line:
             continue
         try:
             rec = json.loads(line)
         except ValueError:
-            continue          # 坏行跳过：不能让一行写坏导致整份不可读
+            # R388-A1：末行未换行且解析失败 = 被截断的残行；其余 = 中间坏行。
+            # 两者都不静默——损坏证据必须可见，否则"读不到"会被误当"没有"。
+            kind = ("truncated tail"
+                    if lineno == len(lines) and not terminated
+                    else "corrupt line")
+            print("WARN: JSONL %s: %s:%d" % (kind, path, lineno),
+                  file=sys.stderr, flush=True)
+            continue
         if isinstance(rec, dict):
             out.append(rec)
+        else:
+            print("WARN: JSONL non-object record: %s:%d" % (path, lineno),
+                  file=sys.stderr, flush=True)
     return out
 
 def _log_files(conv_id=None):
-    """日志文件集合。conv_id 给定时只读该会话。"""
+    """日志文件集合；支持 conversation id 和 pending/unassigned turn id（R388-A6）。"""
     if conv_id:
         cid = _safe_conv_id(conv_id)
+
         if cid:
             return [os.path.join(log_dir(), cid + ".jsonl")]
-        return [unassigned_log_path(conv_id)]   # 缺失或畸形都按原始标识去找
+
+        # 非 conversation UUID 可能是 pending/unassigned 的 turn_id。
+        # 两个候选都经过 _sanitize_segment，不直接拼接外部输入。
+        candidates = [
+            pending_log_path(conv_id),
+            unassigned_log_path(conv_id),
+        ]
+
+        return [path for path in candidates if os.path.isfile(path)]
+
     files = []
     for d in (log_dir(), log_pending_dir(), log_unassigned_dir()):
         try:
             files += [os.path.join(d, n) for n in sorted(os.listdir(d))
                       if n.endswith(".jsonl")]
-        except OSError:
+        except OSError as e:
+            print("WARN: 无法枚举日志目录 %s: %s" % (d, e),
+                  file=sys.stderr, flush=True)
             continue
+
     return files
 
-def iter_turns(conv_id=None):
-    """把 begin/end 两行合并成一"轮"，新 -> 旧返回。
 
-    只有 begin 没有 end 的轮次：reply_state 保持 "unrecorded"、status 保持 None，
-    读取方据此可知"这轮发了、但结果没记上"，不会被当成完整留存。
+def iter_turns(conv_id=None):
+    """跨全部日志文件按 turn_id 聚合，再统一输出（R388-A2）。
+
+    旧版"先出现者胜"会让 conversations 里的 end 把 pending 里带 prompt 的
+    begin 整轮遮掉——磁盘上 prompt 还在，读取视图里却为 None。现在先把所有
+    文件的同键记录聚合（begin 出提示词侧字段、end 出回复侧字段），再输出。
     """
-    seen_turn = set()      # R374-02：跨文件去重——pending 未删时同一轮可能出现两份
-    for fp in _log_files(conv_id):
-        merged = {}
-        order = []
+    merged = {}
+    order = []
+
+    for file_index, fp in enumerate(_log_files(conv_id)):
         rows = _read_jsonl(fp)
-        if rows is None:          # 读不出来：跳过该文件，不当成空
-            print("WARN: 会话日志读不出来（%s）——本次跳过", fp, flush=True)
+
+        if rows is None:
+            print("WARN: 会话日志读不出来（%s）——本次跳过" % fp,
+                  file=sys.stderr, flush=True)
             continue
-        for rec in rows:
+
+        for row_index, rec in enumerate(rows):
             tid = str(rec.get("turn_id") or "")
-            key = tid or ("__noturn__%d" % len(order))
+
+            # 没有 turn_id 的历史记录不能意外合并。
+            key = tid or "__legacy__%d_%d" % (file_index, row_index)
+
             if key not in merged:
                 merged[key] = {"_file": fp}
                 order.append(key)
+
             slot = merged[key]
-            phase = rec.get("phase") or "turn"     # 兼容旧版单行记录
+            phase = rec.get("phase") or "turn"
+
             if phase == "begin":
-                # begin 只贡献提示词侧字段：它自带的 reply="" 是占位，
-                # 若整行 update 会把后写入的 end 结果覆盖成空
-                # （pending 迁移恰好是 end 先落、begin 后拷，实测会踩到）。
                 for k, v in rec.items():
-                    if k not in ("reply", "reply_chars", "reply_sha256",
-                                 "reply_state", "reply_file", "status", "error"):
+                    if k not in (
+                        "reply", "reply_chars", "reply_sha256",
+                        "reply_state", "reply_file",
+                        "status", "error",
+                    ):
                         slot[k] = v
+
             elif phase == "end":
-                slot.update({k: v for k, v in rec.items()
-                             if k not in ("prompt", "prompt_chars", "prompt_sha256")})
+                for k, v in rec.items():
+                    if k not in (
+                        "prompt", "prompt_chars", "prompt_sha256",
+                    ):
+                        slot[k] = v
+
             else:
-                # 旧版单行记录（无 phase）：本身就是完整一轮，按内容推导状态，
-                # 不能一律标 unrecorded——那会把历史里的成功轮次误报成未完成。
+                # 兼容历史单行格式。
                 slot.update(rec)
                 slot["reply_state"] = _reply_state_of(
                     rec.get("status"), rec.get("reply"), None)
+
             slot.setdefault("reply_state", "unrecorded")
-            slot.setdefault("status", None)      # 只有 begin 时也必须显式 None，不能缺字段
+            slot.setdefault("status", None)
             slot.setdefault("error", "")
-        for key in reversed(order):
-            rec = merged[key]
-            rec.pop("phase", None)
-            tid = str(rec.get("turn_id") or "")
-            if tid:
-                if tid in seen_turn:
-                    continue        # 同一轮已在别的文件出现过，不重复计
-                seen_turn.add(tid)
-            yield rec
+
+    # 所有文件合并完毕之后再输出。
+    for key in reversed(order):
+        rec = merged[key]
+        rec.pop("phase", None)
+        yield rec
+
 
 def iter_log_records(conv_id=None):
     """兼容旧名：等价于 iter_turns（已合并两阶段）。"""
     for rec in iter_turns(conv_id):
         yield rec
+
 
 def log_begin(api, target_conv, prompt_file, prompt_text):
     """发送**之前**固化本轮提示词。返回 (turn_id, path)。
@@ -7792,7 +7856,12 @@ def main():
         def _turns_in(fp):
             """单文件的 begin/end 合并（与 iter_turns 同语义，但只读一个文件）。"""
             merged, order = {}, []
-            for rec in _read_jsonl(fp):
+            rows = _read_jsonl(fp)
+            if rows is None:
+                print("WARN: 会话日志读不出来（%s）——本文件跳过" % fp,
+                      file=sys.stderr, flush=True)
+                return []
+            for rec in rows:
                 tid = str(rec.get("turn_id") or "")
                 key = tid or ("__n%d" % len(order))
                 if key not in merged:
