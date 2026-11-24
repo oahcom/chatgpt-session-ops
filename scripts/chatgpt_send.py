@@ -6028,23 +6028,8 @@ def _read_jsonl(path):
                   file=sys.stderr, flush=True)
     return out
 
-def _log_files(conv_id=None):
-    """日志文件集合；支持 conversation id 和 pending/unassigned turn id（R388-A6）。"""
-    if conv_id:
-        cid = _safe_conv_id(conv_id)
-
-        if cid:
-            return [os.path.join(log_dir(), cid + ".jsonl")]
-
-        # 非 conversation UUID 可能是 pending/unassigned 的 turn_id。
-        # 两个候选都经过 _sanitize_segment，不直接拼接外部输入。
-        candidates = [
-            pending_log_path(conv_id),
-            unassigned_log_path(conv_id),
-        ]
-
-        return [path for path in candidates if os.path.isfile(path)]
-
+def _all_log_files():
+    """三个桶的全部日志文件（枚举失败只告警，不炸）。"""
     files = []
     for d in (log_dir(), log_pending_dir(), log_unassigned_dir()):
         try:
@@ -6054,23 +6039,50 @@ def _log_files(conv_id=None):
             print("WARN: 无法枚举日志目录 %s: %s" % (d, e),
                   file=sys.stderr, flush=True)
             continue
-
     return files
 
 
-def iter_turns(conv_id=None):
-    """跨全部日志文件按 turn_id 聚合，再统一输出（R388-A2）。
+def _merge_scalar(slot, key, value):
+    """把 value 合并进 slot[key]，遵循 R389-02/R389-03 的身份规则。
 
-    旧版"先出现者胜"会让 conversations 里的 end 把 pending 里带 prompt 的
-    begin 整轮遮掉——磁盘上 prompt 还在，读取视图里却为 None。现在先把所有
-    文件的同键记录聚合（begin 出提示词侧字段、end 出回复侧字段），再输出。
+    - 空值（""/None）不能覆盖已有有效值；
+    - 两个不同有效值 → 打 WARN 标冲突，保留先到的，不静默采用最后一个。
     """
+    old = slot.get(key)
+    old_empty = old is None or old == ""
+    new_empty = value is None or value == ""
+
+    if new_empty and not old_empty:
+        return                      # R389-02：空不能覆盖有效
+    if old_empty and not new_empty:
+        slot[key] = value
+        return
+    if old_empty and new_empty:
+        slot.setdefault(key, value)
+        return
+    if old == value:
+        return
+    # R389-03：两个不同有效值
+    if key == "conv_id":
+        slot["_conv_id_conflict"] = True
+        print("WARN: 同一轮出现不同 conv_id（%r vs %r）——保留先到者，冲突可见"
+              % (old, value), file=sys.stderr, flush=True)
+        return
+    slot[key] = value               # 非身份字段：后到者优先（如 end 的 reply）
+
+
+_TURN_PROMPT_KEYS = ("prompt", "prompt_chars", "prompt_sha256")
+_TURN_REPLY_KEYS = ("reply", "reply_chars", "reply_sha256", "reply_state",
+                    "reply_file", "status", "error")
+
+
+def _aggregate_turns(files):
+    """把若干日志文件按 turn_id 聚合；返回 (merged, order)。"""
     merged = {}
     order = []
 
-    for file_index, fp in enumerate(_log_files(conv_id)):
+    for file_index, fp in enumerate(files):
         rows = _read_jsonl(fp)
-
         if rows is None:
             print("WARN: 会话日志读不出来（%s）——本次跳过" % fp,
                   file=sys.stderr, flush=True)
@@ -6078,52 +6090,78 @@ def iter_turns(conv_id=None):
 
         for row_index, rec in enumerate(rows):
             tid = str(rec.get("turn_id") or "")
-
             # 没有 turn_id 的历史记录不能意外合并。
             key = tid or "__legacy__%d_%d" % (file_index, row_index)
 
             if key not in merged:
-                merged[key] = {"_file": fp}
+                merged[key] = {"_file": fp, "_files": [fp]}
                 order.append(key)
+            else:
+                srcs = merged[key]["_files"]
+                if fp not in srcs:
+                    srcs.append(fp)     # R389-04：记录全部来源
 
             slot = merged[key]
             phase = rec.get("phase") or "turn"
 
             if phase == "begin":
                 for k, v in rec.items():
-                    if k not in (
-                        "reply", "reply_chars", "reply_sha256",
-                        "reply_state", "reply_file",
-                        "status", "error",
-                    ):
-                        slot[k] = v
+                    if k in _TURN_REPLY_KEYS or k in ("_file", "_files"):
+                        continue
+                    _merge_scalar(slot, k, v)
 
             elif phase == "end":
                 for k, v in rec.items():
-                    if k not in (
-                        "prompt", "prompt_chars", "prompt_sha256",
-                    ):
-                        slot[k] = v
+                    if k in _TURN_PROMPT_KEYS or k in ("_file", "_files"):
+                        continue
+                    _merge_scalar(slot, k, v)
 
             else:
                 # 兼容历史单行格式。
-                slot.update(rec)
+                for k, v in rec.items():
+                    if k in ("_file", "_files"):
+                        continue
+                    _merge_scalar(slot, k, v)
                 slot["reply_state"] = _reply_state_of(
                     rec.get("status"), rec.get("reply"), None)
 
             slot.setdefault("reply_state", "unrecorded")
-            slot.setdefault("status", None)
+            if slot.get("status", "__missing__") == "__missing__":
+                slot["status"] = None
             slot.setdefault("error", "")
 
-    # 所有文件合并完毕之后再输出。
-    for key in reversed(order):
+    return merged, order
+
+
+def iter_turns(conv_id=None):
+    """按 turn_id 聚合后输出；可按 conv_id 或 turn_id 过滤（R389-01）。
+
+    旧版先到先胜 + 只查单个桶，会让迁移中间态丢 prompt（pending 有 begin、
+    conversations 有 end）。现在先跨全部文件聚合，再按入口 ID 过滤——
+    两种入口都能找全同一轮的所有片段。
+    """
+    merged, order = _aggregate_turns(_all_log_files())
+
+    if conv_id:
+        cid = _safe_conv_id(conv_id)
+        if cid:
+            # UUID 入口：聚合后按 conv_id 匹配（pending 的 begin conv_id 为空，
+            # 但合并后该轮已从 end 取得 cid，所以能命中）。
+            keys = [k for k in order if merged[k].get("conv_id") == cid]
+        else:
+            # turn_id 入口：按 turn_id 精确匹配（含 conversations 里的同 turn）。
+            keys = [k for k in order if k == str(conv_id)]
+    else:
+        keys = order
+
+    for key in reversed(keys):
         rec = merged[key]
         rec.pop("phase", None)
         yield rec
 
 
 def iter_log_records(conv_id=None):
-    """兼容旧名：等价于 iter_turns（已合并两阶段）。"""
+    """兼容旧名：等价于 iter_turns（已跨文件聚合）。"""
     for rec in iter_turns(conv_id):
         yield rec
 
@@ -7899,7 +7937,7 @@ def main():
                 want = None      # 默认：全部三桶（行为与之前一致）
 
             rows, incomplete, files = [], [], {}
-            for fp in _log_files():
+            for fp in _all_log_files():
                 bucket = _bucket_of(fp)
                 if want is not None and bucket not in want:
                     continue

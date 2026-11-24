@@ -6387,19 +6387,13 @@ class TestConversationLog(TmpBase):
         """畸形 id 的只读查找必须落在 unassigned 目录内（R382-02）。"""
         base = os.path.abspath(m.log_unassigned_dir())
         os.makedirs(m.log_unassigned_dir(), exist_ok=True)
+        pend = os.path.abspath(m.log_pending_dir())
         for bad in ("../../evil", "../x", "a/b", "..", "x" * 300):
-            # R388-A6 之后 _log_files 只返回**实际存在**的文件；
-            # 先按 _sanitize_segment 造出对应文件，再验证归属不逃逸。
-            with open(m.unassigned_log_path(bad), "w", encoding="utf-8") as f:
-                f.write('{"turn_id": "t", "phase": "end"}' + chr(10))
-            files = m._log_files(bad)
-            self.assertTrue(files, "已存在的畸形 id 记录应能定位（只读）")
-            for fp in files:
-                actual = os.path.abspath(fp)
-                # R384：用 commonpath 精确校验目录归属，而不是 startswith 前缀匹配
-                self.assertEqual(
-                    os.path.commonpath([base, actual]), base,
-                    "畸形 id 不得逃出 unassigned：%r -> %r" % (bad, fp))
+            for path, root in ((m.unassigned_log_path(bad), base),
+                               (m.pending_log_path(bad), pend)):
+                actual = os.path.abspath(path)
+                self.assertEqual(os.path.commonpath([root, actual]), root,
+                                 "畸形 id 不得逃出日志目录：%r -> %r" % (bad, path))
                 self.assertNotIn("..", actual)
 
     def test_malformed_conv_id_rejected_at_migration_entry(self):
@@ -6661,10 +6655,11 @@ class TestConversationLog(TmpBase):
         p = m.conversation_log_path(cid)
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
-            f.write(json.dumps({"prompt": "旧1", "reply": "r1", "status": 200},
-                               ensure_ascii=False) + chr(10))
-            f.write(json.dumps({"prompt": "旧2", "reply": "r2", "status": 200},
-                               ensure_ascii=False) + chr(10))
+            # 真实旧格式单行记录是带 conv_id 的（只是没有 turn_id）
+            f.write(json.dumps({"conv_id": cid, "prompt": "旧1", "reply": "r1",
+                                "status": 200}, ensure_ascii=False) + chr(10))
+            f.write(json.dumps({"conv_id": cid, "prompt": "旧2", "reply": "r2",
+                                "status": 200}, ensure_ascii=False) + chr(10))
         turns = list(m.iter_turns(cid))
         self.assertEqual(len(turns), 2, "两条无 turn_id 记录必须各算一轮")
         self.assertEqual({t["prompt"] for t in turns}, {"旧1", "旧2"})
@@ -6735,14 +6730,14 @@ class TestConversationLog(TmpBase):
         self.assertEqual(list(m.iter_turns("noSuchTurn")), [])
 
     def test_a6_malformed_turn_id_no_traversal(self):
+        base = os.path.abspath(m.log_unassigned_dir())
+        pend = os.path.abspath(m.log_pending_dir())
         for bad in ("../../evil", "../x", "..", "a/b"):
-            for fp in m._log_files(bad):
-                base = os.path.abspath(m.log_unassigned_dir())
-                pend = os.path.abspath(m.log_pending_dir())
-                actual = os.path.abspath(fp)
-                ok = (os.path.commonpath([base, actual]) == base or
-                      os.path.commonpath([pend, actual]) == pend)
-                self.assertTrue(ok, "%r -> %r 逃出日志目录" % (bad, fp))
+            for path, root in ((m.unassigned_log_path(bad), base),
+                               (m.pending_log_path(bad), pend)):
+                actual = os.path.abspath(path)
+                self.assertEqual(os.path.commonpath([root, actual]), root,
+                                 "%r -> %r 逃出日志目录" % (bad, path))
 
 
     # ---------- R388-A5：P1 终态写入失败必须影响退出码 ----------
@@ -6791,6 +6786,181 @@ class TestConversationLog(TmpBase):
         """log_end 正常返回路径 → 既有成功路径保持 0。"""
         code = self._run_p1_main(lambda *a, **k: "/some/path.jsonl")
         self.assertEqual(code, 0)
+
+    # ---------- R389-05：真正的文件顺序交换 ----------
+
+    def test_r389_order_swap_compares_full_result(self):
+        """真正交换 _log_files 的返回顺序，整体聚合结果必须完全一致。"""
+        cid = "cccc1111-2222-4333-8444-555566667777"
+        tid = "swapTurn"
+        os.makedirs(m.log_dir(), exist_ok=True)
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        conv = m.conversation_log_path(cid)
+        pend = m.pending_log_path(tid)
+        with open(conv, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"turn_id": tid, "phase": "end", "conv_id": cid,
+                                "reply": "R", "reply_chars": 1,
+                                "reply_state": "captured", "status": 200},
+                               ensure_ascii=False) + chr(10))
+        with open(pend, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"turn_id": tid, "phase": "begin", "conv_id": "",
+                                "prompt": "P", "prompt_chars": 1,
+                                "status": None, "reply": ""},
+                               ensure_ascii=False) + chr(10))
+
+        real = m._all_log_files
+        try:
+            forward = list(m.iter_turns())
+            m._all_log_files = lambda: list(reversed(real()))
+            backward = list(m.iter_turns())
+        finally:
+            m._all_log_files = real
+
+        def norm(turns):
+            out = []
+            for t in turns:
+                d = dict(t)
+                d.pop("_file", None)
+                d.pop("_files", None)
+                out.append(d)
+            return sorted(out, key=lambda x: str(x.get("turn_id")))
+
+        self.assertEqual(norm(forward), norm(backward),
+                         "文件顺序不得影响聚合结果")
+        self.assertEqual(len(forward), 1)
+        self.assertEqual(forward[0]["prompt"], "P")
+        self.assertEqual(forward[0]["reply"], "R")
+
+    # ---------- R389-02/03：身份合并规则 ----------
+
+    def test_r389_empty_conv_id_does_not_overwrite_valid(self):
+        """begin 的 conv_id="" 不得覆盖 end 的有效 conv_id。"""
+        cid = "dddd1111-2222-4333-8444-555566667777"
+        tid = "idKeep"
+        os.makedirs(m.log_dir(), exist_ok=True)
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        with open(m.conversation_log_path(cid), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"turn_id": tid, "phase": "end", "conv_id": cid,
+                                "reply": "R", "reply_state": "captured",
+                                "status": 200}, ensure_ascii=False) + chr(10))
+        with open(m.pending_log_path(tid), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"turn_id": tid, "phase": "begin", "conv_id": "",
+                                "prompt": "P", "prompt_chars": 1,
+                                "status": None, "reply": ""},
+                               ensure_ascii=False) + chr(10))
+        turns = list(m.iter_turns(tid))
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0]["conv_id"], cid, "空 conv_id 不能覆盖有效身份")
+        self.assertNotIn("_conv_id_conflict", turns[0])
+
+    def test_r389_conflicting_valid_conv_ids_is_visible(self):
+        """两个不同有效 conv_id 必须打 WARN 标冲突，不静默择一。"""
+        import contextlib
+        import io as _io
+        cid_a = "eeee1111-2222-4333-8444-555566667777"
+        cid_b = "ffff1111-2222-4333-8444-555566667777"
+        tid = "idClash"
+        os.makedirs(m.log_dir(), exist_ok=True)
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        with open(m.conversation_log_path(cid_a), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"turn_id": tid, "phase": "end", "conv_id": cid_a,
+                                "reply": "R", "reply_state": "captured",
+                                "status": 200}, ensure_ascii=False) + chr(10))
+        with open(m.pending_log_path(tid), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"turn_id": tid, "phase": "begin", "conv_id": cid_b,
+                                "prompt": "P", "prompt_chars": 1,
+                                "status": None, "reply": ""},
+                               ensure_ascii=False) + chr(10))
+        buf = _io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            turns = list(m.iter_turns(tid))
+        self.assertEqual(len(turns), 1)
+        self.assertIn("不同 conv_id", buf.getvalue(), "冲突必须可见")
+        self.assertTrue(turns[0].get("_conv_id_conflict"), "冲突需留在记录上")
+
+    # ---------- R389-04：_file 兼容 + _files ----------
+
+    def test_r389_files_records_all_sources(self):
+        """_file 保留首个来源，_files 记录全部来源且不重复。"""
+        cid = "1111ffff-2222-4333-8444-555566667777"
+        tid = "srcs"
+        os.makedirs(m.log_dir(), exist_ok=True)
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        with open(m.conversation_log_path(cid), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"turn_id": tid, "phase": "end", "conv_id": cid,
+                                "reply": "R", "reply_state": "captured",
+                                "status": 200}, ensure_ascii=False) + chr(10))
+        with open(m.pending_log_path(tid), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"turn_id": tid, "phase": "begin", "conv_id": "",
+                                "prompt": "P", "prompt_chars": 1,
+                                "status": None, "reply": ""},
+                               ensure_ascii=False) + chr(10))
+            f.write(json.dumps({"turn_id": tid, "phase": "begin", "conv_id": "",
+                                "prompt": "P", "prompt_chars": 1,
+                                "status": None, "reply": ""},
+                               ensure_ascii=False) + chr(10))
+        t = list(m.iter_turns(tid))[0]
+        self.assertIn("_file", t, "保留旧字段")
+        self.assertIn("_files", t)
+        self.assertEqual(len(t["_files"]), len(set(t["_files"])), "来源不重复")
+        self.assertEqual(len(t["_files"]), 2, "两个来源文件都要记录")
+
+    # ---------- R389-06：CLI 跨桶查询 ----------
+
+    def _cli(self, *args):
+        import contextlib
+        import io as _io
+        old_argv = list(sys.argv)
+        sys.argv = ["chatgpt_send.py"] + list(args)
+        out = _io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                code = m.main()
+        finally:
+            sys.argv = old_argv
+        return code, out.getvalue()
+
+    def test_r389_cli_show_turn_id_crosses_buckets(self):
+        """conversations 有 end、pending 有 begin → --log-show <turn_id> 两者都要有。"""
+        cid = "2222ffff-3333-4444-8555-666677778888"
+        tid = "cliTurn"
+        os.makedirs(m.log_dir(), exist_ok=True)
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        with open(m.conversation_log_path(cid), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"turn_id": tid, "phase": "end", "conv_id": cid,
+                                "reply": "跨桶回复", "reply_chars": 5,
+                                "reply_state": "captured", "status": 200},
+                               ensure_ascii=False) + chr(10))
+        with open(m.pending_log_path(tid), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"turn_id": tid, "phase": "begin", "conv_id": "",
+                                "prompt": "跨桶提示词", "prompt_chars": 5,
+                                "status": None, "reply": ""},
+                               ensure_ascii=False) + chr(10))
+        code, out = self._cli("--log-show", tid)
+        self.assertEqual(code, 0)
+        self.assertIn("跨桶提示词", out, "turn_id 入口必须能看到 pending 的 prompt")
+        self.assertIn("跨桶回复", out, "turn_id 入口必须能看到 conversations 的 reply")
+
+    def test_r389_cli_show_conv_id_crosses_buckets(self):
+        """同上场景，--log-show <conv_id> 也要拿到完整一轮。"""
+        cid = "3333ffff-4444-4555-8666-777788889999"
+        tid = "cliConv"
+        os.makedirs(m.log_dir(), exist_ok=True)
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        with open(m.conversation_log_path(cid), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"turn_id": tid, "phase": "end", "conv_id": cid,
+                                "reply": "回复B", "reply_chars": 3,
+                                "reply_state": "captured", "status": 200},
+                               ensure_ascii=False) + chr(10))
+        with open(m.pending_log_path(tid), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"turn_id": tid, "phase": "begin", "conv_id": "",
+                                "prompt": "提示词B", "prompt_chars": 4,
+                                "status": None, "reply": ""},
+                               ensure_ascii=False) + chr(10))
+        code, out = self._cli("--log-show", cid)
+        self.assertEqual(code, 0)
+        self.assertIn("提示词B", out, "conv_id 入口必须能看到 pending 的 prompt")
+        self.assertIn("回复B", out)
 
     # ---------- R377-01：正文错误判定必须整条匹配 ----------
 
