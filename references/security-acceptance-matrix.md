@@ -1,9 +1,8 @@
 # Security Acceptance Matrix — SO MCP surface (v1)
 
-**Scope:** the Session Ops MCP authorization surface as it exists at `fc7a64a` on
-`feat/mcp-server`. Every row names the test that proves it. A row without a
-test name is not evidence, it is an intention; any such row is marked
-`human:` and says why.
+**Scope:** the Session Ops MCP surface as it exists at `2c67d63` on `main`.
+Every row names the test that proves it. A row without a test name is not
+evidence, it is an intention; any such row is marked `human:` and says why.
 
 **What this matrix is for.** B1–B5 were five specific defects. Fixing them does
 not by itself establish that the surface is safe; it only removes five known
@@ -23,12 +22,25 @@ not a feature list.
 **Reproduce**
 
 ```
-python -m unittest tests.test_work_item_authority     # 48
-python -m unittest tests.test_mcp_contract           # 25 + 29-assert additions
+python -m unittest tests.test_work_item_authority        # 49
+python -m unittest tests.test_mcp_contract               # 26
 python -m unittest tests.test_send_prompt_for_work_item  # 6
+python -m unittest tests.test_mcp_transport              # 11
+python -m unittest tests.test_mcp_alg_confusion          # 7
+python -m pytest -q                                      # 707 passed, 6 skipped
 ```
 
-At `fc7a64a` the full suite is `591 tests, OK (skipped=6)`.
+**What PROVEN means here, and what it does not.** PROVEN means the named case
+asserts the behaviour *and* the case goes red when the behaviour is deleted.
+That second half is not a formality: row 12 was PROVEN for three commits on a
+test that stayed green after its guard was removed, and row 4 was CODE_ONLY
+while the guard underneath it had never been executed by any test at all.
+
+Rows marked `mutation-checked` have had that deletion actually performed. Rows
+without the mark have a case that names and asserts the behaviour, but nobody
+has yet deleted the implementation to watch it fail. They are weaker than
+`mutation-checked` even though both currently read PROVEN, and the difference
+is recorded per row rather than averaged away.
 
 ---
 
@@ -39,7 +51,7 @@ At `fc7a64a` the full suite is `591 tests, OK (skipped=6)`.
 | 1 | A caller passes a principal, tenant or scope **as a tool argument** | Rejected. Identity comes from the verified token only. | `test:test_identity_cannot_be_injected_through_arguments` (test_mcp_contract) | PROVEN |
 | 2 | No `Authorization` header, or a header the middleware cannot read | `UNAUTHENTICATED`. No tool dispatch. | `test:test_missing_auth_context_is_unauthenticated` | PROVEN |
 | 3 | A structurally valid JWT whose `aud` is another service | Rejected before any key lookup for `alg`, and at claim validation for `aud`. | `test:test_claim_mapping_rejects_wrong_audience` `code:validate_registered_claims` | PROVEN |
-| 4 | `alg: none`, `alg: HS256`, or a `crit` header | Rejected before key lookup. Algorithm confusion is not reachable. | `code:JWTVerifier.verify` (`if header.get("alg") != "RS256"`) | CODE_ONLY |
+| 4 | `alg: none`, `alg: HS256`, or a `crit` header | Rejected before key lookup. Algorithm confusion is not reachable. | `test:test_none_algorithm_with_forged_signature` `test:test_hs256_using_rsa_public_modulus_as_hmac_key` `test:test_lowercase_rs256_is_rejected` `test:test_missing_alg_is_rejected` `test:test_crit_header_is_rejected_before_key_lookup` `test:test_unexpected_typ_is_rejected_before_key_lookup` (test_mcp_alg_confusion) `code:JWTVerifier.verify` | PROVEN `mutation-checked` |
 
 **Row 4 note.** `alg` rejection is code-reviewed but there is no offline case
 that feeds a forged `alg: none` token through `verify()`. The check is the
@@ -73,7 +85,19 @@ is not tested. Marked CODE_ONLY rather than PROVEN deliberately.
 
 | # | Scenario | Expected | Evidence | Status |
 |---|---|---|---|---|
-| 12 | Caller constructs its own landing evidence and passes it to `link_session` | Rejected outright. `LandingEvidence` no longer exists in the source; any non-`None` `evidence` raises. | `test:test_caller_supplied_evidence_is_rejected` `test:test_caller_supplied_evidence_is_rejected_by_authority` `test:test_plain_ids_convref_and_booleans_are_not_evidence_inputs` `code:link_session` (`if evidence is not None: raise`) | PROVEN |
+| 12 | Caller constructs its own landing evidence and passes it to `link_session` | Rejected outright **even when a valid unclaimed landing event exists**. `LandingEvidence` no longer exists in the source; any non-`None` `evidence` raises. | `test:test_caller_supplied_evidence_is_rejected_even_with_valid_landing` `test:test_caller_supplied_evidence_is_rejected` `test:test_caller_supplied_evidence_is_rejected_by_authority` `test:test_plain_ids_convref_and_booleans_are_not_evidence_inputs` `code:link_session` (`if evidence is not None: raise`) | PROVEN `mutation-checked` |
+
+**Row 12 note.** The original evidence for this row was
+`test_caller_supplied_evidence_is_rejected`, which runs on a session with no
+landing event at all — so the *neighbouring* check (`landing is None`)
+raised first, and deleting the `evidence is not None` guard left the test
+green. The row was PROVEN on a case that could not see its own subject.
+
+The replacement seeds a confirmed, complete, unconsumed event first, asserts the
+refusal, asserts the event is still unconsumed and no `session_links` row was
+written, and then links the same session without evidence to prove the seeded
+event was usable. Mutation check: with the guard deleted, the old case stays
+green and only the new one fails.
 | 13 | No server-recorded landing event exists for the conversation | `QuarantineNotCleared`. Nothing is written. | `test:test_link_requires_server_recorded_landing` `test:test_unconfirmed_f13_evidence_is_rejected` | PROVEN |
 | 14 | A confirmed event is consumed, then replayed | Second attempt fails. Consumption and link creation happen in one transaction. | `test:test_confirmed_complete_landing_can_be_consumed_once` `test:test_event_replay_cannot_create_a_second_link` `code:link_session` (`consumed_at IS NULL` → `UPDATE consumed_at` → `INSERT session_links`) | PROVEN |
 | 15 | Landing is `mismatch`, `ambiguous`, or evidence incomplete; or the send returned 409 | No event recorded, no link. Fail closed. | `test:test_mismatch_ambiguous_and_incomplete_landing_fail_closed` `test:test_mismatch_409_does_not_record_or_link` `test:test_ambiguous_multiple_ids_do_not_record_or_link` `test:test_incomplete_reply_does_not_record_or_link` | PROVEN |
@@ -101,7 +125,34 @@ reproduced".
 
 | # | Scenario | Expected | Evidence | Status |
 |---|---|---|---|---|
-| 18 | Memory adapter is unconfigured; or it returns an oversized response | `DEPENDENCY_UNAVAILABLE` and `RESOURCE_EXHAUSTED` respectively. A degraded dependency must not be reported as an empty success, and an oversized payload must not be silently truncated. | `test:test_context_without_adapter_is_dependency_unavailable` `test:test_oversized_response_becomes_resource_exhausted` `test:test_session_context_with_injected_adapter` | PROVEN |
+| 18 | Memory adapter is unconfigured; or it returns an oversized response | `DEPENDENCY_UNAVAILABLE` and `RESOURCE_EXHAUSTED` respectively. A degraded dependency must not be reported as an empty success, and an oversized payload must not be silently truncated. | `test:test_context_without_adapter_is_dependency_unavailable` `test:test_oversized_response_becomes_resource_exhausted` `test:test_session_context_with_injected_adapter` | PROVEN `mutation-checked` |
+
+**Row 18 note.** `test_session_context_with_injected_adapter` is the happy path
+and does not prove the fail-closed branch. That branch is
+`test_context_without_adapter_is_dependency_unavailable`: deleting the
+`memory_adapter_command is None` guard turns its expected
+`DEPENDENCY_UNAVAILABLE` into `INVALID_ARGUMENT` and it goes red. Checked.
+
+---
+
+## G. Transport and discovery (19–22)
+
+These were absent from v1. An independent review of the deployed surface found
+the three holes below; they are not new features, they are repairs to code that
+was already running.
+
+| # | Scenario | Expected | Evidence | Status |
+|---|---|---|---|---|
+| 19 | An unauthenticated caller sends many random `kid` values to amplify JWKS fetches | Fresh-cache misses fail without fetching. Expired-cache refresh is single-flight and backs off after failure. The lock is never held across network I/O. | `test:test_fresh_cache_unknown_kid_never_downloads` `test:test_expired_cache_concurrent_refresh_is_single_flight` `test:test_failed_refresh_is_not_retried_inside_backoff_window` `test:test_refresh_can_retry_after_backoff_expires` (test_mcp_transport) | PROVEN |
+| 20 | An attacker-influenced issuer points discovery at an internal address | Redirects refused. HTTPS destinations resolved; any non-global answer rejects the whole URL. | `test:test_non_override_discovery_rejects_different_jwks_origin` `test:test_default_fetcher_does_not_follow_redirects` `test:test_https_jwks_rejects_loopback_link_local_and_private_ips` `test:test_jwks_rejects_all_dns_answers_if_any_is_non_global` (test_mcp_transport) | PROVEN, **partial** |
+| 21 | A request targets the MCP endpoint's subpaths | Authenticated. Health and protected-resource metadata stay public. | `test:test_mcp_subpath_is_authenticated` `test:test_mcp_endpoint_itself_is_authenticated` `test:test_health_and_protected_resource_metadata_remain_public` (test_mcp_transport) | PROVEN |
+| 22 | The `aud` claim names another service | Rejected at claim validation. | `test:test_claim_mapping_rejects_wrong_audience` (test_mcp_contract) | PROVEN |
+
+**Row 20 is partial on purpose.** The address check and the HTTP connection
+perform *separate* DNS resolutions, so a rebinding attacker can answer
+differently the second time. The gap is recorded at the call site and is only
+closed by pinning the validated IP to the connection while preserving TLS SNI
+and certificate-hostname verification. Do not read row 20 as "SSRF is fixed".
 
 ---
 
@@ -113,7 +164,8 @@ These are gaps, stated so nobody reads the eighteen rows above as completeness.
 |---|---|---|
 | In-process code execution | Python privacy is not a boundary. `_record_trusted_landing` is a plain method; anything running in the SO process can call it and can also write the SQLite file directly. | B1 is closed against a **remote** caller only. Requires deployment isolation. |
 | Landing event bound to a WorkItem | `authority_landing_events` stores `session_id` but not `work_item_id`. | If signing succeeds and linking fails, the unconsumed event can be claimed by another WorkItem that holds `write` on that conversation. Bounded, accepted, recorded. |
-| `alg`/`crit` rejection | No offline case feeds a forged header through `verify()`. | Row 4 is CODE_ONLY. |
+| DNS rebinding | Rows 20's validation lookup and the client's connection lookup are separate resolutions. | The SSRF defense is real but incomplete. Requires IP pinning. Recorded at the call site. |
+| Mutation coverage is not uniform | Two rows are `mutation-checked`; the rest are not. Nobody has yet deleted each guard and watched its row go red. | The non-marked rows could still contain cases that survive deletion of their subject. This is exactly how row 12 stayed PROVEN for three commits. Treat unmarked PROVEN as "asserts the behaviour", not "proven necessary". |
 | Real thread-level races | No test interleaves two connections. | Row 16 proves the guard, not the race. |
 | Multi-user isolation | D4 fixes the first deployment at one principal, one tenant. | Cross-principal/cross-tenant behaviour is tested at the unit level only; it is not claimed for a multi-user deployment. |
 
@@ -124,3 +176,8 @@ These are gaps, stated so nobody reads the eighteen rows above as completeness.
 A row may move from CODE_ONLY or human to PROVEN only by adding a named offline
 case. Deleting a row requires the same review as deleting a test. New security
 behaviour must arrive with its row, in the same change.
+
+A row may be marked `mutation-checked` only after the guard has actually been
+deleted and the row observed to go red. The deletion, the failing case names and
+the restored state must be in the commit message or the PR body. Asserting that
+a test "would" fail is not a mutation check.
