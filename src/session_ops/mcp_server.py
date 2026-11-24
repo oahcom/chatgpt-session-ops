@@ -92,6 +92,10 @@ class _DeadlineExceeded(Exception):
     pass
 
 
+class _ResourceExhausted(Exception):
+    """A bounded service resource or payload limit was exceeded."""
+
+
 # ---------------------------------------------------------------------------
 # Tool schemas: frozen v0.1 surface
 # ---------------------------------------------------------------------------
@@ -423,6 +427,9 @@ def _exception_code(exc: BaseException) -> Tuple[str, Dict[str, Any]]:
     if isinstance(exc, _DeadlineExceeded):
         return "TIMEOUT", {}
 
+    if isinstance(exc, _ResourceExhausted):
+        return "RESOURCE_EXHAUSTED", {}
+
     if isinstance(exc, sqlite3.OperationalError):
         message = str(exc).lower()
         if "locked" in message or "busy" in message:
@@ -689,7 +696,9 @@ class MCPToolService:
                 len(content) > MAX_CONTEXT_CONTENT_CHARS
                 or len(content.encode("utf-8")) > MAX_CONTEXT_CONTENT_BYTES
             ):
-                raise RuntimeError("memory adapter returned oversized content")
+                raise _ResourceExhausted(
+                    "memory adapter returned oversized content"
+                )
 
             entries.append(
                 {

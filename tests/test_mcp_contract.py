@@ -25,6 +25,7 @@ from src.session_ops.mcp_auth import (
     principal_from_claims,
 )
 from src.session_ops.mcp_server import (
+    MAX_CONTEXT_CONTENT_CHARS,
     MAX_CONTEXT_ENTRIES,
     MAX_CURSOR_CHARS,
     MAX_PAGE_SIZE,
@@ -313,6 +314,32 @@ class MCPContractTests(unittest.TestCase):
         # Authorization must fail before any authority-store operation.
         self.assertEqual(self.store.calls, [])
 
+    def test_work_item_revoke_requires_access_manage(self):
+        """work_item.write alone must not authorize a revoke."""
+        auth = make_auth(scopes=("session_ops.work_item.write",))
+
+        result = self.service.dispatch(
+            "work_item.revoke",
+            {
+                "work_item_id": WORK_ITEM_ID,
+                "target_principal_id": "realm-a:reader",
+                "scope": "read",
+            },
+            auth,
+            request_id="test-request",
+        )
+
+        self.assert_error(result, "PERMISSION_DENIED")
+        self.assertEqual(
+            result["error"]["details"]["required_scopes"],
+            [
+                "session_ops.work_item.write",
+                "session_ops.access.manage",
+            ],
+        )
+        # Authorization must fail before any authority-store operation.
+        self.assertEqual(self.store.calls, [])
+
     def test_session_link(self):
         result = self.dispatch(
             "session.link",
@@ -370,6 +397,45 @@ class MCPContractTests(unittest.TestCase):
             "untrusted_historical_context",
         )
         self.assertEqual(len(FakeMemoryAdapterClient.instances), 1)
+
+    def test_oversized_session_context_becomes_resource_exhausted(self):
+        adapter_module = importlib.import_module(
+            "src.session_ops.memory_adapter_client"
+        )
+
+        class OversizedMemoryAdapterClient(FakeMemoryAdapterClient):
+            def retrieve(self, *, work_item_id, session_id, query, limit):
+                retrieved = super().retrieve(
+                    work_item_id=work_item_id,
+                    session_id=session_id,
+                    query=query,
+                    limit=limit,
+                )
+                retrieved.entries[0].content = (
+                    "x" * (MAX_CONTEXT_CONTENT_CHARS + 1)
+                )
+                return retrieved
+
+        with patch.object(
+            adapter_module,
+            "MemoryAdapterClient",
+            OversizedMemoryAdapterClient,
+        ):
+            configured = MCPToolService(
+                self.store,
+                memory_adapter=["python", "-m", "memory_adapter"],
+            )
+            result = self.dispatch(
+                "session.context",
+                {
+                    "session_id": SESSION_ID,
+                    "query": "oversized content test",
+                    "limit": 1,
+                },
+                service=configured,
+            )
+
+        self.assert_error(result, "RESOURCE_EXHAUSTED")
 
     # --------------------------------------------------------------
     # Authentication and identity isolation
