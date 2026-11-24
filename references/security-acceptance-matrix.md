@@ -1,0 +1,126 @@
+# Security Acceptance Matrix — SO MCP surface (v1)
+
+**Scope:** the Session Ops MCP authorization surface as it exists at `fc7a64a` on
+`feat/mcp-server`. Every row names the test that proves it. A row without a
+test name is not evidence, it is an intention; any such row is marked
+`human:` and says why.
+
+**What this matrix is for.** B1–B5 were five specific defects. Fixing them does
+not by itself establish that the surface is safe; it only removes five known
+holes. This matrix states, scenario by scenario, what an attacker or a mistake
+is expected to achieve and what actually happens. It is a negative-test ledger,
+not a feature list.
+
+**Evidence types**
+
+| Type | Meaning |
+|---|---|
+| `test:` | an offline case in the named file; the name is the assertion |
+| `code:` | a symbol that implements the behaviour |
+| `live:` | observed against a running deployment, with a date |
+| `human:` | cannot be decided by an offline case; the reason is given |
+
+**Reproduce**
+
+```
+python -m unittest tests.test_work_item_authority     # 48
+python -m unittest tests.test_mcp_contract           # 25 + 29-assert additions
+python -m unittest tests.test_send_prompt_for_work_item  # 6
+```
+
+At `fc7a64a` the full suite is `591 tests, OK (skipped=6)`.
+
+---
+
+## A. Identity and authentication (1–4)
+
+| # | Scenario | Expected | Evidence | Status |
+|---|---|---|---|---|
+| 1 | A caller passes a principal, tenant or scope **as a tool argument** | Rejected. Identity comes from the verified token only. | `test:test_identity_cannot_be_injected_through_arguments` (test_mcp_contract) | PROVEN |
+| 2 | No `Authorization` header, or a header the middleware cannot read | `UNAUTHENTICATED`. No tool dispatch. | `test:test_missing_auth_context_is_unauthenticated` | PROVEN |
+| 3 | A structurally valid JWT whose `aud` is another service | Rejected before any key lookup for `alg`, and at claim validation for `aud`. | `test:test_claim_mapping_rejects_wrong_audience` `code:validate_registered_claims` | PROVEN |
+| 4 | `alg: none`, `alg: HS256`, or a `crit` header | Rejected before key lookup. Algorithm confusion is not reachable. | `code:JWTVerifier.verify` (`if header.get("alg") != "RS256"`) | CODE_ONLY |
+
+**Row 4 note.** `alg` rejection is code-reviewed but there is no offline case
+that feeds a forged `alg: none` token through `verify()`. The check is the
+first statement in the method, so the risk of silent regression is low, but it
+is not tested. Marked CODE_ONLY rather than PROVEN deliberately.
+
+---
+
+## B. Authorization (5–8)
+
+| # | Scenario | Expected | Evidence | Status |
+|---|---|---|---|---|
+| 5 | Authenticated principal lacks a required scope for the tool | `PERMISSION_DENIED`, distinct from `UNAUTHENTICATED`. | `test:test_insufficient_scope_is_permission_denied` | PROVEN |
+| 6 | `work_item.grant` / `work_item.revoke` called with only `work_item.write` | Denied. Delegation administration needs `session_ops.access.manage`. | `test:test_work_item_grant_requires_access_manage` | PROVEN |
+| 7 | A `write` grantee tries to grant to a third party, or revoke another principal's grant | Denied. `write` never implies grant administration. | `test:test_write_grantee_cannot_grant_or_revoke` | PROVEN |
+| 8 | Owner grants to a target that is unknown, disabled, or in another tenant | Refused **before** the grant row is written; cross-tenant attempts leave no row. | `test:test_unknown_target_is_rejected_by_default_directory` `test:test_same_tenant_unregistered_target_is_rejected` `test:test_target_must_exist_be_enabled_and_be_same_tenant` `test:test_cross_tenant_target_is_rejected_before_grant_is_written` | PROVEN |
+
+---
+
+## C. Isolation (9–11)
+
+| # | Scenario | Expected | Evidence | Status |
+|---|---|---|---|---|
+| 9 | Same-tenant principal with no grant reads another's WorkItem | Denied. | `test:test_same_tenant_stranger_cannot_read` | PROVEN |
+| 10 | Another tenant reads, and separately: the WorkItem does not exist | **Indistinguishable.** A caller must not be able to probe for existence. | `test:test_other_tenant_cannot_read` `test:test_missing_cross_tenant_and_no_grant_are_identical` `test:test_cross_tenant_and_missing_resource_are_indistinguishable` `code:NotAuthorized()` (empty message) | PROVEN |
+| 11 | A `read` grant tries to update status | Denied; `read` does not imply `write`. | `test:test_read_grant_allows_read_but_not_write` `test:test_write_grant_allows_status_update` | PROVEN |
+
+---
+
+## D. Session linking and F-13 (12–15)
+
+| # | Scenario | Expected | Evidence | Status |
+|---|---|---|---|---|
+| 12 | Caller constructs its own landing evidence and passes it to `link_session` | Rejected outright. `LandingEvidence` no longer exists in the source; any non-`None` `evidence` raises. | `test:test_caller_supplied_evidence_is_rejected` `test:test_caller_supplied_evidence_is_rejected_by_authority` `test:test_plain_ids_convref_and_booleans_are_not_evidence_inputs` `code:link_session` (`if evidence is not None: raise`) | PROVEN |
+| 13 | No server-recorded landing event exists for the conversation | `QuarantineNotCleared`. Nothing is written. | `test:test_link_requires_server_recorded_landing` `test:test_unconfirmed_f13_evidence_is_rejected` | PROVEN |
+| 14 | A confirmed event is consumed, then replayed | Second attempt fails. Consumption and link creation happen in one transaction. | `test:test_confirmed_complete_landing_can_be_consumed_once` `test:test_event_replay_cannot_create_a_second_link` `code:link_session` (`consumed_at IS NULL` → `UPDATE consumed_at` → `INSERT session_links`) | PROVEN |
+| 15 | Landing is `mismatch`, `ambiguous`, or evidence incomplete; or the send returned 409 | No event recorded, no link. Fail closed. | `test:test_mismatch_ambiguous_and_incomplete_landing_fail_closed` `test:test_mismatch_409_does_not_record_or_link` `test:test_ambiguous_multiple_ids_do_not_record_or_link` `test:test_incomplete_reply_does_not_record_or_link` | PROVEN |
+
+---
+
+## E. Atomicity and audit (16–17)
+
+| # | Scenario | Expected | Evidence | Status |
+|---|---|---|---|---|
+| 16 | A concurrent revoke lands between the authorization check and the mutation; or a relink moves the session between the unlink check and the delete | Both fail closed. Check and mutation share one `BEGIN IMMEDIATE` on one connection; `unlink_session` re-checks `expected_link_id` and asserts `rowcount == 1`. | `test:test_stale_expected_link_id_does_not_unlink` `test:test_expected_updated_at_is_compare_and_swap` `code:set_status` `code:unlink_session` | PROVEN |
+| 17 | The audit write fails partway through a mutation | The business change rolls back too. No unaudited mutation survives. | `test:test_audit_failure_rolls_back_work_item_and_owner` `test:test_audit_failure_rolls_back_status_mutation` `test:test_all_successful_mutations_are_audited` `test:test_audit_rows_are_append_only` | PROVEN |
+
+**Row 16 note.** The offline cases prove the *precondition* mechanism (a stale
+`expected_link_id` or `expected_updated_at` is refused) and read the code to
+confirm the transaction shape. They do **not** interleave two real threads and
+observe the race. A true concurrency test would need two connections and a
+deliberate pause; there is none. What is proven is "the mutation is guarded and
+the guard is evaluated inside the same transaction", not "the race was
+reproduced".
+
+---
+
+## F. Degradation (18)
+
+| # | Scenario | Expected | Evidence | Status |
+|---|---|---|---|---|
+| 18 | Memory adapter is unconfigured; or it returns an oversized response | `DEPENDENCY_UNAVAILABLE` and `RESOURCE_EXHAUSTED` respectively. A degraded dependency must not be reported as an empty success, and an oversized payload must not be silently truncated. | `test:test_context_without_adapter_is_dependency_unavailable` `test:test_oversized_response_becomes_resource_exhausted` `test:test_session_context_with_injected_adapter` | PROVEN |
+
+---
+
+## What this matrix does not cover
+
+These are gaps, stated so nobody reads the eighteen rows above as completeness.
+
+| Gap | Why it is not covered | Consequence |
+|---|---|---|
+| In-process code execution | Python privacy is not a boundary. `_record_trusted_landing` is a plain method; anything running in the SO process can call it and can also write the SQLite file directly. | B1 is closed against a **remote** caller only. Requires deployment isolation. |
+| Landing event bound to a WorkItem | `authority_landing_events` stores `session_id` but not `work_item_id`. | If signing succeeds and linking fails, the unconsumed event can be claimed by another WorkItem that holds `write` on that conversation. Bounded, accepted, recorded. |
+| `alg`/`crit` rejection | No offline case feeds a forged header through `verify()`. | Row 4 is CODE_ONLY. |
+| Real thread-level races | No test interleaves two connections. | Row 16 proves the guard, not the race. |
+| Multi-user isolation | D4 fixes the first deployment at one principal, one tenant. | Cross-principal/cross-tenant behaviour is tested at the unit level only; it is not claimed for a multi-user deployment. |
+
+---
+
+## Change control
+
+A row may move from CODE_ONLY or human to PROVEN only by adding a named offline
+case. Deleting a row requires the same review as deleting a test. New security
+behaviour must arrive with its row, in the same change.

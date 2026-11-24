@@ -9,10 +9,12 @@ permissions:
   contents: read
 
 env:
-  # Pinned Memory Adapter commit that provides src/bin/memory-stdio.rs.
-  # MA main does NOT contain that file. Any MA-side implementation change the
-  # SO E2E suite depends on MUST bump this SHA in the same PR that depends on it.
-  MA_PINNED_SHA: 2f302344271d7eb60a0f32a4f6f19a9490463926
+  # Pinned Memory Adapter commit matching MA main at the time of this update.
+  # src/bin/memory-stdio.rs has existed since 2f30234 and has the same blob at
+  # this revision; this SHA locks the exact MA baseline validated by the SO E2E suite.
+  # Any MA-side implementation change the SO E2E suite depends on MUST bump this
+  # SHA in the same PR that depends on it.
+  MA_PINNED_SHA: c12c3df12623c722fdfe33e4fa26aa2846f9d06d
 
 jobs:
   unit:

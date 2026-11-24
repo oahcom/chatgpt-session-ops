@@ -240,6 +240,43 @@ POST /backend-api/aip/connectors/links/list_accessible
 
 `actions` 为空**不等于**认证失败——它是 ChatGPT 那次工具发现被 401 拒了之后不再重拉的结果。但 `auth_status != ACTIVE` 就一定是认证没通。
 
+### 4.1 `REAUTH_REQUIRED` 是存下来的状态，不是实时判断
+
+这条是 2026-11-23 排障得出的，值得单独记：**连接器在 UI 上显示「已连接」，一用却提示「连接已过期」，两者不矛盾。**
+
+`auth_status` 挂在 **link** 上，不是挂在 connector 上。一次授权失败后 ChatGPT 把该 link 标成 `REAUTH_REQUIRED` 并**持久化**；之后即使底层 token 仍然有效，它读到的仍是这个标记。所以要查的是 `list_accessible` 里每个 link 的 `auth_status`，不是 connector 列表页。
+
+同时要意识到：`REAUTH_REQUIRED` 背后至少有两种完全不同的成因，处理方式也不同。
+
+| 现象 | 成因 | 如何处理 |
+|---|---|---|
+| `REAUTH_REQUIRED` 且 `actions == 0` | 创建时就没通过探测，连接器生来没有认证（旧 `WWW-Authenticate` 配置的产物） | 这条 link 无救，删除后重建 |
+| `REAUTH_REQUIRED` 且 `actions > 0` | 曾经成功过，后来凭据失效 | 重新授权；旧 link 必须显式删除 |
+
+实测对照（2026-11-23）：acct2 的 7 条全部是前者，创建于 11-22 11:38–12:26，正好是 `WWW-Authenticate` 尚未改为请求感知之前的窗口；acct1 的 1 条是后者，`actions=11` 但从未产生过网关调用。
+
+### 4.2 重新授权会新增 link，旧 link 不会自动消失
+
+同一个 `connector_id` 重新走一遍 `links/oauth` → 回调，会在 `list_accessible` 里**多出一条**新 link，旧的 `REAUTH_REQUIRED` 那条仍然在。实测出现过同账号同 connector 同时存在 `REAUTH_REQUIRED` 与 `ACTIVE` 两条记录。
+
+所以重链之后必须：
+
+```http
+DELETE /backend-api/aip/connectors/links/<old_link_id>   → 200 {}
+```
+
+否则前端可能仍绑定旧记录，表现就是「明明刚重连过，还是说过期」。
+
+### 4.3 判断「有没有过期」不能只看 connector
+
+`connector` 的 `supported_auth[].type == OAUTH` 只说明它配置成 OAuth，**不说明当前授权还有效**。有效的判据只有 link 级的三项同时成立：
+
+1. 存在该 `connector_id` 的 link；
+2. `auth_status == "ACTIVE"`；
+3. `actions` 非空（工具发现真的跑通过）。
+
+第 3 条容易被忽略，但它正是 4.1 表格第二行的区分依据。
+
 ---
 
 ## 5. 删除

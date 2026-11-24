@@ -405,7 +405,7 @@ ADAPTER_UNAVAILABLE and ADAPTER_TIMEOUT may be marked retryable.
 
 A storage error is not automatically retryable.
 
-NOT_FOUND is not used for ordinary retrieval with zero matches.
+A zero-match retrieval is not NOT_FOUND.
 
 ## 12. Scope enforcement
 
@@ -548,20 +548,25 @@ version.
 
 ## 18. Acceptance tests
 
-The SO client is accepted only after proving:
+### SO client and joint acceptance
 
-1. Valid Store.
-2. Valid Retrieve.
-3. Cross-Session retrieval within one WorkItem.
-4. Cross-WorkItem isolation.
-5. Provenance survives persistence and retrieval.
-6. Unknown version is rejected.
-7. Invalid scope is rejected.
-8. MA unavailable does not disable original SO functions.
-9. Timeout does not create false Store success.
-10. stdout contains exactly one valid JSON response.
-11. stderr contains diagnostics only.
-12. No MCP or Gateway is required for internal calls.
+1. [both] Valid Store.
+2. [both] Valid Retrieve.
+3. [both] Cross-Session retrieval within one WorkItem.
+4. [both] Cross-WorkItem isolation.
+5. [both] Provenance survives persistence and retrieval.
+8. [SO client] MA failures do not disable original SO functions.
+9. [SO client] Timeout does not create false Store success.
+12. [both] No MCP or Gateway is required for internal calls.
+
+### MA acceptance
+
+6. [MA] Unknown version is rejected.
+7. [MA] Invalid scope is rejected.
+10. [MA] stdout contains exactly one valid JSON response.
+11. [MA] stderr contains diagnostics only.
+13. [MA] MA Core is callable without MCP.
+14. [MA] SQLite operation succeeds without a Qdrant service.
 
 ## 19. Change control
 
