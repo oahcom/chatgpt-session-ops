@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -27,6 +28,7 @@ SUPPORTED_SCOPES = [
     "session_ops.session.read",
     "session_ops.session.write",
     "session_ops.context.read",
+    "session_ops.access.manage",
 ]
 
 
@@ -42,7 +44,6 @@ def _validate_https_url(name: str, value: str, *, require_path: bool) -> str:
     """Validate an absolute HTTPS URL without silently rewriting its value."""
     try:
         parsed = urlsplit(value)
-        # Accessing .port also detects malformed port syntax.
         _ = parsed.port
     except ValueError as exc:
         raise RuntimeError(name + " is not a valid URL") from exc
@@ -128,6 +129,8 @@ def load_config() -> dict[str, Any]:
     }:
         raise RuntimeError("UVICORN_LOG_LEVEL is invalid")
 
+    discovery_url = os.environ.get("SO_MCP_DISCOVERY_URL", "").strip() or None
+
     return {
         "issuer": issuer,
         "audience": audience,
@@ -137,7 +140,71 @@ def load_config() -> dict[str, Any]:
         "host": host,
         "port": port,
         "log_level": log_level,
+        "discovery_url": discovery_url,
     }
+
+
+def _without_non_bearer_authorization(scope: dict[str, Any]) -> dict[str, Any]:
+    """Remove non-Bearer or empty/malformed Authorization headers.
+
+    The downstream MCP authentication middleware interprets a missing
+    Authorization header as an unauthenticated request and emits a pure
+    Bearer challenge. Only a non-empty, syntactically single-token Bearer
+    credential is allowed to reach JWT verification.
+    """
+    headers = list(scope.get("headers", ()))
+    authorization_values = [
+        value
+        for key, value in headers
+        if key.lower() == b"authorization"
+    ]
+
+    if not authorization_values:
+        return scope
+
+    keep_bearer = False
+
+    # Multiple Authorization headers are ambiguous; do not select one.
+    if len(authorization_values) == 1:
+        try:
+            value = authorization_values[0].decode("latin-1").strip()
+        except UnicodeError:
+            value = ""
+
+        parts = value.split()
+        keep_bearer = (
+            len(parts) == 2
+            and parts[0].lower() == "bearer"
+            and bool(parts[1])
+            and not any(char.isspace() for char in parts[1])
+        )
+
+    if keep_bearer:
+        return scope
+
+    clean_scope = dict(scope)
+    clean_scope["headers"] = [
+        (key, value)
+        for key, value in headers
+        if key.lower() != b"authorization"
+    ]
+    return clean_scope
+
+
+def _add_access_manage_to_challenge(value: bytes) -> bytes:
+    """Add access.manage to the existing Bearer challenge scope parameter."""
+    match = re.search(rb'(?i)\bscope="([^"]*)"', value)
+    if match is None:
+        return value
+
+    current = match.group(1).decode("ascii", errors="strict")
+    scopes = current.split()
+
+    if "session_ops.access.manage" not in scopes:
+        scopes.append("session_ops.access.manage")
+
+    replacement = " ".join(scopes).encode("ascii")
+    return value[:match.start(1)] + replacement + value[match.end(1):]
 
 
 class DeploymentASGI:
@@ -155,6 +222,7 @@ class DeploymentASGI:
         self.audience = audience
 
         resource = urlsplit(audience)
+        self.endpoint_path = resource.path
         self.metadata_path = (
             "/.well-known/oauth-protected-resource" + resource.path
         )
@@ -230,7 +298,30 @@ class DeploymentASGI:
             )
             return
 
-        await self.inner(scope, receive, send)
+        inner_scope = scope
+        if path == self.endpoint_path:
+            inner_scope = _without_non_bearer_authorization(scope)
+
+        async def send_with_contract_scopes(message: dict[str, Any]) -> None:
+            if message.get("type") == "http.response.start":
+                headers = []
+                for name, value in message.get("headers", ()):
+                    if name.lower() == b"www-authenticate":
+                        value = _add_access_manage_to_challenge(value)
+                    headers.append((name, value))
+
+                updated = dict(message)
+                updated["headers"] = headers
+                await send(updated)
+                return
+
+            await send(message)
+
+        await self.inner(
+            inner_scope,
+            receive,
+            send_with_contract_scopes,
+        )
 
 
 def create_application(config: dict[str, Any]) -> Any:
@@ -245,6 +336,7 @@ def create_application(config: dict[str, Any]) -> Any:
         audience=config["audience"],
         realm_namespace=config["realm_namespace"],
         tenant_claim=config["tenant_claim"],
+        discovery_url=config["discovery_url"],
     )
 
     service = MCPToolService(store)
@@ -274,11 +366,13 @@ def main() -> None:
         raise
 
     logger.info(
-        "Starting Session Ops MCP: issuer=%s audience=%s host=%s port=%d",
+        "Starting Session Ops MCP: issuer=%s audience=%s host=%s port=%d "
+        "internal_discovery=%s",
         config["issuer"],
         config["audience"],
         config["host"],
         config["port"],
+        bool(config["discovery_url"]),
     )
 
     uvicorn.run(

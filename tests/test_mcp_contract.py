@@ -44,6 +44,7 @@ LINK_ID = "sl_12345678-1234-4234-8234-123456789abc"
 ALL_SCOPES = (
     "session_ops.work_item.read",
     "session_ops.work_item.write",
+    "session_ops.access.manage",
     "session_ops.session.read",
     "session_ops.session.write",
     "session_ops.context.read",
@@ -283,6 +284,34 @@ class MCPContractTests(unittest.TestCase):
         )
         self.assert_success(result)
         self.assertTrue(result["data"]["revoked"])
+
+    def test_work_item_grant_requires_access_manage(self):
+        """work_item.write alone must not authorize a grant."""
+        auth = make_auth(
+            scopes=("session_ops.work_item.write",)
+        )
+
+        result = self.service.dispatch(
+            "work_item.grant",
+            {
+                "work_item_id": WORK_ITEM_ID,
+                "target_principal_id": "realm-a:reader",
+                "scope": "read",
+            },
+            auth,
+            request_id="test-request",
+        )
+
+        self.assert_error(result, "PERMISSION_DENIED")
+        self.assertEqual(
+            result["error"]["details"]["required_scopes"],
+            [
+                "session_ops.work_item.write",
+                "session_ops.access.manage",
+            ],
+        )
+        # Authorization must fail before any authority-store operation.
+        self.assertEqual(self.store.calls, [])
 
     def test_session_link(self):
         result = self.dispatch(

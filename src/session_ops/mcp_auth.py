@@ -10,6 +10,7 @@ package. Network access is synchronous and injectable for deterministic tests.
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import re
 import threading
@@ -18,7 +19,7 @@ import urllib.error
 import urllib.request
 
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from src.session_ops.authority import InvalidPrincipal, Principal
 
@@ -92,14 +93,21 @@ class AuthContext:
 
 
 # The scope contract is intentionally explicit. Each tool receives only the
-# minimum read/write capabilities it needs.
+# minimum read/write capabilities it needs. Grant/revoke require both write
+# authority and the dedicated access-management capability.
 TOOL_REQUIRED_SCOPES = {
     "work_item.create": ("session_ops.work_item.write",),
     "work_item.get": ("session_ops.work_item.read",),
     "work_item.list": ("session_ops.work_item.read",),
     "work_item.update": ("session_ops.work_item.write",),
-    "work_item.grant": ("session_ops.work_item.write",),
-    "work_item.revoke": ("session_ops.work_item.write",),
+    "work_item.grant": (
+        "session_ops.work_item.write",
+        "session_ops.access.manage",
+    ),
+    "work_item.revoke": (
+        "session_ops.work_item.write",
+        "session_ops.access.manage",
+    ),
     "session.link": (
         "session_ops.session.write",
         "session_ops.work_item.write",
@@ -436,7 +444,12 @@ def _validate_https_url(value: Any, description: str) -> str:
     if not isinstance(value, str) or not value:
         raise AuthenticationError("%s URL is missing" % description)
 
-    parsed = urlparse(value)
+    try:
+        parsed = urlparse(value)
+        _ = parsed.port
+    except ValueError as exc:
+        raise AuthenticationError("%s URL is malformed" % description) from exc
+
     if parsed.scheme != "https" or not parsed.netloc:
         raise AuthenticationError("%s URL must use HTTPS" % description)
     if parsed.username is not None or parsed.password is not None:
@@ -446,19 +459,113 @@ def _validate_https_url(value: Any, description: str) -> str:
     return value
 
 
+def _validate_discovery_override_url(value: Any) -> str:
+    """Validate an explicit discovery URL.
+
+    Plain HTTP is permitted only for loopback addresses. Remote discovery
+    overrides must use HTTPS and therefore retain normal certificate checks.
+    """
+    if not isinstance(value, str) or not value:
+        raise AuthConfigurationError("discovery URL must be a non-empty string")
+
+    try:
+        parsed = urlparse(value)
+        _ = parsed.port
+    except ValueError as exc:
+        raise AuthConfigurationError("discovery URL is malformed") from exc
+
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise AuthConfigurationError("discovery URL must be absolute HTTP or HTTPS")
+    if parsed.username is not None or parsed.password is not None:
+        raise AuthConfigurationError("discovery URL must not contain credentials")
+    if parsed.query or parsed.fragment:
+        raise AuthConfigurationError("discovery URL must not contain query or fragment")
+    if not parsed.path.endswith("/.well-known/openid-configuration"):
+        raise AuthConfigurationError(
+            "discovery URL must end with /.well-known/openid-configuration"
+        )
+
+    if parsed.scheme == "http":
+        host = parsed.hostname or ""
+        is_loopback = host.lower() == "localhost"
+        if not is_loopback:
+            try:
+                is_loopback = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                is_loopback = False
+        if not is_loopback:
+            raise AuthConfigurationError(
+                "plain HTTP discovery is allowed only on loopback"
+            )
+
+    return value
+
+
+def _validate_fetch_url(value: str, description: str) -> None:
+    """Validate fetch URLs; HTTP is restricted to loopback."""
+    try:
+        parsed = urlparse(value)
+        _ = parsed.port
+    except ValueError as exc:
+        raise AuthenticationError("%s URL is malformed" % description) from exc
+
+    if parsed.scheme == "https" and parsed.netloc:
+        pass
+    elif parsed.scheme == "http" and parsed.netloc:
+        host = parsed.hostname or ""
+        is_loopback = host.lower() == "localhost"
+        if not is_loopback:
+            try:
+                is_loopback = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                is_loopback = False
+        if not is_loopback:
+            raise AuthenticationError("plain HTTP fetch is allowed only on loopback")
+    else:
+        raise AuthenticationError("%s URL must use HTTPS or loopback HTTP" % description)
+
+    if parsed.username is not None or parsed.password is not None:
+        raise AuthenticationError("%s URL must not contain credentials" % description)
+    if parsed.fragment:
+        raise AuthenticationError("%s URL must not contain a fragment" % description)
+
+
 def _default_json_fetcher(url: str, timeout: float, max_bytes: int) -> Dict[str, Any]:
-    """Fetch one bounded JSON document over HTTPS using the stdlib."""
+    """Fetch one bounded JSON document using the stdlib.
+
+    HTTPS is accepted normally. HTTP is accepted only for loopback URLs, which
+    is used when a configured internal discovery URL maps the issuer's JWKS
+    path onto the local Keycloak listener.
+    """
+    _validate_fetch_url(url, "request")
+
     request = urllib.request.Request(
         url,
-        headers={"Accept": "application/json"},
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "Session-Ops-MCP/1.0",
+        },
         method="GET",
     )
 
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             final_url = response.geturl()
-            _validate_https_url(final_url, "response")
+            _validate_fetch_url(final_url, "response")
+
+            original = urlparse(url)
+            final = urlparse(final_url)
+            if original.scheme == "http" and (
+                final.scheme != original.scheme
+                or final.netloc.lower() != original.netloc.lower()
+            ):
+                raise AuthenticationError(
+                    "internal identity endpoint redirected to another origin"
+                )
+
             raw = response.read(max_bytes + 1)
+    except AuthenticationError:
+        raise
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise JWKSFetchError("identity endpoint request failed") from exc
     except Exception as exc:
@@ -476,12 +583,19 @@ class JWKSProvider:
     ``fetch_json`` is injectable and must have signature
     ``fetch_json(url, timeout, max_bytes) -> Mapping``. It can be a simple
     deterministic test fake; no MCP SDK or event loop is involved.
+
+    When ``discovery_url`` is configured, discovery is fetched from that
+    address, while the discovery document's issuer is still required to equal
+    the configured public issuer. The discovered public JWKS URI must share
+    the issuer's origin; only then is its origin mapped to the internal
+    discovery origin. The JWT issuer claim is never rewritten.
     """
 
     def __init__(
         self,
         issuer: str,
         *,
+        discovery_url: Optional[str] = None,
         fetch_json: Optional[Callable[[str, float, int], Mapping[str, Any]]] = None,
         timeout_seconds: float = DEFAULT_HTTP_TIMEOUT_SECONDS,
         cache_seconds: float = DEFAULT_CACHE_SECONDS,
@@ -489,9 +603,23 @@ class JWKSProvider:
         self.issuer = issuer.rstrip("/")
         _validate_https_url(self.issuer, "issuer")
 
-        self.discovery_url = (
-            self.issuer + "/.well-known/openid-configuration"
-        )
+        self._discovery_override = discovery_url is not None
+        if discovery_url is None:
+            self.discovery_url = (
+                self.issuer + "/.well-known/openid-configuration"
+            )
+        else:
+            self.discovery_url = _validate_discovery_override_url(discovery_url)
+
+            expected_path = (
+                urlparse(self.issuer).path.rstrip("/")
+                + "/.well-known/openid-configuration"
+            )
+            if urlparse(self.discovery_url).path != expected_path:
+                raise AuthConfigurationError(
+                    "discovery URL path does not match configured issuer path"
+                )
+
         self.fetch_json = fetch_json or _default_json_fetcher
         self.timeout_seconds = float(timeout_seconds)
         self.cache_seconds = float(cache_seconds)
@@ -531,11 +659,39 @@ class JWKSProvider:
         if document.get("issuer") != self.issuer:
             raise AuthenticationError("OIDC discovery issuer mismatch")
 
-        jwks_uri = _validate_https_url(
+        public_jwks_uri = _validate_https_url(
             document.get("jwks_uri"),
             "JWKS",
         )
-        return jwks_uri
+
+        if not self._discovery_override:
+            return public_jwks_uri
+
+        issuer_parts = urlparse(self.issuer)
+        jwks_parts = urlparse(public_jwks_uri)
+
+        if (
+            jwks_parts.scheme.lower() != issuer_parts.scheme.lower()
+            or jwks_parts.netloc.lower() != issuer_parts.netloc.lower()
+        ):
+            raise AuthenticationError(
+                "discovered JWKS origin does not match configured issuer"
+            )
+
+        internal_parts = urlparse(self.discovery_url)
+
+        # Preserve the Keycloak JWKS path and query, changing only the network
+        # origin to the explicitly configured internal discovery origin.
+        return urlunparse(
+            (
+                internal_parts.scheme,
+                internal_parts.netloc,
+                jwks_parts.path,
+                jwks_parts.params,
+                jwks_parts.query,
+                "",
+            )
+        )
 
     def _download_jwks(self) -> Dict[str, Any]:
         if self._jwks_uri is None:
@@ -651,6 +807,7 @@ class JWTVerifier:
         realm_namespace: str,
         tenant_claim: str = "tenant_id",
         jwks_provider: Optional[JWKSProvider] = None,
+        discovery_url: Optional[str] = None,
         fetch_json: Optional[
             Callable[[str, float, int], Mapping[str, Any]]
         ] = None,
@@ -668,6 +825,10 @@ class JWTVerifier:
             raise AuthConfigurationError("valid realm_namespace is required")
         if not isinstance(tenant_claim, str) or not tenant_claim:
             raise AuthConfigurationError("tenant_claim is required")
+        if jwks_provider is not None and discovery_url is not None:
+            raise AuthConfigurationError(
+                "provide jwks_provider or discovery_url, not both"
+            )
 
         self.issuer = issuer.rstrip("/")
         _validate_https_url(self.issuer, "issuer")
@@ -681,6 +842,7 @@ class JWTVerifier:
 
         self.jwks_provider = jwks_provider or JWKSProvider(
             self.issuer,
+            discovery_url=discovery_url,
             fetch_json=fetch_json,
             timeout_seconds=timeout_seconds,
             cache_seconds=cache_seconds,
