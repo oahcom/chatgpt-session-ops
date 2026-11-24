@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "scope": "test_hardening.py regression-count declarations only",
+  "expected_declaration_count": 6
+}
