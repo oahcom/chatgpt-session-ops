@@ -5929,13 +5929,22 @@ def _log_write(path, record):
     return path
 
 def _read_jsonl(path):
+    """读 JSONL。**读失败返回 None**，与「文件不存在/确实是空」区分开（R376-04）。
+
+    三种情况必须分开，否则调用方无法判断能否继续：
+      - 文件不存在   → []      （正常：还没写过）
+      - 文件存在且空 → []      （正常：写过但没内容）
+      - 读不出来     → None    （异常：权限/编码/IO；不得当成"没有"）
+    旧版一律返回 []，于是 pending 读失败被当空文件删掉（唯一副本丢失），
+    target 读失败则 existing 被当成空字典，无法判断是否已有同键。
+    """
+    if not os.path.exists(path):
+        return []
     try:
         with open(path, encoding="utf-8") as f:
             lines = f.readlines()
     except (OSError, UnicodeDecodeError):
-        # 编码坏也属于"读不出来"：绝不能返回空列表让上层误判成"没有内容"，
-        # 那会导致 pending 被当空文件删掉（唯一副本丢失）。
-        return []
+        return None
     out = []
     for line in lines:
         line = line.strip()
@@ -5975,7 +5984,11 @@ def iter_turns(conv_id=None):
     for fp in _log_files(conv_id):
         merged = {}
         order = []
-        for rec in _read_jsonl(fp):
+        rows = _read_jsonl(fp)
+        if rows is None:          # 读不出来：跳过该文件，不当成空
+            print("WARN: 会话日志读不出来（%s）——本次跳过", fp, flush=True)
+            continue
+        for rec in rows:
             tid = str(rec.get("turn_id") or "")
             key = tid or ("__noturn__%d" % len(order))
             if key not in merged:
@@ -6060,11 +6073,15 @@ def _turn_payload(rec):
 
 
 def _migrate_pending(turn_id, begin_path, real_conv):
-    """把 pending 里的整轮搬到真实会话文件。
+    """把 pending 的整轮复制进真实会话文件，**确认目标已完整**后才删 pending。
 
-    R374-02 幂等性：迁移可能在任意阶段崩溃（拷完 begin、拷完 end、删 pending 前），
-    重试时不得重复追加。以 (turn_id, phase) 为幂等键：目标文件已有同键则跳过；
-    只有目标文件**完整**落盘后才删 pending，否则保留可重试。
+    R376-03 的根因是：靠写入顺序逼近事务性，只能移动崩溃窗口、不能消除它。
+    这里改成「以目标文件的实际内容为准」：
+      1) 复制 pending 的所有行进目标（(turn_id, phase) 幂等去重）
+      2) 回读目标，确认该 turn_id 的 begin + end **都在**
+      3) 两者都确认后，才删 pending
+    任何一步失败或中途崩溃 → pending 仍在（它持有唯一完整副本）→ 下次重试补齐。
+    读不出来一律中止且不删，绝不把"读不到"当成"没有"。
     """
     cid = _safe_conv_id(real_conv)
     if not cid or not begin_path:
@@ -6072,45 +6089,72 @@ def _migrate_pending(turn_id, begin_path, real_conv):
     if os.path.dirname(os.path.abspath(begin_path)) != os.path.abspath(log_pending_dir()):
         return None
     target = conversation_log_path(cid)
-    existing = {}
-    for r in _read_jsonl(target):
-        existing[(r.get("turn_id"), r.get("phase") or "turn")] = r
+
     source = _read_jsonl(begin_path)
-    if not source:
-        # P1-1：读不出来 ≠ 没内容。此时删 pending 等于把唯一副本删掉。
-        print("FAIL: pending 读不出来或为空（%s）——保留，不删" % begin_path, flush=True)
+    if source is None:
+        print("FAIL: pending 读不出来（%s）——保留，不删" % begin_path, flush=True)
         return None
-    complete = True
+    if not source:
+        print("FAIL: pending 为空（%s）——保留，不删" % begin_path, flush=True)
+        return None
+
+    target_rows = _read_jsonl(target)
+    if target_rows is None:
+        # R376-04：目标读不出来就无法判断是否已有同键，继续写可能造成重复，
+        # 更可能让后面"回读确认"误判。直接中止，pending 保留。
+        print("FAIL: 目标日志读不出来（%s）——迁初中止，pending 保留" % target, flush=True)
+        return None
+
+    existing = {}
+    for r in target_rows:
+        existing[(r.get("turn_id"), r.get("phase") or "turn")] = r
+
     for rec in source:
         key = (rec.get("turn_id"), rec.get("phase") or "turn")
         if key in existing:
-            # R375-02：同批次内也要去重（旧版只在循环外算一次 existing，
-            # 源文件里若有两条同键记录，第二条会认为目标没有而重复写入）。
-            prior = existing[key]
-            if _turn_payload(prior) != _turn_payload(rec):
-                # 同键不同内容：静默挑一条会掩盖数据完整性问题，报错并保留 pending
+            if _turn_payload(existing[key]) != _turn_payload(rec):
                 print("FAIL: 迁移发现同键冲突 %r（内容不同）——保留 pending 待人工处理"
                       % (key,), flush=True)
-                return None          # P2-7：返回 None 让调用方知道"迁移未完成"
+                return None
             continue
         try:
             moved = dict(rec)
             moved["conv_id"] = cid
             _log_write(target, moved)
-            existing[key] = moved          # 写成功才登记，后续同键才能被跳过
-        except Exception:
-            complete = False       # 没搬完 → 保留 pending，下次可重试
-            break
-    if complete:
-        try:
-            os.remove(begin_path)
-        except OSError:
-            pass      # 删不掉不算失败：读取端按 turn_id 去重合并
+            existing[key] = moved          # 写成功才登记
+        except Exception as e:
+            print("FAIL: 迁移写入失败（%s）——pending 保留，可重试" % e, flush=True)
+            return None
+
+    # 回读确认：目标里该 turn_id 的 begin 与 end 都必须在
+    verify_rows = _read_jsonl(target)
+    if verify_rows is None:
+        print("FAIL: 迁移后回读目标失败（%s）——pending 保留" % target, flush=True)
+        return None
+    have = {(r.get("turn_id"), r.get("phase") or "turn") for r in verify_rows}
+    need = {(rec.get("turn_id"), rec.get("phase") or "turn") for rec in source}
+    missing = need - have
+    if missing:
+        print("FAIL: 迁移后校验缺行 %r——pending 保留，可重试" % (sorted(missing),),
+              flush=True)
+        return None
+
+    try:
+        os.remove(begin_path)
+    except OSError:
+        pass          # 删不掉不算失败：读取端按 turn_id 去重合并
     return target
+
 
 def log_end(api, turn_id, begin_path, target_conv, real_conv, status, reply_path,
             reply_state, error=""):
-    """发送之后补写回复。失败会抛出——调用方必须显式报告"回复未留存"。"""
+    """发送之后补写回复。失败会抛出——调用方必须显式报告"回复未留存"。
+
+    R376-03：不再靠"写入顺序"逼近事务性（那只移动崩溃窗口，不消除它）。
+    改为：pending 先持有**完整一轮**（begin + end），再整体迁移，
+    由 `_migrate_pending` 回读确认目标已含两个 phase 之后才删 pending。
+    这样任何一步崩溃，待迁移的那一轮都完整留在 pending 里，可重试。
+    """
     reply = getattr(api, "_last_reply_text", None)
     reply = "" if reply is None else reply
     reply_file = ""
@@ -6137,34 +6181,26 @@ def log_end(api, turn_id, begin_path, target_conv, real_conv, status, reply_path
     # 413/异常时 real_conv 为空，但 target_conv 是已知的——这一轮确实属于它，
     # 落到 unassigned 反而会把已知身份的轮次丢掉（R373-03 的"不得伪装"不等于"一律丢弃"）。
     cid = _safe_conv_id(real_conv) or _safe_conv_id(target_conv)
+    from_pending = bool(begin_path) and (
+        os.path.dirname(os.path.abspath(begin_path)) == os.path.abspath(log_pending_dir()))
     if cid:
         rec["conv_id"] = cid
         target = conversation_log_path(cid)
-        # P1-2：先把 pending 的 begin 迁进目标，再写 end。
-        # 反过来的话，两次写之间崩溃会留下"end 在目标、begin 在 pending"，
-        # 读取端会把同一轮拆成两个都不完整的轮次（数据没丢，但形态是错的）。
-        if begin_path:
+        if from_pending:
+            # 先让 pending 变成"完整一轮"，再整体迁移。
+            # 顺序反了就会留下"目标有 begin、pending 没了、end 没写"的最坏形态。
+            try:
+                _log_write(begin_path, rec)
+            except Exception as e:
+                print("FAIL: end 写入 pending 失败（%s）——本轮回复未留存" % e, flush=True)
+                return None
             moved = _migrate_pending(turn_id, begin_path, cid)
-            if moved is None and os.path.dirname(os.path.abspath(begin_path)) == os.path.abspath(log_pending_dir()):
-                # 迁移没成（同键冲突 / 读不出来）：绝不能单独把 end 写进目标，
-                # 那会造出"有 end 无 begin"的残轮，且 pending 里还留着 begin 副本。
-                # 正确做法是让 end 也进 pending，保持这一对在同一处、可人工处置。
-                try:
-                    _log_write(begin_path, rec)
-                    print("FAIL: begin 未能迁入目标，end 已与 begin 一并留在 pending（%s）" % begin_path, flush=True)
-                    return begin_path
-                except Exception as e:
-                    print("FAIL: end 连 pending 都写不进去（%s）——本轮回复未留存" % e, flush=True)
-                    return None
-        _log_write(target, rec)
-        # 只有"确实来自 pending 的暂存文件"才能删；begin 直接写在会话文件里时
-        # begin_path 就是 target 本身，删它等于把刚写的两行一起抹掉。
-        if begin_path and os.path.dirname(os.path.abspath(begin_path)) == os.path.abspath(log_pending_dir()):
-            if os.path.exists(begin_path):
-                try:
-                    os.remove(begin_path)   # begin 已迁且 end 已落，可以清暂存
-                except OSError:
-                    pass
+            if moved is None:
+                print("FAIL: 迁移未完成——完整一轮仍在 pending（%s），可重试"
+                      % begin_path, flush=True)
+                return begin_path
+            return moved
+        _log_write(target, rec)      # 非 pending：直接追加，天然是一轮
         return target
     # 真实 id 与目标都不可用：按原始标识单独成文件，不与会话桶合并（R373-03）
     target = unassigned_log_path(target_conv or turn_id)
@@ -6177,6 +6213,7 @@ def log_end(api, turn_id, begin_path, target_conv, real_conv, status, reply_path
         except OSError:
             pass
     return target
+
 
 def search_logs(term, conv_id=None, limit=20):
     """在会话日志里按子串检索（大小写不敏感），返回命中记录（新 -> 旧）。"""

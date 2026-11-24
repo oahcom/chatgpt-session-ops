@@ -5506,11 +5506,12 @@ class _FakeCdp:
     """
 
     def __init__(self, counts, last="未完成的正文", streaming=True,
-                 has_error=False, frames=None):
+                 has_error=False, frames=None, alert_text=""):
         self.counts = list(counts)
         self.last = last
         self.streaming = streaming
         self.has_error = has_error
+        self.alert_text = alert_text
         self.frames = list(frames) if frames else None
 
     def evaluate(self, js):
@@ -5518,9 +5519,12 @@ class _FakeCdp:
             f = self.frames.pop(0) if len(self.frames) > 1 else self.frames[0]
             return {"value": json.dumps(f)}
         n = self.counts.pop(0) if len(self.counts) > 1 else self.counts[0]
-        return {"value": json.dumps({
-            "count": n, "last": self.last,
-            "streaming": self.streaming, "hasError": self.has_error})}
+        alert = self.alert_text
+        if self.has_error and not alert:
+            alert = "Something went wrong"   # 注入结构错误（等价于页面有 alert）
+        return {"value": json.dumps({"count": n, "last": self.last,
+                                     "streaming": self.streaming,
+                                     "alert_text": alert})}
 
 
 class TestConversationLog(TmpBase):
@@ -5907,6 +5911,205 @@ class TestConversationLog(TmpBase):
         self.assertNotIn("end", phases, "迁移失败时目标里绝不能单独出现 end")
         self.assertTrue(os.path.exists(begin), "begin 与 end 都应留在 pending")
 
+    # ---------- R376 崩溃注入（审查要求：不能只靠总量通过）----------
+
+    def test_crash_after_begin_written_before_pending_deleted(self):
+        """begin 已进目标、pending 还没删时崩溃：重试必须补齐且不重复。"""
+        cid = "aaaabbbb-cccc-4ddd-8eee-ffff00001111"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-crash1")
+        rows = [
+            {"turn_id": "t-crash1", "phase": "begin", "conv_id": "", "prompt": "P",
+             "prompt_chars": 1, "status": None, "reply": ""},
+            {"turn_id": "t-crash1", "phase": "end", "conv_id": "", "reply": "R",
+             "reply_chars": 1, "reply_state": "captured", "status": 200},
+        ]
+        with open(begin, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rows[0], ensure_ascii=False) + "\n")   # 只落了 begin
+
+        m._migrate_pending("t-crash1", begin, cid)   # 模拟恢复
+        got = m._read_jsonl(target)
+        self.assertEqual([r.get("phase") for r in got], ["begin", "end"])
+        self.assertFalse(os.path.exists(begin), "补齐后才删 pending")
+
+    def test_end_write_fails_pending_retained(self):
+        """end 写入 pending 失败时不得删除任何东西，且不能留下半轮。"""
+        cid = "bbbbcccc-dddd-4eee-8fff-000011112222"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-crash2")
+        rec = {"turn_id": "t-crash2", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+        real = m._log_write
+        def boom(path, record):
+            if record.get("phase") == "end":
+                raise OSError("模拟 end 写失败")
+            return real(path, record)
+        m._log_write = boom
+        try:
+            class _A:
+                account = "acct1"
+                _last_reply_text = None
+                reply_source = "api"
+            out = m.log_end(_A(), "t-crash2", begin, None, cid, 200, None, "captured")
+        finally:
+            m._log_write = real
+        self.assertIsNone(out, "end 写不进 pending 时必须报未完成")
+        self.assertTrue(os.path.exists(begin), "pending 必须保留")
+        self.assertFalse(os.path.exists(m.conversation_log_path(cid)),
+                         "不得在目标里留下任何残缺行")
+
+    def test_target_unicode_error_keeps_pending(self):
+        """target 编码坏（读不出来）时必须中止迁移并保留 pending（R376-04）。"""
+        cid = "ccccdddd-eeee-4fff-8000-111122223333"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-crash3")
+        rec = {"turn_id": "t-crash3", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as f:
+            f.write(bytes([255, 254]) + b"broken")
+        self.assertIsNone(m._migrate_pending("t-crash3", begin, cid))
+        self.assertTrue(os.path.exists(begin), "target 读不出来时 pending 必须保留")
+
+    def test_pending_unicode_error_keeps_pending(self):
+        """pending 编码坏时必须保留（已覆盖，这里钉住返回 None）。"""
+        cid = "ddddeeee-ffff-4000-8111-222233334444"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-crash4")
+        with open(begin, "wb") as f:
+            f.write(bytes([255, 254]) + b"broken")
+        self.assertIsNone(m._migrate_pending("t-crash4", begin, cid))
+        self.assertTrue(os.path.exists(begin))
+
+    def test_long_body_with_error_word_is_not_error(self):
+        """500 字正文里提到"网络错误"（在讨论它）不算错误。"""
+        p1 = _load_p1()
+        body = ("网络错误" * 100) + "这一段是在讨论该错误，不是真的出错"
+        c = _FakeCdp([], frames=[
+            {"count": 4, "last": body, "streaming": False, "hasError": False},
+            {"count": 4, "last": body, "streaming": False, "hasError": False},
+        ])
+        text, state = p1.reply_after(c, {"count": 3, "last": "旧", "streaming": False,
+                                       "hasError": False}, settle_tries=2, settle_gap=0)
+        self.assertEqual(state, "captured", "长正文不应因含错误词被判错")
+
+    def test_structural_error_with_long_body_is_error(self):
+        """长正文 + 真实结构性错误：不得因正文长而漏判（R376-01 反例）。"""
+        p1 = _load_p1()
+        c = _FakeCdp([], frames=[
+            {"count": 4, "last": "很长很长的正文" * 50, "streaming": False,
+             "alert_text": "Something went wrong"},
+        ])
+        text, state = p1.reply_after(c, {"count": 3, "last": "旧", "streaming": False,
+                                       "hasError": False}, settle_tries=3, settle_gap=0)
+        self.assertEqual(state, "partial", "结构性错误不得被长正文屏蔽")
+
+    def test_no_new_message_ever_returns_unavailable(self):
+        """连续采样始终没有新增消息：必须 unavailable，且不能 NameError（R376-02）。"""
+        p1 = _load_p1()
+        c = _FakeCdp([3])        # 条数一直是基线
+        text, state = p1.reply_after(c, {"count": 3, "last": "旧", "streaming": False,
+                                       "hasError": False}, settle_tries=3, settle_gap=0)
+        self.assertIsNone(text)
+        self.assertEqual(state, "unavailable")
+
+    def test_unreadable_target_gets_no_appended_bytes(self):
+        """target 读不出来时绝不能往里追加——那会把坏文件进一步弄乱（R376-04）。"""
+        cid = "11113333-2222-4444-8555-666677778888"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.pending_log_path("t-ro")
+        rec = {"turn_id": "t-ro", "phase": "begin", "conv_id": "",
+               "prompt": "P", "prompt_chars": 1, "status": None, "reply": ""}
+        with open(begin, "w", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        target = m.conversation_log_path(cid)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        bad = bytes([255, 254]) + b"broken"
+        with open(target, "wb") as f:
+            f.write(bad)
+        m._migrate_pending("t-ro", begin, cid)
+        with open(target, "rb") as f:
+            after = f.read()
+        self.assertEqual(after, bad, "读不出来时不得追加任何字节")
+
+    def test_silently_lost_write_keeps_pending(self):
+        """end 写入静默丢失（不抛错但不落盘）：回读校验必须挡住，pending 保留。"""
+        cid = "22224444-3333-4555-8666-777788889999"
+        os.makedirs(m.log_pending_dir(), exist_ok=True)
+        os.makedirs(m.log_dir(), exist_ok=True)
+        begin = m.log_pending_dir() + "/t-lost"
+        begin = m.pending_log_path("t-lost")
+        rows = [
+            {"turn_id": "t-lost", "phase": "begin", "conv_id": "", "prompt": "P",
+             "prompt_chars": 1, "status": None, "reply": ""},
+            {"turn_id": "t-lost", "phase": "end", "conv_id": "", "reply": "R",
+             "reply_chars": 1, "reply_state": "captured", "status": 200},
+        ]
+        with open(begin, "w", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+        real = m._log_write
+        def swallow(path, record):
+            if record.get("phase") == "end" and path != begin:
+                return path      # 静默不写：既不抛错也不落盘
+            return real(path, record)
+        m._log_write = swallow
+        try:
+            out = m._migrate_pending("t-lost", begin, cid)
+        finally:
+            m._log_write = real
+        self.assertIsNone(out, "回读发现缺行时必须报未完成")
+        self.assertTrue(os.path.exists(begin), "end 没真正落盘时 pending 必须保留")
+
+    # ---------- R376-01：judge_error 是纯函数，直接单测 ----------
+
+    def test_judge_error_structural_independent_of_length(self):
+        """结构性错误不受正文长度影响（R376-01 的核心反例）。"""
+        p1 = _load_p1()
+        long_body = "很长正文" * 200
+        has, struct, text = p1.judge_error(long_body, "Something went wrong")
+        self.assertTrue(has, "长正文必须不能屏蔽结构性错误")
+        self.assertTrue(struct)
+
+    def test_judge_error_long_body_mentioning_error_is_not_error(self):
+        """长正文里提到"网络错误"（在讨论它）不算错。"""
+        p1 = _load_p1()
+        body = ("网络错误" * 5) + "这一段是在讨论该错误，并不是真的出错，请继续"
+        has, struct, _text = p1.judge_error(body, "")
+        self.assertFalse(has, "长正文提及错误词不得判错")
+        self.assertFalse(struct)
+
+    def test_judge_error_short_error_sentence_is_error(self):
+        """整条正文就是一句错误提示 → 判错。"""
+        p1 = _load_p1()
+        has, _s, text = p1.judge_error("Something went wrong.", "")
+        self.assertTrue(has)
+        self.assertTrue(text)
+
+    def test_judge_error_clean_reply_is_clean(self):
+        """正常回复不误判。"""
+        p1 = _load_p1()
+        has, struct, text = p1.judge_error("这是正常回复", "")
+        self.assertFalse(has)
+        self.assertFalse(struct)
+        self.assertFalse(text)
+
     # ---------- R375-01：DOM 完成状态的稳定性证据 ----------
 
     def test_p1_new_node_without_streaming_flag_not_captured(self):
@@ -5949,8 +6152,10 @@ class TestConversationLog(TmpBase):
         """页面明确报错时，即使正文稳定也不得报 captured。"""
         p1 = _load_p1()
         c = _FakeCdp([], frames=[
-            {"count": 4, "last": "部分内容", "streaming": False, "hasError": True},
-            {"count": 4, "last": "部分内容", "streaming": False, "hasError": True},
+            {"count": 4, "last": "部分内容", "streaming": False,
+             "alert_text": "Something went wrong"},
+            {"count": 4, "last": "部分内容", "streaming": False,
+             "alert_text": "Something went wrong"},
         ])
         text, state = p1.reply_after(c, {"count": 3, "last": "旧", "streaming": False,
                                        "hasError": False}, settle_tries=2, settle_gap=0)

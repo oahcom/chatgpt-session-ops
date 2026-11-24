@@ -51,24 +51,44 @@ class _LogCtx:
 JS_REPLY_SNAPSHOT = """(function(){
   var nodes = document.querySelectorAll('[data-message-author-role="assistant"]');
   var last = nodes.length ? (nodes[nodes.length - 1].innerText || '') : '';
-  var lastNode = nodes.length ? nodes[nodes.length - 1] : null;
-  var own = lastNode ? (lastNode.innerText || '') : '';
-  // 只认本次新增节点自身的错误提示，或页面级 role=alert。
-  // 旧版扫整页 innerText：正常回复里出现"网络错误"三个字就会被误判成出错。
-  var alerts = [...document.querySelectorAll('[role="alert"]')]
-      .map(function(e){ return (e.innerText || '').trim(); }).join(' ');
-  var hasError = /Something went wrong|出现错误|网络错误|重新生成/.test(own + ' ' + alerts)
-      && own.length < 200;   // 长正文里提到这些词不算
+  // JS 只负责**采集原始信号**，判定放 Python（judge_error）——写在 JS 里没法单测，
+  // 而 hasError 直接决定 captured/partial，必须有可验证的实现。
+  var alertText = [...document.querySelectorAll('[role="alert"], [data-testid*="error" i]')]
+      .map(function(e){ return (e.innerText || '').trim(); })
+      .filter(function(t){ return t && t.length < 300; })
+      .join(' ');
   return JSON.stringify({
     count: nodes.length,
     last: last.trim(),
     streaming: [...document.querySelectorAll('button')].some(function(b){
       return /停止生成|stop/i.test(b.getAttribute('aria-label') || '');
     }),
-    hasError: hasError
+    alert_text: alertText
   });
 })()"""
 
+
+ERROR_PATTERNS = ("Something went wrong", "出现错误", "网络错误", "消息发送失败")
+
+
+def judge_error(own, alert_text):
+    """判定"页面是否明确报错"。返回 (has_error, structural, text)。
+
+    规则（R376-01）：
+      - **结构性错误独立判定，绝不受正文长度影响**：页面级 alert 里出现错误词即算。
+        旧版用 `own.length < 200` 同时管住了结构性错误，长正文会屏蔽真实错误。
+      - 正文内错误词只作辅助：仅当**整条正文就是一句错误提示**时成立；
+        长正文里提到"网络错误"（在讨论它）不算。
+    """
+    alert_text = (alert_text or "").strip()
+    structural = any(p in alert_text for p in ERROR_PATTERNS)
+    own = (own or "").strip()
+    text_err = False
+    if own and len(own) < 200:
+        core = own.splitlines()[0] if own.splitlines() else ""
+        core = core.strip().rstrip("\t\r\n .。！!")
+        text_err = core in ERROR_PATTERNS
+    return (structural or text_err), structural, text_err
 
 def reply_snapshot(c):
     """取 assistant 消息的**当前快照**（条数 + 最后一条正文 + 是否仍在生成）。
@@ -84,11 +104,15 @@ def reply_snapshot(c):
         return None
     if not isinstance(d, dict):
         return None
+    last = d.get("last") or ""
+    has_err, structural, text_err = judge_error(last, d.get("alert_text"))
     return {
         "count": int(d.get("count") or 0),
-        "last": d.get("last") or "",
+        "last": last,
         "streaming": bool(d.get("streaming")),
-        "hasError": bool(d.get("hasError")),
+        "hasError": has_err,
+        "structuralError": structural,
+        "textError": text_err,
     }
 
 
@@ -111,6 +135,7 @@ def reply_after(c, baseline, settle_tries=8, settle_gap=1.5, stable_need=2):
     snap = None
     stable_run = 0
     prev_text = None
+    text = ""          # R376-02：全空档（始终没有新消息）时也不能未绑定后访问
     # 预算按"轮数"控制（不是墙钟），否则 settle_gap=0 的测试会立刻过期，
     # 真实运行时也不会因为单次 evaluate 慢就把本该拿到的回复判成 partial。
     for _ in range(max(1, int(settle_tries))):
@@ -122,7 +147,7 @@ def reply_after(c, baseline, settle_tries=8, settle_gap=1.5, stable_need=2):
             prev_text = None
             time.sleep(settle_gap)     # 还没出现新消息，继续等
             continue
-        text = snap["last"]
+        text = snap["last"] or ""
         if snap["streaming"]:
             stable_run = 0             # 还在生成，稳定序列中断
         elif prev_text is None or text != prev_text:
