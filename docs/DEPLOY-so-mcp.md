@@ -60,10 +60,11 @@ many commits, at one path or several. The evidence is the combination of
 - the blob ID that commit records for that path, and
 - the verifier's comparison of the deployed file against that blob.
 
-SHA-256 of the raw and LF-normalized bytes is recorded as well. It makes line
-ending drift diagnosable and is a second, independent content check. It does
-not replace the commit identity carried by the blob ID and the manifest
-commit.
+SHA-256 of the raw and LF-normalized bytes is recorded as well. The gate is
+the LF-normalized digest: a file whose LF-normalized content matches passes,
+and a difference in the raw bytes alone is reported as `EOL_DRIFT`, which
+`--strict` turns into a failure. The blob ID remains the commit-linked
+identity; a blob difference is reported when the content itself differs.
 
 A deployment is attributable to a commit only when all of the following hold:
 
@@ -108,6 +109,10 @@ git fetch origin main
 git rev-parse --verify '<FULL_40_HEX_SHA>^{commit}'
 git show -s --format='commit=%H%ncommitter_time=%ct' '<FULL_40_HEX_SHA>'
 ```
+
+`committer_time` is recorded for provenance only. It is not an acceptance
+criterion; section 8 establishes production equality from content, not from
+timestamps.
 
 Create a clean candidate from that exact commit:
 
@@ -229,10 +234,12 @@ PREV="/opt/so-mcp.prev-$SHORT"
 
 test -d /opt/so-mcp
 test ! -e "$PREV"
-touch -m "$TMP"
 mv /opt/so-mcp "$PREV"
 mv "$TMP" /opt/so-mcp
 ```
+
+Do not `touch` the new directory. Its mtime is an observation, not evidence;
+section 8 explains why and what replaced that condition.
 
 The service uses `WorkingDirectory=/opt/so-mcp`; this directory swap
 keeps the configured path stable. There is a short interval between
@@ -543,7 +550,7 @@ Run the following from the trusted checkout. Replace the placeholder with the
 full 40-character commit SHA selected for deployment.
 
 ```bash
-COMMIT=<FULL_40_HEX_SHA>
+COMMIT='<FULL_40_HEX_SHA>'
 
 sudo python3 tools/gen_manifest.py \
   --repo "$PWD" \
@@ -566,12 +573,13 @@ The command needs permission to read the environment file and the database and
 to write `/etc/so-mcp/manifest.json`. The manifest records hashes and metadata
 for the external objects; it does not copy the environment file's contents.
 
-The generator requires the database path to be absolute and to resolve to an
-existing, non-empty file. That catches a mistyped path, an unmounted volume, or
-a database that does not exist yet at manifest-generation time; the verifier
-checks the same path again at deployment-verification time. Asking for required
-columns without a database path is an error, not a contract that gets silently
-dropped.
+The generator rejects a database path that is not absolute or does not name an
+existing file. That catches a mistyped path or an unmounted volume at
+manifest-generation time; the verifier opens the same path again at
+verification time and checks the required columns. The generator does not
+inspect the file's contents or its size: an empty or corrupt database passes
+generation and fails verification. Asking for required columns without a
+database path is an error, not a contract that gets silently dropped.
 
 The database contract requires the listed columns to exist. In particular,
 `authority_landing_events.attempt_id` must be present after the P1/P2
@@ -651,51 +659,144 @@ sudo /opt/so-mcp/.venv/bin/python /opt/so-mcp/tools/verify_deploy.py \
 A successful non-strict run may contain `EOL_DRIFT` warnings. It must
 not contain any other issue. A strict run treats EOL drift as failure.
 
-## 8. Proving the production commit without network access
+## 8. Proving the deployed tree matches main
 
-An offline server cannot independently prove that a commit is the
-current GitHub `main` tip. It can prove only that its deployed files
-match the commit SHA recorded in its manifest.
+Production equality is established by content identity, not by the order of
+timestamps.
 
-The stronger statement "production = <SHA>" is permitted in the
-change record only when all three conditions are satisfied:
+The claim "production = `<SHA>`" is permitted only when all three conditions
+hold:
 
-1. `verify_deploy.py` passes against the production root and manifest.
-2. The manifest's full `commit` equals the full SHA obtained from
-   `git rev-parse main` in a trusted checkout whose `main` was
-   refreshed from GitHub for this deployment.
-3. The deployment root directory modification time is later than
-   that commit's committer timestamp.
+1. **Trusted source.** The manifest's `commit` is an ancestor of the current
+   trusted `origin/main`.
+2. **Managed tree equality.** The manifest commit and the current
+   `origin/main` agree, blob for blob, on every path listed in
+   `deploy/paths.txt` — content, file type, and presence.
+3. **Production equality.** `verify_deploy.py` passes against the production
+   root and the manifest, in both the default and `--strict` modes.
 
-On the trusted connected operator checkout:
+The verifier matches each deployed file against the manifest, which records
+both the commit's blob ID and the digest of the deployed content. A file passes
+when its LF-normalized content matches; a raw-byte difference is reported as
+`EOL_DRIFT` and fails under `--strict`. That is why condition 3 requires both
+modes. Conditions 2 and 3 then chain to:
 
-```bash
-git fetch origin main
-MAIN_SHA="$(git rev-parse main)"
-MAIN_TIME="$(git show -s --format=%ct "$MAIN_SHA")"
+```
+deployed managed tree == manifest commit managed tree
+                      == current origin/main managed tree
 ```
 
-On the production host, run the verifier and inspect the manifest
-commit and directory timestamp:
+Run the source and tree checks from a checkout that can reach the trusted
+remote. The production host does not need a `.git` directory, and it does not
+need network access; the comparison happens where the trusted reference lives.
+
+```bash
+set -euo pipefail
+
+REPO=/path/to/trusted/checkout
+MANIFEST_SHA='<commit recorded in /etc/so-mcp/manifest.json>'
+
+git -C "$REPO" fetch origin main
+MAIN_SHA="$(git -C "$REPO" rev-parse 'origin/main^{commit}')"
+
+# The comparison set is deploy/paths.txt, the same list the archive
+# selection and the manifest use.
+# Read the list from the reference commit, not from the working tree:
+# the comparison is between two commits, and a stale checkout must not
+# define what gets compared.
+mapfile -t MANAGED \
+  < <(git -C "$REPO" show "$MAIN_SHA:deploy/paths.txt" \
+      | grep -vE '^[[:space:]]*(#|$)')
+
+if ! git -C "$REPO" merge-base --is-ancestor "$MANIFEST_SHA" "$MAIN_SHA"; then
+  echo "SOURCE: FAIL - manifest commit is not in origin/main history" >&2
+  exit 1
+fi
+
+if ! git -C "$REPO" diff --quiet \
+    "$MANIFEST_SHA" "$MAIN_SHA" -- "${MANAGED[@]}"; then
+  echo "MANAGED TREE: FAIL - managed paths differ from origin/main" >&2
+  git -C "$REPO" diff --stat \
+    "$MANIFEST_SHA" "$MAIN_SHA" -- "${MANAGED[@]}" >&2
+  exit 1
+fi
+
+echo "SOURCE AND MANAGED TREE: PASS"
+echo "manifest_commit=$MANIFEST_SHA"
+echo "main_commit=$MAIN_SHA"
+```
+
+If `git fetch` fails, the script exits before evaluating anything. That is the
+correct outcome: conditions 1 and 2 compare against a reference that has to be
+current, and an unreachable remote means there is no current reference. A local
+`main` that was not refreshed for this check is not a substitute. Record the
+check as not performed rather than as passed.
+
+Then, on the production host:
 
 ```bash
 sudo /opt/so-mcp/.venv/bin/python /opt/so-mcp/tools/verify_deploy.py \
   --root /opt/so-mcp \
   --manifest /etc/so-mcp/manifest.json
 
-MANIFEST_SHA="$(python3 -c \
-  'import json; print(json.load(open("/etc/so-mcp/manifest.json"))["commit"])')"
-DEPLOY_MTIME="$(stat -c %Y /opt/so-mcp)"
+sudo /opt/so-mcp/.venv/bin/python /opt/so-mcp/tools/verify_deploy.py \
+  --root /opt/so-mcp \
+  --manifest /etc/so-mcp/manifest.json \
+  --strict
 ```
 
-Compare `MANIFEST_SHA` with the trusted `MAIN_SHA`, and
-`DEPLOY_MTIME` with `MAIN_TIME`. All three conditions must be true.
+Both runs must print `DEPLOY VERIFY OK` with no issues.
 
-If the server is offline and the operator has not brought the trusted
-`MAIN_SHA` and `MAIN_TIME` into the deployment record through an
-authenticated channel, the correct status is:
+### Interpreting the result
 
-"deployed tree matches manifest commit <SHA>; current GitHub main
-equivalence not independently established."
+| Outcome | Meaning |
+|---|---|
+| All three conditions pass | Production managed tree equals current `main`. |
+| Condition 1 fails | The manifest names a commit outside `main` history; no trusted source relationship exists. |
+| Condition 2 fails | Managed content on `main` has moved; production or the manifest has not caught up. |
+| Condition 3 fails | Production disagrees with the manifest on a file, an external object, or the database contract. |
 
-Do not write "production = <SHA>" based on the manifest alone.
+If the operator has not brought a trusted `origin/main` reference into the
+deployment record through an authenticated channel, the correct status is
+narrower: "deployed tree matches manifest commit `<SHA>`; equivalence with
+current `main` not established." Do not write "production = `<SHA>`" from the
+manifest alone.
+
+### The manifest does not have to track the tip
+
+A manifest commit that is an ancestor of `main`, with an identical managed
+tree, is sufficient. Commits that touch only `docs/`, `tests/`, CI
+configuration, or any other unmanaged path do not require regenerating the
+manifest or redeploying: the managed content did not change, and condition 2
+still holds against the newer tip.
+
+Regenerate and redeploy when a managed path changes, or when `deploy/paths.txt`
+itself changes — a change to the managed set has to be reviewed as a change to
+the contract, not waved through as documentation.
+
+The manifest continues to record the commit it was actually generated from.
+This section removes the requirement that it always name the tip; it does not
+authorise rewriting a manifest's commit field to a revision whose content was
+never deployed.
+
+### Why the timestamp condition was removed
+
+An earlier revision of this section required the deployment root's directory
+mtime to be later than the tip commit's committer timestamp. Two failures made
+that unsound:
+
+- A directory mtime changes when the directory is swapped, and not otherwise.
+  Any commit that leaves the managed paths untouched — documentation, tests,
+  CI — advances the tip and turns a correct deployment into a reported
+  failure.
+- The cheapest way to satisfy it was `touch /opt/so-mcp`. That fabricates the
+  evidence the condition was meant to establish, and it does so without
+  changing a single deployed byte.
+
+Git committer timestamps are commit metadata, not a trustworthy record of when
+something was installed. The directory mtime stays useful as an operational
+observation — it is how the deployment window is found in the journal — but it
+is not a pass/fail condition, and it must not be manufactured.
+
+Deployment time is established by the deployment log and the change record,
+not by comparing a directory mtime with a commit timestamp.
