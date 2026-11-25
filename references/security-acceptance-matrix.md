@@ -178,7 +178,7 @@ deletion.
 | # | Scenario | Expected | Evidence | Status |
 |---|---|---|---|---|
 | 12 | Caller constructs its own landing evidence and passes it to `link_session` | Rejected outright **even when a valid unclaimed landing event exists**. `LandingEvidence` no longer exists in the source; any non-`None` `evidence` raises. | `test:test_caller_supplied_evidence_is_rejected_even_with_valid_landing` `test:test_caller_supplied_evidence_is_rejected` `test:test_caller_supplied_evidence_is_rejected_by_authority` `test:test_plain_ids_convref_and_booleans_are_not_evidence_inputs` `code:link_session` (`if evidence is not None: raise`) | PROVEN `mutation-checked` |
-| 13 | No server-recorded landing event exists for the conversation | `QuarantineNotCleared`. Nothing is written. | `test:test_link_requires_server_recorded_landing` `test:test_unconfirmed_f13_evidence_is_rejected` | PROVEN `mutation-checked` |
+| 13 | No server-recorded landing event exists for the conversation | `QuarantineNotCleared`. | `test:test_link_requires_server_recorded_landing` `test:test_unconfirmed_f13_evidence_is_rejected` | PROVEN `mutation-checked` |
 | 14 | A confirmed event is consumed, then replayed | Second attempt fails. Consumption and link creation happen in one transaction. | `test:test_confirmed_complete_landing_can_be_consumed_once` `test:test_event_replay_cannot_create_a_second_link` `code:link_session` (`consumed_at IS NULL` → `UPDATE consumed_at` → `INSERT session_links`) | PROVEN `mutation-checked` |
 | 15 | Landing is `mismatch`, `ambiguous`, or evidence incomplete; or the send returned 409 | No event recorded, no link. Fail closed. | `test:test_mismatch_ambiguous_and_incomplete_landing_fail_closed` `test:test_mismatch_409_does_not_record_or_link` `test:test_ambiguous_multiple_ids_do_not_record_or_link` `test:test_incomplete_reply_does_not_record_or_link` `test:test_missing_archive_file_does_not_record_a_landing_event` | PROVEN `mutation-checked` |
 
@@ -193,6 +193,18 @@ refusal, asserts the event is still unconsumed and no `session_links` row was
 written, and then links the same session without evidence to prove the seeded
 event was usable. Mutation check: with the guard deleted, the old case stays
 green and only the new one fails.
+
+**Row 13 note — a clause that no case watched.** The Expected cell used to add
+"Nothing is written." Both named cases assert the refusal and stop there:
+`test_link_requires_server_recorded_landing` raises and never looks at
+`session_links`, and `test_unconfirmed_f13_evidence_is_rejected` asserts the
+error string `QUARANTINED_SESSION`. Delete the landing requirement and both go
+red, so the refusal is held. Reverse the order inside `link_session` — insert the
+link, then raise — and both stay green while a quarantined session is linked.
+The property is true of the code: the guard returns before the first `INSERT`.
+It was never true of a test, so it is not in the table any more. Row 12's landing
+case does assert `link_count == 0`, for its own path; nothing does so for this
+one, and that asymmetry is now visible in how the two rows read.
 
 **Row 15 note — nine conjuncts, two of them load-bearing.** The landing
 decision in `scripts/chatgpt_send.py` is a conjunction of nine conditions.
