@@ -604,7 +604,7 @@ PoW 算法、POST 请求体全字段、SSE 解析、mapping tail 计算等实现
 
 ## 代码仓库
 
-代码与协议文档已仓库化：<https://github.com/oahcom/chatgpt-session-ops>（公开）。仓库只含代码与文档，凭据、`replies/`、状态 json 全部由 `.gitignore` 排除；同步时只拷 `SKILL.md`、`references/`、`scripts/*.py`，勿带本机运行态。
+代码与协议文档已仓库化：<https://github.com/oahcom/chatgpt-session-ops>（公开）。仓库只含代码与文档，凭据、`replies/`、状态 json 全部由 `.gitignore` 排除；**发布拷哪些文件以 B 侧 `docs/RELEASE-AUTHORITY.md` §2 的显式白名单为唯一权威**（本文不复述清单——复述必与政策分叉，此前那句「只拷 `SKILL.md`、`references/`、`scripts/*.py`」就与白名单相矛盾，已删）；勿带本机运行态。
 
 **备份文件（`.bak-<ts>` / `.corrupt-<ts>`）同属敏感物**：它们是凭据与私有会话 id 的历史快照，与正本同等级。`.gitignore` 已用 `*.bak-*` / `*.corrupt-*` 覆盖（此前只有精确文件名规则，`cookies.json.bak-20261121-191330` 这类副本能溜进仓库）。处置纪律：审计确认正本已完全覆盖备份内容后即删，不留档；**不要**把凭据备份丢进云同步目录。
 
