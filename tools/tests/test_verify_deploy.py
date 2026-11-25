@@ -144,6 +144,35 @@ class VerifyDeployTests(unittest.TestCase):
         self.assertIn("CONTENT_MISMATCH", codes)
         self.assertIn("GIT_BLOB_MISMATCH", codes)
 
+    def test_blob_mismatch_is_independent_of_lf_and_raw_hashes(self) -> None:
+        manifest = json.loads(
+            self.manifest_path.read_text(encoding="utf-8")
+        )
+        manifest["files"][0]["git_blob_sha1"] = "f" * 40
+        self.manifest_path.write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            any(
+                issue["code"] == "GIT_BLOB_MISMATCH"
+                and issue["path"] == "app.py"
+                for issue in result["issues"]
+            ),
+            result["issues"],
+        )
+        self.assertFalse(
+            any(
+                warning["code"] == "EOL_DRIFT"
+                for warning in result["warnings"]
+            ),
+            result["warnings"],
+        )
+
     def test_symlinked_managed_directory_is_rejected(self) -> None:
         pkg = self.root / "pkg"
         pkg.mkdir()

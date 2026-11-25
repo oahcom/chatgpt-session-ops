@@ -190,11 +190,11 @@ def verify(
 
         # Check symlinks before is_dir(): Path.is_dir() follows symlinks.
         # rglob yields the symlink directory itself but does not descend
-        # into it. A symlink anywhere on a managed path is a failure: the
-        # commit tree carries none, so one in the deployment root did not
-        # come from the commit. Unmanaged paths that the allow-list covers
-        # are exempt, because a virtualenv legitimately contains links to
-        # its interpreter.
+        # into it. A link on a managed path, or on any ancestor of one, is
+        # a failure: the commit carries no links. Links that the allow-list
+        # covers are exempt and their targets are not content-verified;
+        # that exemption is about unmanaged paths, not about ancestors of
+        # managed ones, which are caught above.
         if path.is_symlink():
             covers_managed = rel in expected or any(
                 managed_rel.startswith(rel + "/") for managed_rel in expected
@@ -273,12 +273,11 @@ def verify(
             )
 
         # Compare Git blob identity independently of the LF content check.
+        # Keep this comparison independent: otherwise a bad manifest blob
+        # can pass whenever the LF and raw SHA-256 happen to match.
         # A raw-byte difference with matching LF-normalized content is
-        # classified as EOL drift, not as a content identity failure.
-        eol_drift = (
-            lf_matches
-            and (not raw_matches or not blob_matches)
-        )
+        # line-ending drift, not a content identity failure.
+        eol_drift = lf_matches and not raw_matches
 
         if not blob_matches and not eol_drift:
             add_issue(
