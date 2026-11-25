@@ -38,11 +38,12 @@ python -m unittest tests.test_mcp_rs256                  # 8
 python -m unittest tests.test_mcp_sdk_integration        # 4 (skips without mcp)
 python -m unittest tests.test_cdp_import_order           # 13
 python -m unittest tests.test_security_matrix            # 7 (this file)
+python -m unittest tests.test_landing_identity_contract  # 6
 python -m pytest -q                                      # must be green; total not restated
 ```
 
 The module counts above are the ones a reader can check in a single command: the
-seven that back this table's rows, `test_security_matrix`, which validates the
+eight that back this table's rows, `test_security_matrix`, which validates the
 table itself, and `test_cdp_import_order`, which backs no row here and is listed
 only because it is the module whose arrival moved the number this block used to
 carry. The whole-suite total is deliberately not restated. It moves whenever any
@@ -207,15 +208,20 @@ listed as an uncovered branch rather than counted as evidence.
 | # | Scenario | Expected | Evidence | Status |
 |---|---|---|---|---|
 | 12 | Caller constructs its own landing evidence and passes it to `link_session` | Rejected outright **even when a valid unclaimed landing event exists**. `LandingEvidence` no longer exists in the source; any non-`None` `evidence` raises. | `test:test_caller_supplied_evidence_is_rejected_even_with_valid_landing` `test:test_caller_supplied_evidence_is_rejected` `test:test_caller_supplied_evidence_is_rejected_by_authority` `test:test_plain_ids_convref_and_booleans_are_not_evidence_inputs` `code:link_session` (`if evidence is not None: raise`) | PROVEN `mutation-checked` |
-| 13 | No server-recorded landing event exists for the conversation | `QuarantineNotCleared`. | `test:test_link_requires_server_recorded_landing` `test:test_unconfirmed_f13_evidence_is_rejected` | PROVEN `mutation-checked` |
-| 14 | A confirmed event is consumed, then replayed | Second attempt fails. Consumption and link creation happen in one transaction. | `test:test_confirmed_complete_landing_can_be_consumed_once` `test:test_event_replay_cannot_create_a_second_link` `code:link_session` (`consumed_at IS NULL` → `UPDATE consumed_at` → `INSERT session_links`) | PROVEN `mutation-checked` |
+| 13 | No server-recorded landing event exists for the conversation, or the event that exists is bound to a different `attempt_id` or a different WorkItem | `QuarantineNotCleared`. The event stays unconsumed and unrejected: it belongs to the attempt that produced it. | `test:test_link_requires_server_recorded_landing` `test:test_unconfirmed_f13_evidence_is_rejected` `test:test_t2_landing_for_attempt_one_cannot_be_consumed_by_attempt_two` `test:test_t1_landing_for_work_item_a_cannot_be_consumed_by_work_item_b` | PROVEN `mutation-checked` |
+| 14 | A confirmed event is consumed and then replayed; or a second landing arrives for a session that already holds an active link | The replay fails. Consumption and link creation happen in one transaction. The second landing is rejected terminally — `rejected_at` and `rejection_reason = 'session_already_linked'` are written in a separate transaction after the link transaction rolls back, and a failure to write them propagates instead of marking the event rejected. | `test:test_confirmed_complete_landing_can_be_consumed_once` `test:test_event_replay_cannot_create_a_second_link` `code:link_session` (`consumed_at IS NULL` → `UPDATE consumed_at` → `INSERT session_links`) `test:test_t3_duplicate_active_session_link_rejects_second_landing_terminally` `test:test_t6_failure_while_recording_rejection_propagates_and_does_not_mark` | PROVEN `mutation-checked` |
 | 15 | Landing is `mismatch`, `ambiguous`, or evidence incomplete; or the send returned 409 | No event recorded, no link. Fail closed. | `test:test_mismatch_ambiguous_and_incomplete_landing_fail_closed` `test:test_mismatch_409_does_not_record_or_link` `test:test_ambiguous_multiple_ids_do_not_record_or_link` `test:test_incomplete_reply_does_not_record_or_link` `test:test_missing_archive_file_does_not_record_a_landing_event` | PROVEN `mutation-checked` |
 
 **Row 12 note.** The original evidence for this row was
-`test_caller_supplied_evidence_is_rejected`, which runs on a session with no
-landing event at all — so the *neighbouring* check (`landing is None`)
-raised first, and deleting the `evidence is not None` guard left the test
-green. The row was PROVEN on a case that could not see its own subject.
+`test_caller_supplied_evidence_is_rejected`, which seeds no landing event — so
+the *neighbouring* check (`landing is None`) raised first, and deleting the
+`evidence is not None` guard left the test green. It still cannot see its own
+subject: `f9d88c5` made `attempt_id` the fourth positional parameter, and that
+case passes a dict where the id belongs, so it now stops at the attempt-id shape
+check before reaching either guard. The row is PROVEN on
+`test_caller_supplied_evidence_is_rejected_even_with_valid_landing`, which seeds
+a landing, passes a real attempt id, and asserts the refusal plus
+`consumed_at is None`, `rejected_at is None` and `link_count == 0`.
 
 The replacement seeds a confirmed, complete, unconsumed event first, asserts the
 refusal, asserts the event is still unconsumed and no `session_links` row was
@@ -234,6 +240,39 @@ The property is true of the code: the guard returns before the first `INSERT`.
 It was never true of a test, so it is not in the table any more. Row 12's landing
 case does assert `link_count == 0`, for its own path; nothing does so for this
 one, and that asymmetry is now visible in how the two rows read.
+
+`f9d88c5` then bound the event to a `(work_item_id, attempt_id)` pair, and the
+binding is enforced **three times**: filtered in the landing `SELECT`, filtered
+again in the consuming `UPDATE`, and the `consumed != 1` check turns a lost race
+into `QuarantineNotCleared`. Removing any one of the three leaves the whole
+suite green; removing the filter from all three turns `t2` red, twice in a row,
+and the WorkItem half behaves the same way on `t1`. That is redundancy, not
+coverage: an edit that deletes one filter and keeps two is caught by nothing.
+
+The attempt id is also checked by shape before any query — `att_` plus a
+canonical lowercase UUIDv4, in `link_session` and again in
+`_record_trusted_landing`. Deleting that check leaves the suite green *except*
+for `test_caller_supplied_evidence_is_rejected`, which passes a dict where the
+attempt id belongs: the old blind case from row 12 now holds a new guard by
+accident. Repairing that test to pass a real attempt id would silently unhold
+the shape check, which is why the coupling is written down here rather than
+discovered by whoever does the repair.
+
+**Row 14 note — the rejection is a second transaction, and the cases know it.**
+`reject_after_rollback` opens its own connection, takes `BEGIN IMMEDIATE`,
+updates the exact pending row and commits; a failure to persist is re-raised
+rather than swallowed, because the caller must not report REJECTED unless that
+transaction committed. Replacing both call sites with a no-op turns `t3` and
+`t6` red, twice each. Deleting the `rejected_at IS NULL` predicates everywhere —
+ten sites — also turns `t3` red, and that is what makes "terminal" mean
+terminal: a rejected event is never reconsidered.
+
+Both rows were re-measured on `f9d88c5` with a harness that collects `SUBFAILED`
+as well as `FAILED`. The earlier version read only `FAILED`, which reports a
+`subTest` failure as a pass; every value in these two notes was taken after that
+fix, and one mutation that the broken harness called green
+(`match = 'confirmed'` removed at six sites) is in fact red on this row's
+`test_mismatch_ambiguous_and_incomplete_landing_fail_closed`.
 
 **Row 15 note — nine conjuncts, two of them load-bearing.** The landing
 decision in `scripts/chatgpt_send.py` is a conjunction of nine conditions.
@@ -416,7 +455,7 @@ These are gaps, stated so nobody reads the rows above as completeness.
 | Gap | Why it is not covered | Consequence |
 |---|---|---|
 | In-process code execution | Python privacy is not a boundary. `_record_trusted_landing` is a plain method; anything running in the SO process can call it and can also write the SQLite file directly. | B1 is closed against a **remote** caller only. Requires deployment isolation. |
-| Landing event bound to a WorkItem | `authority_landing_events` stores `session_id` but not `work_item_id`. | If signing succeeds and linking fails, the unconsumed event can be claimed by another WorkItem that holds `write` on that conversation. Bounded, accepted, recorded. |
+| Landing events never expire | `authority_landing_events` has `created_at` but no expiry, and nothing sweeps pending rows. | A confirmed event that was never consumed can still be spent much later by the attempt that knows its `attempt_id`. That needs the id and `write` on the WorkItem, so it is a replay window rather than a bypass. Stated, not closed. |
 | A mandatory corporate proxy | `ProxyHandler({})` is passed unconditionally, so a deployment that can only reach the identity provider through a proxy fails to fetch JWKS. | Fail closed, deliberately: the alternative is an address check describing a host the process never contacts. Stated here rather than solved. |
 | The pinned address has no failover | Only the first validated answer is dialled. A host with several public addresses loses the rest if the first one is down. | Availability, not security. Retrying a second answer would reintroduce the resolution the pin exists to remove. |
 | Mutation coverage is not uniform | Row 16 carries the mark for its lock only, and row 3 for the layer its case actually observes. Every other row carries it outright. | The two that do not are named individually with a reason. Treat an unmarked claim as "asserts the behaviour", not "proven necessary" — that is exactly how row 12 stayed PROVEN for three commits. |
