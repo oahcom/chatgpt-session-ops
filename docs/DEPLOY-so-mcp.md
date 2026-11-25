@@ -42,36 +42,45 @@ was one PR older and lacked two SSRF protections introduced by #42:
 A file-existence check cannot detect this class of failure. It sees a file at
 the expected path and learns nothing about which revision supplied its bytes.
 
-The verifier therefore uses Git blob object IDs as the content identity of
-managed files. A blob ID is
+The manifest records Git blob object IDs for managed files. A blob ID is
 
     SHA1("blob " + decimal_byte_length + NUL + file_bytes)
 
 which is the same object identity `git hash-object` computes for those bytes.
-It lets the verifier compare a deployed file against the blob ID recorded in a
-manifest generated from a specific commit, even when the deployment host has
-no `.git` directory.
+It names a file's content without requiring a `.git` directory on the
+deployment host, which is why it is the field an operator cross-checks against
+the selected commit.
 
 A blob ID identifies content, not a commit: identical content can appear in
-many commits, at one path or several. The evidence is the combination of
+many commits, at one path or several. Binding a path to a blob ID and a commit
+is the manifest's claim, and the verifier does not resolve that claim against
+git.
 
 - the full commit SHA selected as the deployment source,
-- the repository-relative path,
-- the blob ID that commit records for that path, and
-- the verifier's comparison of the deployed file against that blob.
+- the repository-relative path, and
+- the blob ID that commit records for that path.
 
 SHA-256 of the raw and LF-normalized bytes is recorded as well. The gate is
 the LF-normalized digest: a file whose LF-normalized content matches passes,
 and a difference in the raw bytes alone is reported as `EOL_DRIFT`, which
-`--strict` turns into a failure. The blob ID remains the commit-linked
-identity; a blob difference is reported when the content itself differs.
+`--strict` turns into a failure.
+
+The blob comparison runs only when the LF-normalized digest has already
+differed, so it labels a failure the run has already recorded rather than
+adding an independent gate. The blob ID in the list above is a field to
+cross-check by hand; see "What a passing run does not prove" in section 7.
 
 A deployment is attributable to a commit only when all of the following hold:
 
-1. The manifest names a full commit SHA, not a branch or tag.
+1. The manifest names a full commit SHA, not a branch or tag, and that SHA was
+   resolved to a commit in a trusted checkout (`git rev-parse --verify
+   '<SHA>^{commit}'`). The verifier checks the shape of the field, not that the
+   value names a commit, so this condition is met by resolving it, not by the
+   verifier passing.
 2. The manifest's managed path list is exactly the intended deployment
-   selection.
-3. Every deployed managed file passes verification against that manifest.
+   selection, and is not empty.
+3. Every deployed managed file passes verification against that manifest, and
+   the deployment root contains no symbolic links.
 4. Required external objects pass their recorded hash checks.
 5. The database contract is present in the manifest and its required columns
    pass verification.
@@ -659,6 +668,71 @@ sudo /opt/so-mcp/.venv/bin/python /opt/so-mcp/tools/verify_deploy.py \
 A successful non-strict run may contain `EOL_DRIFT` warnings. It must
 not contain any other issue. A strict run treats EOL drift as failure.
 
+### What a passing run does not prove
+
+`DEPLOY VERIFY OK` means the files the verifier could see matched the hashes in
+the manifest it was given. It does not establish that the manifest describes
+the named commit, and there are trees it cannot see. The following are measured
+properties of `tools/verify_deploy.py`, not cautions about misuse.
+
+**The commit is a label, not a check.** The verifier never invokes `git`. It
+requires `commit` to be 40 lowercase hex characters and prints it back
+unchanged, so a manifest naming `0000000000000000000000000000000000000000`
+passes. The SHA becomes evidence only through the rule above that the manifest
+is generated on the trusted checkout, and through section 8's source and
+managed-tree checks. Do not cite the verifier's exit status as proof of the
+commit it names.
+
+**A symlinked directory is skipped silently.** The tree walk does not descend
+into it, `Path.is_dir()` follows it so the "managed files must be regular
+files" check never sees it, and the missing-file check `(root / rel).is_file()`
+follows it as well, so nothing is reported missing. The managed files
+underneath are never read. Measured: a manifest carrying the authentic hashes
+for `pkg/auth.py`, produced exactly as described above, against a root where
+`pkg/` is a symlink to a directory holding a different `auth.py`, prints
+`DEPLOY VERIFY OK: 1 files, 0 external objects` and exits 0. The same bytes in
+a real `pkg/` directory produce `CONTENT_MISMATCH`. Only a symlinked *file* is
+rejected, as `UNEXPECTED_SYMLINK`.
+
+Confirm the deployed tree holds no links before trusting a pass:
+
+```bash
+sudo find /opt/so-mcp -type l -print
+```
+
+Any output invalidates the run. The commit tree carries no symbolic links, so a
+link in the deployment root did not come from the commit: rebuild the root from
+the recorded commit and verify again. `git archive` preserves links rather than
+dropping them, so check the rebuilt root the same way instead of assuming the
+extraction removed them.
+
+**`checked_files` counts manifest entries, not verified files.** The banner's
+`N files` is the length of `manifest["files"]`. A run that read no file bodies
+still announces files, so read that number as the size of the manifest, not the
+size of the evidence.
+
+**The blob ID is not an independent check.** `git_blob_sha1` is compared only
+inside the branch that has already recorded `CONTENT_MISMATCH`. When the
+LF-normalized SHA-256 matches, the blob is never read. The SHA-256 pair is the
+content check that actually runs. Measured: replacing the blob comparison with
+`if False and ...` leaves every test in `tools/tests` passing.
+
+**An empty managed list passes.** `files: []` returns `ok` with
+`checked_files: 0`. `tools/gen_manifest.py` refuses to produce such a manifest
+(`the explicit managed path list is empty`); the verifier does not refuse to
+accept one, so a truncated manifest passes vacuously.
+
+**`allowed_unmanaged` is taken from the manifest.** A `*` entry matches every
+path, including across `/`, and suppresses `UNMANAGED_FILE` for the whole tree.
+The patterns in the command above are the reviewed set; any other entry is an
+unreviewed exclusion.
+
+None of this argues against running the verifier. It argues for running it on a
+tree extracted from the recorded commit, with a manifest generated on the
+trusted checkout, with the link check above returning nothing, and for reading
+the result as "these bytes match this manifest" rather than "these bytes came
+from this commit".
+
 ## 8. Proving the deployed tree matches main
 
 Production equality is established by content identity, not by the order of
@@ -673,13 +747,14 @@ hold:
    `origin/main` agree, blob for blob, on every path listed in
    `deploy/paths.txt` — content, file type, and presence.
 3. **Production equality.** `verify_deploy.py` passes against the production
-   root and the manifest, in both the default and `--strict` modes.
+   root and the manifest, in both the default and `--strict` modes, and
+   `find /opt/so-mcp -type l -print` returns nothing (section 7).
 
-The verifier matches each deployed file against the manifest, which records
-both the commit's blob ID and the digest of the deployed content. A file passes
-when its LF-normalized content matches; a raw-byte difference is reported as
-`EOL_DRIFT` and fails under `--strict`. That is why condition 3 requires both
-modes. Conditions 2 and 3 then chain to:
+The verifier compares each deployed file against the manifest, which records
+both a blob ID for the path and the digest of the deployed content. A file
+passes when its LF-normalized content matches; a raw-byte difference is
+reported as `EOL_DRIFT` and fails under `--strict`. That is why condition 3
+requires both modes. Conditions 2 and 3 then chain to:
 
 ```
 deployed managed tree == manifest commit managed tree
@@ -755,6 +830,17 @@ Both runs must print `DEPLOY VERIFY OK` with no issues.
 | Condition 1 fails | The manifest names a commit outside `main` history; no trusted source relationship exists. |
 | Condition 2 fails | Managed content on `main` has moved; production or the manifest has not caught up. |
 | Condition 3 fails | Production disagrees with the manifest on a file, an external object, or the database contract. |
+
+A pass on conditions 1–3 says the deployed managed tree equals `main`'s managed
+tree, provided the deployment root is a plain directory tree. Two properties of
+the verifier bound that claim; section 7 states them and how to check for the
+first:
+
+- A symlinked directory is not entered, so managed files beneath it are never
+  read and are not reported missing. The `find … -type l` check in condition 3
+  is what closes this.
+- `commit` is checked for shape only. Condition 1, not the verifier, is what
+  ties the manifest to a trusted commit.
 
 If the operator has not brought a trusted `origin/main` reference into the
 deployment record through an authenticated channel, the correct status is
