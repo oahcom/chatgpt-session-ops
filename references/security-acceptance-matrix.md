@@ -50,6 +50,11 @@ and wrong three hours later when #50 added those same CDP import-order cases.
 The last recorded full-suite snapshot is in `references/baselines.md` §G, with
 its own as-of date and commit; it describes that commit and nothing after it.
 
+These counts are checked by running the commands, not by reading the files:
+`test_work_item_authority` builds its cases in loops, so counting `def test_`
+in the source returns 8 for a module that reports 50, and a guard built on that
+count would have been born red.
+
 **What PROVEN means here, and what it does not.** PROVEN means the named case
 asserts the behaviour *and* the case goes red when the behaviour is deleted.
 That second half is not a formality: row 12 was PROVEN for three commits on a
@@ -425,6 +430,7 @@ the row was downgraded.
 | `streamable_http_path=endpoint_path` → `"/wrong"` | 1 failed — the audience-path case | Row 22 route claim is held. |
 | `is_error=not envelope["ok"]` → `is_error=False` | 1 failed — the unauthenticated `tools/call` case | Row 22 envelope claim is held. |
 | `structured_content=envelope` → `structuredResult=envelope` | 1 failed — pydantic rejects the unknown field | Row 22 field-name claim is held. |
+| `structured_content=envelope` → `structured_content=None` | 1 failed — the client asserts the field is a dict | Spelling is not the claim; the envelope must arrive. |
 | `for name in TOOL_SCHEMAS` → `list(TOOL_SCHEMAS)[:-1]` | 1 failed — the tool-surface case | Row 22 surface claim is held. |
 | `structured_content` → `structuredContent` | **all 4 green** | Equivalent mutant: SDK sets `alias_generator=to_camel` with `populate_by_name=True`. Both spellings are valid. Not a gap. |
 
