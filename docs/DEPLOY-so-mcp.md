@@ -191,9 +191,35 @@ treats `*.bak-*` inside the deployment root as a hard failure; the
 exemption for `.venv/**` and `bin/**` does not extend to them.
 
 Before switching, ensure the candidate has the correct ownership and
-permissions and has passed the verifier. Do not copy `.venv` from an
-older deployment into the new tree. Create or populate the venv from
-the deployment's pinned dependency process.
+permissions and has passed the verifier.
+
+An existing `.venv` may be preserved and moved into the candidate tree only
+when all of the following hold:
+
+- The `requirements-mcp.txt` Git blob is identical between the currently
+  running deployment and the target commit.
+- The Python interpreter version, ABI, operating-system environment, and
+  architecture remain compatible with the existing environment.
+- The existing environment passes its dependency and runtime checks before the
+  directory switch.
+- The environment ends up at its original absolute runtime path after the
+  switch. Do not leave a venv at a different path merely because its directory
+  was moved.
+
+If any condition is not established, rebuild the environment from the pinned
+dependency process. An unchanged requirements file alone is not proof that the
+existing environment is valid.
+
+At minimum, check the environment before the switch:
+
+```bash
+/opt/so-mcp/.venv/bin/python --version
+/opt/so-mcp/.venv/bin/python -m pip check
+```
+
+`pip check` finds dependency conflicts between installed packages. It does not
+prove that the installed set matches the requirements file exactly, so it is
+not an environment-equivalence proof.
 
 Switch the directories only after the database backup and candidate
 checks have succeeded:
@@ -335,6 +361,24 @@ test "$(curl -sS -o /dev/null -w '%{http_code}' \
 
 The unauthenticated MCP request must return 401; a 200 response is
 not an acceptable substitute for the authentication boundary.
+
+The health probe is the root path. `/so-mcp/healthz` is protected by the same
+authentication policy as the rest of `/so-mcp`: it answers 401 without
+credentials, and that 401 means the request reached the authentication layer,
+not that the nginx route is missing.
+
+| Target | Expected |
+|---|---|
+| `/healthz` | 200, the health probe |
+| `/so-mcp` | 401 without credentials |
+| `/so-mcp/healthz` | 401 without credentials; not a routing failure |
+| `/.well-known/oauth-protected-resource/so-mcp` | 200 |
+
+Exempting `/so-mcp/healthz` from authentication would be a new security
+boundary decision, not a deployment fix, and has not been made. If external
+monitoring ever needs an unauthenticated probe there, decide it separately:
+what the endpoint reveals, how far the exemption reaches in nginx location
+matching, and which release authorises it.
 
 Also inspect the service journal for startup errors:
 
@@ -483,8 +527,13 @@ Do not delete the retirement snapshots as part of this cleanup.
 ### Generate the manifest from the trusted commit
 
 The manifest is generated from a trusted checkout and an explicit full commit
-SHA. Do not generate it from the production deployment directory: that would
-turn the files being checked into their own expected values.
+SHA. The commit must come from a trusted checkout; the environment that runs
+the generator must be able to read the external objects and the database that
+the manifest names. In practice that means the production host, or a host with
+the exact production paths mounted and readable.
+
+Do not generate it from the production deployment directory: that would turn
+the files being checked into their own expected values.
 
 Use `deploy/paths.txt` as the authoritative list of repository-managed
 deployment files. It must match the explicit `git archive` selection used in
@@ -496,12 +545,33 @@ full 40-character commit SHA selected for deployment.
 ```bash
 COMMIT=<FULL_40_HEX_SHA>
 
-sudo python3 tools/gen_manifest.py   --repo "$PWD"   --commit "$COMMIT"   --paths-from deploy/paths.txt   --external systemd-unit=/etc/systemd/system/so-mcp.service   --external nginx-snippet=/etc/nginx/snippets/so-mcp.conf   --external environment-file=/etc/so-mcp/so-mcp.env   --db-path /var/lib/so-mcp/work-items.sqlite3   --db-required-column session_links.session_id   --db-required-column authority_landing_events.attempt_id   --allow-unmanaged '.venv/**'   --allow-unmanaged 'bin/**'   --allow-unmanaged '*.pyc'   --allow-unmanaged '**/*.pyc'   --out /etc/so-mcp/manifest.json
+sudo python3 tools/gen_manifest.py \
+  --repo "$PWD" \
+  --commit "$COMMIT" \
+  --paths-from deploy/paths.txt \
+  --external systemd-unit=/etc/systemd/system/so-mcp.service \
+  --external nginx-snippet=/etc/nginx/snippets/so-mcp.conf \
+  --external environment-file=/etc/so-mcp/so-mcp.env \
+  --db-path /var/lib/so-mcp/work-items.sqlite3 \
+  --db-required-column session_links.session_id \
+  --db-required-column authority_landing_events.attempt_id \
+  --allow-unmanaged '.venv/**' \
+  --allow-unmanaged 'bin/**' \
+  --allow-unmanaged '*.pyc' \
+  --allow-unmanaged '**/*.pyc' \
+  --out /etc/so-mcp/manifest.json
 ```
 
 The command needs permission to read the environment file and the database and
 to write `/etc/so-mcp/manifest.json`. The manifest records hashes and metadata
 for the external objects; it does not copy the environment file's contents.
+
+The generator requires the database path to be absolute and to resolve to an
+existing, non-empty file. That catches a mistyped path, an unmounted volume, or
+a database that does not exist yet at manifest-generation time; the verifier
+checks the same path again at deployment-verification time. Asking for required
+columns without a database path is an error, not a contract that gets silently
+dropped.
 
 The database contract requires the listed columns to exist. In particular,
 `authority_landing_events.attempt_id` must be present after the P1/P2
