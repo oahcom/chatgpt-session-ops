@@ -39,11 +39,14 @@ That second half is not a formality: row 12 was PROVEN for three commits on a
 test that stayed green after its guard was removed, and row 4 was CODE_ONLY
 while the guard underneath it had never been executed by any test at all.
 
-Rows marked `mutation-checked` have had that deletion actually performed. Rows
-without the mark have a case that names and asserts the behaviour, but nobody
-has yet deleted the implementation to watch it fail. They are weaker than
-`mutation-checked` even though both currently read PROVEN, and the difference
-is recorded per row rather than averaged away.
+Rows marked `mutation-checked` have had that deletion actually performed. A row
+without the mark would name and assert the behaviour while nobody had deleted the
+implementation to watch it fail; it is weaker than a marked row and recorded as
+such rather than averaged away. As of `a435f09` (#47) no row lacked the mark, so
+the mark alone no longer separates a strong tier from a weak one — the qualifier
+does. "for the claiming layer" and "for the lock" mean the deletion was performed
+and one layer went red, while the rest of the row is covered by the same case
+without being proven necessary; the note under each says which half is which.
 
 **Erratum — the #30 commit title overstates this.** Commit `cca106c` is titled
 "matrix v3 — every PROVEN row now has a deletion behind it". That is a commit
