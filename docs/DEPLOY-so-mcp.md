@@ -671,6 +671,45 @@ sudo /opt/so-mcp/.venv/bin/python /opt/so-mcp/tools/verify_deploy.py \
 A successful non-strict run may contain `EOL_DRIFT` warnings. It must
 not contain any other issue. A strict run treats EOL drift as failure.
 
+A passing run prints a banner and a set of counts:
+
+```text
+DEPLOY VERIFY OK: 9/9 files verified, byte-identical 9/9, 0 external objects
+```
+
+| Field | Meaning |
+|---|---|
+| `expected_files` | Managed entries in the manifest. |
+| `read_files` | Managed files whose bytes were read. |
+| `checked_files` | Read, and no issue in the mode that ran. |
+| `failed_files` | Read, and at least one issue. |
+| `skipped_files` | Managed files not read: absent, behind a link, or unreadable. |
+| `byte_identical_files` | Read files whose raw bytes match the manifest's raw digest. |
+
+`expected_files = checked_files + failed_files + skipped_files` holds for every
+run. `read_files` is never less than `checked_files`.
+
+`verified` in the banner means "read, and no issue in this mode". It does not
+mean byte-identical, and the two are reported separately for that reason.
+Measured on a nine-file managed tree where three files differ from the manifest
+only by CRLF:
+
+```text
+default   DEPLOY VERIFY OK: 9/9 files verified, byte-identical 6/9, 0 external objects
+          WARNINGS: 3 (EOL drift)
+          checked_files 9, failed_files 0, byte_identical_files 6
+
+--strict  DEPLOY VERIFY FAILED: 3 issue(s)
+          checked_files 6, failed_files 3, byte_identical_files 6
+```
+
+The byte-identical count is the same in both modes, because it is computed from
+the per-file raw digest rather than from the issue classification. Cite it when
+a change record needs an unambiguous "how many deployed files are exactly the
+manifest's bytes". Do not derive it by subtracting warnings from
+`checked_files`: a warning need not be EOL drift, and under `--strict` the same
+drift is an issue rather than a warning.
+
 ### What a passing run does not prove
 
 `DEPLOY VERIFY OK` means the files the verifier could see matched the hashes in
@@ -679,23 +718,26 @@ the named commit, and there are trees it cannot see. The following are measured
 properties of `tools/verify_deploy.py`, not cautions about misuse.
 
 **The commit is a label, not a check.** The verifier never invokes `git`. It
-requires `commit` to be 40 lowercase hex characters and prints it back
-unchanged, so a manifest naming `0000000000000000000000000000000000000000`
-passes. The SHA becomes evidence only through the rule above that the manifest
-is generated on the trusted checkout, and through section 8's source and
-managed-tree checks. Do not cite the verifier's exit status as proof of the
-commit it names.
+requires `commit` to be 40 lowercase hex characters, rejects the all-zero and
+all-`f` placeholders, and prints the value back unchanged; any other
+well-formed SHA it has never seen still passes. The SHA becomes evidence only
+through the rule above that the manifest is generated on the trusted checkout,
+and through section 8's source and managed-tree checks. Do not cite the
+verifier's exit status as proof of the commit it names.
 
-**A symlinked directory is skipped silently.** The tree walk does not descend
-into it, `Path.is_dir()` follows it so the "managed files must be regular
-files" check never sees it, and the missing-file check `(root / rel).is_file()`
-follows it as well, so nothing is reported missing. The managed files
-underneath are never read. Measured: a manifest carrying the authentic hashes
-for `pkg/auth.py`, produced exactly as described above, against a root where
-`pkg/` is a symlink to a directory holding a different `auth.py`, prints
-`DEPLOY VERIFY OK: 1 files, 0 external objects` and exits 0. The same bytes in
-a real `pkg/` directory produce `CONTENT_MISMATCH`. Only a symlinked *file* is
-rejected, as `UNEXPECTED_SYMLINK`.
+**A symlinked directory on a managed path is rejected.** The tree walk does not
+descend into it, so the check runs on the link itself: a link that is, or is an
+ancestor of, a manifest-managed path is `UNEXPECTED_SYMLINK`, and every managed
+file beneath it is counted in `skipped_files` instead of being read. Measured:
+a manifest carrying the authentic hashes for `pkg/auth.py`, against a root where
+`pkg/` is a symlink to a directory holding a different `auth.py`, exits 1 with
+`UNEXPECTED_SYMLINK` on `pkg` and reports `read_files 0, skipped_files 1`.
+
+Links are exempt only where `allowed_unmanaged` covers them, which is what
+keeps a real `.venv` deployable. The exemption is about unmanaged paths: it
+does not apply to an ancestor of a managed one. A link that the allow-list
+covers is reported nowhere and its target is not content-verified, so the
+allow-list is part of the reviewed contract, not a convenience.
 
 Confirm the deployed tree holds no links before trusting a pass:
 
@@ -718,10 +760,11 @@ command does list a link, the commit itself carries one, and the verifier's
 inability to look through a symlinked directory applies to that path by design:
 resolve it in the deployment record rather than treating the run as clean.
 
-**`checked_files` counts manifest entries, not verified files.** The banner's
-`N files` is the length of `manifest["files"]`. A run that read no file bodies
-still announces files, so read that number as the size of the manifest, not the
-size of the evidence.
+**`checked_files` counts verified files, not manifest entries.** `expected_files`
+is the size of `manifest["files"]`; `checked_files` is how many of those were
+read and passed every check in the mode that ran. Measured: two managed files
+where one is tampered reports `expected_files 2, read_files 2, checked_files 1,
+failed_files 1`.
 
 **The blob ID is checked independently.** `git_blob_sha1` is compared on every
 managed file, outside the LF-normalized comparison. A manifest whose `sha256_raw`
@@ -857,9 +900,9 @@ tree, provided the deployment root is a plain directory tree. Two properties of
 the verifier bound that claim; section 7 states them and how to check for the
 first:
 
-- A symlinked directory is not entered, so managed files beneath it are never
-  read and are not reported missing. The `find … -type l` check in condition 3
-  is what closes this.
+- A symlinked directory on a managed path is rejected, but a link the
+  `allowed_unmanaged` patterns cover is exempt and its target is not read. The
+  `find … -type l` check in condition 3 is what closes the remaining gap.
 - `commit` is checked for shape only. Condition 1, not the verifier, is what
   ties the manifest to a trusted commit.
 
@@ -905,5 +948,125 @@ something was installed. The directory mtime stays useful as an operational
 observation — it is how the deployment window is found in the journal — but it
 is not a pass/fail condition, and it must not be manufactured.
 
-Deployment time is established by the deployment log and the change record,
+Two production instances of the first failure mode have been observed. The
+first was a documentation-only commit that advanced the tip without touching a
+managed path. A second production example confirmed the same failure mode on
+2026-11-25. The
+deployment changed only `tools/verify_deploy.py`, using an atomic file
+replacement; it did not replace the `/opt/so-mcp` directory. The directory
+mtime was `12:31:39`, while the installed manifest was regenerated and
+installed at `16:43:03`. The old directory-mtime condition would therefore have
+reported a failure even though the new verifier passed in both default and
+strict modes, and the section 8 source-and-managed-tree checks passed.
+
+This was not a documentation-only change or a hypothetical edge case: it was a
+successful production deployment in which the deployed artifact changed without
+a corresponding deployment-root directory mtime update. Directory mtime is
+therefore not reliable evidence of deployment completion and must not be used
+as a PASS/FAIL condition.
+
+Deployment time is established by the deployment record described in section 9,
 not by comparing a directory mtime with a commit timestamp.
+
+## 9. Deployment record
+
+Every production deployment must have a deployment record attached to its
+change record (for example, the relevant PR, issue, or release record). The
+deployment record is the auditable evidence of what was deployed, what was
+verified, and what rollback material was retained.
+
+The deployment record is not part of the deployment manifest and must not be
+stored under the managed deployment tree or `/etc/so-mcp/`.
+
+### Required fields
+
+Each deployment record must include:
+
+| Field | Required content |
+|---|---|
+| `deployed_at` | Deployment completion time, including timezone or UTC offset |
+| `commit` | Full Git commit SHA deployed |
+| `manifest_sha256` | SHA-256 of the installed manifest |
+| `verifier_sha256` | SHA-256 of the installed deployment verifier |
+| `verify_default` | Default-mode verifier result, including expected/read/checked/failed/skipped counts and warning count |
+| `verify_strict` | Strict-mode verifier result, including expected/read/checked/failed/skipped counts and warning count |
+| `restart` | Whether a restart was required and performed; if performed, its result and completion time |
+| `health_checks` | Results of the deployment's applicable health and boundary checks, including endpoint and HTTP status |
+| `previous_tree` | Location or identifier of the complete previous deployment tree, or explicit `none` |
+| `backup` | Location or identifier of retained pre-deployment backup material, or explicit `none` |
+
+The record must report actual command results. Do not infer a successful
+restart or health check from a successful verifier run. When the verifier
+extension above is deployed, record `byte_identical_files` alongside the other
+counts.
+
+### Optional fields
+
+The following fields should be recorded when applicable:
+
+- `changed_managed_paths`: managed paths changed by this deployment.
+- `manifest_commit`: full commit SHA recorded in the installed manifest, if
+  different from or useful to distinguish from `commit`.
+- `source_and_managed_tree_check`: result of the section 8 source ancestry and
+  managed-tree comparison.
+- `main_commit`: trusted `origin/main` commit used for that check.
+- `deployment_method`: for example, atomic file replacement or complete tree
+  replacement.
+- `rollback_notes`: any deployment-specific rollback instructions or
+  limitations.
+- `operator_notes`: relevant deviations, warnings, or follow-up actions.
+
+### Previous tree and backup are distinct
+
+`previous_tree` and `backup` must not be treated as interchangeable:
+
+- `previous_tree` identifies a complete prior deployment tree retained for
+  rollback. It should be usable as a coherent deployment, subject to the
+  documented rollback procedure.
+- `backup` identifies retained copies of files or configuration captured before
+  the deployment, commonly only the files changed by that deployment. It is
+  recovery evidence and is not necessarily a complete runnable deployment.
+
+If both exist, record both locations. If either does not exist, record `none`;
+do not imply that an incremental backup is a complete rollback tree.
+
+### Record location and manifest boundary
+
+The canonical deployment record belongs in the corresponding change record (PR,
+issue, or release record). An operational log may retain a copy or a
+machine-readable record outside the managed deployment tree.
+
+Deployment records must not be added to `/etc/so-mcp/manifest.json`, and must
+not be included in the manifest's managed paths. The manifest describes the
+deployed artifact and its declared external dependencies; a record of the act of
+deploying that manifest is separate evidence. Including the deployment record in
+the manifest would create an unnecessary self-reference and force manifest
+regeneration for every record update.
+
+### Example
+
+```text
+deployed_at          2026-11-25 12:56:17 CST
+commit               15dca1ac88be60ca5a7d71e4ea9dcac343ba0fc0
+manifest_sha256      2ceb5da5c61d0a19e4f92adf13f2c47ad0dff84f34f546032b15736357556d9e
+verifier_sha256      e37d16b3a303b66ec227ba156e21c6b1ed94fd9eae68bc35c8ff7b234ba71703
+verify_default      PASS — 9/9 files verified, 3 external objects
+                    expected 9, checked 9, failed 0, skipped 0, warnings 0
+                    byte-identical n/a (verifier predates the field)
+verify_strict       PASS — 9/9 files verified, 3 external objects
+                    expected 9, checked 9, failed 0, skipped 0, warnings 0
+                    byte-identical n/a (verifier predates the field)
+restart             PASS — 12:56:17 CST, MainPID 3287710
+health_checks       /healthz=200; /so-mcp=401; /so-mcp/healthz=401;
+                    /.well-known/oauth-protected-resource/so-mcp=200
+previous_tree       /opt/so-mcp.prev-f9d88c523370
+backup              /var/backups/so-mcp/pre-15dca1ac/
+```
+
+The example is illustrative. Each deployment record must contain the actual
+observed values for that deployment.
+
+`byte-identical n/a` is the correct entry for a deployment verified by a
+verifier that did not yet report the field. Do not back-fill a value that was
+never measured, and do not omit the line: a reader must be able to tell
+"not applicable" from "not recorded".

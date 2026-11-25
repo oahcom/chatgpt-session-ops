@@ -253,6 +253,51 @@ class VerifyDeployTests(unittest.TestCase):
         self.assertEqual(result["failed_files"], 1)
         self.assertEqual(result["skipped_files"], 0)
 
+    def test_byte_identical_count_agrees_across_modes(self) -> None:
+        # One clean file plus one whose only difference is CRLF. Default
+        # mode records a warning and keeps both files "verified"; strict
+        # mode fails the drifted file. The byte-identical count must not
+        # move with that classification: two files are byte-identical to
+        # nothing, one is.
+        lf = b"print('session ops')\n"
+        crlf = b"print('session ops')\r\n"
+        (self.root / "app.py").write_bytes(lf)
+        (self.root / "b.py").write_bytes(crlf)
+
+        self.write_manifest([
+            make_entry("app.py", lf),
+            {
+                "path": "b.py",
+                "git_blob_sha1": blob_sha1(lf),
+                "sha256_lf": hashlib.sha256(lf).hexdigest(),
+                "sha256_raw": hashlib.sha256(lf).hexdigest(),
+                "bytes": len(lf),
+            },
+        ])
+
+        default = verify(self.root, self.manifest_path)
+        strict = verify(self.root, self.manifest_path, strict=True)
+
+        self.assertTrue(default["ok"], default["issues"])
+        self.assertEqual(default["checked_files"], 2)
+        self.assertEqual(default["failed_files"], 0)
+        self.assertEqual(default["byte_identical_files"], 1)
+
+        self.assertFalse(strict["ok"])
+        self.assertEqual(strict["checked_files"], 1)
+        self.assertEqual(strict["failed_files"], 1)
+        self.assertEqual(strict["byte_identical_files"], 1)
+
+    def test_byte_identical_excludes_unread_file(self) -> None:
+        # A skipped file is not evidence of byte identity, in either mode.
+        (self.root / "app.py").unlink()
+
+        default = verify(self.root, self.manifest_path)
+        strict = verify(self.root, self.manifest_path, strict=True)
+
+        self.assertEqual(default["byte_identical_files"], 0)
+        self.assertEqual(strict["byte_identical_files"], 0)
+
     def test_modified_file_fails(self) -> None:
         (self.root / "app.py").write_bytes(b"print('tampered')\n")
         result = verify(self.root, self.manifest_path)
