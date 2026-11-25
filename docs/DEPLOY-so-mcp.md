@@ -755,6 +755,29 @@ does not apply to an ancestor of a managed one. A link that the allow-list
 covers is reported nowhere and its target is not content-verified, so the
 allow-list is part of the reviewed contract, not a convenience.
 
+The exemption is wider than "unmanaged paths" suggests, and the difference is
+worth stating because it inverts the intuition that a managed directory is
+safe. A link *inside* a managed directory is exempt too, provided the link's
+own path matches a pattern. Measured on a manifest managing `pkg/auth.py`,
+against a root where `pkg/auth.py` is correct:
+
+```text
+pkg/c.py    -> /external/evil.py      allow 'pkg/*'   exit 0, checked 1, no issue
+pkg/c.py    -> /external/evil.py      allow '*'       exit 0, checked 1, no issue
+pkg/c.py    -> /external/evil.py      no allow        exit 1, UNEXPECTED_SYMLINK
+pkg/cache   -> /external (directory)  allow 'pkg/cache*'  exit 0, checked 1, no issue
+pkg/cache   -> /external (directory)  no allow        exit 1, UNEXPECTED_SYMLINK
+```
+
+So a pattern written to ignore build output, such as `pkg/cache*` or the
+natural-looking `pkg/*`, silently admits links that point outside the
+deployment root. Being inside a managed directory does not protect a path; only
+being *on* a managed path does, and only when no pattern matches it.
+
+This is why the `find … -type l` check below is not redundant with the
+verifier, and why the reviewed allow-list should name directories, not
+wildcards that happen to cover a subtree.
+
 Confirm the deployed tree holds no links before trusting a pass:
 
 ```bash

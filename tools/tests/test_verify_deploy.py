@@ -246,6 +246,41 @@ class VerifyDeployTests(unittest.TestCase):
             result["checked_files"], 0, "链接下的受管文件一个都没读到，不能算已验证"
         )
 
+    def test_allow_list_admits_a_link_inside_a_managed_directory(self) -> None:
+        # Counter-intuitive but measured: being inside a managed directory
+        # does not protect a path. A pattern that covers the link's own path
+        # exempts it, so `pkg/*` written to ignore build output also admits a
+        # link pointing outside the deployment root. Pinned so the behaviour
+        # is a documented property rather than a surprise, and so the
+        # section 7 warning about `find -type l` stays justified.
+        (self.root / "pkg").mkdir()
+        (self.root / "pkg" / "auth.py").write_bytes(self.content)
+        outside = Path(self.tmp.name) / "evil.py"
+        outside.write_bytes(b"print('evil')\n")
+        os.symlink(str(outside), str(self.root / "pkg" / "c.py"))
+
+        # setUp already manages app.py; keep it so the fixture stays coherent.
+        files = [make_entry("app.py", self.content),
+                 make_entry("pkg/auth.py", self.content)]
+
+        self.write_manifest(files, allowed_unmanaged=["pkg/*"])
+
+        with_allow = verify(self.root, self.manifest_path)
+
+        self.assertTrue(with_allow["ok"], with_allow["issues"])
+        self.assertEqual(with_allow["issues"], [])
+        self.assertEqual(with_allow["checked_files"], 2)
+
+        # Without the pattern the same tree is rejected, which is what proves
+        # the exemption is what admitted it.
+        self.write_manifest(files, allowed_unmanaged=[])
+        without_allow = verify(self.root, self.manifest_path)
+
+        self.assertFalse(without_allow["ok"])
+        self.assertEqual(
+            [(i["code"], i["path"]) for i in without_allow["issues"]],
+            [("UNEXPECTED_SYMLINK", "pkg/c.py")])
+
     def test_symlink_under_allowed_path_is_not_an_issue(self) -> None:
         venv = self.root / ".venv" / "bin"
         venv.mkdir(parents=True)
