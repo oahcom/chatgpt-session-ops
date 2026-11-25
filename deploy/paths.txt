@@ -1,0 +1,16 @@
+# Runtime entry point
+scripts/run_mcp_server.py
+
+# Application package
+src/session_ops/__init__.py
+src/session_ops/authority.py
+src/session_ops/mcp_auth.py
+src/session_ops/mcp_server.py
+src/session_ops/memory_adapter_client.py
+src/session_ops/work_items.py
+
+# Runtime dependency declaration
+requirements-mcp.txt
+
+# Deployment integrity verifier
+tools/verify_deploy.py

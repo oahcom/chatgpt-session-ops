@@ -15,7 +15,7 @@ import re
 import subprocess
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Iterable
 
 
@@ -26,6 +26,8 @@ _EXTERNAL_KINDS = {
 }
 
 _COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+
+_DATABASE_CONTRACT_VERSION = 1
 
 
 class ManifestError(Exception):
@@ -211,27 +213,46 @@ def _build_manifest(args: argparse.Namespace) -> dict:
         for spec in args.external
     ]
 
-    database_schema = None
-    if args.db_user_version is not None or args.db_required_column:
-        required_columns: dict[str, list[str]] = {}
-        for value in args.db_required_column:
-            table, column = _parse_required_column(value)
-            columns = required_columns.setdefault(table, [])
-            if column in columns:
-                raise ManifestError(
-                    "duplicate required database column: %s.%s"
-                    % (table, column)
-                )
-            columns.append(column)
+    required_columns: dict[str, list[str]] = {}
+    for value in args.db_required_column:
+        table, column = _parse_required_column(value)
+        columns = required_columns.setdefault(table, [])
+        if column in columns:
+            raise ManifestError(
+                "duplicate required database column: %s.%s"
+                % (table, column)
+            )
+        columns.append(column)
 
-        database_schema = {}
-        if args.db_user_version is not None:
-            database_schema["user_version"] = args.db_user_version
+    database = None
+
+    if args.db_path is None:
         if required_columns:
-            database_schema["required_columns"] = {
+            raise ManifestError(
+                "--db-path is required when --db-required-column is supplied"
+            )
+    else:
+        db_path = args.db_path
+        posix_path = PurePosixPath(db_path)
+
+        if (
+            not posix_path.is_absolute()
+            or "\x00" in db_path
+            or "\\" in db_path
+            or ".." in posix_path.parts
+        ):
+            raise ManifestError(
+                "--db-path must be a normalized absolute POSIX path"
+            )
+
+        database = {
+            "path": db_path,
+            "schema_version": _DATABASE_CONTRACT_VERSION,
+            "required_columns": {
                 table: columns
                 for table, columns in sorted(required_columns.items())
-            }
+            },
+        }
 
     generated_at = args.generated_at or datetime.now(
         timezone.utc
@@ -250,10 +271,14 @@ def _build_manifest(args: argparse.Namespace) -> dict:
             "*.bak-*",
             "**/*.bak-*",
         ],
+        "allowed_unmanaged": [
+            "*.pyc",
+            "**/*.pyc",
+        ],
     }
 
-    if database_schema is not None:
-        manifest["database_schema"] = database_schema
+    if database is not None:
+        manifest["database"] = database
 
     return manifest
 
@@ -285,16 +310,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Override generated_at (useful for reproducible generation)",
     )
     parser.add_argument(
-        "--db-user-version",
-        type=int,
-        help="Expected SQLite PRAGMA user_version",
+        "--db-path",
+        metavar="ABSOLUTE_POSIX_PATH",
+        help="Target SQLite database path on the deployment host",
     )
     parser.add_argument(
         "--db-required-column",
         action="append",
         default=[],
         metavar="TABLE.COLUMN",
-        help="Required SQLite column; may be repeated",
+        help="Required SQLite column; requires --db-path; may be repeated",
     )
     return parser
 
@@ -302,9 +327,6 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Iterable[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-
-    if args.db_user_version is not None and args.db_user_version < 0:
-        parser.error("--db-user-version must be non-negative")
 
     try:
         manifest = _build_manifest(args)

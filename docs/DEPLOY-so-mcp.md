@@ -1,5 +1,97 @@
 # Deploy Session Ops MCP
 
+## Why deployment must be commit-verifiable
+
+A deployment is not proven correct merely because the expected files exist.
+
+There are two distinct sets:
+
+- The deployment set: the paths and bytes actually present in the deployed
+  directory.
+- The commit tree set: the paths and Git blob objects recorded by one specific
+  commit.
+
+For a deployment to be attributable to a commit, every managed deployment file
+must match the blob recorded at the same path in that commit. In other words,
+the deployed `(path, content)` pairs must be contained in the selected commit
+tree. A deliberately scoped deployment may contain only a subset of the
+commit's paths, but every deployed managed file must still match that commit.
+
+A directory assembled by copying individual files can violate this condition
+without looking incomplete. It may contain every expected filename while
+combining files from different commits. In that case there is no single commit
+whose tree explains the deployed set.
+
+This has happened in this service.
+
+Production `src/session_ops/mcp_auth.py` was found with SHA-256 `312a1836…`
+and 34843 bytes, which is commit `f28561b` (PR #36), Git blob `c17bfefd`.
+`main` carried SHA-256 `117d0725…` and 38278 bytes, commit `aef7a1f`
+(PR #42), Git blob `1a285abb`. The production file existed, but its content
+was one PR older and lacked two SSRF protections introduced by #42:
+
+- DNS validation and the subsequent HTTPS connection performed two independent
+  resolutions. The address that passed validation was not necessarily the
+  address that was connected to. The fix resolves once and pins that address
+  for the connection while keeping TLS SNI and hostname verification.
+- The default `urllib` opener honoured proxy environment variables, and a
+  configured proxy performs its own DNS resolution. With a proxy in play the
+  local destination check was skipped entirely. The fix disables proxy
+  handling for these requests.
+
+A file-existence check cannot detect this class of failure. It sees a file at
+the expected path and learns nothing about which revision supplied its bytes.
+
+The verifier therefore uses Git blob object IDs as the content identity of
+managed files. A blob ID is
+
+    SHA1("blob " + decimal_byte_length + NUL + file_bytes)
+
+which is the same object identity `git hash-object` computes for those bytes.
+It lets the verifier compare a deployed file against the blob ID recorded in a
+manifest generated from a specific commit, even when the deployment host has
+no `.git` directory.
+
+A blob ID identifies content, not a commit: identical content can appear in
+many commits, at one path or several. The evidence is the combination of
+
+- the full commit SHA selected as the deployment source,
+- the repository-relative path,
+- the blob ID that commit records for that path, and
+- the verifier's comparison of the deployed file against that blob.
+
+SHA-256 of the raw and LF-normalized bytes is recorded as well. It makes line
+ending drift diagnosable and is a second, independent content check. It does
+not replace the commit identity carried by the blob ID and the manifest
+commit.
+
+A deployment is attributable to a commit only when all of the following hold:
+
+1. The manifest names a full commit SHA, not a branch or tag.
+2. The manifest's managed path list is exactly the intended deployment
+   selection.
+3. Every deployed managed file passes verification against that manifest.
+4. Required external objects pass their recorded hash checks.
+5. The database contract is present in the manifest and its required columns
+   pass verification.
+6. The deployment record states which manifest and which commit were
+   installed.
+
+A successful health check is necessary operational evidence but proves nothing
+about commit identity: a service can be healthy while running a mixture of old
+and new files. Likewise, a successful file-existence check says nothing about
+where the bytes came from.
+
+When the verifier reports a missing file, a content or blob mismatch, external
+object drift, or a database schema failure, do not describe the deployment as
+matching the selected commit. Correct the deployment first.
+
+The verifier result, the manifest commit, and the deployment directory
+timestamp belong together in the deployment record. A commit SHA written in a
+manifest is an expected source identity; on its own it is not proof that the
+files on disk were installed from that commit.
+
+
 ## 1. Deployment authority
 
 The only deployment authority is a full Git commit SHA from
@@ -28,7 +120,10 @@ test "$(git cat-file -t "$COMMIT")" = commit
 test ! -e "$TMP"
 install -d -o ubuntu -g ubuntu -m 0750 "$TMP"
 git archive --format=tar "$COMMIT" \
-  scripts src tools/verify_deploy.py requirements-mcp.txt \
+  scripts/run_mcp_server.py \
+  src \
+  requirements-mcp.txt \
+  tools/verify_deploy.py \
   | tar -xf - -C "$TMP"
 ```
 
@@ -38,11 +133,25 @@ script. Check the extracted tree before switching production:
 ```bash
 test -f "$TMP/scripts/run_mcp_server.py"
 test -f "$TMP/src/session_ops/authority.py"
+test -f "$TMP/src/session_ops/mcp_auth.py"
 test -f "$TMP/src/session_ops/mcp_server.py"
-test ! -e "$TMP/.git"
+test -f "$TMP/src/session_ops/memory_adapter_client.py"
+test -f "$TMP/src/session_ops/work_items.py"
+test -f "$TMP/src/session_ops/__init__.py"
+test -f "$TMP/requirements-mcp.txt"
+test -f "$TMP/tools/verify_deploy.py"
+
 test ! -e "$TMP/tests"
 test ! -e "$TMP/deploy"
 test ! -e "$TMP/docs"
+test ! -e "$TMP/references"
+test ! -e "$TMP/.github"
+test ! -e "$TMP/scripts/chatgpt_send.py"
+test ! -e "$TMP/scripts/continue_full.py"
+test ! -e "$TMP/scripts/extract_auth.py"
+test ! -e "$TMP/scripts/mcp_connector.py"
+test ! -e "$TMP/scripts/pow_solver.py"
+test ! -e "$TMP/scripts/accounts"
 ```
 
 The managed path list in `deploy/paths.txt` must describe exactly this

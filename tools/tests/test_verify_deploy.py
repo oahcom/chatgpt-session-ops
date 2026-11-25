@@ -155,10 +155,16 @@ class VerifyDeployTests(unittest.TestCase):
 
         conn = sqlite3.connect(db_path)
         try:
-            # The verifier requires session_id, but this deployed schema
-            # only has link_id.
             conn.execute(
                 "CREATE TABLE session_links (link_id TEXT PRIMARY KEY)"
+            )
+            conn.execute(
+                """
+                CREATE TABLE authority_landing_events (
+                    event_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL
+                )
+                """
             )
             conn.commit()
         finally:
@@ -167,9 +173,10 @@ class VerifyDeployTests(unittest.TestCase):
         manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
         manifest["database"] = {
             "path": str(db_path),
-            "schema_version": 2,
+            "schema_version": 1,
             "required_columns": {
                 "session_links": ["link_id", "session_id"],
+                "authority_landing_events": ["event_id", "session_id", "attempt_id"],
             },
         }
         self.manifest_path.write_text(
@@ -179,17 +186,25 @@ class VerifyDeployTests(unittest.TestCase):
 
         result = verify(self.root, self.manifest_path)
 
+        self.assertIsNotNone(result["database"])
         self.assertFalse(result["ok"])
         self.assertFalse(result["database"]["schema_contract_ok"])
+
         self.assertEqual(
             result["database"]["tables"]["session_links"]["missing_columns"],
             ["session_id"],
         )
-        self.assertTrue(
-            any(
+        self.assertEqual(
+            result["database"]["tables"]["authority_landing_events"]["missing_columns"],
+            ["attempt_id"],
+        )
+
+        self.assertEqual(
+            sum(
                 issue["code"] == "DB_SCHEMA_BEHIND"
                 for issue in result["issues"]
             ),
+            2,
             result["issues"],
         )
 
