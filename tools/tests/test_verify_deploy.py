@@ -45,7 +45,7 @@ class VerifyDeployTests(unittest.TestCase):
         (self.root / "app.py").write_bytes(self.content)
         self.write_manifest([make_entry("app.py", self.content)])
 
-    def write_manifest(self, files: list[dict]) -> None:
+    def write_manifest(self, files: list[dict], allowed_unmanaged: list[str] | None = None) -> None:
         self.manifest_path.write_text(
             json.dumps({
                 "format_version": 1,
@@ -53,7 +53,7 @@ class VerifyDeployTests(unittest.TestCase):
                 "generated_at": "2026-11-25T00:00:00Z",
                 "files": files,
                 "external_objects": [],
-                "allowed_unmanaged": [],
+                "allowed_unmanaged": list(allowed_unmanaged or []),
                 "forbidden": [
                     ".git",
                     "tests",
@@ -200,6 +200,51 @@ class VerifyDeployTests(unittest.TestCase):
         )
         self.assertEqual(result["checked_files"], 0)
         self.assertEqual(result["skipped_files"], 1)
+
+    def test_symlink_covering_managed_files_is_rejected_despite_allow_list(self) -> None:
+        """allow-list 覆盖的符号链接，如果下面藏着受管文件，仍然必须报错。
+
+        事故形态：`allowed_unmanaged` 里写了 `pkg*`（本意只是忽略 `pkg/cache` 这类
+        产物），有人把整个 `pkg/` 换成指向外部目录的链接。只看 `matches_any(rel,
+        allowed)` 的话它命中白名单，于是链接不报，而受管文件因为链接不下钻也永远
+        不会被读到——`ok=True`，零个文件被验证。
+
+        这一条必须单独存在：已有的 `test_symlinked_managed_directory_is_rejected`
+        用的 manifest 没有 allow-list，`matches_any` 恒假，所以两个 `or` 分支
+        永远走右边，左侧的 `covers_managed` 从未被单独检验——删掉它那个测试照样绿。
+        """
+        pkg = self.root / "pkg"
+        pkg.mkdir()
+        (pkg / "auth.py").write_bytes(b"authentic = True\n")
+        self.write_manifest(
+            [make_entry("pkg/auth.py", b"authentic = True\n")],
+            allowed_unmanaged=["pkg*"],
+        )
+
+        elsewhere = Path(self.tmp.name) / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "auth.py").write_bytes(b"different = True\n")
+
+        shutil.move(str(pkg), str(Path(self.tmp.name) / "moved"))
+        os.symlink(str(elsewhere), str(pkg), target_is_directory=True)
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assertFalse(
+            result["ok"],
+            "被 allow-list 覆盖的符号链接目录藏了受管文件，却报了 OK：%r" % (result,),
+        )
+        self.assertTrue(
+            any(
+                issue["code"] == "UNEXPECTED_SYMLINK"
+                and issue["path"] == "pkg"
+                for issue in result["issues"]
+            ),
+            result["issues"],
+        )
+        self.assertEqual(
+            result["checked_files"], 0, "链接下的受管文件一个都没读到，不能算已验证"
+        )
 
     def test_symlink_under_allowed_path_is_not_an_issue(self) -> None:
         venv = self.root / ".venv" / "bin"
