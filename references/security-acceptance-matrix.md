@@ -78,7 +78,7 @@ and restating a derivable count in prose is what produced this erratum.
 What is worth stating instead is that a row can pass its deletion for the
 wrong reason, and two did. The pinned-connection tunnel case went green when its
 guard was deleted, because the real network dial failed with the same
-exception type the case expected; and six of the eight conjuncts in the
+exception type the case expected; and seven of the nine conjuncts in the
 landing-confirmation expression cannot fail at all, because earlier
 early-returns already guarantee them. Neither is visible in a green run, and
 neither would have been found by counting marks.
@@ -187,19 +187,21 @@ written, and then links the same session without evidence to prove the seeded
 event was usable. Mutation check: with the guard deleted, the old case stays
 green and only the new one fails.
 
-**Row 15 note — eight conjuncts, two of them load-bearing.** The landing
-decision in `scripts/chatgpt_send.py` is a conjunction of eight conditions.
-Deleting them one at a time: six leave the file green, and only
+**Row 15 note — nine conjuncts, two of them load-bearing.** The landing
+decision in `scripts/chatgpt_send.py` is a conjunction of nine conditions.
+Deleting them one at a time: seven leave the file green, and only
 `reply_complete is True` and `os.path.isfile(path)` change the outcome.
 
-The six that cannot fail are not a testing gap — they are guaranteed by earlier
-early-returns in the same function, so the condition can never be reached with
-them false. `st == 200` because `st != 200` returned above; `len(all_cids) == 1`
-because a longer list returned above; `not mismatch` for the same reason;
-`first_cid == real_conv` because `real_conv` *is* `first_cid`; `all_cids[0] ==
-real_conv` because the list has one element by then; `bool(path)` because
-`isfile` implies it. They are defence in depth, and deleting them is an
-equivalent mutant.
+The seven that cannot fail are not a testing gap — they are guaranteed by
+earlier early-returns in the same function, so the condition can never be
+reached with them false. `st == 200` because `st != 200` returned above;
+`len(all_cids) == 1` because a longer list returned above; `not mismatch` for the
+same reason; `first_cid == real_conv` because `real_conv` *is* `first_cid`;
+`all_cids[0] == real_conv` because the list has one element by then; `bool(path)`
+because `isfile` implies it; `(not conv_id or conv_id == real_conv)` because
+`mismatch` is `bool(conv_id) and real_conv != conv_id` and that branch already
+returned, so the disjunction is true before it is evaluated. They are defence in
+depth, and deleting them is an equivalent mutant.
 
 The one real gap this exposed: `os.path.isfile(path)` had **no** case behind it.
 `FakeAPI.save_reply` always writes the file, so "a path was returned" and "a
@@ -212,7 +214,7 @@ session cannot be linked.
 |---|---|
 | `reply_complete is True` | `test_incomplete_reply_does_not_record_or_link` red |
 | `os.path.isfile(path)` | `test_missing_archive_file_does_not_record_a_landing_event` red |
-| the other six | green — equivalent mutants, each guaranteed by an earlier return |
+| the other seven | green — equivalent mutants, each guaranteed by an earlier return |
 
 ---
 
@@ -370,7 +372,7 @@ These are gaps, stated so nobody reads the rows above as completeness.
 | A mandatory corporate proxy | `ProxyHandler({})` is passed unconditionally, so a deployment that can only reach the identity provider through a proxy fails to fetch JWKS. | Fail closed, deliberately: the alternative is an address check describing a host the process never contacts. Stated here rather than solved. |
 | The pinned address has no failover | Only the first validated answer is dialled. A host with several public addresses loses the rest if the first one is down. | Availability, not security. Retrying a second answer would reintroduce the resolution the pin exists to remove. |
 | Mutation coverage is not uniform | Row 16 carries the mark for its lock only, and row 3 for the layer its case actually observes. Every other row carries it outright. | The two that do not are named individually with a reason. Treat an unmarked claim as "asserts the behaviour", not "proven necessary" — that is exactly how row 12 stayed PROVEN for three commits. |
-| Six landing conjuncts cannot fail | Row 15's landing expression has eight conjuncts; six are already guaranteed by earlier early-returns, so deleting them changes nothing. | Equivalent mutants, listed one by one in the row 15 note rather than counted as coverage. The two load-bearing ones each have a deletion behind them. |
+| Seven landing conjuncts cannot fail | Row 15's landing expression has nine conjuncts; seven are already guaranteed by earlier early-returns, so deleting them changes nothing. | Equivalent mutants, listed one by one in the row 15 note rather than counted as coverage. The two load-bearing ones each have a deletion behind them. |
 | Security tests can skip to green | `test_mcp_rs256` and `test_mcp_sdk_integration` both skip as units when their optional dependency is absent. The unit job installs `requirements-mcp.txt` and asserts the skip count is unchanged, printing every skip reason on failure; the `sdk` job asserts its four cases executed. | Before those guards, the signature path and the SDK compatibility surface could both be skipped and the log still read green. Any future optional dependency needs the same treatment. |
 | `unlink_session` `rowcount` guard is unreachable | `BEGIN IMMEDIATE` precedes the SELECT and the SELECT filters `unlinked_at IS NULL`, so SQLite's single-writer rule makes `rowcount != 1` impossible. | Defence in depth, not evidence. It cannot be tested, and pretending otherwise would be worse than saying so. |
 | `aud` is checked twice, once unheld | Deleting the `validate_registered_claims` check changes no test outcome. | Redundant layer. Harmless, but not a second proof. |
