@@ -3,7 +3,7 @@
 The service layer is independent of the MCP SDK. Only build_mcp_server()
 imports the optional SDK.
 
-Python source syntax: 3.8+
+Python source syntax: 3.11+
 MCP SDK runtime: mcp==2.3.0
 """
 

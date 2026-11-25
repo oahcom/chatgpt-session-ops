@@ -41,7 +41,7 @@
 ```bash
 git clone https://github.com/oahcom/chatgpt-session-ops.git
 cd chatgpt-session-ops
-python --version   # 需要 3.8+
+python --version   # 需要 3.11+（fromisoformat 的紧凑/无秒形式在 3.11 才有）
 ```
 
 只需 Python 标准库。`continue_full.py` / `extract_auth.py` 额外依赖 CDP 助手模块（`from cdp import CDPClient`），按下面任一方式提供：
