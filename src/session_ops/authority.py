@@ -86,11 +86,40 @@ CREATE TABLE IF NOT EXISTS work_item_grants (
 CREATE TABLE IF NOT EXISTS authority_landing_events (
     event_id TEXT PRIMARY KEY NOT NULL,
     session_id TEXT NOT NULL,
-    match TEXT NOT NULL CHECK (match IN ('confirmed', 'mismatch', 'ambiguous')),
-    evidence_complete INTEGER NOT NULL CHECK (evidence_complete IN (0, 1)),
+    work_item_id TEXT,
+    attempt_id TEXT,
+    match TEXT NOT NULL
+        CHECK (match IN ('confirmed', 'mismatch', 'ambiguous')),
+    evidence_complete INTEGER NOT NULL
+        CHECK (evidence_complete IN (0, 1)),
     created_at TEXT NOT NULL,
-    consumed_at TEXT
+    consumed_at TEXT,
+    rejected_at TEXT,
+    rejection_reason TEXT,
+    CHECK (
+        (work_item_id IS NULL AND attempt_id IS NULL)
+        OR
+        (
+            work_item_id IS NOT NULL
+            AND length(trim(work_item_id)) > 0
+            AND attempt_id IS NOT NULL
+            AND length(trim(attempt_id)) > 0
+        )
+    ),
+    CHECK (
+        (rejected_at IS NULL AND rejection_reason IS NULL)
+        OR
+        (
+            rejected_at IS NOT NULL
+            AND rejection_reason IS NOT NULL
+            AND length(trim(rejection_reason)) > 0
+        )
+    ),
+    CHECK (consumed_at IS NULL OR rejected_at IS NULL)
 );
+
+CREATE INDEX IF NOT EXISTS ix_authority_landing_pending
+ON authority_landing_events(session_id, consumed_at, created_at);
 
 CREATE INDEX IF NOT EXISTS ix_work_item_owners_tenant
 ON work_item_owners(tenant_id, owner_principal_id);
@@ -381,6 +410,250 @@ class SecureWorkItemStore:
                 "CREATE INDEX IF NOT EXISTS ix_authority_audit_link "
                 "ON authority_audit_events(link_id, action, created_at)"
             )
+
+            # -- Trusted landing evidence identity migration ----------------
+            #
+            # Keep this migration separate from the terminal-link
+            # reconciliation transaction below. It has its own atomic
+            # boundary so a failed migration cannot leave a partially
+            # upgraded landing-evidence schema.
+            #
+            # Legacy pending confirmed events without identity cannot be
+            # safely attributed to a WorkItem or execution attempt.
+            # Preserve them, but downgrade them to non-consumable ambiguous
+            # evidence. Never infer an identity from session_links.
+
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                def _landing_migration_snapshot():
+                    total = conn.execute(
+                        "SELECT COUNT(*) FROM authority_landing_events"
+                    ).fetchone()[0]
+
+                    distributions = {
+                        (row["match"], row["consumed"]): row["count"]
+                        for row in conn.execute(
+                            "SELECT match, "
+                            "CASE WHEN consumed_at IS NULL THEN 0 ELSE 1 END "
+                            "AS consumed, COUNT(*) AS count "
+                            "FROM authority_landing_events "
+                            "GROUP BY match, consumed "
+                            "ORDER BY match, consumed"
+                        ).fetchall()
+                    }
+
+                    events_with_link = conn.execute(
+                        "SELECT COUNT(*) FROM authority_landing_events AS e "
+                        "WHERE e.consumed_at IS NOT NULL "
+                        "AND EXISTS ("
+                        "SELECT 1 FROM session_links AS s "
+                        "WHERE s.session_id = e.session_id "
+                        "AND s.linked_at = e.consumed_at"
+                        ")"
+                    ).fetchone()[0]
+
+                    links_with_event = conn.execute(
+                        "SELECT COUNT(*) FROM session_links AS s "
+                        "WHERE EXISTS ("
+                        "SELECT 1 FROM authority_landing_events AS e "
+                        "WHERE e.session_id = s.session_id "
+                        "AND e.consumed_at = s.linked_at"
+                        ")"
+                    ).fetchone()[0]
+
+                    return {
+                        "total": total,
+                        "distributions": distributions,
+                        "events_with_link": events_with_link,
+                        "links_with_event": links_with_event,
+                    }
+
+                before = _landing_migration_snapshot()
+
+                landing_columns = {
+                    row["name"]
+                    for row in conn.execute(
+                        "PRAGMA table_info(authority_landing_events)"
+                    ).fetchall()
+                }
+
+                # Preserve the existing PRAGMA -> ALTER -> CREATE INDEX
+                # migration convention. All changes are inside BEGIN IMMEDIATE.
+                if "work_item_id" not in landing_columns:
+                    conn.execute(
+                        "ALTER TABLE authority_landing_events "
+                        "ADD COLUMN work_item_id TEXT"
+                    )
+
+                if "attempt_id" not in landing_columns:
+                    conn.execute(
+                        "ALTER TABLE authority_landing_events "
+                        "ADD COLUMN attempt_id TEXT"
+                    )
+
+                if "rejected_at" not in landing_columns:
+                    conn.execute(
+                        "ALTER TABLE authority_landing_events "
+                        "ADD COLUMN rejected_at TEXT"
+                    )
+
+                if "rejection_reason" not in landing_columns:
+                    conn.execute(
+                        "ALTER TABLE authority_landing_events "
+                        "ADD COLUMN rejection_reason TEXT"
+                    )
+
+                # Reject malformed partial identities rather than guessing
+                # which side of an identity pair is authoritative.
+                malformed_identity = conn.execute(
+                    "SELECT COUNT(*) FROM authority_landing_events "
+                    "WHERE (work_item_id IS NULL AND attempt_id IS NOT NULL) "
+                    "OR (work_item_id IS NOT NULL AND attempt_id IS NULL) "
+                    "OR (work_item_id IS NOT NULL "
+                    "AND length(trim(work_item_id)) = 0) "
+                    "OR (attempt_id IS NOT NULL "
+                    "AND length(trim(attempt_id)) = 0)"
+                ).fetchone()[0]
+
+                if malformed_identity:
+                    raise AuthorityError(
+                        "landing evidence contains a partial or malformed identity"
+                    )
+
+                malformed_state = conn.execute(
+                    "SELECT COUNT(*) FROM authority_landing_events "
+                    "WHERE (consumed_at IS NOT NULL AND rejected_at IS NOT NULL) "
+                    "OR (rejected_at IS NULL AND rejection_reason IS NOT NULL) "
+                    "OR (rejected_at IS NOT NULL "
+                    "AND (rejection_reason IS NULL "
+                    "OR length(trim(rejection_reason)) = 0))"
+                ).fetchone()[0]
+
+                if malformed_state:
+                    raise AuthorityError(
+                        "landing evidence contains an inconsistent consumption state"
+                    )
+
+                # Count and downgrade only legacy-format pending confirmed
+                # events. Identity-bearing events created by the new
+                # producer are never modified by subsequent initialization.
+                legacy_pending_count = conn.execute(
+                    "SELECT COUNT(*) FROM authority_landing_events "
+                    "WHERE work_item_id IS NULL "
+                    "AND attempt_id IS NULL "
+                    "AND consumed_at IS NULL "
+                    "AND rejected_at IS NULL "
+                    "AND match = 'confirmed'"
+                ).fetchone()[0]
+
+                changed = conn.execute(
+                    "UPDATE authority_landing_events "
+                    "SET match = 'ambiguous', evidence_complete = 0 "
+                    "WHERE work_item_id IS NULL "
+                    "AND attempt_id IS NULL "
+                    "AND consumed_at IS NULL "
+                    "AND rejected_at IS NULL "
+                    "AND match = 'confirmed'"
+                ).rowcount
+
+                if changed != legacy_pending_count:
+                    raise AuthorityError(
+                        "landing evidence migration changed an unexpected row count"
+                    )
+
+                remaining_legacy_pending = conn.execute(
+                    "SELECT COUNT(*) FROM authority_landing_events "
+                    "WHERE work_item_id IS NULL "
+                    "AND attempt_id IS NULL "
+                    "AND consumed_at IS NULL "
+                    "AND rejected_at IS NULL "
+                    "AND match = 'confirmed'"
+                ).fetchone()[0]
+
+                if remaining_legacy_pending:
+                    raise AuthorityError(
+                        "legacy pending confirmed landing evidence remains"
+                    )
+
+                # Use a new index name: an existing database may already
+                # have ix_authority_landing_pending with the old definition.
+                # Do not DROP or rebuild the existing index.
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS "
+                    "ix_authority_landing_pending_identity "
+                    "ON authority_landing_events("
+                    "work_item_id, attempt_id, session_id, "
+                    "consumed_at, rejected_at, created_at, event_id)"
+                )
+
+                after = _landing_migration_snapshot()
+
+                # Total event count must never change.
+                if after["total"] != before["total"]:
+                    raise AuthorityError(
+                        "landing evidence migration changed total event count"
+                    )
+
+                # The only permitted distribution change is:
+                # pending confirmed -> pending ambiguous.
+                expected_distributions = dict(before["distributions"])
+
+                if legacy_pending_count:
+                    confirmed_key = ("confirmed", 0)
+                    ambiguous_key = ("ambiguous", 0)
+
+                    expected_distributions[confirmed_key] = (
+                        expected_distributions.get(confirmed_key, 0)
+                        - legacy_pending_count
+                    )
+                    expected_distributions[ambiguous_key] = (
+                        expected_distributions.get(ambiguous_key, 0)
+                        + legacy_pending_count
+                    )
+
+                    if expected_distributions.get(confirmed_key) == 0:
+                        expected_distributions.pop(confirmed_key)
+
+                if after["distributions"] != expected_distributions:
+                    raise AuthorityError(
+                        "landing evidence migration changed unexpected match/consumption distribution"
+                    )
+
+                # Historical consumed-event <-> session-link relationships
+                # must remain unchanged. In particular, consumed_at and
+                # historical linked_at values must not be rewritten.
+                if (
+                    after["events_with_link"] != before["events_with_link"]
+                    or after["links_with_event"] != before["links_with_event"]
+                ):
+                    raise AuthorityError(
+                        "landing evidence migration changed historical session-link correspondence"
+                    )
+
+                # Verify the legacy downgrade did not accidentally populate
+                # identity or rejection metadata.
+                invalid_legacy_rows = conn.execute(
+                    "SELECT COUNT(*) FROM authority_landing_events "
+                    "WHERE match = 'ambiguous' "
+                    "AND evidence_complete = 0 "
+                    "AND work_item_id IS NULL "
+                    "AND attempt_id IS NULL "
+                    "AND consumed_at IS NULL "
+                    "AND rejected_at IS NULL "
+                    "AND rejection_reason IS NULL"
+                ).fetchone()[0]
+
+                if invalid_legacy_rows < legacy_pending_count:
+                    raise AuthorityError(
+                        "landing evidence migration failed legacy-row verification"
+                    )
+
+                conn.execute("COMMIT")
+
+            except BaseException:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
             conn.execute("BEGIN IMMEDIATE")
             stale_links = conn.execute(
                 "SELECT s.link_id, s.session_id, s.work_item_id "
@@ -808,31 +1081,78 @@ class SecureWorkItemStore:
 
     # -- Trusted landing evidence and Session links -------------------------
 
+
     def _record_trusted_landing(
         self,
         session_id: str,
         match: str,
         evidence_complete: bool,
+        work_item_id: str,
+        attempt_id: str,
     ) -> str:
-        """Internal trusted-sender hook; do not expose as an MCP operation.
+        """Record landing evidence bound to one WorkItem send attempt.
 
-        The caller must be the real landing/send pipeline after it has verified
-        the actual conversation identity and F-13 quarantine evidence.
+        This is an internal trusted-sender hook, not an MCP operation.
+        The caller must be the real send pipeline after verifying the actual
+        conversation identity, complete reply, and archived reply file.
         """
         validate_conversation_id(session_id)
+        validate_work_item_id(work_item_id)
+
         if match not in ("confirmed", "mismatch", "ambiguous"):
             raise QuarantineNotCleared("unknown landing match result")
         if not isinstance(evidence_complete, bool):
             raise QuarantineNotCleared("evidence_complete must be boolean")
+        if not isinstance(attempt_id, str) or not attempt_id.startswith("att_"):
+            raise QuarantineNotCleared("attempt_id must use the att_ prefix")
+
+        attempt_suffix = attempt_id[4:]
+        try:
+            parsed_attempt = uuid.UUID(attempt_suffix)
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise QuarantineNotCleared(
+                "attempt_id must contain a UUIDv4"
+            ) from exc
+        if (
+            parsed_attempt.version != 4
+            or str(parsed_attempt) != attempt_suffix
+            or len(attempt_id) != 40
+        ):
+            raise QuarantineNotCleared(
+                "attempt_id must be att_ followed by a canonical lowercase UUIDv4"
+            )
+
         event_id = "le_" + str(uuid.uuid4())
+        created_at = _utc_now()
+
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             conn.execute(
-                "INSERT INTO authority_landing_events"
-                "(event_id, session_id, match, evidence_complete, created_at, consumed_at) "
-                "VALUES (?, ?, ?, ?, ?, NULL)",
-                (event_id, session_id, match, int(evidence_complete), _utc_now()),
+                """
+                INSERT INTO authority_landing_events (
+                    event_id,
+                    session_id,
+                    match,
+                    evidence_complete,
+                    created_at,
+                    consumed_at,
+                    work_item_id,
+                    attempt_id,
+                    rejected_at,
+                    rejection_reason
+                )
+                VALUES (?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL)
+                """,
+                (
+                    event_id,
+                    session_id,
+                    match,
+                    int(evidence_complete),
+                    created_at,
+                    work_item_id,
+                    attempt_id,
+                ),
             )
             conn.execute("COMMIT")
         except BaseException:
@@ -841,6 +1161,7 @@ class SecureWorkItemStore:
             raise
         finally:
             conn.close()
+
         return event_id
 
     def link_session(
@@ -848,26 +1169,115 @@ class SecureWorkItemStore:
         principal: Principal,
         session_id: str,
         work_item_id: str,
+        attempt_id: str,
         evidence: Any = None,
         request_id: Optional[str] = None,
     ) -> SessionLink:
-        """Link using a pending trusted landing event, never caller evidence.
+        """Consume only evidence bound to this exact WorkItem attempt.
 
-        `evidence` remains only for source compatibility. Supplying any value
-        is rejected; old caller-created LandingEvidence objects are not trusted.
+        Caller-supplied evidence remains unsupported. A confirmed event is
+        consumed atomically with link creation and audit insertion.
+
+        A same-session active-link conflict is a deterministic rejection.
+        Its REJECTED terminal state is written only after the link transaction
+        has rolled back, using a separate connection and transaction.
         """
         validate_conversation_id(session_id)
         validate_work_item_id(work_item_id)
+
+        if not isinstance(attempt_id, str) or not attempt_id.startswith("att_"):
+            raise QuarantineNotCleared("attempt_id must use the att_ prefix")
+        try:
+            parsed_attempt = uuid.UUID(attempt_id[4:])
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise QuarantineNotCleared(
+                "attempt_id must contain a UUIDv4"
+            ) from exc
+        if (
+            parsed_attempt.version != 4
+            or str(parsed_attempt) != attempt_id[4:]
+            or len(attempt_id) != 40
+        ):
+            raise QuarantineNotCleared(
+                "attempt_id must be att_ followed by a canonical lowercase UUIDv4"
+            )
+
         if evidence is not None:
             raise QuarantineNotCleared(
                 "caller-supplied landing evidence is not accepted"
             )
+
+        def reject_after_rollback(event_id: str, reason: str) -> None:
+            """Persist a deterministic rejection in its own transaction.
+
+            Failure to persist the rejection is deliberately propagated.
+            The caller must not report REJECTED unless this transaction commits.
+            """
+            rejected_at = _utc_now()
+            reject_conn = self._connect()
+            try:
+                reject_conn.execute("BEGIN IMMEDIATE")
+                changed = reject_conn.execute(
+                    """
+                    UPDATE authority_landing_events
+                    SET rejected_at = ?, rejection_reason = ?
+                    WHERE event_id = ?
+                      AND session_id = ?
+                      AND work_item_id = ?
+                      AND attempt_id = ?
+                      AND match = 'confirmed'
+                      AND evidence_complete = 1
+                      AND consumed_at IS NULL
+                      AND rejected_at IS NULL
+                    """,
+                    (
+                        rejected_at,
+                        reason,
+                        event_id,
+                        session_id,
+                        work_item_id,
+                        attempt_id,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise AuthorityError(
+                        "could not persist landing rejection: "
+                        "the exact pending event was not updated"
+                    )
+                reject_conn.execute("COMMIT")
+            except BaseException:
+                if reject_conn.in_transaction:
+                    reject_conn.execute("ROLLBACK")
+                raise
+            finally:
+                reject_conn.close()
+
+        def has_active_link() -> bool:
+            check_conn = self._connect()
+            try:
+                row = check_conn.execute(
+                    """
+                    SELECT 1
+                    FROM session_links
+                    WHERE session_id = ? AND unlinked_at IS NULL
+                    LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+                return row is not None
+            finally:
+                check_conn.close()
+
         conn = self._connect()
         link_id = "sl_" + str(uuid.uuid4())
         now = _utc_now()
+        selected_event_id = None
+
         try:
             conn.execute("BEGIN IMMEDIATE")
+
             self._require(conn, principal, work_item_id, "write")
+
             item = conn.execute(
                 "SELECT status FROM work_items WHERE work_item_id = ?",
                 (work_item_id,),
@@ -875,49 +1285,148 @@ class SecureWorkItemStore:
             if item is None:
                 raise NotAuthorized()
             if item["status"] in TERMINAL_STATUSES:
-                raise InvalidTransition("terminal WorkItem cannot receive a Session link")
+                raise InvalidTransition(
+                    "terminal WorkItem cannot receive a Session link"
+                )
+
             landing = conn.execute(
-                "SELECT event_id, match, evidence_complete "
-                "FROM authority_landing_events "
-                "WHERE session_id = ? AND consumed_at IS NULL "
-                "ORDER BY created_at DESC, event_id DESC LIMIT 1",
+                """
+                SELECT event_id
+                FROM authority_landing_events
+                WHERE session_id = ?
+                  AND work_item_id = ?
+                  AND attempt_id = ?
+                  AND match = 'confirmed'
+                  AND evidence_complete = 1
+                  AND consumed_at IS NULL
+                  AND rejected_at IS NULL
+                ORDER BY created_at DESC, event_id DESC
+                LIMIT 1
+                """,
+                (session_id, work_item_id, attempt_id),
+            ).fetchone()
+
+            if landing is None:
+                raise QuarantineNotCleared(
+                    "a confirmed, complete, unused landing record for this "
+                    "WorkItem attempt is required"
+                )
+
+            selected_event_id = landing["event_id"]
+
+            # Check the deterministic conflict before consuming the evidence.
+            # The unique index remains the race-safe final enforcement.
+            active = conn.execute(
+                """
+                SELECT 1
+                FROM session_links
+                WHERE session_id = ? AND unlinked_at IS NULL
+                LIMIT 1
+                """,
                 (session_id,),
             ).fetchone()
-            if (
-                landing is None
-                or landing["match"] != "confirmed"
-                or landing["evidence_complete"] != 1
-            ):
-                raise QuarantineNotCleared(
-                    "a confirmed, complete, unused landing record is required"
+            if active is not None:
+                raise SessionAlreadyLinked(
+                    "session already has an active WorkItem link"
                 )
+
+            consumed = conn.execute(
+                """
+                UPDATE authority_landing_events
+                SET consumed_at = ?
+                WHERE event_id = ?
+                  AND session_id = ?
+                  AND work_item_id = ?
+                  AND attempt_id = ?
+                  AND match = 'confirmed'
+                  AND evidence_complete = 1
+                  AND consumed_at IS NULL
+                  AND rejected_at IS NULL
+                """,
+                (
+                    now,
+                    selected_event_id,
+                    session_id,
+                    work_item_id,
+                    attempt_id,
+                ),
+            ).rowcount
+            if consumed != 1:
+                raise QuarantineNotCleared(
+                    "landing evidence was consumed or changed concurrently"
+                )
+
             conn.execute(
-                "UPDATE authority_landing_events SET consumed_at = ? "
-                "WHERE event_id = ? AND consumed_at IS NULL",
-                (now, landing["event_id"]),
-            )
-            conn.execute(
-                "INSERT INTO session_links"
-                "(link_id, session_id, work_item_id, linked_at, unlinked_at) "
-                "VALUES (?, ?, ?, ?, NULL)",
+                """
+                INSERT INTO session_links (
+                    link_id, session_id, work_item_id, linked_at, unlinked_at
+                )
+                VALUES (?, ?, ?, ?, NULL)
+                """,
                 (link_id, session_id, work_item_id, now),
             )
+
             self._audit(
-                conn, principal, "session.link", work_item_id=work_item_id,
-                session_id=session_id, link_id=link_id, request_id=request_id,
+                conn,
+                principal,
+                "session.link",
+                work_item_id=work_item_id,
+                session_id=session_id,
+                link_id=link_id,
+                request_id=request_id,
             )
             conn.execute("COMMIT")
+
+        except SessionAlreadyLinked:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            conn.close()
+            conn = None
+
+            if selected_event_id is None:
+                raise
+
+            reject_after_rollback(
+                selected_event_id,
+                "session_already_linked",
+            )
+            raise
+
         except sqlite3.IntegrityError as exc:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
-            raise SessionAlreadyLinked("session already has an active WorkItem link") from exc
+            conn.close()
+            conn = None
+
+            # IntegrityError alone is not enough to classify this as a
+            # duplicate active link. Confirm the exact session conflict
+            # after rollback; otherwise preserve the original DB exception.
+            if selected_event_id is not None and has_active_link():
+                reject_after_rollback(
+                    selected_event_id,
+                    "session_already_linked",
+                )
+                raise SessionAlreadyLinked(
+                    "session already has an active WorkItem link"
+                ) from exc
+            raise
+
         except BaseException:
-            if conn.in_transaction:
+            if conn is not None and conn.in_transaction:
                 conn.execute("ROLLBACK")
             raise
+
         finally:
-            conn.close()
-        return SessionLink(link_id, session_id, work_item_id, now, None)
+            if conn is not None:
+                conn.close()
+
+        return SessionLink(
+            link_id,
+            session_id,
+            work_item_id,
+            now,
+            None,
+        )
 
     def unlink_session(
         self,

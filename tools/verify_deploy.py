@@ -1,0 +1,314 @@
+#!/usr/bin/env python3
+"""Verify a deployed Session Ops tree against a commit-derived manifest."""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+from pathlib import Path
+from typing import Any
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def git_blob_sha1(data: bytes) -> str:
+    header = b"blob " + str(len(data)).encode("ascii") + b"\0"
+    return hashlib.sha1(header + data).hexdigest()
+
+
+def normalize_lf(data: bytes) -> bytes:
+    # Deliberately normalize CRLF only. Do not rewrite lone CR bytes.
+    return data.replace(b"\r\n", b"\n")
+
+
+def matches_any(path: str, patterns: list[str]) -> bool:
+    return any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
+
+
+def add_issue(
+    issues: list[dict[str, Any]],
+    code: str,
+    path: str,
+    detail: str,
+) -> None:
+    issues.append({"code": code, "path": path, "detail": detail})
+
+
+def verify_database(
+    spec: dict[str, Any],
+    issues: list[dict[str, Any]],
+) -> dict[str, Any]:
+    db_path = Path(spec["path"])
+    result: dict[str, Any] = {
+        "path": str(db_path),
+        "expected_schema_version": spec["schema_version"],
+        "schema_contract_ok": False,
+        "tables": {},
+    }
+
+    if not db_path.is_file():
+        add_issue(issues, "DB_MISSING", str(db_path), "database file is missing")
+        return result
+
+    # URI read-only mode prevents verification from creating or modifying DB.
+    uri = db_path.resolve().as_uri() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+        try:
+            for table, required in spec["required_columns"].items():
+                rows = conn.execute(
+                    "PRAGMA table_info(%s)" % quote_identifier(table)
+                ).fetchall()
+                actual = sorted(row[1] for row in rows)
+                missing = sorted(set(required) - set(actual))
+                result["tables"][table] = {
+                    "actual_columns": actual,
+                    "required_columns": sorted(required),
+                    "missing_columns": missing,
+                }
+                if missing:
+                    add_issue(
+                        issues,
+                        "DB_SCHEMA_BEHIND",
+                        str(db_path),
+                        "%s missing columns: %s"
+                        % (table, ", ".join(missing)),
+                    )
+
+            result["schema_contract_ok"] = all(
+                not value["missing_columns"]
+                for value in result["tables"].values()
+            )
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        add_issue(issues, "DB_SCHEMA_ERROR", str(db_path), str(exc))
+
+    return result
+
+
+def quote_identifier(value: str) -> str:
+    # SQLite identifiers cannot be bound as parameters.
+    if not value or "\x00" in value:
+        raise ValueError("invalid SQLite identifier")
+    return '"' + value.replace('"', '""') + '"'
+
+
+def verify(
+    root: Path,
+    manifest_path: Path,
+    strict: bool = False,
+) -> dict[str, Any]:
+    issues: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return {
+            "ok": False,
+            "root": str(root),
+            "manifest": str(manifest_path),
+            "issues": [{
+                "code": "MANIFEST_ERROR",
+                "path": str(manifest_path),
+                "detail": str(exc),
+            }],
+            "warnings": [],
+        }
+
+    if manifest.get("format_version") != 1:
+        add_issue(issues, "MANIFEST_VERSION", str(manifest_path),
+                  "unsupported format_version")
+
+    commit = manifest.get("commit", "")
+    if (
+        not isinstance(commit, str)
+        or len(commit) != 40
+        or any(c not in "0123456789abcdef" for c in commit)
+    ):
+        add_issue(issues, "INVALID_COMMIT", "commit",
+                  "commit must be a full lowercase 40-character SHA")
+
+    expected: dict[str, dict[str, Any]] = {}
+    for entry in manifest.get("files", []):
+        rel = entry.get("path")
+        if not isinstance(rel, str) or not rel:
+            add_issue(issues, "INVALID_FILE_ENTRY", "files",
+                      "file entry has no valid path")
+            continue
+        candidate = Path(rel)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            add_issue(issues, "UNSAFE_MANIFEST_PATH", rel,
+                      "manifest file path must be relative and stay under root")
+            continue
+        if rel in expected:
+            add_issue(issues, "DUPLICATE_MANIFEST_PATH", rel,
+                      "duplicate file entry")
+            continue
+        expected[rel] = entry
+
+    allowed = manifest.get("allowed_unmanaged", [])
+    forbidden = manifest.get("forbidden", [])
+
+    # Forbidden artifacts are reported even if an allow-list could match them.
+    for pattern in forbidden:
+        if pattern == ".git" or pattern == "tests" or pattern == "deploy":
+            candidate = root / pattern
+            if candidate.exists():
+                add_issue(issues, "FORBIDDEN_PATH", pattern,
+                          "forbidden deployment path exists")
+
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root).as_posix()
+
+        if matches_any(rel, forbidden):
+            add_issue(issues, "FORBIDDEN_PATH", rel,
+                      "forbidden deployment artifact exists")
+            continue
+
+        if path.is_dir():
+            continue
+
+        if rel not in expected:
+            if not matches_any(rel, allowed):
+                add_issue(issues, "UNMANAGED_FILE", rel,
+                          "file is not listed in manifest")
+            continue
+
+        if path.is_symlink():
+            add_issue(issues, "UNEXPECTED_SYMLINK", rel,
+                      "managed files must be regular files")
+            continue
+
+        entry = expected[rel]
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            add_issue(issues, "FILE_READ_ERROR", rel, str(exc))
+            continue
+
+        lf = normalize_lf(raw)
+
+        # Git blob identity is defined over the exact bytes, not over the
+        # LF-normalized representation.
+        actual_blob = git_blob_sha1(raw)
+        actual_lf_sha = sha256(lf)
+        actual_raw_sha = sha256(raw)
+
+        expected_blob = entry.get("git_blob_sha1")
+        expected_lf_sha = entry.get("sha256_lf")
+        expected_raw_sha = entry.get("sha256_raw")
+
+        # Content equality is judged after the explicitly permitted
+        # CRLF-to-LF normalization.
+        if actual_lf_sha != expected_lf_sha:
+            add_issue(issues, "CONTENT_MISMATCH", rel,
+                      "LF-normalized SHA-256 differs from manifest")
+            if actual_blob != expected_blob:
+                add_issue(issues, "GIT_BLOB_MISMATCH", rel,
+                          "raw Git blob SHA-1 differs from manifest")
+        elif actual_raw_sha != expected_raw_sha:
+            warning = {
+                "code": "EOL_DRIFT",
+                "path": rel,
+                "detail": "raw SHA-256 differs; CRLF-normalized content matches",
+            }
+            if strict:
+                issues.append(warning)
+            else:
+                warnings.append(warning)
+
+        # The manifest byte count is the LF-normalized byte count.
+        if len(lf) != entry.get("bytes"):
+            add_issue(issues, "BYTE_COUNT_MISMATCH", rel,
+                      "LF-normalized byte count differs from manifest")
+
+    # A manifest entry not seen in the tree is missing.
+    for rel in sorted(expected):
+        if not (root / rel).is_file():
+            add_issue(issues, "MISSING_FILE", rel,
+                      "manifest-managed file is absent")
+
+    for obj in manifest.get("external_objects", []):
+        path_text = obj.get("path", "")
+        path = Path(path_text)
+        if not path.is_absolute():
+            add_issue(issues, "INVALID_EXTERNAL_PATH", path_text,
+                      "external object path must be absolute")
+            continue
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            add_issue(issues, "EXTERNAL_OBJECT_ERROR", path_text, str(exc))
+            continue
+        if sha256(raw) != obj.get("sha256"):
+            add_issue(issues, "EXTERNAL_DRIFT", path_text,
+                      "external object SHA-256 differs from manifest")
+
+    database_result = None
+    if "database" in manifest:
+        database_result = verify_database(manifest["database"], issues)
+
+    return {
+        "ok": not issues,
+        "root": str(root),
+        "manifest": str(manifest_path),
+        "commit": commit,
+        "strict": strict,
+        "checked_files": len(expected),
+        "checked_external_objects": len(manifest.get("external_objects", [])),
+        "database": database_result,
+        "issues": issues,
+        "warnings": warnings,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", required=True, type=Path)
+    parser.add_argument("--manifest", required=True, type=Path)
+    parser.add_argument("--strict", action="store_true")
+    args = parser.parse_args()
+
+    root = args.root.resolve()
+    if not root.is_dir():
+        result = {
+            "ok": False,
+            "root": str(root),
+            "issues": [{
+                "code": "ROOT_MISSING",
+                "path": str(root),
+                "detail": "deployment root is not a directory",
+            }],
+            "warnings": [],
+        }
+    else:
+        result = verify(root, args.manifest.resolve(), args.strict)
+
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    if result["ok"]:
+        print(
+            "DEPLOY VERIFY OK: %d files, %d external objects"
+            % (
+                result.get("checked_files", 0),
+                result.get("checked_external_objects", 0),
+            )
+        )
+        if result.get("warnings"):
+            print("WARNINGS: %d (EOL drift)" % len(result["warnings"]))
+        return 0
+
+    print("DEPLOY VERIFY FAILED: %d issue(s)" % len(result.get("issues", [])))
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

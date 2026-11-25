@@ -115,15 +115,19 @@ class WorkItemCliTests(unittest.TestCase):
     def test_work_item_cli_new_send_records_consumed_event_and_active_link(self):
         session_id = cid()
         api = CountingFakeAPI([session_id], root=self.root)
-        with patch.object(sender, "record_conv") as record:
-            code, output, _ = self.run_main(
-                [
-                    "--account", "acct1",
-                    *self.cli_flags(),
-                    "--new", str(self.prompt),
-                ],
-                api=api,
-            )
+        trusted_root = Path(__file__).resolve().parents[1]
+
+        with patch.object(sender, "require_trusted_worktree_root",
+                          return_value=trusted_root):
+            with patch.object(sender, "record_conv") as record:
+                code, output, _ = self.run_main(
+                    [
+                        "--account", "acct1",
+                        *self.cli_flags(),
+                        "--new", str(self.prompt),
+                    ],
+                    api=api,
+                )
 
         self.assertEqual(code, 0, output)
         self.assertEqual(api.send_calls, 1)
@@ -151,9 +155,10 @@ class WorkItemCliTests(unittest.TestCase):
             ("ambiguous", [cid(), cid()], True, False),
             ("incomplete", [cid()], False, False),
         ]
+        trusted_root = Path(__file__).resolve().parents[1]
+
         for name, ids, complete, mismatch in cases:
             with self.subTest(name=name):
-                # 每个子用例使用独立数据库和 WorkItem，避免事件互相污染。
                 case_db = self.root / (name + ".sqlite3")
                 store = SecureWorkItemStore(
                     case_db,
@@ -182,9 +187,14 @@ class WorkItemCliTests(unittest.TestCase):
                     "_quarantine_reply",
                     return_value=(str(self.root / "quarantine"), True),
                 )
-                with quarantine_patch:
-                    with patch.object(sender, "record_conv"):
-                        code, output, _ = self.run_main(argv, api=api)
+                with patch.object(
+                    sender,
+                    "require_trusted_worktree_root",
+                    return_value=trusted_root,
+                ):
+                    with quarantine_patch:
+                        with patch.object(sender, "record_conv"):
+                            code, output, _ = self.run_main(argv, api=api)
 
                 self.assertNotEqual(code, 0, output)
                 self.assertEqual(api.send_calls, 1)
@@ -227,22 +237,28 @@ class WorkItemCliTests(unittest.TestCase):
                 factory.assert_not_called()
 
     def test_evidence_and_match_flags_are_rejected(self):
-        for forbidden in ("--evidence", "--match", "--confirmed"):
-            with self.subTest(forbidden=forbidden):
-                api = CountingFakeAPI([cid()], root=self.root)
-                code, output, factory = self.run_main(
-                    [
-                        "--account", "acct1",
-                        *self.cli_flags(),
-                        forbidden, "confirmed",
-                        "--new", str(self.prompt),
-                    ],
-                    api=api,
-                )
-                self.assertEqual(code, 2, output)
-                self.assertIn("usage:", output)
-                self.assertEqual(api.send_calls, 0)
-                factory.assert_not_called()
+        trusted_root = Path(__file__).resolve().parents[1]
+        with patch.object(
+            sender,
+            "require_trusted_worktree_root",
+            return_value=trusted_root,
+        ):
+            for forbidden in ("--evidence", "--match", "--confirmed"):
+                with self.subTest(forbidden=forbidden):
+                    api = CountingFakeAPI([cid()], root=self.root)
+                    code, output, factory = self.run_main(
+                        [
+                            "--account", "acct1",
+                            *self.cli_flags(),
+                            forbidden, "confirmed",
+                            "--new", str(self.prompt),
+                        ],
+                        api=api,
+                    )
+                    self.assertEqual(code, 2, output)
+                    self.assertIn("usage:", output)
+                    self.assertEqual(api.send_calls, 0)
+                    factory.assert_not_called()
 
 
 if __name__ == "__main__":

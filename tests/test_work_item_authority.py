@@ -63,16 +63,30 @@ class Base(unittest.TestCase):
     def record_landing(
         self,
         session_id: str,
+        work_item_id: str,
         match: str = "confirmed",
         complete: bool = True,
+        attempt_id: str | None = None,
     ) -> str:
         # This simulates the trusted Session Ops landing/send component.
-        return self.store._record_trusted_landing(session_id, match, complete)
+        # The same attempt identity must be supplied when consuming the event.
+        if attempt_id is None:
+            attempt_id = "att_" + str(uuid.uuid4())
+        self.store._record_trusted_landing(
+            session_id,
+            match,
+            complete,
+            work_item_id,
+            attempt_id,
+        )
+        return attempt_id
 
     def create_link(self, work_item_id: str) -> str:
         sid = conversation_id()
-        self.record_landing(sid)
-        link = self.store.link_session(self.alice, sid, work_item_id)
+        attempt_id = self.record_landing(sid, work_item_id)
+        link = self.store.link_session(
+            self.alice, sid, work_item_id, attempt_id
+        )
         return link.link_id
 
 
@@ -397,7 +411,7 @@ class LandingEvidenceTests(Base):
     ) -> None:
         item = self.store.create_work_item(self.alice)
         sid = conversation_id()
-        self.record_landing(sid)
+        attempt_id = self.record_landing(sid, item.work_item_id)
         fake = {
             "conversation_id": sid,
             "match": "confirmed",
@@ -406,15 +420,19 @@ class LandingEvidenceTests(Base):
 
         with self.assertRaises(QuarantineNotCleared):
             self.store.link_session(
-                self.alice, sid, item.work_item_id, fake
+                self.alice,
+                sid,
+                item.work_item_id,
+                attempt_id,
+                evidence=fake,
             )
 
         conn = self.store._connect()
         try:
             landing = conn.execute(
-                "SELECT consumed_at FROM authority_landing_events "
-                "WHERE session_id = ? AND consumed_at IS NULL",
-                (sid,),
+                "SELECT consumed_at, rejected_at FROM authority_landing_events "
+                "WHERE session_id = ? AND work_item_id = ? AND attempt_id = ?",
+                (sid, item.work_item_id, attempt_id),
             ).fetchone()
             link_count = conn.execute(
                 "SELECT count(*) FROM session_links WHERE session_id = ?",
@@ -425,27 +443,37 @@ class LandingEvidenceTests(Base):
 
         self.assertIsNotNone(landing)
         self.assertIsNone(landing["consumed_at"])
+        self.assertIsNone(landing["rejected_at"])
         self.assertEqual(link_count, 0)
 
         # The same trusted landing event must be usable without caller evidence.
-        link = self.store.link_session(self.alice, sid, item.work_item_id)
+        link = self.store.link_session(
+            self.alice, sid, item.work_item_id, attempt_id
+        )
         self.assertEqual(link.session_id, sid)
 
     def test_link_requires_server_recorded_landing(self) -> None:
         item = self.store.create_work_item(self.alice)
         with self.assertRaises(QuarantineNotCleared):
             self.store.link_session(
-                self.alice, conversation_id(), item.work_item_id
+                self.alice,
+                conversation_id(),
+                item.work_item_id,
+                "att_" + str(uuid.uuid4()),
             )
 
     def test_confirmed_complete_landing_can_be_consumed_once(self) -> None:
         item = self.store.create_work_item(self.alice)
         sid = conversation_id()
-        self.record_landing(sid)
-        link = self.store.link_session(self.alice, sid, item.work_item_id)
+        attempt_id = self.record_landing(sid, item.work_item_id)
+        link = self.store.link_session(
+            self.alice, sid, item.work_item_id, attempt_id
+        )
         self.assertEqual(link.session_id, sid)
         with self.assertRaises(QuarantineNotCleared):
-            self.store.link_session(self.alice, sid, item.work_item_id)
+            self.store.link_session(
+                self.alice, sid, item.work_item_id, attempt_id
+            )
 
     def test_mismatch_ambiguous_and_incomplete_landing_fail_closed(self) -> None:
         item = self.store.create_work_item(self.alice)
@@ -455,49 +483,61 @@ class LandingEvidenceTests(Base):
             ("confirmed", False),
         ):
             sid = conversation_id()
-            self.record_landing(sid, match, complete)
+            attempt_id = self.record_landing(
+                sid, item.work_item_id, match, complete
+            )
             with self.subTest(match=match, complete=complete):
                 with self.assertRaises(QuarantineNotCleared):
                     self.store.link_session(
-                        self.alice, sid, item.work_item_id
+                        self.alice,
+                        sid,
+                        item.work_item_id,
+                        attempt_id,
                     )
 
     def test_session_link_requires_write_authority(self) -> None:
         item = self.store.create_work_item(self.alice)
         self.store.grant(self.alice, item.work_item_id, "bob", "read")
         sid = conversation_id()
-        self.record_landing(sid)
+        attempt_id = self.record_landing(sid, item.work_item_id)
         with self.assertRaises(NotAuthorized):
-            self.store.link_session(self.bob, sid, item.work_item_id)
+            self.store.link_session(
+                self.bob, sid, item.work_item_id, attempt_id
+            )
 
     def test_duplicate_active_link_is_rejected(self) -> None:
         item = self.store.create_work_item(self.alice)
         sid = conversation_id()
-        self.record_landing(sid)
-        self.store.link_session(self.alice, sid, item.work_item_id)
+        first_attempt = self.record_landing(sid, item.work_item_id)
+        self.store.link_session(
+            self.alice, sid, item.work_item_id, first_attempt
+        )
+
         other = self.store.create_work_item(self.alice)
-        self.record_landing(sid)
+        second_attempt = self.record_landing(sid, other.work_item_id)
         with self.assertRaises(SessionAlreadyLinked):
-            self.store.link_session(self.alice, sid, other.work_item_id)
+            self.store.link_session(
+                self.alice, sid, other.work_item_id, second_attempt
+            )
 
     def test_terminal_work_item_cannot_receive_link(self) -> None:
         item = self.store.create_work_item(self.alice)
         self.store.set_status(self.alice, item.work_item_id, "completed")
         sid = conversation_id()
-        self.record_landing(sid)
+        attempt_id = self.record_landing(sid, item.work_item_id)
         with self.assertRaises(InvalidTransition):
-            self.store.link_session(self.alice, sid, item.work_item_id)
+            self.store.link_session(
+                self.alice, sid, item.work_item_id, attempt_id
+            )
 
 
 class UnlinkAndVisibilityTests(Base):
     def test_begin_immediate_blocks_second_writer_before_it_reads(self) -> None:
         item = self.store.create_work_item(self.alice)
         sid = conversation_id()
-        self.record_landing(sid)
+        attempt_id = self.record_landing(sid, item.work_item_id)
 
         # Two independently-created SQLite connections are essential here.
-        # A holds the writer reservation during the simulated
-        # "authorization checked, mutation not committed" window.
         conn_a = self.store._connect()
         conn_b = self.store._connect()
         self.addCleanup(conn_a.close)
@@ -509,10 +549,6 @@ class UnlinkAndVisibilityTests(Base):
             (item.work_item_id,),
         ).fetchone()
 
-        # Keep the production timeout/busy_timeout (3 seconds). This is
-        # intentionally a slow lock test: shortening the timeout, or merely
-        # checking eventual failure, would not prove that BEGIN IMMEDIATE
-        # blocks B before it can read the pre-commit state.
         statements = []
         conn_b.set_trace_callback(statements.append)
 
@@ -523,12 +559,10 @@ class UnlinkAndVisibilityTests(Base):
                         self.alice,
                         sid,
                         item.work_item_id,
+                        attempt_id,
                     )
 
             self.assertRegex(str(caught.exception).lower(), r"locked|busy")
-            # With BEGIN IMMEDIATE, B fails at transaction acquisition. A
-            # deferred BEGIN would allow SELECTs before its first write fails,
-            # so this also makes the BEGIN -> deferred mutation red.
             self.assertEqual(statements, ["BEGIN IMMEDIATE"])
         finally:
             if conn_a.in_transaction:
@@ -537,8 +571,10 @@ class UnlinkAndVisibilityTests(Base):
     def test_unlink_absent_and_unauthorized_are_indistinguishable(self) -> None:
         item = self.store.create_work_item(self.alice)
         sid = conversation_id()
-        self.record_landing(sid)
-        self.store.link_session(self.alice, sid, item.work_item_id)
+        attempt_id = self.record_landing(sid, item.work_item_id)
+        self.store.link_session(
+            self.alice, sid, item.work_item_id, attempt_id
+        )
         unauthorized_result = self.store.unlink_session(self.bob, sid)
         absent_result = self.store.unlink_session(self.bob, conversation_id())
         self.assertIsNone(unauthorized_result)
@@ -548,8 +584,10 @@ class UnlinkAndVisibilityTests(Base):
     def test_owner_can_unlink_and_link_disappears(self) -> None:
         item = self.store.create_work_item(self.alice)
         sid = conversation_id()
-        self.record_landing(sid)
-        link = self.store.link_session(self.alice, sid, item.work_item_id)
+        attempt_id = self.record_landing(sid, item.work_item_id)
+        link = self.store.link_session(
+            self.alice, sid, item.work_item_id, attempt_id
+        )
         removed = self.store.unlink_session(
             self.alice, sid, expected_link_id=link.link_id
         )
@@ -560,8 +598,10 @@ class UnlinkAndVisibilityTests(Base):
     def test_stale_expected_link_id_does_not_unlink(self) -> None:
         item = self.store.create_work_item(self.alice)
         sid = conversation_id()
-        self.record_landing(sid)
-        link = self.store.link_session(self.alice, sid, item.work_item_id)
+        attempt_id = self.record_landing(sid, item.work_item_id)
+        link = self.store.link_session(
+            self.alice, sid, item.work_item_id, attempt_id
+        )
         result = self.store.unlink_session(
             self.alice,
             sid,
@@ -574,8 +614,10 @@ class UnlinkAndVisibilityTests(Base):
     def test_active_link_is_hidden_from_stranger(self) -> None:
         item = self.store.create_work_item(self.alice)
         sid = conversation_id()
-        self.record_landing(sid)
-        self.store.link_session(self.alice, sid, item.work_item_id)
+        attempt_id = self.record_landing(sid, item.work_item_id)
+        self.store.link_session(
+            self.alice, sid, item.work_item_id, attempt_id
+        )
         self.assertIsNotNone(self.store.get_active_link(self.alice, sid))
         self.assertIsNone(self.store.get_active_link(self.bob, sid))
 
@@ -619,8 +661,10 @@ class PaginationTests(Base):
         item = self.store.create_work_item(self.alice)
         session_ids = [conversation_id() for _ in range(5)]
         for sid in session_ids:
-            self.record_landing(sid)
-            self.store.link_session(self.alice, sid, item.work_item_id)
+            attempt_id = self.record_landing(sid, item.work_item_id)
+            self.store.link_session(
+                self.alice, sid, item.work_item_id, attempt_id
+            )
         first = self.store.list_sessions(
             self.alice, item.work_item_id, limit=2
         )
@@ -677,15 +721,15 @@ class AuditTests(Base):
         self.store.grant(self.alice, item.work_item_id, "bob", "read")
         self.store.revoke(self.alice, item.work_item_id, "bob", "read")
         sid = conversation_id()
-        self.record_landing(sid)
-        link = self.store.link_session(self.alice, sid, item.work_item_id)
+        attempt_id = self.record_landing(sid, item.work_item_id)
+        link = self.store.link_session(
+            self.alice, sid, item.work_item_id, attempt_id
+        )
         self.store.unlink_session(
             self.alice, sid, expected_link_id=link.link_id
         )
-        actions = [
-            event["action"]
-            for event in self.store.list_audit_events(item.work_item_id)
-        ]
+        events = self.store.list_audit_events(item.work_item_id)
+        actions = [event["action"] for event in events]
         self.assertEqual(
             actions,
             [
@@ -697,10 +741,7 @@ class AuditTests(Base):
                 "session.unlink",
             ],
         )
-        events = self.store.list_audit_events(item.work_item_id)
-        self.assertTrue(
-            all(event["outcome"] == "success" for event in events)
-        )
+        self.assertTrue(all(event["outcome"] == "success" for event in events))
         self.assertTrue(
             all(event["principal_id"] == "alice" for event in events)
         )
