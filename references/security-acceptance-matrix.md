@@ -154,6 +154,18 @@ cited case only ever called `work_item.grant`, so deleting
 left all cases green. A symmetric revoke case now exists and goes red on that
 deletion.
 
+**Row 8 note — a fourth refusal that no case can reach.** `_resolve_grant_target`
+also refuses when `record.principal_id != target`. Both directories bundled with
+this tree key their lookup by principal id — `StaticPrincipalDirectory.resolve`
+is `self._records.get(principal_id)`, and `DenyAllPrincipalDirectory` returns
+nothing — so a record answering for a different id cannot occur with either. The
+clause defends against a `PrincipalDirectory` implementation that replies with the
+wrong principal, which the Protocol permits and neither bundled implementation
+does. Mutation check: deleting the clause leaves `tests/test_work_item_authority`
+green. So this row's "unknown, disabled, or another tenant" names three of the
+four checks the function performs; the fourth is defence in depth, the same shape
+as row 3's duplicate `aud`.
+
 ---
 
 ## C. Isolation (9–11)
@@ -163,6 +175,14 @@ deletion.
 | 9 | Same-tenant principal with no grant reads another's WorkItem | Denied. | `test:test_same_tenant_stranger_cannot_read` | PROVEN `mutation-checked` |
 | 10 | Another tenant reads, and separately: the WorkItem does not exist | **Indistinguishable.** A caller must not be able to probe for existence. | `test:test_other_tenant_cannot_read` `test:test_missing_cross_tenant_and_no_grant_are_identical` `test:test_cross_tenant_and_missing_resource_are_indistinguishable` `code:NotAuthorized()` (empty message) | PROVEN `mutation-checked` |
 | 11 | A `read` grant tries to update status | Denied; `read` does not imply `write`. | `test:test_read_grant_allows_read_but_not_write` `test:test_write_grant_allows_status_update` | PROVEN `mutation-checked` |
+
+**Row 10 note — one branch with nothing behind it.** `_require_owner` also raises
+when the `work_item_owners` lookup returns no row. That is reachable: an owner row
+can be absent, which is what `OrphanReport` exists to describe. But no offline
+case builds one, so replacing the clause with `False` leaves the suite green.
+This is **not** the unreachable code that row 16 records — the `rowcount` guard
+there cannot be executed at all, while this branch can and simply never is. It is
+listed as an uncovered branch rather than counted as evidence.
 
 ---
 
