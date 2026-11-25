@@ -79,8 +79,9 @@ A deployment is attributable to a commit only when all of the following hold:
    verifier passing.
 2. The manifest's managed path list is exactly the intended deployment
    selection, and is not empty.
-3. Every deployed managed file passes verification against that manifest, and
-   the deployment root contains no symbolic links.
+3. Every deployed managed file passes verification against that manifest under
+   `--strict`, so no file differs from the commit even in line endings, and the
+   deployment root contains no symbolic links.
 4. Required external objects pass their recorded hash checks.
 5. The database contract is present in the manifest and its required columns
    pass verification.
@@ -96,10 +97,12 @@ When the verifier reports a missing file, a content or blob mismatch, external
 object drift, or a database schema failure, do not describe the deployment as
 matching the selected commit. Correct the deployment first.
 
-The verifier result, the manifest commit, and the deployment directory
-timestamp belong together in the deployment record. A commit SHA written in a
-manifest is an expected source identity; on its own it is not proof that the
-files on disk were installed from that commit.
+The verifier result and the manifest commit belong together in the deployment
+record. The deployment directory timestamp may be recorded beside them as an
+operational marker — it locates the window in the journal — but it is not
+evidence of what was installed. A commit SHA written in a manifest is an
+expected source identity; on its own it is not proof that the files on disk
+were installed from that commit. Section 8 states what is.
 
 
 ## 1. Deployment authority
