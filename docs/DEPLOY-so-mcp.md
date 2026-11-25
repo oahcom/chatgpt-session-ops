@@ -791,6 +791,17 @@ path, including across `/`, and suppresses `UNMANAGED_FILE` for the whole tree.
 The patterns in the command above are the reviewed set; any other entry is an
 unreviewed exclusion.
 
+The suppression is not limited to empty manifests. Measured on the current
+verifier with a manifest that manages `app.py` and sets
+`allowed_unmanaged: ["*"]`, against a root holding a correct `app.py` and an
+unmanaged `backdoor.py`: exit 0, `DEPLOY VERIFY OK: 1/1 files verified`,
+`UNMANAGED_FILE` not reported. Removing the `*` entry from the same tree
+produces exit 1 with `UNMANAGED_FILE` on `backdoor.py`. A `*` in the allow-list
+therefore converts "a file nobody reviewed was added to the deployment root"
+from a failure into a silent pass. That is why the reviewed pattern set is part
+of the contract, and why a manifest carrying `*` should be rejected in review
+rather than accepted because the run passed.
+
 None of this argues against running the verifier. It argues for running it on a
 tree extracted from the recorded commit, with a manifest generated on the
 trusted checkout, with the link check above returning nothing, and for reading
