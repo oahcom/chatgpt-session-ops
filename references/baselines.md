@@ -141,6 +141,8 @@
 
 **所以 A23 的硬门禁落在「必须探测」而不是「假设 flag 有效」**：flag 是缓解，`--proxy-check --browser` 的 `leaked/unverified` 才是判定。另有一条环境坑：`--temp` 的 profile 目录是固定的，多端口并存时第二实例会被单实例机制吞掉（CDP 永不就绪），自启动必须按端口用独立 profile 目录。
 
+| 编号 | 基线 | 判定口径 | 违例后果 |
+|---|---|---|---|
 | **A24** | 解析不到出口就拒绝联网 | `SystemExit(3)`（1=业务失败 2=参数错 3=未满足联网条件）；只有 `CHATGPT_ALLOW_DIRECT=1` 放行直连 | 静默直连最坏：任务「成功」了，真实 IP 已暴露 |
 | **A25** | 探活必须端到端握手 | 代理 CONNECT/SOCKS 协商 + 目标 HTTPS TLS 握手 + **证书链/有效期/域名校验**；每阶段超时 ≤10s；`UNEXPECTED_EOF`/证书错误/超时判失败；bypass 不算代理成功；`--proxy-check --browser` 两侧公网 IP 不一致 → `exit 3` | 端口在听 ≠ 能用（7890 回 200 后断流，7897 才通） |
 | **A26** | 探活必须验**目标站**，不能只量 IP | `probe_site()`：对 `https://chatgpt.com/` 发一次 GET，`verdict ∈ {ok, challenge}` 才算通过（`blocked_vpn/forbidden/unreachable/http_<code>` 一律不通过）；`--proxy-check` 的 `ok` 必须同时满足「代理生效」且 `site.ok`，否则 `exit 3`（`full_chain_verified=false`）；只有 `ipify` 通不算 | 见下 |

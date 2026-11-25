@@ -36,8 +36,9 @@ python -m unittest tests.test_mcp_transport              # 18
 python -m unittest tests.test_mcp_alg_confusion          # 7
 python -m unittest tests.test_mcp_rs256                  # 8
 python -m unittest tests.test_mcp_sdk_integration        # 4 (skips without mcp)
-python -m pytest -q                                      # 746 passed, 6 skipped
-                                                         # 742 passed, 10 skipped without mcp
+python -m unittest tests.test_cdp_import_order           # 13
+python -m pytest -q                                      # 759 passed, 6 skipped
+                                                         # 755 passed, 10 skipped without mcp
 ```
 
 **What PROVEN means here, and what it does not.** PROVEN means the named case
