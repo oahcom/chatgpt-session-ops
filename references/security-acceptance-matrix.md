@@ -37,9 +37,18 @@ python -m unittest tests.test_mcp_alg_confusion          # 7
 python -m unittest tests.test_mcp_rs256                  # 8
 python -m unittest tests.test_mcp_sdk_integration        # 4 (skips without mcp)
 python -m unittest tests.test_cdp_import_order           # 13
-python -m pytest -q                                      # 759 passed, 6 skipped
-                                                         # 755 passed, 10 skipped without mcp
+python -m pytest -q                                      # must be green; total not restated
 ```
+
+The module counts above are the ones a reader can check in a single command: the
+seven that back this table's rows, plus `test_cdp_import_order`, which backs no
+row here and is listed only because it is the module whose arrival moved the
+number this block used to carry. The whole-suite total is deliberately not
+restated. It moves whenever any test anywhere is added, and the previous version
+of this block shows what that costs — it was measured at `ac2b50c`, correct then,
+and wrong three hours later when #50 added those same CDP import-order cases.
+The last recorded full-suite snapshot is in `references/baselines.md` §G, with
+its own as-of date and commit; it describes that commit and nothing after it.
 
 **What PROVEN means here, and what it does not.** PROVEN means the named case
 asserts the behaviour *and* the case goes red when the behaviour is deleted.
