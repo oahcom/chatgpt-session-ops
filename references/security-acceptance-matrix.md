@@ -256,7 +256,12 @@ for `test_caller_supplied_evidence_is_rejected`, which passes a dict where the
 attempt id belongs: the old blind case from row 12 now holds a new guard by
 accident. Repairing that test to pass a real attempt id would silently unhold
 the shape check, which is why the coupling is written down here rather than
-discovered by whoever does the repair.
+discovered by whoever does the repair. The same shape is enforced a third time
+as a JSON-Schema `pattern`, and that layer is held by nothing: replacing the
+`att_` pattern with `.*` leaves the suite green, and so does disabling the
+`if "pattern" in rule` branch in `_validate_arguments` outright. No case sends a
+malformed id through a tool call, and the store validates every id it receives,
+which is why nothing notices.
 
 **Row 14 note — the rejection is a second transaction, and the cases know it.**
 `reject_after_rollback` opens its own connection, takes `BEGIN IMMEDIATE`,
