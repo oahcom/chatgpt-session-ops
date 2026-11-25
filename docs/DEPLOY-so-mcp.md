@@ -700,11 +700,20 @@ Confirm the deployed tree holds no links before trusting a pass:
 sudo find /opt/so-mcp -type l -print
 ```
 
-Any output invalidates the run. The commit tree carries no symbolic links, so a
-link in the deployment root did not come from the commit: rebuild the root from
-the recorded commit and verify again. `git archive` preserves links rather than
-dropping them, so check the rebuilt root the same way instead of assuming the
-extraction removed them.
+Any output invalidates the run. Check the recorded commit the same way before
+concluding a link came from it:
+
+```bash
+git -C <trusted/checkout> ls-tree -r "$COMMIT" | awk '$1=="120000"'
+```
+
+An empty result means the commit carries no symbolic links, so a link in the
+deployment root was not installed from it: rebuild the root from the commit and
+verify again. `git archive` preserves links rather than dropping them, so check
+the rebuilt root instead of assuming the extraction removed them. If the
+command does list a link, the commit itself carries one, and the verifier's
+inability to look through a symlinked directory applies to that path by design:
+resolve it in the deployment record rather than treating the run as clean.
 
 **`checked_files` counts manifest entries, not verified files.** The banner's
 `N files` is the length of `manifest["files"]`. A run that read no file bodies
