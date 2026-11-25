@@ -1,6 +1,13 @@
 # Security Acceptance Matrix — SO MCP surface (v1)
 
-**Scope:** the Session Ops MCP surface as it exists at `3839aeadf56cab4de3e477d28b477d1ae61f7cbc` on `main`.
+**Scope:** the Session Ops MCP surface on `main`. This paragraph says what the
+document covers, not a revision it is frozen at: rows are added as behaviour
+lands, so a commit pinned here describes the table on the day it was written and
+nothing after. The line used to pin
+`3839aeadf56cab4de3e477d28b477d1ae61f7cbc`, and that stopped being true — row 22
+did not exist at that revision, and row 20 has since been extended to cover an
+address-pinning fix that landed later. Where a claim depends on a revision, the
+row names that revision.
 Every row names the test that proves it. A row without a test name is not
 evidence, it is an intention; any such row is marked `human:` and says why.
 
