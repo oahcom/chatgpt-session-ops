@@ -4816,6 +4816,27 @@ class TestRegistryMonotonicGuard(TmpBase):
         self.assertIn("6afd0001-1111-83ee-8000-000000000001", on_disk)
         self.assertIn("6afd0002-2222-83ee-8000-000000000002", on_disk)
 
+        # 第二层（高水位）在场时，上面那两条断言其实是被它兜住的，不是被
+        # `lost` 兜住的——把 `if lost:` 改成永假，这一半仍然绿。`lost` 唯一
+        # 不可替代的场景是 A 态：高水位基准还不存在。删掉基准再测一次，
+        # 才能让那个分支真的被覆盖。
+        #
+        # 这一段的现实意义：A 态意味着这是本机第一次跑带守卫的版本。基准用
+        # 当前注册表初始化，所以如果没有 `lost`，删除会静默落盘，而且基准会
+        # 用**删完之后**的集合写下去——高水位从此永久抹平，后面再也发现不了。
+        os.remove(m.CONV_MAP_FILE + ".highwater.json")
+
+        with self.assertRaises(m.RegistryShrinkRefused):
+            m._update_json(m.CONV_MAP_FILE, shrink, {})
+
+        self.assertIn("6afd0001-1111-83ee-8000-000000000001",
+                      m._load_json(m.CONV_MAP_FILE, {}),
+                      "A 态下删除被放行——lost 守卫不是冗余的")
+        self.assertFalse(
+            os.path.exists(m.CONV_MAP_FILE + ".highwater.json"),
+            "守卫必须在初始化基准之前就拒绝，否则基准会用删完的集合落盘",
+        )
+
     def test_guard_detects_cross_process_deletion_via_highwater(self):
         path = m.CONV_MAP_FILE
         m.record_conv("6afd0003-3333-83ee-8000-000000000003", "acct1", "p3.md")
