@@ -15,10 +15,44 @@ import json
 import os
 import sys
 
-_CDP_DIR = os.environ.get("CHATGPT_CDP_DIR") or os.path.join(
-    os.path.expanduser("~"), ".workbuddy", "skills", "browser-automation-cdp", "scripts")
-sys.path.insert(0, _CDP_DIR)
-from cdp import CDPClient  # noqa: E402
+# P2-CDP：CDP 适配器延迟加载。
+# 模块级 `from cdp import CDPClient` 会把「解析参数」「judge_error」这类纯逻辑
+# 一并绑上浏览器依赖——无 CDP 的环境（CI、Linux 服务器）连 --help 都起不来。
+# 这里保留 `CDPClient` 这个名字：它是模块级可替换点（tests/test_hardening.py
+# 用 p1.CDPClient 对 CDP 打桩），默认 None 表示「尚未解析」。
+CDPClient = None
+
+
+class CdpUnavailable(RuntimeError):
+    """CDP 浏览器适配器不可用——延迟到真正需要浏览器时才判定。"""
+
+
+_CDP_HINT = (
+    "CDP_UNAVAILABLE\n"
+    "本操作需要 CDP 浏览器适配器。\n"
+    "cdp 模块未安装，或运行路径未配置（CHATGPT_CDP_DIR）。\n"
+    "未执行任何浏览器操作。"
+)
+
+
+def _cdp_client():
+    """按需导入 cdp.CDPClient。只有真正要连浏览器时才可能失败。"""
+    cdp_dir = os.environ.get("CHATGPT_CDP_DIR") or os.path.join(
+        os.path.expanduser("~"), ".workbuddy", "skills", "browser-automation-cdp", "scripts")
+    if cdp_dir not in sys.path:
+        sys.path.insert(0, cdp_dir)
+    try:
+        from cdp import CDPClient as _client
+    except ModuleNotFoundError as e:
+        # 区分「cdp 本身不存在」与「cdp 内部依赖损坏」：否则后者会被误报成
+        # 未安装，排查方向直接错。
+        if e.name == "cdp":
+            raise CdpUnavailable("%s（查找路径：%s）" % (_CDP_HINT, cdp_dir)) from e
+        raise CdpUnavailable("CDP 模块内部依赖缺失：%s" % e.name) from e
+    except Exception as e:
+        raise CdpUnavailable(
+            "CDP 模块初始化失败：%s: %s" % (type(e).__name__, e)) from e
+    return _client
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 TOKEN_JS = """(function(){
@@ -80,6 +114,12 @@ def chatgpt_cookies(c):
 def main():
     argv = sys.argv[1:]
     port = 9222
+    if "-h" in argv or "--help" in argv:
+        print("usage: python extract_auth.py [--port 9222]", flush=True)
+        print("  从已登录的调试浏览器里导出 ChatGPT cookies 与 access_token。", flush=True)
+        print("  运行前需先启动调试端口：python start_chrome.py --port 9222", flush=True)
+        print("  退出码：0 成功 / 2 用法或参数错误 / 3 缺少 CDP 浏览器适配器", flush=True)
+        return 0
     if "--port" in argv:
         i = argv.index("--port")
         if i + 1 >= len(argv):
@@ -93,7 +133,8 @@ def main():
     else:
         port = int(os.environ.get("CHATGPT_CDP_PORT") or 9222)
 
-    c = CDPClient(host="127.0.0.1", port=port, timeout=30)
+    client_cls = CDPClient or _cdp_client()
+    c = client_cls(host="127.0.0.1", port=port, timeout=30)
     try:
         c.ensure_page(url_contains="chatgpt.com")
     except Exception as e:
@@ -135,4 +176,12 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # 退出码契约（不得扩大捕获范围）：
+    #   0 成功 / 2 用法或参数错误 / 3 缺少 CDP 浏览器适配器
+    # 只捕获 CdpUnavailable。其他异常一律按原语义抛出，不得被映射成 3——
+    # 否则真实的程序缺陷会被伪装成「环境没装好」，排查方向直接错。
+    try:
+        sys.exit(main())
+    except CdpUnavailable as e:
+        print(str(e), file=sys.stderr, flush=True)
+        sys.exit(3)
