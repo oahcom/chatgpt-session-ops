@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import os
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -67,6 +70,188 @@ class VerifyDeployTests(unittest.TestCase):
         self.assertTrue(result["ok"], result["issues"])
         self.assertEqual(result["issues"], [])
         self.assertEqual(result["warnings"], [])
+
+    def test_all_zero_commit_is_rejected(self) -> None:
+        manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        manifest["commit"] = "0" * 40
+        self.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            any(
+                issue["code"] == "INVALID_COMMIT"
+                and issue["path"] == "commit"
+                for issue in result["issues"]
+            ),
+            result["issues"],
+        )
+
+    def test_all_f_commit_is_rejected(self) -> None:
+        manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        manifest["commit"] = "f" * 40
+        self.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            any(issue["code"] == "INVALID_COMMIT"
+                for issue in result["issues"]),
+            result["issues"],
+        )
+
+    def test_crlf_content_produces_only_eol_drift(self) -> None:
+        lf = b"print('session ops')\n"
+        crlf = b"print('session ops')\r\n"
+        (self.root / "app.py").write_bytes(crlf)
+
+        entry = {
+            "path": "app.py",
+            "git_blob_sha1": blob_sha1(lf),
+            "sha256_lf": hashlib.sha256(lf).hexdigest(),
+            "sha256_raw": hashlib.sha256(lf).hexdigest(),
+            "bytes": len(lf),
+        }
+        self.write_manifest([entry])
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assertTrue(result["ok"], result["issues"])
+        self.assertEqual(result["issues"], [])
+        self.assertEqual(
+            [w["code"] for w in result["warnings"]],
+            ["EOL_DRIFT"],
+        )
+        self.assertFalse(
+            any(i["code"] == "GIT_BLOB_MISMATCH" for i in result["issues"])
+        )
+
+        strict_result = verify(self.root, self.manifest_path, strict=True)
+        self.assertFalse(strict_result["ok"])
+        self.assertEqual(
+            [i["code"] for i in strict_result["issues"]],
+            ["EOL_DRIFT"],
+        )
+
+    def test_real_change_reports_both_codes(self) -> None:
+        (self.root / "app.py").write_bytes(b"print('different content')\n")
+
+        result = verify(self.root, self.manifest_path)
+
+        codes = [i["code"] for i in result["issues"]]
+        self.assertIn("CONTENT_MISMATCH", codes)
+        self.assertIn("GIT_BLOB_MISMATCH", codes)
+
+    def test_blob_mismatch_is_independent_of_lf_and_raw_hashes(self) -> None:
+        manifest = json.loads(
+            self.manifest_path.read_text(encoding="utf-8")
+        )
+        manifest["files"][0]["git_blob_sha1"] = "f" * 40
+        self.manifest_path.write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(
+            any(
+                issue["code"] == "GIT_BLOB_MISMATCH"
+                and issue["path"] == "app.py"
+                for issue in result["issues"]
+            ),
+            result["issues"],
+        )
+        self.assertFalse(
+            any(
+                warning["code"] == "EOL_DRIFT"
+                for warning in result["warnings"]
+            ),
+            result["warnings"],
+        )
+
+    def test_symlinked_managed_directory_is_rejected(self) -> None:
+        pkg = self.root / "pkg"
+        pkg.mkdir()
+        (pkg / "auth.py").write_bytes(b"authentic = True\n")
+        self.write_manifest([make_entry("pkg/auth.py", b"authentic = True\n")])
+
+        elsewhere = Path(self.tmp.name) / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "auth.py").write_bytes(b"different = True\n")
+
+        shutil.move(str(pkg), str(Path(self.tmp.name) / "moved"))
+
+        os.symlink(str(elsewhere), str(pkg), target_is_directory=True)
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assertFalse(result["ok"], result)
+        self.assertTrue(
+            any(
+                issue["code"] == "UNEXPECTED_SYMLINK"
+                and issue["path"] == "pkg"
+                for issue in result["issues"]
+            ),
+            result["issues"],
+        )
+        self.assertEqual(result["checked_files"], 0)
+        self.assertEqual(result["skipped_files"], 1)
+
+    def test_symlink_under_allowed_path_is_not_an_issue(self) -> None:
+        venv = self.root / ".venv" / "bin"
+        venv.mkdir(parents=True)
+        real = Path(self.tmp.name) / "python-real"
+        real.write_bytes(b"interpreter\n")
+        os.symlink(str(real), str(venv / "python"))
+
+        manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        manifest["allowed_unmanaged"] = [".venv/**"]
+        self.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assertTrue(result["ok"], result["issues"])
+        self.assertEqual(result["issues"], [])
+        self.assertEqual(result["checked_files"], 1)
+
+    def test_checked_files_counts_only_verified_files(self) -> None:
+        second = b"other = 2\n"
+        (self.root / "b.py").write_bytes(second)
+        self.write_manifest([
+            make_entry("app.py", self.content),
+            make_entry("b.py", second),
+        ])
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assertTrue(result["ok"], result["issues"])
+        self.assertEqual(result["expected_files"], 2)
+        self.assertEqual(result["read_files"], 2)
+        self.assertEqual(result["checked_files"], 2)
+        self.assertEqual(result["failed_files"], 0)
+        self.assertEqual(result["skipped_files"], 0)
+
+    def test_checked_files_excludes_failed_file(self) -> None:
+        second = b"other = 2\n"
+        (self.root / "b.py").write_bytes(second)
+        self.write_manifest([
+            make_entry("app.py", self.content),
+            make_entry("b.py", second),
+        ])
+        (self.root / "b.py").write_bytes(b"tampered = 3\n")
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["expected_files"], 2)
+        self.assertEqual(result["read_files"], 2)
+        self.assertEqual(result["checked_files"], 1)
+        self.assertEqual(result["failed_files"], 1)
+        self.assertEqual(result["skipped_files"], 0)
 
     def test_modified_file_fails(self) -> None:
         (self.root / "app.py").write_bytes(b"print('tampered')\n")
