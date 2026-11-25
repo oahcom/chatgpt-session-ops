@@ -723,16 +723,25 @@ resolve it in the deployment record rather than treating the run as clean.
 still announces files, so read that number as the size of the manifest, not the
 size of the evidence.
 
-**The blob ID is not an independent check.** `git_blob_sha1` is compared only
-inside the branch that has already recorded `CONTENT_MISMATCH`. When the
-LF-normalized SHA-256 matches, the blob is never read. The SHA-256 pair is the
-content check that actually runs. Measured: replacing the blob comparison with
-`if False and ...` leaves every test in `tools/tests` passing.
+**The blob ID is checked independently.** `git_blob_sha1` is compared on every
+managed file, outside the LF-normalized comparison. A manifest whose `sha256_raw`
+and `sha256_lf` match the deployed bytes but whose `git_blob_sha1` does not is a
+`GIT_BLOB_MISMATCH` and fails the run. Verified on 15dca1a by editing only the
+blob field of an otherwise-correct manifest: exit 1, `GIT_BLOB_MISMATCH`.
 
-**An empty managed list passes.** `files: []` returns `ok` with
-`checked_files: 0`. `tools/gen_manifest.py` refuses to produce such a manifest
-(`the explicit managed path list is empty`); the verifier does not refuse to
-accept one, so a truncated manifest passes vacuously.
+The SHA-256 pair and the blob answer different questions. The SHA-256 pair says
+the LF-normalized content matches; the blob says the exact bytes match. Neither
+substitutes for the other, which is why the comparison sits outside the branch
+that records `CONTENT_MISMATCH`.
+
+**An empty managed list fails.** `files: []` is rejected: with nothing managed,
+every file in the root is `UNMANAGED_FILE`, so the run exits 1. Verified on
+15dca1a with `files: []` and one file in the root: exit 1, `UNMANAGED_FILE`.
+`tools/gen_manifest.py` additionally refuses to produce such a manifest
+(`the explicit managed path list is empty`). An empty allow-list is what makes
+the rejection work — a manifest that also sets `allowed_unmanaged: ["*"]` still
+suppresses `UNMANAGED_FILE` and passes with `checked_files: 0`, which is the
+entry below.
 
 **`allowed_unmanaged` is taken from the manifest.** A `*` entry matches every
 path, including across `/`, and suppresses `UNMANAGED_FILE` for the whole tree.
