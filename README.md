@@ -192,7 +192,7 @@ python scripts/chatgpt_send.py --anon-restore <device>     # 把留存身份回�
 | `CHATGPT_ANON_IDLE_SEC` | 900 | 匿名等待生成结束的预算 |
 
 ```bash
-python -m unittest discover -s tests -v      # 61 条，零依赖
+python -m unittest discover -s tests -v      # 全绿即通过；条数见 references/baselines.md 的 §G 快照
 ```
 
 ---
