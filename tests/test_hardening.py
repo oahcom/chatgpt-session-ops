@@ -4502,6 +4502,14 @@ class TestScheduleContract(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
 
 
+# 条款 id 语法：字母前缀 + 1~2 位数字 + 可选「-大写字母」后缀。
+# 后缀不是装饰：`B15-R` 已经存在（B8 第 5 条列表项），而 `([A-E]\d{1,2})`
+# 这一族正则看不见它。若将来有人把带后缀的条款写成表格行或 `### 标题`，
+# 旧正则仍会静默跳过——条款与证据行会同时隐形，集合相等断言也照样通过，
+# 因为两边被同一个过滤器剪掉了（对称盲区）。
+CLAUSE_ID = r"[A-E]\d{1,2}(?:-[A-Z])?"
+
+
 class TestEvidenceMatrix(unittest.TestCase):
     """反夸大校验：`baselines.md` 的每条判定口径都必须在矩阵里有且只有一行，
     且引用的用例名/符号必须真实存在。
@@ -4518,19 +4526,46 @@ class TestEvidenceMatrix(unittest.TestCase):
 
     def _clauses(self):
         text = self._read("references", "baselines.md")
-        ids = re.findall(r"^\|\s*\*\*([A-E]\d{1,2})\*\*\s*\|", text, re.M)
-        ids += re.findall(r"^###\s+([A-E]\d{1,2})\s", text, re.M)
+        ids = re.findall(r"^\|\s*\*\*(" + CLAUSE_ID + r")\*\*\s*\|", text, re.M)
+        ids += re.findall(r"^###\s+(" + CLAUSE_ID + r")\s", text, re.M)
         return ids
 
     def _rows(self):
         rows = {}
         for line in self._read("references", "evidence-matrix.md").splitlines():
-            m = re.match(r"^\|\s*([A-E]\d{1,2})\s*\|(.*)$", line)
+            m = re.match(r"^\|\s*(" + CLAUSE_ID + r")\s*\|(.*)$", line)
             if m:
                 rows.setdefault(m.group(1), []).append(m.group(2))
         return rows
 
     def test_every_clause_has_exactly_one_row(self):
+        # 阳性对照：守卫必须能识别带后缀的条款 id。
+        # 没有这一条，把 CLAUSE_ID 退回 `[A-E]\d{1,2}` 不会有任何用例变红——
+        # 一个只能靠「今天恰好没有后缀条款」才成立的守卫，等于没守卫。
+        # 探针用与 _clauses/_rows 完全相同的三段脱衣，不是单拿 CLAUSE_ID 试。
+        probe = "| **B15-R** | x |\n### A4-R 标题\n| B15-R | row |\n"
+        with self.subTest(probe="table-row"):
+            self.assertEqual(
+                re.findall(r"^\|\s*\*\*(" + CLAUSE_ID + r")\*\*\s*\|", probe, re.M),
+                ["B15-R"],
+                "条款表格行解析不认带后缀的 id",
+            )
+        with self.subTest(probe="heading"):
+            self.assertEqual(
+                re.findall(r"^###\s+(" + CLAUSE_ID + r")\s", probe, re.M), ["A4-R"],
+                "条款标题解析不认带后缀的 id",
+            )
+        with self.subTest(probe="matrix-row"):
+            self.assertEqual(
+                [m.group(1) for m in re.finditer(
+                    r"^\|\s*(" + CLAUSE_ID + r")\s*\|(.*)$", probe, re.M)],
+                ["B15-R"],
+                "证据矩阵行解析不认带后缀的 id",
+            )
+            # 类别字母仍然是封闭集：不能为了兼容后缀把 Z9 也放进来
+            self.assertIsNone(re.search(r"^\|\s*(" + CLAUSE_ID + r")\s*\|", "| Z9 | x |"),
+                              "条款 id 语法不能接受 A–E 之外的类别")
+
         clauses, rows = self._clauses(), self._rows()
         self.assertTrue(clauses, "没解析到任何条款，解析规则失效")
         missing = sorted(set(clauses) - set(rows))
