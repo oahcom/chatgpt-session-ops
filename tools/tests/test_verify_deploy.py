@@ -776,6 +776,63 @@ class VerifyDeployTests(unittest.TestCase):
         self.assertIn("ROOT_MISSING", printed)
         self.assertNotIn("DEPLOY VERIFY OK", printed)
 
+    # Two paragraphs of section 7 assert how an empty managed list and a
+    # star allow-list behave, and no test backed either one (#78). These
+    # pin the behaviour as measured; two of the three are sharp edges that
+    # the document calls out rather than fixes.
+
+    def test_empty_managed_list_fails_when_the_root_has_a_file(self) -> None:
+        # Section 7: "files: [] is rejected: with nothing managed, every
+        # file in the root is UNMANAGED_FILE, so the run exits 1."
+        self.write_manifest([])
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["expected_files"], 0)
+        self.assertTrue(
+            any(
+                issue["code"] == "UNMANAGED_FILE"
+                and issue["path"] == "app.py"
+                for issue in result["issues"]
+            ),
+            result["issues"],
+        )
+
+    def test_empty_manifest_against_an_empty_root_verifies_nothing(self) -> None:
+        # The sharp edge section 7 records: 0/0 is a pass. This pins the
+        # behaviour so that rejecting expected_files == 0 is a deliberate
+        # change that has to update the test and the document together.
+        (self.root / "app.py").unlink()
+        self.write_manifest([])
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assertTrue(result["ok"], result["issues"])
+        self.assertEqual(result["expected_files"], 0)
+        self.assertEqual(result["checked_files"], 0)
+
+    def test_star_allowlist_suppresses_an_unmanaged_file(self) -> None:
+        # Section 7: a single "*" lets an added, unreviewed file pass as
+        # clean. Pinned, not endorsed: the reviewed pattern set is what
+        # keeps this closed, and changing that decision must change this
+        # test.
+        (self.root / "backdoor.py").write_bytes(b"import os\n")
+
+        self.write_manifest(
+            [make_entry("app.py", self.content)],
+            allowed_unmanaged=["*"],
+        )
+        result = verify(self.root, self.manifest_path)
+
+        self.assertTrue(result["ok"], result["issues"])
+        self.assertEqual(result["checked_files"], 1)
+        self.assertEqual(result["failed_files"], 0)
+        self.assertFalse(
+            any(issue["code"] == "UNMANAGED_FILE" for issue in result["issues"]),
+            result["issues"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
