@@ -36,7 +36,7 @@ incorporated into B, tested, and committed.
 
 ## 2. Explicit B → A publication allowlist
 
-The following eight files are the complete allowlist for the current release
+The following nine files are the complete allowlist for the current release
 baseline:
 
 | B-relative path | A-relative path | Purpose |
@@ -45,6 +45,7 @@ baseline:
 | `references/baselines.md` | `references/baselines.md` | Baseline reference |
 | `references/evidence-matrix.md` | `references/evidence-matrix.md` | Evidence reference |
 | `scripts/chatgpt_send.py` | `scripts/chatgpt_send.py` | Reviewed conversation-send utility |
+| `scripts/pow_solver.py` | `scripts/pow_solver.py` | Proof-of-work solver that `scripts/chatgpt_send.py` imports at module level |
 | `scripts/mcp_connector.py` | `scripts/mcp_connector.py` | Reviewed MCP connector eligibility utility |
 | `tests/test_hardening.py` | `tests/test_hardening.py` | Reviewed hardening tests |
 | `references/mcp-oauth-connector-contract.md` | `references/mcp-oauth-connector-contract.md` | Connector/OAuth contract that `SKILL.md` cites |
@@ -52,6 +53,16 @@ baseline:
 
 This is an explicit file allowlist, not permission to synchronize the containing
 directories.
+
+One entry is here only because another entry cannot run without it.
+`scripts/chatgpt_send.py` executes `from pow_solver import solve` at module
+level. While the solver is outside this list, two things are both true: a copy
+left behind in A from an earlier release never receives updates, so a change to
+the proof-of-work algorithm in B silently never reaches the copy that runs; and
+a tree assembled only from the list cannot import the sender at all
+(`ModuleNotFoundError: No module named 'pow_solver'`), nor collect a single test
+in `tests/test_hardening.py`, which loads the sender at import time. Pure
+algorithm, no credential or account state.
 
 A file not listed above MUST NOT be copied as part of this release procedure.
 A new file or path may be added only through a separately reviewed and
