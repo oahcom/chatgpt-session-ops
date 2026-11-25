@@ -298,6 +298,29 @@ class VerifyDeployTests(unittest.TestCase):
         self.assertEqual(default["byte_identical_files"], 0)
         self.assertEqual(strict["byte_identical_files"], 0)
 
+    def test_byte_identical_can_be_nonzero_while_the_run_fails(self) -> None:
+        # The count answers "how many read files have the manifest's raw
+        # bytes", not "did this pass". A manifest whose LF digest is wrong
+        # still lets the raw digest match, so the file is counted and the
+        # run is rejected. Pinned so nobody later "fixes" the counter by
+        # clearing it on failure, which would make it a second verdict
+        # instead of a count.
+        raw = b"print('session ops')\n"
+        (self.root / "app.py").write_bytes(raw)
+
+        entry = make_entry("app.py", raw)
+        entry["sha256_lf"] = "0" * 64
+        self.write_manifest([entry])
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual([i["code"] for i in result["issues"]],
+                         ["CONTENT_MISMATCH"])
+        self.assertEqual(result["byte_identical_files"], 1)
+        self.assertEqual(result["checked_files"], 0)
+        self.assertEqual(result["failed_files"], 1)
+
     def test_modified_file_fails(self) -> None:
         (self.root / "app.py").write_bytes(b"print('tampered')\n")
         result = verify(self.root, self.manifest_path)

@@ -710,6 +710,22 @@ manifest's bytes". Do not derive it by subtracting warnings from
 `checked_files`: a warning need not be EOL drift, and under `--strict` the same
 drift is an issue rather than a warning.
 
+The independence runs in both directions, and the second direction is the one
+that misleads. A high `byte_identical_files` does not mean the run passed: the
+count answers "how many read files have the manifest's raw bytes", and a run
+can fail for reasons that leave it non-zero. Measured with a manifest whose
+`sha256_lf` is wrong while `git_blob_sha1` and `sha256_raw` are correct,
+against a file holding exactly those raw bytes:
+
+```text
+exit=1  byte_identical_files=1  checked_files=0  failed_files=1  CONTENT_MISMATCH
+```
+
+The file is byte-identical and the deployment is rejected. Read the banner and
+the exit status for the verdict, and read `byte_identical_files` only as the
+count it names. Neither number substitutes for the other, which is why they are
+printed separately instead of being collapsed into one figure.
+
 ### What a passing run does not prove
 
 `DEPLOY VERIFY OK` means the files the verifier could see matched the hashes in
