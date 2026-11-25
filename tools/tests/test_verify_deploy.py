@@ -881,6 +881,31 @@ class VerifyDeployTests(unittest.TestCase):
             "a '*' allow-list exempted the whole tree: %r" % (result["issues"],),
         )
 
+    def test_empty_managed_list_reports_every_root_file_as_unmanaged(self) -> None:
+        """Section 7's positive claim: `files: []` plus a file in the root.
+
+        The two `expectedFailure` cases above pin what must not happen. This
+        one pins what does happen, and it is the mechanism the document
+        relies on: with nothing managed, every file in the root is
+        `UNMANAGED_FILE`, which is why an empty list is rejected in practice
+        even though `ok` is `not issues`. Asserting only the failure would
+        leave the reason untested — a refactor that stopped reporting
+        `UNMANAGED_FILE` would make the run pass, not fail.
+        """
+        manifest = self.load_manifest()
+        manifest["files"] = []
+        self.store_manifest(manifest)
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["expected_files"], 0)
+        self.assertEqual(result["checked_files"], 0)
+        self.assertEqual(
+            [(issue["code"], issue["path"]) for issue in result["issues"]],
+            [("UNMANAGED_FILE", "app.py")],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
