@@ -10,6 +10,7 @@ or real Memory Adapter subprocess is used.
 
 import importlib
 import tempfile
+import uuid
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -131,10 +132,17 @@ class FakeStore:
         self.calls.append(("revoke", principal, target_principal_id, scope))
 
     def link_session(
-        self, principal, session_id, work_item_id,
-        evidence=None, request_id=None,
+        self,
+        principal,
+        session_id,
+        work_item_id,
+        attempt_id,
+        evidence=None,
+        request_id=None,
     ):
-        self.calls.append(("link", principal, session_id, work_item_id))
+        self.calls.append(
+            ("link", principal, session_id, work_item_id, attempt_id)
+        )
         return {
             "link_id": LINK_ID,
             "session_id": session_id,
@@ -627,11 +635,11 @@ class MCPContractTests(unittest.TestCase):
                 {
                     "session_id": SESSION_ID,
                     "work_item_id": item.work_item_id,
+                    "attempt_id": "att_" + str(uuid.uuid4()),
                 },
                 self.auth,
                 request_id="test-request",
             )
-
             self.assert_error(result, "QUARANTINED_SESSION")
 
     def test_caller_supplied_evidence_is_rejected_by_authority(self):
@@ -648,7 +656,11 @@ class MCPContractTests(unittest.TestCase):
                     principal,
                     SESSION_ID,
                     item.work_item_id,
-                    evidence={"confirmed": True, "evidence_complete": True},
+                    "att_" + str(uuid.uuid4()),
+                    evidence={
+                        "confirmed": True,
+                        "evidence_complete": True,
+                    },
                 )
 
             self.assertEqual(

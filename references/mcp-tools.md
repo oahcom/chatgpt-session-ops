@@ -176,7 +176,8 @@ curl -sS https://so-mcp.example.com/mcp \
 - `session_id`: canonical lowercase UUID string.
 - `work_item_id`: canonical `wi_<UUIDv4>` string.
 
-**Optional parameters:** None.
+**Optional parameters:**
+- `attempt_id`: canonical `att_<UUIDv4>` string identifying the trusted landing attempt. If omitted, the link request is quarantined unless the authority has a matching identity (which a missing attempt ID cannot establish).
 
 **Success data:** SessionLink object:
 
@@ -206,7 +207,7 @@ curl -sS https://so-mcp.example.com/mcp \
   -H "Authorization: Bearer $SO_MCP_TOKEN" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"session.link","arguments":{"session_id":"12345678-1234-4234-8234-123456789abc","work_item_id":"wi_12345678-1234-4234-8234-123456789abc"}}}'
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"session.link","arguments":{"session_id":"12345678-1234-4234-8234-123456789abc","work_item_id":"wi_12345678-1234-4234-8234-123456789abc","attempt_id":"att_12345678-1234-4234-8234-123456789abc"}}}'
 ```
 
 ---

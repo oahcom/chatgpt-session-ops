@@ -139,9 +139,17 @@ class SendForWorkItemTests(unittest.TestCase):
         self.assertEqual(result[0], 200)
         self.assertIsNone(link)
         self.assertEqual(self.event_count(), 0)
+
+        # Probe with a syntactically valid identity. No matching landing event
+        # exists, so the authority must reject consumption.
+        attempt_id = "att_" + str(uuid.uuid4())
+
         with self.assertRaises(QuarantineNotCleared):
             self.store.link_session(
-                self.principal, session_id, self.item.work_item_id
+                self.principal,
+                session_id,
+                self.item.work_item_id,
+                attempt_id,
             )
 
     def test_mismatch_409_does_not_record_or_link(self):
@@ -162,13 +170,15 @@ class SendForWorkItemTests(unittest.TestCase):
         self.assertEqual(self.event_count(), 0)
         with self.assertRaises(QuarantineNotCleared):
             self.store.link_session(
-                self.principal, actual_id, self.item.work_item_id
+                self.principal,
+                actual_id,
+                self.item.work_item_id,
+                "att_" + str(uuid.uuid4()),
             )
 
     def test_ambiguous_multiple_ids_do_not_record_or_link(self):
         first, second = cid(), cid()
         api = FakeAPI([first, second], root=self.root)
-
         result, link, _ = self.call_sender(api)
 
         self.assertEqual(result[0], 1)
@@ -176,13 +186,15 @@ class SendForWorkItemTests(unittest.TestCase):
         self.assertEqual(self.event_count(), 0)
         with self.assertRaises(QuarantineNotCleared):
             self.store.link_session(
-                self.principal, first, self.item.work_item_id
+                self.principal,
+                first,
+                self.item.work_item_id,
+                "att_" + str(uuid.uuid4()),
             )
 
     def test_incomplete_reply_does_not_record_or_link(self):
         session_id = cid()
         api = FakeAPI([session_id], complete=False, root=self.root)
-
         result, link, _ = self.call_sender(api)
 
         self.assertEqual(result[0], 200)
@@ -190,7 +202,10 @@ class SendForWorkItemTests(unittest.TestCase):
         self.assertEqual(self.event_count(), 0)
         with self.assertRaises(QuarantineNotCleared):
             self.store.link_session(
-                self.principal, session_id, self.item.work_item_id
+                self.principal,
+                session_id,
+                self.item.work_item_id,
+                "att_" + str(uuid.uuid4()),
             )
 
     def test_event_replay_cannot_create_a_second_link(self):
@@ -200,9 +215,15 @@ class SendForWorkItemTests(unittest.TestCase):
         self.assertIsNotNone(link)
         self.assertIsNone(error)
 
+        # A replay cannot consume the same landing identity a second time.
+        # The sender's event is already consumed; a fresh attempt identity
+        # without a corresponding server-recorded event must fail closed.
         with self.assertRaises(QuarantineNotCleared):
             self.store.link_session(
-                self.principal, session_id, self.item.work_item_id
+                self.principal,
+                session_id,
+                self.item.work_item_id,
+                "att_" + str(uuid.uuid4()),
             )
 
     def test_plain_ids_convref_and_booleans_are_not_evidence_inputs(self):
@@ -215,14 +236,16 @@ class SendForWorkItemTests(unittest.TestCase):
         self.assertNotIn("match", parameters)
 
         session_id = cid()
-        fake_ref = sender.ConvRef(
-            session_id, reply_complete=True
-        )
+        fake_ref = sender.ConvRef(session_id, reply_complete=True)
         self.assertTrue(fake_ref.reply_complete)
         self.assertEqual(self.event_count(), 0)
+
         with self.assertRaises(QuarantineNotCleared):
             self.store.link_session(
-                self.principal, session_id, self.item.work_item_id,
+                self.principal,
+                session_id,
+                self.item.work_item_id,
+                "att_" + str(uuid.uuid4()),
                 evidence={
                     "session_id": session_id,
                     "match": "confirmed",

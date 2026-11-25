@@ -6505,9 +6505,18 @@ def load_prompt_text(prompt_file):
     return text
 
 
-def _send_prompt_impl(api, conv_id, prompt_file, new_chat=False, thinking=None,
-                      text=None, _landing_store=None,
-                      _landing_work_item_id=None):
+
+def _send_prompt_impl(
+    api,
+    conv_id,
+    prompt_file,
+    new_chat=False,
+    thinking=None,
+    text=None,
+    _landing_store=None,
+    _landing_work_item_id=None,
+    _landing_attempt_id=None,
+):
     """完整投递流程：tail → requirements+PoW → POST → 收割 → 落盘。
 
     返回 (status, reply_path, real_conv_id)；real_conv_id 用于登记会话归属。
@@ -6766,10 +6775,10 @@ def _send_prompt_impl(api, conv_id, prompt_file, new_chat=False, thinking=None,
     archived = (completeness_note + reply) if completeness_note else reply
     path = api.save_reply(real_conv, pfile, archived)
 
-    # D7: only the real successful send path may create a consumable landing
-    # event. All evidence is derived here, not accepted from caller arguments.
-    # Failure to record must not turn an already-sent-and-archived message into
-    # a send failure. The caller will observe link failure separately.
+
+    # D7: only the real successful send path may create consumable evidence.
+    # The attempt identity is created before sending and passed unchanged
+    # through transport retries. The event is bound to all three identities.
     if _landing_store is not None:
         try:
             from src.session_ops.authority import (
@@ -6779,6 +6788,13 @@ def _send_prompt_impl(api, conv_id, prompt_file, new_chat=False, thinking=None,
 
             validate_work_item_id(_landing_work_item_id)
             validate_conversation_id(real_conv)
+
+            if (
+                not isinstance(_landing_attempt_id, str)
+                or not _landing_attempt_id.startswith("att_")
+            ):
+                raise RuntimeError("trusted landing attempt_id is missing")
+
             landing_confirmed = (
                 st == 200
                 and first_cid == real_conv
@@ -6790,14 +6806,20 @@ def _send_prompt_impl(api, conv_id, prompt_file, new_chat=False, thinking=None,
                 and bool(path)
                 and os.path.isfile(path)
             )
+
             if landing_confirmed:
                 _landing_store._record_trusted_landing(
-                    real_conv, "confirmed", True
+                    real_conv,
+                    "confirmed",
+                    True,
+                    _landing_work_item_id,
+                    _landing_attempt_id,
                 )
         except Exception as exc:
             print(
-                "WARN: trusted landing event was not recorded (%s); "
-                "the sent message remains archived and unchanged" % exc,
+                "WARN: trusted landing event was not recorded "
+                "(%s); the sent message remains archived and unchanged"
+                % exc,
                 flush=True,
             )
     return st, path, ConvRef(real_conv, reply_complete=reply_complete)
@@ -6823,6 +6845,7 @@ def _reply_state_of(status, reply, conv):
     return "unavailable"              # 413/非 200 且无正文：本来就没有回复
 
 
+
 def send_prompt_for_work_item(
     api,
     store,
@@ -6833,11 +6856,14 @@ def send_prompt_for_work_item(
     new_chat=False,
     thinking=None,
 ):
-    """Send, record confirmed landing evidence, then atomically link a WorkItem.
+    """Send one WorkItem attempt, record its landing, then link it.
 
-    Return (send_result, link_or_none, link_error_or_none). A link failure is
-    reported separately and never rewrites the result of an already-sent turn.
+    A fresh attempt_id is allocated once per invocation, before sending.
+    Retries inside _send_prompt_impl reuse that same attempt_id.
+    A later independent invocation receives a different attempt_id.
     """
+    import uuid
+
     from src.session_ops.authority import (
         Principal,
         SecureWorkItemStore,
@@ -6848,9 +6874,14 @@ def send_prompt_for_work_item(
         raise TypeError("store must be SecureWorkItemStore")
     if not isinstance(principal, Principal):
         raise TypeError("principal must be a verified Principal")
+
     validate_work_item_id(work_item_id)
     if getattr(api, "is_anon", False):
-        raise ValueError("anonymous sends cannot establish trusted landing evidence")
+        raise ValueError(
+            "anonymous sends cannot establish trusted landing evidence"
+        )
+
+    attempt_id = "att_" + str(uuid.uuid4())
 
     # Match main's R373-07 flow: read and validate once, before logging or sending.
     text = load_prompt_text(prompt_file)
@@ -6867,6 +6898,7 @@ def send_prompt_for_work_item(
             text=text,
             _landing_store=store,
             _landing_work_item_id=work_item_id,
+            _landing_attempt_id=attempt_id,
         )
     except BaseException as exc:
         try:
@@ -6883,8 +6915,8 @@ def send_prompt_for_work_item(
             )
         except Exception as log_exc:
             print(
-                "FAIL: 异常轮次补写失败（%s）——该轮只有 begin，读取时会显示未完成"
-                % log_exc,
+                "FAIL: 异常轮次补写失败（%s）——该轮只有 begin，"
+                "读取时会显示未完成" % log_exc,
                 flush=True,
             )
         raise
@@ -6925,13 +6957,14 @@ def send_prompt_for_work_item(
             principal,
             str(conv),
             work_item_id,
+            attempt_id,
         )
         return result, link, None
     except Exception as exc:
-        # link_session consumes the event and creates the link in one
-        # transaction; on failure its transaction rolls back both effects.
+        # link_session owns consume + link atomicity. A deterministic
+        # active-link conflict is marked REJECTED only after its link
+        # transaction has rolled back. Other DB failures remain retryable.
         return result, None, exc
-
 def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
     """完整投递流程（外层）：先固化提示词，再发送，最后补写回复。
 
@@ -7570,6 +7603,123 @@ def reconcile_conversation_ownership(
         "invalid_ids": invalid_ids,
     }
 
+
+
+def require_trusted_worktree_root():
+    """Require an explicitly declared B-side Git worktree.
+
+    This function must run before any src.session_ops import.
+    The script's own location and the current working directory are not
+    trust signals. The caller must explicitly set SO_MCP_TRUSTED_ROOT.
+    """
+    import subprocess
+    from pathlib import Path
+
+    raw_root = os.environ.get("SO_MCP_TRUSTED_ROOT")
+    if not raw_root:
+        raise RuntimeError(
+            "SO_MCP_TRUSTED_ROOT is not set; "
+            "--work-item is permitted only from the declared B-side worktree"
+        )
+
+    declared = Path(raw_root).expanduser()
+    if not declared.is_absolute():
+        raise RuntimeError(
+            "SO_MCP_TRUSTED_ROOT must be an absolute path"
+        )
+
+    try:
+        root = declared.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(
+            "SO_MCP_TRUSTED_ROOT does not resolve to an existing directory: %s"
+            % exc
+        ) from exc
+
+    if not root.is_dir():
+        raise RuntimeError(
+            "SO_MCP_TRUSTED_ROOT is not a directory: %s" % root
+        )
+
+    git_marker = root / ".git"
+    if not git_marker.exists():
+        raise RuntimeError(
+            "declared root has no .git worktree marker: %s" % root
+        )
+
+    required_files = (
+        root / "src" / "session_ops" / "authority.py",
+        root / "src" / "session_ops" / "work_items.py",
+    )
+    for required in required_files:
+        if not required.is_file():
+            raise RuntimeError(
+                "declared worktree is missing required source file: %s"
+                % required
+            )
+
+    def git_output(*args):
+        completed = subprocess.run(
+            ["git", "-C", str(root), *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip()
+            raise RuntimeError(
+                "git %s failed in declared root: %s"
+                % (" ".join(args), detail or "exit %d" % completed.returncode)
+            )
+        return completed.stdout.strip()
+
+    reported_root = Path(
+        git_output("rev-parse", "--show-toplevel")
+    ).resolve(strict=True)
+
+    if reported_root != root:
+        raise RuntimeError(
+            "declared root is not the Git worktree top level "
+            "(declared=%s, git=%s)" % (root, reported_root)
+        )
+
+    origin = git_output("remote", "get-url", "origin")
+    normalized_origin = origin.strip().lower()
+
+    if normalized_origin.startswith("git@github.com:"):
+        normalized_origin = (
+            "https://github.com/" + normalized_origin[len("git@github.com:"):]
+        )
+    elif normalized_origin.startswith("ssh://git@github.com/"):
+        normalized_origin = (
+            "https://github.com/"
+            + normalized_origin[len("ssh://git@github.com/"):]
+        )
+
+    if normalized_origin.endswith(".git"):
+        normalized_origin = normalized_origin[:-4]
+    normalized_origin = normalized_origin.rstrip("/")
+
+    expected_origin = "https://github.com/oahcom/chatgpt-session-ops"
+    if normalized_origin != expected_origin:
+        raise RuntimeError(
+            "Git origin does not identify the trusted repository "
+            "(expected=%s, actual=%s)"
+            % (expected_origin, origin)
+        )
+
+    # Explicitly prioritize this verified worktree. Do not rely on cwd,
+    # script-relative import behavior, or an incidental src/ directory.
+    root_text = str(root)
+    sys.path[:] = [
+        entry for entry in sys.path
+        if entry and os.path.realpath(entry) != root_text
+    ]
+    sys.path.insert(0, root_text)
+
+    return root
 
 def main():
     args = sys.argv[1:]
@@ -8392,11 +8542,32 @@ def main():
             print("FAIL: account auth unavailable: %s" % e, flush=True)
             return None
 
-    # D10a/D10b：本地 CLI 操作者权威，不是 IdP 认证身份。
-    # 预检在创建 API 和发送消息之前完成。
+
+    # D10a/D10b: local CLI operator authority is not IdP authentication.
+    # Establish the B-side worktree identity before importing src.session_ops.
     work_item_store = None
     work_item_principal = None
+
     if work_item_id is not None:
+        try:
+            trusted_root = require_trusted_worktree_root()
+        except Exception as exc:
+            print(
+                json.dumps(
+                    {
+                        "result": "error",
+                        "error": "untrusted WorkItem execution environment: %s"
+                        % exc,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            return 2
+
+        # require_trusted_worktree_root() has inserted this exact root at
+        # sys.path[0]. No import from the script directory or current
+        # working directory is used as a trust decision.
         from src.session_ops.authority import (
             DenyAllPrincipalDirectory,
             Principal,
@@ -8416,6 +8587,7 @@ def main():
             work_item_options.get("database_path")
             or os.environ.get("SO_MCP_DB")
         )
+
         if not principal_id or not tenant_id or not database_path:
             print(
                 json.dumps(
@@ -8431,6 +8603,7 @@ def main():
                 flush=True,
             )
             return 2
+
         if database_path == ":memory:":
             print(
                 json.dumps(
@@ -8443,6 +8616,7 @@ def main():
                 flush=True,
             )
             return 2
+
         try:
             validate_work_item_id(work_item_id)
             work_item_principal = Principal(tenant_id, principal_id)
@@ -8452,18 +8626,25 @@ def main():
             )
             work_item_store.initialize()
 
-            # 发送前验证 write 权限，避免对无权 WorkItem 先发消息再失败。
+            # Verify write authority before creating an API client or sending.
             conn = work_item_store._connect()
             try:
                 work_item_store._require(
-                    conn, work_item_principal, work_item_id, "write"
+                    conn,
+                    work_item_principal,
+                    work_item_id,
+                    "write",
                 )
             finally:
                 conn.close()
-        except Exception as e:
+
+        except Exception as exc:
             print(
                 json.dumps(
-                    {"result": "error", "error": "WorkItem preflight failed: %s" % e},
+                    {
+                        "result": "error",
+                        "error": "WorkItem preflight failed: %s" % exc,
+                    },
                     ensure_ascii=False,
                 ),
                 flush=True,

@@ -28,11 +28,23 @@ class TerminalSessionLinkAuditTests(unittest.TestCase):
                     "12345678-1234-4234-8234-"
                     + ("123456789abc" if terminal_status == "completed" else "123456789abd")
                 )
+                attempt_id = (
+                    "att_12345678-1234-4234-8234-123456789abc"
+                    if terminal_status == "completed"
+                    else "att_12345678-1234-4234-8234-123456789abd"
+                )
                 self.store._record_trusted_landing(
-                    session_id, match="confirmed", evidence_complete=True
+                    session_id,
+                    match="confirmed",
+                    evidence_complete=True,
+                    work_item_id=item.work_item_id,
+                    attempt_id=attempt_id,
                 )
                 linked = self.store.link_session(
-                    self.principal, session_id, item.work_item_id
+                    self.principal,
+                    session_id,
+                    item.work_item_id,
+                    attempt_id,
                 )
 
                 updated = self.store.set_status(
@@ -71,33 +83,53 @@ class TerminalSessionLinkAuditTests(unittest.TestCase):
     def test_manual_unlink_audit_is_distinct_and_link_specific(self) -> None:
         item = self.store.create_work_item(self.principal)
         session_id = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        attempt_id = "att_" + str(__import__("uuid").uuid4())
         self.store._record_trusted_landing(
-            session_id, match="confirmed", evidence_complete=True
+            session_id,
+            match="confirmed",
+            evidence_complete=True,
+            work_item_id=item.work_item_id,
+            attempt_id=attempt_id,
         )
-        linked = self.store.link_session(self.principal, session_id, item.work_item_id)
-        self.store.unlink_session(self.principal, session_id, request_id="manual-unlink")
+        linked = self.store.link_session(
+            self.principal, session_id, item.work_item_id, attempt_id
+        )
+        self.store.unlink_session(
+            self.principal, session_id, request_id="manual-unlink"
+        )
         events = [
-            event for event in self.store.list_audit_events(item.work_item_id)
+            event
+            for event in self.store.list_audit_events(item.work_item_id)
             if event["link_id"] == linked.link_id
-            and event["action"] in ("session.unlink", "session.auto_unlink_terminal")
+            and event["action"]
+            in ("session.unlink", "session.auto_unlink_terminal")
         ]
-        self.assertEqual([event["action"] for event in events], ["session.unlink"])
-        self.assertEqual(events[0]["principal_id"], self.principal.principal_id)
+        self.assertEqual(
+            [event["action"] for event in events],
+            ["session.unlink"],
+        )
+        self.assertEqual(
+            events[0]["principal_id"],
+            self.principal.principal_id,
+        )
 
     def test_list_sessions_handles_all_link_states(self) -> None:
         def create_link(item):
             session_id = str(__import__("uuid").uuid4())
+            attempt_id = "att_" + str(__import__("uuid").uuid4())
             self.store._record_trusted_landing(
                 session_id,
                 match="confirmed",
                 evidence_complete=True,
+                work_item_id=item.work_item_id,
+                attempt_id=attempt_id,
             )
-            link = self.store.link_session(
+            return self.store.link_session(
                 self.principal,
                 session_id,
                 item.work_item_id,
+                attempt_id,
             )
-            return link
 
         # 1. 无 link：默认视图与历史视图均为空。
         empty_item = self.store.create_work_item(self.principal)
@@ -119,7 +151,6 @@ class TerminalSessionLinkAuditTests(unittest.TestCase):
         # 2. 有活跃 link：默认视图与历史视图都返回该 link。
         active_item = self.store.create_work_item(self.principal)
         active_link = create_link(active_item)
-
         self.assertEqual(
             list(self.store.list_sessions(self.principal, active_item.work_item_id)),
             [active_link],
@@ -141,7 +172,6 @@ class TerminalSessionLinkAuditTests(unittest.TestCase):
             active_link.session_id,
             expected_link_id=active_link.link_id,
         )
-
         self.assertEqual(
             list(self.store.list_sessions(self.principal, active_item.work_item_id)),
             [],
@@ -165,7 +195,6 @@ class TerminalSessionLinkAuditTests(unittest.TestCase):
             terminal_item.work_item_id,
             "cancelled",
         )
-
         self.assertEqual(
             list(
                 self.store.list_sessions(
@@ -189,11 +218,16 @@ class TerminalSessionLinkAuditTests(unittest.TestCase):
     def test_get_active_link_respects_owner_visibility_and_unlink(self) -> None:
         item = self.store.create_work_item(self.principal)
         session_id = "12345678-1234-4234-8234-123456789abc"
+        attempt_id = "att_" + str(__import__("uuid").uuid4())
         self.store._record_trusted_landing(
-            session_id, match="confirmed", evidence_complete=True
+            session_id,
+            match="confirmed",
+            evidence_complete=True,
+            work_item_id=item.work_item_id,
+            attempt_id=attempt_id,
         )
         linked = self.store.link_session(
-            self.principal, session_id, item.work_item_id
+            self.principal, session_id, item.work_item_id, attempt_id
         )
 
         owner_link = self.store.get_active_link(self.principal, session_id)

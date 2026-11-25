@@ -118,6 +118,10 @@ _WORK_ITEM_ID = {
     "type": "string",
     "pattern": r"^wi_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
 }
+_ATTEMPT_ID = {
+    "type": "string",
+    "pattern": r"^att_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+}
 _SESSION_ID = {
     "type": "string",
     "pattern": r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
@@ -180,6 +184,7 @@ TOOL_SCHEMAS = {
         {
             "session_id": _SESSION_ID,
             "work_item_id": _WORK_ITEM_ID,
+            "attempt_id": _ATTEMPT_ID,
         },
         ("session_id", "work_item_id"),
     ),
@@ -589,6 +594,7 @@ class MCPToolService:
                         principal,
                         args["session_id"],
                         args["work_item_id"],
+                        args.get("attempt_id"),
                         evidence=None,
                         request_id=request_id,
                     )
