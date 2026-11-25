@@ -149,8 +149,8 @@ jobs:
 
           # Expected skips are derived from the tree, not from a magic number.
           # On a base without the E2E suite the only legitimate skip is the
-          # POSIX-only directory-fsync test. Once the E2E suite lands it adds
-          # 5 conditional skips (1 gate test + 4 adapter tests).
+          # one POSIX-only directory-fsync test. Once the E2E suite lands it
+          # adds 5 conditional skips (1 gate test + 4 adapter tests).
           #
           # This job installs requirements-mcp.txt above, so both the RS256
           # suite and the real-SDK integration suite must execute here. If
@@ -158,13 +158,31 @@ jobs:
           # this count moves. That is the whole assertion: a skipped security
           # or compatibility test reads as green in a log, a wrong number does
           # not. The reasons are printed so the failure names the culprit.
+          #
+          # The number used to be the literals 6 / 1. Those are wrong the
+          # moment a legitimate platform skip is added, and it fails as
+          # "skipped 7 but 6 expected", which reads like a lost test rather
+          # than a new one. The platform skips are counted from the decorators
+          # themselves; the runner is Linux, so the Windows-only cases are the
+          # ones that skip and the POSIX-only case is the one that runs.
           e2e_present = os.path.isfile("tests/test_memory_adapter_e2e.py")
-          expected = 6 if e2e_present else 1
+
+          platform_skips = 0
+          for name in sorted(os.listdir("tests")):
+              if not name.endswith(".py"):
+                  continue
+              body = open(os.path.join("tests", name),
+                          encoding="utf-8", errors="replace").read()
+              platform_skips += len(re.findall(
+                  r'@unittest\.skipIf\(os\.name != "nt"'
+                  r'|@unittest\.skipUnless\(os\.name == "nt"', body))
+
+          expected = platform_skips + (5 if e2e_present else 0)
 
           found = re.search(r"skipped=(\d+)", text)
           skipped = int(found.group(1)) if found else 0
-          print("ran=%d skipped=%d expected=%d e2e_present=%s"
-                % (ran, skipped, expected, e2e_present))
+          print("ran=%d skipped=%d expected=%d e2e_present=%s platform_skips=%d"
+                % (ran, skipped, expected, e2e_present, platform_skips))
 
           if skipped != expected:
               reasons = sorted(

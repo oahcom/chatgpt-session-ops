@@ -1387,15 +1387,18 @@ def _lock_holder_stale(lock):
          走 mtime 判据（LOCK_STALE_SEC 内视为正在写身份的新锁）。**注意**：
          mtime 兼容是历史格式的退化恢复机制，不具备三态身份验证的同等保证
          （第十九轮审查口径：不得把两者等同描述）；
+      0'. 内容为 `{"released": true}`（持有者释放时删不掉锁文件，主动改写的
+         终态，见 `_release_lock_file`）→ **可回收**，与年龄/存活无关；
       1. 成功解析的字典里没有 pid **字段**（真·老格式）→ 退化为 mtime 判据；
          pid 字段**存在但假值/非法**（0/None/空串/float/bool/垃圾串）→ 身份损坏，
          按 UNKNOWN 处理，**不回收**（F-04/F-07：假值 pid 不得借 mtime 逃生）；
-      2. 租约未过期 → 不可回收；
-      3. 原 PID 确认不存在（DEAD）→ 可回收；
-      4. UNKNOWN（无权限/查询失败）→ **不可回收**（F-03：查不到 ≠ 死了）；
-      5. 存活但启动时间读不到 → **不可回收**（宁可等超时，也不误删活锁）；
-      6. 存活但启动时间与记录不一致 → PID 被复用，可回收；
-      7. 否则不可回收。
+      2. 原 PID 确认不存在（DEAD）→ **可回收，与年龄无关**——LOCK_TIMEOUT_SEC(3)
+         比 LOCK_STALE_SEC(60) 小一个数量级，按年龄先卡的话，崩在 60 秒内留下的
+         锁任何调用方都等不到可回收的那一刻（等于永久死锁）；
+      3. UNKNOWN（无权限/查询失败）→ **不可回收**（F-03：查不到 ≠ 死了）；
+      4. 存活但启动时间读不到 → **不可回收**（宁可等超时，也不误删活锁）；
+      5. 存活但启动时间与记录不一致 → PID 被复用，可回收；
+      6. 否则不可回收。
 
     F-31b：`lock` 必须是路径字符串。`open(True)` 在 Python 里等价于 `open(1)`
     ——**把 stdout 当文件读**（fuzz 时实测会挂住读终端）；`open(10**400)` 抛
@@ -1424,6 +1427,10 @@ def _lock_holder_stale(lock):
         return False            # F-08：非空损坏内容 = 新格式损坏，保守不回收
     if not isinstance(info, dict):
         return False            # F-08：非字典内容保守不回收
+    if info.get("released"):
+        # 持有者已放弃锁但删不掉文件（Windows 共享冲突），见 _release_lock_file。
+        # 与年龄、pid 无关：立刻允许回收，否则残留的活 pid 会造成永久死锁。
+        return True
     if "pid" not in info:
         # 字典但无 pid 字段（老格式）→ mtime 判据
         try:
@@ -1431,18 +1438,17 @@ def _lock_holder_stale(lock):
         except OSError:
             return False
     pid = info.get("pid")
-    # F-30：`float()` 对超大整数抛 OverflowError（ArithmeticError，不是
-    # TypeError/ValueError），旧写法只 catch 后两者会让异常穿出锁判定。
-    created = _as_float(info.get("created_at"), 0.0)
-    if time.time() - created <= LOCK_STALE_SEC:
-        return False
+    # 死活先于年龄：确认 DEAD 的持有者不会因为锁只创建了几秒就「还年轻」而
+    # 不可回收（LOCK_TIMEOUT_SEC 3s < LOCK_STALE_SEC 60s，先看年龄 = 崩在窗口内
+    # 的锁永远等不到）。年龄已不参与判定：UNKNOWN 本来就禁止回收，ALIVE 只看
+    # 启动时间是否一致。
     # F-03：只有确认 DEAD 才可回收。UNKNOWN（无权限查询/系统调用失败）绝不当死亡
     # ——「查不到」不是「死了」，UNKNOWN 回收活锁 = 跨进程互斥失效。
     state = _proc_state(pid)
-    if state == PROC_UNKNOWN:
-        return False
     if state == PROC_DEAD:
         return True
+    if state == PROC_UNKNOWN:
+        return False
     cur = _proc_start_time(pid)
     if cur is None:
         return False
@@ -1532,6 +1538,42 @@ def _try_reclaim_stale(lock):
             pass
 
 
+def _release_lock_file(lock):
+    """释放时删除锁文件；删不掉（Windows 共享冲突）就改写成「已释放」终态。
+
+    为什么不能只 `except OSError: pass`：Windows 上只要还有任何未关闭的句柄
+    （`_lock_holder_stale` 每次抢锁失败都会 open(lock) 读身份），os.remove 就抛
+    WinError 32（errno=EACCES）。fd 已关闭，没有别的删除手段；静默放弃会把一把
+    「活 pid + 匹配启动时间」的锁永久留在盘上——判定永远为活，之后每个抢锁者
+    都要等满 timeout 抛 LockTimeout（跨进程永久死锁，不是等 60 秒就好）。
+
+    重试只覆盖「等待者恰好在这几毫秒里读完」的窗口；仍然删不掉就写入
+    `{"released": true}`（读共享允许写），让任何抢锁者立即回收。写完后**不再
+    碰这个路径**：此刻别的抢锁者可能已删旧建新，再删就会删掉别人的新锁。
+    """
+    for attempt in range(4):
+        if attempt:
+            time.sleep(0.01)          # 首次直删；冲突时最多再等 30ms
+        try:
+            os.remove(lock)
+            return
+        except OSError:
+            pass
+    marked = False
+    if os.path.exists(lock):
+        try:
+            with open(lock, "w", encoding="utf-8") as f:
+                f.write('{"released": true}')
+            marked = True
+        except OSError:
+            pass
+    if not marked and os.path.exists(lock):
+        # 连标记都写不进去（只读/无权限/被独占）：锁会卡死直到有人手工清掉，
+        # 必须让这件事可见，不能又是静默 pass。
+        print("WARN: 锁文件无法删除也无法标记已释放（%s）" % os.path.basename(lock),
+              flush=True)
+
+
 @contextlib.contextmanager
 def _file_lock(path, timeout=LOCK_TIMEOUT_SEC, strict=True):
     """默认 strict=True（fail-closed）：超时抛 LockTimeout，绝不「跳过加锁继续跑」。
@@ -1611,10 +1653,7 @@ def _file_lock(path, timeout=LOCK_TIMEOUT_SEC, strict=True):
                     os.close(fd)
                 except OSError:
                     pass
-                try:
-                    os.remove(lock)
-                except OSError:
-                    pass
+                _release_lock_file(lock)
     finally:
         tlock.release()
 
