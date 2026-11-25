@@ -237,7 +237,7 @@ class TestSecurityMatrix(unittest.TestCase):
 
         PROVEN 额外要求至少一条 `test:`。理由就在本文件自己的词汇里：
         `human:` 的定义是「无法用离线用例判定」，`code:` 只说明代码做了这件事、
-        不说明有人验过它；而 PROVEN（矩阵里写作 `PROVEN \`mutation-checked\``）
+        不说明有人验过它；而 PROVEN（矩阵里写作 PROVEN 加 mutation-checked）
         的含义是「删掉实现会有测试变红」。只挂 `human:` 却标 PROVEN，等于
         把「没人验」写成「验过了」——正是这个矩阵存在的目的。
         """
