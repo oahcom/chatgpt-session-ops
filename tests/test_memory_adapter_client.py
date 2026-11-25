@@ -9,11 +9,13 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -443,14 +445,37 @@ class TransportErrorTestCase(MemoryAdapterClientTestCase):
 
     def test_no_retry_after_uncertain_store_timeout(self) -> None:
         # Assertion 23
+        # The timeout is raised by the transport instead of being slept
+        # through: under load a child can take longer than any fixed budget
+        # just to reach the point where it records the invocation, so a real
+        # 0.3s wait was a race whose loser lost the record, not the invariant.
         client = self.client("timeout", timeout_seconds=0.3)
-        with self.assertRaises(MemoryAdapterError) as ctx:
-            client.store(
-                work_item_id=self.work_item_id,
-                session_id="session-001",
-                content="c",
-                provenance=self.provenance(),
-            )
+        record = self.record
+
+        def timeout_without_waiting(command, **kwargs):
+            with open(record, "a", encoding="utf-8") as f:
+                f.write(
+                    json.dumps(
+                        {
+                            "argv": list(command)[1:],
+                            "raw": kwargs.get("input", ""),
+                        }
+                    )
+                    + "\n"
+                )
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+        with mock.patch(
+            "src.session_ops.memory_adapter_client.subprocess.run",
+            timeout_without_waiting,
+        ):
+            with self.assertRaises(MemoryAdapterError) as ctx:
+                client.store(
+                    work_item_id=self.work_item_id,
+                    session_id="session-001",
+                    content="c",
+                    provenance=self.provenance(),
+                )
         self.assertEqual(ctx.exception.code, "ADAPTER_TIMEOUT")
         self.assertEqual(len(self.invocations()), 1)
 
