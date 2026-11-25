@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import json
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from tools.verify_deploy import verify
+from tools.verify_deploy import main, verify
 
 
 COMMIT = "a" * 40
@@ -640,6 +642,139 @@ class VerifyDeployTests(unittest.TestCase):
             ),
             result["issues"],
         )
+
+    # One case per issue code that had no test able to fail (#81). Each
+    # assertion names the code it exists for, so deleting that branch in
+    # tools/verify_deploy.py turns this specific method red.
+
+    def load_manifest(self) -> dict:
+        return json.loads(self.manifest_path.read_text(encoding="utf-8"))
+
+    def store_manifest(self, manifest: dict) -> None:
+        self.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    def assert_code(self, result: dict, code: str, path: str | None = None) -> None:
+        self.assertFalse(result["ok"])
+        for issue in result["issues"]:
+            if issue["code"] != code:
+                continue
+            if path is None or issue["path"] == path:
+                return
+        self.fail(
+            "%s (path=%r) not in %r"
+            % (code, path, [(i["code"], i["path"]) for i in result["issues"]])
+        )
+
+    def test_manifest_version_must_be_one(self) -> None:
+        manifest = self.load_manifest()
+        manifest["format_version"] = 99
+        self.store_manifest(manifest)
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assert_code(result, "MANIFEST_VERSION", str(self.manifest_path))
+
+    def test_file_entry_without_a_path_is_rejected(self) -> None:
+        manifest = self.load_manifest()
+        manifest["files"].append({"path": ""})
+        self.store_manifest(manifest)
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assert_code(result, "INVALID_FILE_ENTRY", "files")
+
+    def test_manifest_path_traversal_is_rejected(self) -> None:
+        manifest = self.load_manifest()
+        manifest["files"].append({"path": "../outside.py"})
+        self.store_manifest(manifest)
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assert_code(result, "UNSAFE_MANIFEST_PATH", "../outside.py")
+
+    def test_duplicate_manifest_path_is_rejected(self) -> None:
+        manifest = self.load_manifest()
+        manifest["files"].append(dict(manifest["files"][0]))
+        self.store_manifest(manifest)
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assert_code(result, "DUPLICATE_MANIFEST_PATH", "app.py")
+
+    def test_lf_byte_count_mismatch_is_rejected(self) -> None:
+        manifest = self.load_manifest()
+        manifest["files"][0]["bytes"] = len(self.content) + 1
+        self.store_manifest(manifest)
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assert_code(result, "BYTE_COUNT_MISMATCH", "app.py")
+
+    def test_relative_external_object_path_is_rejected(self) -> None:
+        manifest = self.load_manifest()
+        manifest["external_objects"] = [{"path": "relative/unit.service"}]
+        self.store_manifest(manifest)
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assert_code(result, "INVALID_EXTERNAL_PATH", "relative/unit.service")
+
+    def test_absent_external_object_is_rejected(self) -> None:
+        absent = str(Path(self.tmp.name) / "absent.service")
+        manifest = self.load_manifest()
+        manifest["external_objects"] = [
+            {"path": absent, "sha256": hashlib.sha256(b"x").hexdigest()}
+        ]
+        self.store_manifest(manifest)
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assert_code(result, "EXTERNAL_OBJECT_ERROR", absent)
+
+    def test_unreadable_manifest_is_rejected(self) -> None:
+        self.manifest_path.write_bytes(b'{"format_version": 1,')
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assert_code(result, "MANIFEST_ERROR", str(self.manifest_path))
+        self.assertEqual(result["warnings"], [])
+
+    def test_non_database_file_is_rejected(self) -> None:
+        db_path = Path(self.tmp.name) / "not-a-database.sqlite3"
+        db_path.write_bytes(b"this is not a SQLite header\n" * 64)
+        manifest = self.load_manifest()
+        manifest["database"] = {
+            "path": str(db_path),
+            "schema_version": 1,
+            "required_columns": {"work_items": ["id"]},
+        }
+        self.store_manifest(manifest)
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assert_code(result, "DB_SCHEMA_ERROR", str(db_path))
+
+    def test_missing_root_exits_nonzero(self) -> None:
+        absent_root = Path(self.tmp.name) / "no-such-root"
+        argv = sys.argv
+        sys.argv = [
+            "verify_deploy.py",
+            "--root",
+            str(absent_root),
+            "--manifest",
+            str(self.manifest_path),
+        ]
+        stdout = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout):
+                rc = main()
+        finally:
+            sys.argv = argv
+
+        printed = stdout.getvalue()
+        self.assertEqual(rc, 1, printed)
+        self.assertIn("ROOT_MISSING", printed)
+        self.assertNotIn("DEPLOY VERIFY OK", printed)
 
 
 if __name__ == "__main__":
