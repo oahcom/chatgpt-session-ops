@@ -92,7 +92,7 @@ neither would have been found by counting marks.
 
 ---
 
-## A. Identity and authentication (1–4)
+## A. Identity and authentication (1–4b)
 
 | # | Scenario | Expected | Evidence | Status |
 |---|---|---|---|---|
@@ -291,7 +291,7 @@ always 1. It is defence in depth, not evidence. No test can fail when it is
 deleted because no execution can reach it. Recorded as dead code rather than
 counted as a proof.
 
-**Row 16 note — what the cases prove, and what they do not.** The offline cases
+**Row 16, continued — what the cases prove, and what they do not.** The offline cases
 prove the *precondition* mechanism (a stale `expected_link_id` or
 `expected_updated_at` is refused) and read the code to confirm the transaction
 shape. They do **not** interleave two real threads and observe the race. A true
@@ -322,7 +322,7 @@ Now a dedicated `_ResourceExhausted` maps to `RESOURCE_EXHAUSTED`, and
 `session.context` itself. Short-circuiting the branch to `False` returns the
 oversized payload to the client verbatim and turns that case red.
 
-**Row 18 note — the happy path proves nothing about the failure branch.** `test_session_context_with_injected_adapter` is the happy path
+**Row 18, continued — the happy path proves nothing about the failure branch.** `test_session_context_with_injected_adapter` is the happy path
 and does not prove the fail-closed branch. That branch is
 `test_context_without_adapter_is_dependency_unavailable`: deleting the
 `memory_adapter_command is None` guard turns its expected
