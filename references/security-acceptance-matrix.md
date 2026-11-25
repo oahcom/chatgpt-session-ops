@@ -29,17 +29,26 @@ not a feature list.
 **Reproduce**
 
 ```
-python -m unittest tests.test_work_item_authority        # 50
-python -m unittest tests.test_mcp_contract               # 28
-python -m unittest tests.test_send_prompt_for_work_item  # 7
-python -m unittest tests.test_mcp_transport              # 18
-python -m unittest tests.test_mcp_alg_confusion          # 7
-python -m unittest tests.test_mcp_rs256                  # 8
-python -m unittest tests.test_mcp_sdk_integration        # 4 (skips without mcp)
-python -m unittest tests.test_cdp_import_order           # 13
-python -m pytest -q                                      # 759 passed, 6 skipped
-                                                         # 755 passed, 10 skipped without mcp
+python -m unittest tests.test_work_item_authority
+python -m unittest tests.test_mcp_contract
+python -m unittest tests.test_send_prompt_for_work_item
+python -m unittest tests.test_mcp_transport
+python -m unittest tests.test_mcp_alg_confusion
+python -m unittest tests.test_mcp_rs256
+python -m unittest tests.test_mcp_sdk_integration        # skips without mcp
+python -m unittest tests.test_cdp_import_order
+
+python -m pytest -q        # the result to accept: 759 passed, 6 skipped
+                           # without mcp:        755 passed, 10 skipped
 ```
+
+The per-module counts that used to sit beside these commands are gone. They were
+restated derivable numbers, and they drifted twice in one day — first when #50
+added thirteen tests, again in the same pass that corrected the totals. Nothing
+checked them, and nothing could cheaply: `test_work_item_authority` generates
+fifty cases from eight declarations, so counting test methods disagrees with
+counting tests. The commands are the thing to run; the totals are the thing to
+compare. Everything between them was maintenance.
 
 **What PROVEN means here, and what it does not.** PROVEN means the named case
 asserts the behaviour *and* the case goes red when the behaviour is deleted.
