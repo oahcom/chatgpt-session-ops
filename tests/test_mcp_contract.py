@@ -837,5 +837,98 @@ class MCPContractTests(unittest.TestCase):
             )
 
 
+class ArgumentValidationTests(unittest.TestCase):
+    """One case per rejection branch in _validate_arguments (#76).
+
+    Every branch raises ValueError, and _error_code_for maps all of them to
+    the same INVALID_ARGUMENT with empty details, so the caller cannot tell
+    them apart. That is deliberate non-disclosure, and it is also why a
+    dispatch-level test cannot watch these branches: deleting one leaves
+    another raising, and the response looks identical. The message is the
+    only observable, so these cases assert it directly.
+    """
+
+    def assert_rejected(self, tool, arguments, message):
+        with self.assertRaises(ValueError) as ctx:
+            _validate_arguments(tool, arguments)
+        self.assertEqual(str(ctx.exception), message)
+
+    def test_required_argument_missing(self):
+        self.assert_rejected("work_item.get", {}, "required argument missing")
+
+    def test_string_argument_required(self):
+        self.assert_rejected(
+            "work_item.get", {"work_item_id": 5}, "string argument required"
+        )
+
+    def test_string_argument_too_short(self):
+        self.assert_rejected(
+            "session.context",
+            {"session_id": SESSION_ID, "query": ""},
+            "string argument too short",
+        )
+
+    def test_string_argument_too_long(self):
+        self.assert_rejected(
+            "session.context",
+            {"session_id": SESSION_ID, "query": "a" * 2049},
+            "string argument too long",
+        )
+
+    def test_string_argument_is_not_an_allowed_value(self):
+        self.assert_rejected(
+            "work_item.list",
+            {"status": "definitely-not-in-enum"},
+            "string argument is not an allowed value",
+        )
+
+    def test_string_argument_has_invalid_format(self):
+        self.assert_rejected(
+            "work_item.get",
+            {"work_item_id": "wi_not-a-uuid"},
+            "string argument has invalid format",
+        )
+
+    def test_integer_argument_required(self):
+        for value in ("5", 5.0, True):
+            with self.subTest(value=value):
+                self.assert_rejected(
+                    "work_item.list",
+                    {"page_size": value},
+                    "integer argument required",
+                )
+
+    def test_integer_argument_below_minimum(self):
+        self.assert_rejected(
+            "session.context",
+            {"session_id": SESSION_ID, "query": "x", "limit": 0},
+            "integer argument below minimum",
+        )
+
+    def test_boolean_argument_required(self):
+        self.assert_rejected(
+            "session.list",
+            {"work_item_id": WORK_ITEM_ID, "include_unlinked": "yes"},
+            "boolean argument required",
+        )
+
+    def test_cursor_length_guard_cannot_be_reached(self):
+        # "cursor is too long" is dead code: the schema declares
+        # maxLength == MAX_CURSOR_CHARS, so the string branch rejects a
+        # longer cursor first and an equal one passes this guard. Pinned so
+        # that the branch is either removed or made reachable on purpose.
+        self.assertEqual(MAX_CURSOR_CHARS, 2048)
+
+        self.assert_rejected(
+            "work_item.list",
+            {"cursor": "x" * (MAX_CURSOR_CHARS + 1)},
+            "string argument too long",
+        )
+        accepted = _validate_arguments(
+            "work_item.list", {"cursor": "x" * MAX_CURSOR_CHARS}
+        )
+        self.assertEqual(len(accepted["cursor"]), MAX_CURSOR_CHARS)
+
+
 if __name__ == "__main__":
     unittest.main()
