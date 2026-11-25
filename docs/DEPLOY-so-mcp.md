@@ -710,6 +710,22 @@ manifest's bytes". Do not derive it by subtracting warnings from
 `checked_files`: a warning need not be EOL drift, and under `--strict` the same
 drift is an issue rather than a warning.
 
+The independence runs in both directions, and the second direction is the one
+that misleads. A high `byte_identical_files` does not mean the run passed: the
+count answers "how many read files have the manifest's raw bytes", and a run
+can fail for reasons that leave it non-zero. Measured with a manifest whose
+`sha256_lf` is wrong while `git_blob_sha1` and `sha256_raw` are correct,
+against a file holding exactly those raw bytes:
+
+```text
+exit=1  byte_identical_files=1  checked_files=0  failed_files=1  CONTENT_MISMATCH
+```
+
+The file is byte-identical and the deployment is rejected. Read the banner and
+the exit status for the verdict, and read `byte_identical_files` only as the
+count it names. Neither number substitutes for the other, which is why they are
+printed separately instead of being collapsed into one figure.
+
 ### What a passing run does not prove
 
 `DEPLOY VERIFY OK` means the files the verifier could see matched the hashes in
@@ -790,6 +806,17 @@ entry below.
 path, including across `/`, and suppresses `UNMANAGED_FILE` for the whole tree.
 The patterns in the command above are the reviewed set; any other entry is an
 unreviewed exclusion.
+
+The suppression is not limited to empty manifests. Measured on the current
+verifier with a manifest that manages `app.py` and sets
+`allowed_unmanaged: ["*"]`, against a root holding a correct `app.py` and an
+unmanaged `backdoor.py`: exit 0, `DEPLOY VERIFY OK: 1/1 files verified`,
+`UNMANAGED_FILE` not reported. Removing the `*` entry from the same tree
+produces exit 1 with `UNMANAGED_FILE` on `backdoor.py`. A `*` in the allow-list
+therefore converts "a file nobody reviewed was added to the deployment root"
+from a failure into a silent pass. That is why the reviewed pattern set is part
+of the contract, and why a manifest carrying `*` should be rejected in review
+rather than accepted because the run passed.
 
 None of this argues against running the verifier. It argues for running it on a
 tree extracted from the recorded commit, with a manifest generated on the
