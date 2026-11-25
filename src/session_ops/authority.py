@@ -1,6 +1,6 @@
 """Transactional authorization boundary for WorkItem and Session resources.
 
-Python 3.8+, standard library only. MCP handlers must call this module rather
+Python 3.11+, standard library only. MCP handlers must call this module rather
 than WorkItemStore directly.
 
 Landing evidence is deliberately not accepted as a caller-created object.
