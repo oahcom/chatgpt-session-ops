@@ -206,7 +206,7 @@ python scripts/chatgpt_send.py --account acct2 <conv_id> <prompt_file>
 | `--log-search <关键词> [--conv <id>] [--limit N] [--json]` | 全库或按会话检索（大小写不敏感，匹配提示词或回复正文） |
 | `--log-list --pending` | 只列 pending（新会话尚未确认 conv_id 的暂存轮次） |
 | `--log-list --unassigned` | 只列 unassigned（身份不可用且无法归属，按原始标识分文件） |
-| `--log-list --unresolved` | 同时列 pending 与 unassigned——人工处置入口；与 `--pending`/`--unassigned` 同给报参数冲突（exit 2） |
+| `--log-list --unresolved` | 同时列 pending 与 unassigned——人工处置入口。**与 `--pending`/`--unassigned` 同给不会报错**：分派顺序是 `--pending` → `--unassigned` → `--unresolved`，先命中的那一个生效，另一桶静默不列（实测 `--unresolved --pending` 退出码 0，只出 pending）。唯一被代码拒绝的组合是 `--pending` + `--unassigned`（exit 2）。要两桶就用 `--unresolved` 单给 |
 
 轮次形状：`turn_id / ts / conv_id / target_conv / account / prompt_file / prompt(全文) / prompt_chars / prompt_sha256 / reply(全文) / reply_chars / reply_sha256 / reply_state / reply_file / status / error`。
 
@@ -422,10 +422,12 @@ python scripts/chatgpt_send.py --tail <conv_id>
 | fail-closed | 解析不到出口直接 `SystemExit`，只有 `CHATGPT_ALLOW_DIRECT=1` 放行直连 | 静默直连是最坏的失败方式：任务「成功」了，但真实 IP 已暴露 |
 | 本机绕过 | `127.0.0.1 / localhost / ::1 / 0.0.0.0` 永不过代理 | CDP 与本地闸口（`CHATGPT_BASE`）被塞进代理后，代理一挂全链路瘫痪 |
 
-环境变量：`CHATGPT_PROXY`（出口代理，最高优先级）、`CHATGPT_ALLOW_DIRECT=1`（显式放行直连，仅调试）、
+环境变量：`CHATGPT_PROXY`（出口代理，最高优先级；`CHATGPT_PROXY_URL` 是它的等价别名，两者同时设时 `CHATGPT_PROXY` 先读）、`CHATGPT_ALLOW_DIRECT=1`（显式放行直连，仅调试）、
 `CHATGPT_REPLY_MAX_CHARS`（默认 0=全文）、`CHATGPT_ANON_IDLE_SEC`（默认 900）、
 `CHATGPT_CDP_PORT`（`continue_full.py` / `extract_auth.py` 用，默认 9222）、`CHATGPT_ANON_CDP_PORT`（匿名通道，默认 9333）、
-`CHATGPT_THINKING=1`（等价 `--thinking`，新会话走 `-t-` 思考模型）、`CHATGPT_MODEL`（直接指定 model slug，优先级最高）、`CHATGPT_NO_THINKING=1`（浏览器侧显式不点「思考」）。
+`CHATGPT_THINKING=1`（等价 `--thinking`，新会话走 `-t-` 思考模型）、`CHATGPT_NO_THINKING=1`（浏览器侧显式不点「思考」）。
+
+`CHATGPT_MODEL`（指定思考模型 slug）**只在 `--thinking` / `CHATGPT_THINKING=1` 生效时被读取**，且必须是含 `-t-` 的 slug，否则抛 `ThinkingModelUnavailable`。它不是「覆盖一切的最高优先级」：不开启思考时设它完全无效果，也无法用它指定非思考模型。
 
 回归测试（离线，不触网、不需要凭据）：
 
@@ -492,7 +494,10 @@ python scripts/chatgpt_send.py --proxy-clear                # 清掉 proxy.json 
 python scripts/mcp_connector.py inspect --url https://mcp.example.com/mcp
 python scripts/mcp_connector.py eligibility --account acct1
 python scripts/mcp_connector.py eligibility --accounts acct1,acct2,acct3,acct4,acct5,acct6
+python scripts/mcp_connector.py eligibility --account acct1 --capability CUSTOM_MCP_READ_FETCH
 ```
+
+`--capability` 的取值只有 `CUSTOM_MCP_FULL`（默认）与 `CUSTOM_MCP_READ_FETCH` 两个；给其他值 argparse 直接拒。
 
 `inspect` 做四层检查：HTTPS 与 SSRF 防护（解析 DNS 后拒绝私网/回环/链路本地）、端点可达性与 401 探测、`resource_metadata` 与授权服务器元数据、匿名端点才做 `initialize` + `tools/list`。OAuth 端点会明确输出 `protocol handshake skipped`，不冒充客户端替用户完成授权。
 
@@ -517,6 +522,34 @@ python scripts/mcp_connector.py eligibility --accounts acct1,acct2,acct3,acct4,a
 - `ELIGIBILITY_UNKNOWN`（接口异常）不得当作最终结论，需结合实测 API 响应判定。
 
 退出码：`0` 全部检查完成、`1` 部分检查操作失败、`2` 参数或凭据缺失、`4` 资格无法确定。
+
+## 可信 WorkItem 投递（D10）
+
+`chatgpt_send.py` 有第四条投递入口，与普通投递的区别是**先验权限再发送**：它要求一个存在的 WorkItem 与一份写入授权，发送成功后写一条 landing event 和一条 session link。普通 `--new` / `<conv_id>` 路径不碰这套东西。
+
+```bash
+SO_MCP_TRUSTED_ROOT=/path/to/chatgpt-session-ops \
+python scripts/chatgpt_send.py --work-item wi_<uuid> \
+  --principal <principal_id> --tenant <tenant_id> --db /var/lib/so-mcp/work-items.sqlite3 \
+  --account acct1 --new prompt.md
+```
+
+四个参数各有环境变量等价物，任一组缺失即 `exit 2` 且**不发任何请求**（`api.send_calls == 0`，连账号客户端都不创建）：
+
+| 参数 | 环境变量 |
+|---|---|
+| `--work-item` | 无（必须显式给） |
+| `--principal` | `SO_MCP_PRINCIPAL` |
+| `--tenant` | `SO_MCP_TENANT` |
+| `--db` | `SO_MCP_DB`（`--db`，不是 `--db-path`；后者属 `tools/gen_manifest.py`） |
+
+**`SO_MCP_TRUSTED_ROOT` 是硬前置，不是可选优化**。它是本仓库工作树根，必须绝对路径、必须存在、必须有 `.git`、必须含 `src/session_ops/authority.py` 与 `work_items.py`、且 `git rev-parse --show-toplevel` 要等于它本身、`origin` 要等于 `https://github.com/oahcom/chatgpt-session-ops`。任一不满足 → `exit 2`，报 `untrusted WorkItem execution environment`。**这是设计意图：本地 CLI 操作者身份不等于 IdP 认证**，脚本自己也不把脚本目录或 cwd 当信任信号。
+
+`--db` 必须指向持久文件，`:memory:` 被拒（`--db must name a persistent database file`）。`--evidence` / `--match` / `--confirmed` 是**禁用参数**：给了就 `exit 2`，防止调用方自带“已确认”证据冒充权威记录。
+
+输出是 JSON：`result` / `status` / `work_item_id` / `link` / `link_error`。`link` 成功时是 `{link_id, session_id}`；link 失败时 `link_error` 非空、`link` 为 null，而发送结果仍然保留（`status` 仍是 200），并多一个 `message` 提示需要手工关联。**两者分开报，不把一个折叠成另一个**。退出码 `0` 要求**发送成功且 link 已建**，只有其一时是 `1`。
+
+`--work-item --new` 强制要求显式登录账号（`--account acct1..acct6`）：给 `auto` 或 `nologin` 直接 `exit 2`，因为自动轮转与匿名通道发不出可信的 landing 证据。
 
 ## 故障速查
 
