@@ -125,6 +125,25 @@ row 16's `rowcount` guard — a second check that no test can distinguish, kept
 because the cost of keeping it is one comparison and the cost of being wrong
 about the first layer is an accepted token from another service.
 
+**Row 3 note, continued — `iss` is not covered at all.** The paragraph above is
+about `aud`. `iss` sits on the line above it in both layers
+(`mcp_auth.py:361` in `validate_registered_claims`, `mcp_auth.py:400` in
+`principal_from_claims`) and has no case at all. Measured by deleting both
+guards at once — `if False:` in place of each comparison — and running
+`test_mcp_contract`, `test_mcp_alg_confusion`, `test_mcp_rs256` and
+`test_mcp_transport`: `OK`, no failures.
+
+The reason is visible in the call sites. Every test that reaches either layer
+passes the issuer it is checking against: `expected_issuer=claims["iss"]` at
+`tests/test_mcp_contract.py:718` and `:745`, and the real issuer in the
+`JWTVerifier` fixtures. No case ever presents a token signed by the right key
+whose `iss` names a different realm.
+
+This is not a claim this row makes, so the row is not false — it is silent.
+What it means is that the binding "a token from another realm is rejected" is
+implemented and untested, in both layers, and would be a live defect if either
+guard were ever refactored away. Row 3 stays as it is; this note is the record.
+
 **Row 4 note — stale, corrected.** An earlier revision of this document said
 `alg` rejection was CODE_ONLY because no offline case fed a forged token
 through `verify()`. That was true when written and stopped being true when
@@ -200,6 +219,19 @@ case builds one, so replacing the clause with `False` leaves the suite green.
 This is **not** the unreachable code that row 16 records — the `rowcount` guard
 there cannot be executed at all, while this branch can and simply never is. It is
 listed as an uncovered branch rather than counted as evidence.
+
+Three more of the same shape sit on the read and write paths, and the whole-suite
+line count shows none of them executing: `get_work_item` (`if row is None: raise
+NotAuthorized()`), `transition_work_item`, and the landing path each re-check for a
+missing row *after* calling `_require`. `_require` already raises `NotAuthorized`
+when the `work_item_owners` lookup finds nothing, so the later check cannot be
+reached while `_require` is intact — it is a second line of defence behind the
+first, not an independent gate. That is why the row's evidence names
+`code:NotAuthorized()` without distinguishing which of the six raises it means: the
+ones the cases actually exercise are in `_require` and `_require_owner`, and these
+three are unreachable while those hold. If `_require` is ever weakened, these
+become the only thing between a caller and another tenant's row, and no case would
+notice that they had become load-bearing. Counted as uncovered, not as evidence.
 
 ---
 
