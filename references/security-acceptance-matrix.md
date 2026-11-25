@@ -125,6 +125,32 @@ row 16's `rowcount` guard — a second check that no test can distinguish, kept
 because the cost of keeping it is one comparison and the cost of being wrong
 about the first layer is an accepted token from another service.
 
+**Row 3 note, continued — `iss` is covered in neither layer.** The paragraph
+above is about `aud`. `iss` sits on the line above it in both layers —
+`mcp_auth.py:361` in `validate_registered_claims`, `mcp_auth.py:400` in
+`principal_from_claims` — and no case exercises either one.
+
+Measured on `f2e61a7`, each run against `test_mcp_contract`,
+`test_mcp_alg_confusion`, `test_mcp_rs256` and `test_mcp_transport`:
+
+| Mutation | Result |
+|---|---|
+| `iss` guard in `principal_from_claims` → `if False:` | `OK` — nothing red |
+| `iss` guard in `validate_registered_claims` → `if False:` | `OK` — nothing red |
+| both `iss` guards → `if False:` | `OK` — nothing red |
+| `aud` guard in `principal_from_claims` → `if False:` | 1 failed — the audience case |
+
+The call sites show why. Every case passes the issuer it is checking against:
+`expected_issuer=claims["iss"]` at `tests/test_mcp_contract.py:718` and `:745`,
+and the real issuer in the `JWTVerifier` fixtures. No case presents a token
+whose signature verifies while its `iss` names a different realm.
+
+Row 3 makes no claim about `iss`, so nothing in the row is false — it is silent.
+The consequence is that the binding "a token from another realm is rejected" is
+implemented in two places and observed in none. Unlike the `aud` duplicate
+above, there is no layer here that a test can distinguish, so this is a gap
+rather than a redundancy. Stated, not closed.
+
 **Row 3 note, continued — `iss` is not covered at all.** The paragraph above is
 about `aud`. `iss` sits on the line above it in both layers
 (`mcp_auth.py:361` in `validate_registered_claims`, `mcp_auth.py:400` in
