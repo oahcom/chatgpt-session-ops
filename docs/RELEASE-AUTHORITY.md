@@ -36,7 +36,7 @@ incorporated into B, tested, and committed.
 
 ## 2. Explicit B → A publication allowlist
 
-The following nine files are the complete allowlist for the current release
+The following eleven files are the complete allowlist for the current release
 baseline:
 
 | B-relative path | A-relative path | Purpose |
@@ -47,6 +47,8 @@ baseline:
 | `scripts/chatgpt_send.py` | `scripts/chatgpt_send.py` | Reviewed conversation-send utility |
 | `scripts/pow_solver.py` | `scripts/pow_solver.py` | Proof-of-work solver that `scripts/chatgpt_send.py` imports at module level |
 | `scripts/mcp_connector.py` | `scripts/mcp_connector.py` | Reviewed MCP connector eligibility utility |
+| `scripts/continue_full.py` | `scripts/continue_full.py` | CDP continuation channel that `tests/test_hardening.py` loads by path |
+| `scripts/extract_auth.py` | `scripts/extract_auth.py` | Cookie extractor whose domain predicate `tests/test_hardening.py` cross-checks against the sender |
 | `tests/test_hardening.py` | `tests/test_hardening.py` | Reviewed hardening tests |
 | `references/mcp-oauth-connector-contract.md` | `references/mcp-oauth-connector-contract.md` | Connector/OAuth contract that `SKILL.md` cites |
 | `references/mcp-tools.md` | `references/mcp-tools.md` | MCP tool operations contract for the ten exposed tools |
@@ -54,7 +56,8 @@ baseline:
 This is an explicit file allowlist, not permission to synchronize the containing
 directories.
 
-One entry is here only because another entry cannot run without it.
+Three entries are here only because another entry cannot run without them.
+
 `scripts/chatgpt_send.py` executes `from pow_solver import solve` at module
 level. While the solver is outside this list, two things are both true: a copy
 left behind in A from an earlier release never receives updates, so a change to
@@ -63,6 +66,37 @@ a tree assembled only from the list cannot import the sender at all
 (`ModuleNotFoundError: No module named 'pow_solver'`), nor collect a single test
 in `tests/test_hardening.py`, which loads the sender at import time. Pure
 algorithm, no credential or account state.
+
+`tests/test_hardening.py` loads `scripts/continue_full.py` and
+`scripts/extract_auth.py` by path. While they are outside this list, a tree
+assembled from it still imports the product, but the shipped test file cannot
+run: 24 of its cases fail on `FileNotFoundError` for `continue_full.py`, one on
+the `extract_auth` import, and one more on the A27 citation
+`code:enable_thinking`, a symbol that only resolves because `continue_full.py`
+is on disk. Those failures are indistinguishable at a glance
+from a real regression, so an operator who follows the `SKILL.md` instruction to
+run the suite before touching locks, persistence, ids, device identity or proxy
+sees a red suite on a healthy install. The closure was computed, not guessed:
+the eleven files are exactly the shipped files plus every local module they
+load, and a tree built from them runs the suite green at the same counts as B.
+
+`scripts/extract_auth.py` is the module that reads browser cookies, so listing
+it does change what a release may overwrite: the copy in A is now maintained by
+B instead of being frozen at whatever an earlier release left behind. That is
+the point. The file is the one place where the cookie domain predicate exists in
+a second implementation, and the shipped test exists precisely to catch the two
+implementations drifting apart. Freezing the A-side copy means the drift check
+runs against a file no release can correct.
+
+One file is deliberately NOT listed, and the difference matters.
+`scripts/start_chrome.py` is launched, not imported: no shipped file loads it at
+module level, no shipped test loads it at all, and `scripts/chatgpt_send.py`
+resolves it at runtime from the CDP directory (`CHATGPT_CDP_DIR`, defaulting to
+the `browser-automation-cdp` skill). A tree built from this list therefore still
+imports the product and still runs the suite green without it. Publishing it
+would make this repository the owner of a script it does not test, and would
+silently overwrite whatever browser launcher the operator's CDP install
+provides.
 
 A file not listed above MUST NOT be copied as part of this release procedure.
 A new file or path may be added only through a separately reviewed and
