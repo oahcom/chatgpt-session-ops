@@ -159,7 +159,10 @@ location /mcp {
 **五态回归**（每次动这段配置都跑）：
 
 ```bash
-H="Host: <host>"; U=https://127.0.0.1/mcp
+# HOST 必须换成 nginx 实际匹配的 server_name，否则四态都不可复现：
+# `-H "Host: <host>"` 会把尖括号逐字发出，server_name 不匹配就落到默认 server。
+HOST=chatgpt-mcp.example.com
+H="Host: $HOST"; U=https://127.0.0.1/mcp
 p(){ curl -sk -o /dev/null -D - -X POST $U -H "$H" -H "Content-Type: application/json" "$@" -d '{}' \
      | grep -iE '^(HTTP|www-authenticate|strict-transport|x-frame|x-content-type)'; }
 p                                    # 匿名          -> 纯挑战
