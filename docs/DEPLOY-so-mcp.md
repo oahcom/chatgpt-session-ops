@@ -180,6 +180,16 @@ Do not leave timestamped `.bak-*` files in the application tree.
 Files such as `mcp_auth.py.bak-1795566998` are deployment debris, not
 rollback artifacts. Rollback is the previous complete tree.
 
+Preserve them under `/var/backups/so-mcp/` instead of deleting them.
+Do not delete historical backup files merely to make verification pass:
+some of them are forensic evidence of a version that was deployed.
+`mcp_auth.py.bak-1795573995` is 34843 bytes, the same size as the
+`f28561b` revision of that file, which is how the drift described above
+was established. Record the original path, destination path, SHA-256,
+size, and the change record that authorised the move. The verifier still
+treats `*.bak-*` inside the deployment root as a hard failure; the
+exemption for `.venv/**` and `bin/**` does not extend to them.
+
 Before switching, ensure the candidate has the correct ownership and
 permissions and has passed the verifier. Do not copy `.venv` from an
 older deployment into the new tree. Create or populate the venv from
@@ -383,16 +393,39 @@ it, back it up with `.backup`, and verify each snapshot. Never use `cp`;
 a plain copy of a live SQLite file can capture a torn page image.
 
 ```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
 RETIRE=/var/backups/so-mcp/retired
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
 sudo install -d -o root -g root -m 0700 "$RETIRE"
+
+# Keep the find output outside the directories being retired.
+LIST="$(mktemp)"
+trap 'rm -f "$LIST"' EXIT
 
 for ROOT in /opt/so-mcp.stage /opt/so-mcp.ab; do
   [ -d "$ROOT" ] || continue
 
   NAME="$(basename "$ROOT")"
   DEST="$RETIRE/$NAME-$STAMP"
+  COUNT=0
+
+  # Do not use process substitution here: its find exit status would not
+  # reliably become the status of this script.
+  if ! sudo find "$ROOT" -type f -name '*.sqlite3' -print0 > "$LIST"; then
+    echo "Cannot enumerate SQLite databases under $ROOT" >&2
+    exit 1
+  fi
+
+  # These directories are known to contain databases. An empty list must
+  # not silently authorize deletion.
+  if [ ! -s "$LIST" ]; then
+    echo "No SQLite databases found under $ROOT; refusing retirement" >&2
+    exit 1
+  fi
+
   sudo install -d -o root -g root -m 0700 "$DEST"
 
   while IFS= read -r -d '' DB; do
@@ -400,15 +433,37 @@ for ROOT in /opt/so-mcp.stage /opt/so-mcp.ab; do
     OUT="$DEST/$REL"
 
     sudo install -d -o root -g root -m 0700 "$(dirname "$OUT")"
+
+    # SQLite's .backup API produces a consistent database snapshot.
     sudo sqlite3 "$DB" ".backup '$OUT'"
 
+    # Require a real, non-empty backup before running integrity_check.
+    sudo test -s "$OUT"
+
     CHECK="$(sudo sqlite3 "$OUT" 'PRAGMA integrity_check;')"
-    test "$CHECK" = ok || {
+    if [ "$CHECK" != "ok" ]; then
       echo "SQLite backup integrity failure: $DB" >&2
+      echo "Backup path: $OUT" >&2
+      echo "integrity_check: $CHECK" >&2
       exit 1
-    }
-  done < <(sudo find "$ROOT" -type f -name '*.sqlite3' -print0)
+    fi
+
+    COUNT=$((COUNT + 1))
+    printf 'Backed up and checked: %s -> %s
+' "$DB" "$OUT"
+  done < "$LIST"
+
+  if [ "$COUNT" -eq 0 ]; then
+    echo "No SQLite backup completed under $ROOT; refusing retirement" >&2
+    exit 1
+  fi
+
+  printf 'Verified %s SQLite backup(s) for %s
+' "$COUNT" "$ROOT"
 done
+
+echo "All retirement database backups passed integrity_check."
+echo "Only now is it safe to remove the retired directories."
 ```
 
 The retirement snapshots are data, not deployments: they must not be
@@ -424,6 +479,80 @@ sudo rm -rf -- /opt/so-mcp.stage /opt/so-mcp.ab
 Do not delete the retirement snapshots as part of this cleanup.
 
 ## 7. Verify the deployed tree
+
+### Generate the manifest from the trusted commit
+
+The manifest is generated from a trusted checkout and an explicit full commit
+SHA. Do not generate it from the production deployment directory: that would
+turn the files being checked into their own expected values.
+
+Use `deploy/paths.txt` as the authoritative list of repository-managed
+deployment files. It must match the explicit `git archive` selection used in
+section 1.
+
+Run the following from the trusted checkout. Replace the placeholder with the
+full 40-character commit SHA selected for deployment.
+
+```bash
+COMMIT=<FULL_40_HEX_SHA>
+
+sudo python3 tools/gen_manifest.py   --repo "$PWD"   --commit "$COMMIT"   --paths-from deploy/paths.txt   --external systemd-unit=/etc/systemd/system/so-mcp.service   --external nginx-snippet=/etc/nginx/snippets/so-mcp.conf   --external environment-file=/etc/so-mcp/so-mcp.env   --db-path /var/lib/so-mcp/work-items.sqlite3   --db-required-column session_links.session_id   --db-required-column authority_landing_events.attempt_id   --allow-unmanaged '.venv/**'   --allow-unmanaged 'bin/**'   --allow-unmanaged '*.pyc'   --allow-unmanaged '**/*.pyc'   --out /etc/so-mcp/manifest.json
+```
+
+The command needs permission to read the environment file and the database and
+to write `/etc/so-mcp/manifest.json`. The manifest records hashes and metadata
+for the external objects; it does not copy the environment file's contents.
+
+The database contract requires the listed columns to exist. In particular,
+`authority_landing_events.attempt_id` must be present after the P1/P2
+migration. A database missing that column fails with `DB_SCHEMA_BEHIND`; a
+missing database file fails with `DB_MISSING`.
+
+The manifest's `database.schema_version` is a contract label. The verifier
+reports it as `expected_schema_version` but does not compare it against SQLite
+`PRAGMA user_version`. The enforced gate is the `required_columns` mapping. Do
+not treat `schema_version` as proof that the database carries a particular
+`user_version`.
+
+`allowed_unmanaged` records the deliberate deployment-root exclusions. The
+`.venv/**` and `bin/**` patterns cover the Python virtual environment and the
+separately maintained Memory Adapter executable, neither of which is a
+commit-managed application file. Files matching these patterns are not
+individually content-verified. This does **not** verify `.pth` files,
+`sitecustomize.py`, installed packages, or the interpreter inside `.venv`. A
+`.pth` file or a `sitecustomize.py` planted in that environment would execute
+on every service start and would not be reported. Do not describe the runtime
+environment as verified; the accurate statement is that the managed
+application files and the listed external objects were verified.
+
+The following external-object values were observed on the production host when
+this procedure was written. They are reference values for review, not
+constants: a legitimate operations change to a unit, snippet, or environment
+file changes its hash and requires regenerating and reviewing the manifest.
+
+| Kind | Path | SHA-256 | Bytes | Observed mode |
+|---|---|---|---:|---|
+| `systemd-unit` | `/etc/systemd/system/so-mcp.service` | `f8ac60885fa5ee99206648b81e7f809fed169ece8c43dc50efdbd5ab77aad678` | 740 | `0644 root:root` |
+| `environment-file` | `/etc/so-mcp/so-mcp.env` | `aa32562faaf758e4474c7a650ea6f4adc8aa40bf447671502c0f36323a80c2fa` | 412 | `0600 root:root` |
+| `nginx-snippet` | `/etc/nginx/snippets/so-mcp.conf` | `ea2a2525476d100bd3c0b6fa0fd1e4803859a70b8364d68a7476046a145902e8` | 1794 | `0644 root:root` |
+
+The snippet is included by `/etc/nginx/conf.d/rmc-native-ip.conf` at line 36.
+That including file is shared with unrelated server configuration and is
+deliberately not hashed as a service-specific external object: hashing it
+would turn an unrelated site's nginx change into a failure of this service's
+deployment check.
+
+The generator records external-object content hashes and byte counts. The
+observed modes above are operational reference information; they are not
+enforced by the verifier.
+
+After generating, review the full commit SHA, the managed file list, the
+external-object entries, the database path and required columns, and the
+unmanaged allow-list. Do not install a manifest whose commit or managed path
+list does not match the approved deployment selection.
+
+### Run the verifier
+
 
 Keep the manifest outside the application root, for example:
 

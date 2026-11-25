@@ -105,6 +105,63 @@ class VerifyDeployTests(unittest.TestCase):
                 for issue in strict_result["issues"])
         )
 
+    def test_crlf_blob_and_crlf_worktree_match(self) -> None:
+        crlf = b"print('session ops')\r\n"
+        (self.root / "app.py").write_bytes(crlf)
+
+        entry = {
+            "path": "app.py",
+            "git_blob_sha1": blob_sha1(crlf),
+            "sha256_lf": hashlib.sha256(
+                b"print('session ops')\n"
+            ).hexdigest(),
+            "sha256_raw": hashlib.sha256(crlf).hexdigest(),
+            "bytes": len(b"print('session ops')\n"),
+        }
+        self.write_manifest([entry])
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assertTrue(result["ok"], result["issues"])
+        self.assertEqual(result["issues"], [])
+        self.assertEqual(result["warnings"], [])
+
+    def test_crlf_blob_and_lf_worktree_is_eol_warning(self) -> None:
+        crlf = b"print('session ops')\r\n"
+        lf = b"print('session ops')\n"
+        (self.root / "app.py").write_bytes(lf)
+
+        entry = {
+            "path": "app.py",
+            "git_blob_sha1": blob_sha1(crlf),
+            "sha256_lf": hashlib.sha256(lf).hexdigest(),
+            "sha256_raw": hashlib.sha256(crlf).hexdigest(),
+            "bytes": len(lf),
+        }
+        self.write_manifest([entry])
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assertTrue(result["ok"], result["issues"])
+        self.assertEqual(result["issues"], [])
+        self.assertEqual(
+            [warning["code"] for warning in result["warnings"]],
+            ["EOL_DRIFT"],
+        )
+
+        strict_result = verify(
+            self.root,
+            self.manifest_path,
+            strict=True,
+        )
+        self.assertFalse(strict_result["ok"])
+        self.assertTrue(
+            any(
+                issue["code"] == "EOL_DRIFT"
+                for issue in strict_result["issues"]
+            )
+        )
+
     def test_missing_managed_file_fails(self) -> None:
         (self.root / "app.py").unlink()
 

@@ -196,18 +196,26 @@ def verify(
             continue
 
         lf = normalize_lf(raw)
-        actual_blob = git_blob_sha1(lf)
+
+        # Git blob identity is defined over the exact bytes, not over the
+        # LF-normalized representation.
+        actual_blob = git_blob_sha1(raw)
         actual_lf_sha = sha256(lf)
         actual_raw_sha = sha256(raw)
 
-        if actual_blob != entry.get("git_blob_sha1"):
-            add_issue(issues, "GIT_BLOB_MISMATCH", rel,
-                      "Git blob SHA-1 differs from manifest")
+        expected_blob = entry.get("git_blob_sha1")
+        expected_lf_sha = entry.get("sha256_lf")
+        expected_raw_sha = entry.get("sha256_raw")
 
-        if actual_lf_sha != entry.get("sha256_lf"):
+        # Content equality is judged after the explicitly permitted
+        # CRLF-to-LF normalization.
+        if actual_lf_sha != expected_lf_sha:
             add_issue(issues, "CONTENT_MISMATCH", rel,
                       "LF-normalized SHA-256 differs from manifest")
-        elif actual_raw_sha != entry.get("sha256_raw"):
+            if actual_blob != expected_blob:
+                add_issue(issues, "GIT_BLOB_MISMATCH", rel,
+                          "raw Git blob SHA-1 differs from manifest")
+        elif actual_raw_sha != expected_raw_sha:
             warning = {
                 "code": "EOL_DRIFT",
                 "path": rel,
@@ -218,6 +226,7 @@ def verify(
             else:
                 warnings.append(warning)
 
+        # The manifest byte count is the LF-normalized byte count.
         if len(lf) != entry.get("bytes"):
             add_issue(issues, "BYTE_COUNT_MISMATCH", rel,
                       "LF-normalized byte count differs from manifest")

@@ -15,7 +15,7 @@ import re
 import subprocess
 import sys
 from datetime import datetime, timezone
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Iterable
 
 
@@ -139,7 +139,7 @@ def _file_entry(repo: Path, commit: str, path: str) -> dict:
         "git_blob_sha1": _git_blob_sha1(raw),
         "sha256_lf": _sha256(lf),
         "sha256_raw": _sha256(raw),
-        "bytes": len(raw),
+        "bytes": len(lf),
     }
 
 
@@ -232,21 +232,16 @@ def _build_manifest(args: argparse.Namespace) -> dict:
                 "--db-path is required when --db-required-column is supplied"
             )
     else:
-        db_path = args.db_path
-        posix_path = PurePosixPath(db_path)
+        db_path = Path(args.db_path)
 
-        if (
-            not posix_path.is_absolute()
-            or "\x00" in db_path
-            or "\\" in db_path
-            or ".." in posix_path.parts
-        ):
-            raise ManifestError(
-                "--db-path must be a normalized absolute POSIX path"
-            )
+        if not db_path.is_absolute() or "\x00" in args.db_path:
+            raise ManifestError("--db-path must be an absolute path")
+
+        if not db_path.is_file():
+            raise ManifestError("--db-path must name an existing file")
 
         database = {
-            "path": db_path,
+            "path": str(db_path),
             "schema_version": _DATABASE_CONTRACT_VERSION,
             "required_columns": {
                 table: columns
@@ -271,10 +266,7 @@ def _build_manifest(args: argparse.Namespace) -> dict:
             "*.bak-*",
             "**/*.bak-*",
         ],
-        "allowed_unmanaged": [
-            "*.pyc",
-            "**/*.pyc",
-        ],
+        "allowed_unmanaged": list(args.allow_unmanaged),
     }
 
     if database is not None:
@@ -311,8 +303,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--db-path",
-        metavar="ABSOLUTE_POSIX_PATH",
         help="Target SQLite database path on the deployment host",
+    )
+    parser.add_argument(
+        "--allow-unmanaged",
+        action="append",
+        default=[],
+        metavar="GLOB",
+        help="allow an unmanaged deployment path matching this glob; repeatable",
     )
     parser.add_argument(
         "--db-required-column",
