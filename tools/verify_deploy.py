@@ -179,6 +179,7 @@ def verify(
     read_files = 0
     checked_files = 0
     failed_files = 0
+    byte_identical_files = 0
 
     for path in sorted(root.rglob("*")):
         rel = path.relative_to(root).as_posix()
@@ -306,6 +307,13 @@ def verify(
             add_issue(issues, "BYTE_COUNT_MISMATCH", rel,
                       "LF-normalized byte count differs from manifest")
 
+        # Counted from the per-file raw digest, never derived from
+        # checked_files or from the warning count: a warning need not be
+        # EOL drift, and under --strict the same drift is an issue. Both
+        # modes must therefore report the same value for one tree.
+        if raw_matches:
+            byte_identical_files += 1
+
         # checked_files means successfully read AND passed all per-file
         # checks. A non-strict EOL warning does not fail the file.
         if len(issues) == file_issue_start:
@@ -356,6 +364,7 @@ def verify(
         "checked_files": checked_files,
         "failed_files": failed_files,
         "skipped_files": skipped_files,
+        "byte_identical_files": byte_identical_files,
         "checked_external_objects": len(manifest.get("external_objects", [])),
         "database": database_result,
         "issues": issues,
@@ -388,9 +397,12 @@ def main() -> int:
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if result["ok"]:
         print(
-            "DEPLOY VERIFY OK: %d/%d files verified, %d external objects"
+            "DEPLOY VERIFY OK: %d/%d files verified, byte-identical %d/%d, "
+            "%d external objects"
             % (
                 result.get("checked_files", 0),
+                result.get("expected_files", 0),
+                result.get("byte_identical_files", 0),
                 result.get("expected_files", 0),
                 result.get("checked_external_objects", 0),
             )
