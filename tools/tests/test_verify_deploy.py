@@ -776,6 +776,111 @@ class VerifyDeployTests(unittest.TestCase):
         self.assertIn("ROOT_MISSING", printed)
         self.assertNotIn("DEPLOY VERIFY OK", printed)
 
+    def test_clean_tree_exits_zero_and_names_the_count(self) -> None:
+        """The success path had no test at all.
+
+        `test_missing_root_exits_nonzero` asserts the banner is absent when
+        the run fails. Nothing asserted it is present, or correct, when the
+        run succeeds — so a change that printed `0/0 files verified` on a
+        fully verified tree, or that kept exit 0 while checking nothing,
+        would have gone unnoticed. The deploy document's claim is that a
+        human reads this line, so the numbers in it have to be asserted.
+        """
+        argv = sys.argv
+        sys.argv = [
+            "verify_deploy.py",
+            "--root",
+            str(self.root),
+            "--manifest",
+            str(self.manifest_path),
+        ]
+        stdout = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(stdout):
+                rc = main()
+        finally:
+            sys.argv = argv
+
+        printed = stdout.getvalue()
+        self.assertEqual(rc, 0, printed)
+        self.assertIn("DEPLOY VERIFY OK: 1/1 files verified", printed)
+
+    def test_file_entry_with_a_non_string_path_is_rejected(self) -> None:
+        """`isinstance` and truthiness are two different guards.
+
+        `test_file_entry_without_a_path_is_rejected` supplies `""`, which the
+        truthiness half catches. A number is truthy and not a `str`, so it
+        takes the `isinstance` half — the one a refactor to `if not rel:`
+        would silently drop.
+        """
+        manifest = self.load_manifest()
+        manifest["files"] = [{"path": 17}]
+        self.store_manifest(manifest)
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assert_code(result, "INVALID_FILE_ENTRY", "files")
+
+    # ------------------------------------------------------------------
+    # Two fails recorded, not fixed.
+    #
+    # `expectedFailure` is deliberate: these pin the safe behaviour while the
+    # production code still does the unsafe thing, so the suite stays green
+    # and the defect stays visible in the source. When the tool is fixed, the
+    # case turns into an unexpected success and the suite fails — that is the
+    # signal to delete the decorator, not to widen the assertion.
+    # ------------------------------------------------------------------
+
+    @unittest.expectedFailure
+    def test_empty_managed_list_is_not_a_pass(self) -> None:
+        """A manifest managing nothing must not report OK.
+
+        `ok` is `not issues`; an empty `expected` produces no issues, so the
+        tool reports `DEPLOY VERIFY OK: 0/0 files verified` and exits 0.
+        `gen_manifest.py` refuses to build such a manifest, so this arrives
+        only through a truncated download or a hand-edited file — but
+        "verified nothing, reported success" is the exact failure the deploy
+        document exists to prevent, and `0/0` reads as success at a glance.
+        """
+        manifest = self.load_manifest()
+        manifest["files"] = []
+        self.store_manifest(manifest)
+        # The managed file has to go too, or it becomes UNMANAGED_FILE and
+        # the run fails for a reason unrelated to the empty list. The
+        # reported scenario is an empty root and an empty manifest.
+        (self.root / "app.py").unlink()
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assertEqual(result["checked_files"], 0)
+        self.assertFalse(
+            result["ok"],
+            "a manifest that manages no files reported OK: %r" % (result,),
+        )
+
+    @unittest.expectedFailure
+    def test_star_allow_list_does_not_exempt_the_whole_tree(self) -> None:
+        """`allowed_unmanaged: ["*"]` must not silently accept every file.
+
+        `fnmatch.fnmatchcase` lets `*` cross `/`, so a single entry suppresses
+        `UNMANAGED_FILE` everywhere. The manifest is untrusted input; an
+        operator who writes `*` to ignore a build directory has exempted the
+        entire deployment root, and nothing says so.
+        """
+        (self.root / "backdoor.py").write_bytes(b"raise SystemExit\n")
+        manifest = self.load_manifest()
+        manifest["files"] = []
+        manifest["allowed_unmanaged"] = ["*"]
+        self.store_manifest(manifest)
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assertIn(
+            "UNMANAGED_FILE",
+            [issue["code"] for issue in result["issues"]],
+            "a '*' allow-list exempted the whole tree: %r" % (result["issues"],),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
