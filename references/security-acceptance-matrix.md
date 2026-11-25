@@ -102,6 +102,15 @@ neither would have been found by counting marks.
 | 4 | `alg: none`, `alg: HS256`, or a `crit` header | Rejected before key lookup. Algorithm confusion is not reachable. | `test:test_none_algorithm_with_forged_signature` `test:test_hs256_using_rsa_public_modulus_as_hmac_key` `test:test_lowercase_rs256_is_rejected` `test:test_missing_alg_is_rejected` `test:test_crit_header_is_rejected_before_key_lookup` `test:test_unexpected_typ_is_rejected_before_key_lookup` (test_mcp_alg_confusion) | PROVEN `mutation-checked` |
 | 4b | The signature itself: forged, wrong key, wrong hash, undersized or malformed key material | Rejected at verification. A genuine RS256 token is accepted and maps to the right principal. | `test:test_valid_rs256_signature_returns_claim_mapped_auth_context` `test:test_one_byte_signature_tampering_is_rejected` `test:test_signature_from_another_rsa_key_is_rejected` `test:test_sha1_signature_is_not_accepted_as_rs256` `test:test_1024_bit_rsa_modulus_is_rejected` `test:test_even_rsa_public_exponent_is_rejected` `test:test_rsa_public_exponent_one_is_rejected` `test:test_missing_cryptography_is_classified_as_dependency_unavailable` (test_mcp_rs256) | PROVEN `mutation-checked` |
 
+**Row 2 note — where "No tool dispatch" is actually asserted.** The named case
+calls `dispatch("work_item.create", {}, None, ...)` and asserts the error code;
+`assert_error` checks four fields of the envelope and never looks at whether the
+tool ran. The clause is true — `assert_error` sits behind the auth check — but
+for the service path it is read from the code. The middleware path is the one
+that asserts it: row 21's cases compare `inner_calls` against `[]` after a 401,
+so a request that reached the inner app would turn them red. Row 1, which
+asserts `self.store.calls == []` directly, is the shape this row is missing.
+
 **Row 3 note.** `aud` is checked twice: once in `validate_registered_claims`
 and again in `principal_from_claims`. The cited test exercises
 `principal_from_claims`. Deleting the `aud` check there fails it; deleting the
