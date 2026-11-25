@@ -136,6 +136,13 @@ def verify(
     ):
         add_issue(issues, "INVALID_COMMIT", "commit",
                   "commit must be a full lowercase 40-character SHA")
+    elif commit in {"0" * 40, "f" * 40}:
+        add_issue(
+            issues,
+            "INVALID_COMMIT",
+            "commit",
+            "commit must not be an all-zero or all-f placeholder SHA",
+        )
 
     expected: dict[str, dict[str, Any]] = {}
     for entry in manifest.get("files", []):
@@ -166,12 +173,50 @@ def verify(
                 add_issue(issues, "FORBIDDEN_PATH", pattern,
                           "forbidden deployment path exists")
 
+    read_paths: set[str] = set()
+    skipped_paths: set[str] = set()
+
+    read_files = 0
+    checked_files = 0
+    failed_files = 0
+
     for path in sorted(root.rglob("*")):
         rel = path.relative_to(root).as_posix()
 
-        if matches_any(rel, forbidden):
+        is_forbidden = matches_any(rel, forbidden)
+        if is_forbidden:
             add_issue(issues, "FORBIDDEN_PATH", rel,
                       "forbidden deployment artifact exists")
+
+        # Check symlinks before is_dir(): Path.is_dir() follows symlinks.
+        # rglob yields the symlink directory itself but does not descend
+        # into it. A symlink anywhere on a managed path is a failure: the
+        # commit tree carries none, so one in the deployment root did not
+        # come from the commit. Unmanaged paths that the allow-list covers
+        # are exempt, because a virtualenv legitimately contains links to
+        # its interpreter.
+        if path.is_symlink():
+            covers_managed = rel in expected or any(
+                managed_rel.startswith(rel + "/") for managed_rel in expected
+            )
+            if covers_managed or not matches_any(rel, allowed):
+                add_issue(
+                    issues,
+                    "UNEXPECTED_SYMLINK",
+                    rel,
+                    "deployment tree must not contain symlinks",
+                )
+            for managed_rel in expected:
+                if (
+                    managed_rel == rel
+                    or managed_rel.startswith(rel + "/")
+                ):
+                    skipped_paths.add(managed_rel)
+            continue
+
+        if is_forbidden:
+            if rel in expected:
+                skipped_paths.add(rel)
             continue
 
         if path.is_dir():
@@ -186,6 +231,7 @@ def verify(
         if path.is_symlink():
             add_issue(issues, "UNEXPECTED_SYMLINK", rel,
                       "managed files must be regular files")
+            skipped_paths.add(rel)
             continue
 
         entry = expected[rel]
@@ -193,7 +239,12 @@ def verify(
             raw = path.read_bytes()
         except OSError as exc:
             add_issue(issues, "FILE_READ_ERROR", rel, str(exc))
+            skipped_paths.add(rel)
             continue
+
+        read_files += 1
+        read_paths.add(rel)
+        file_issue_start = len(issues)
 
         lf = normalize_lf(raw)
 
@@ -209,17 +260,42 @@ def verify(
 
         # Content equality is judged after the explicitly permitted
         # CRLF-to-LF normalization.
-        if actual_lf_sha != expected_lf_sha:
-            add_issue(issues, "CONTENT_MISMATCH", rel,
-                      "LF-normalized SHA-256 differs from manifest")
-            if actual_blob != expected_blob:
-                add_issue(issues, "GIT_BLOB_MISMATCH", rel,
-                          "raw Git blob SHA-1 differs from manifest")
-        elif actual_raw_sha != expected_raw_sha:
+        lf_matches = actual_lf_sha == expected_lf_sha
+        blob_matches = actual_blob == expected_blob
+        raw_matches = actual_raw_sha == expected_raw_sha
+
+        if not lf_matches:
+            add_issue(
+                issues,
+                "CONTENT_MISMATCH",
+                rel,
+                "LF-normalized SHA-256 differs from manifest",
+            )
+
+        # Compare Git blob identity independently of the LF content check.
+        # A raw-byte difference with matching LF-normalized content is
+        # classified as EOL drift, not as a content identity failure.
+        eol_drift = (
+            lf_matches
+            and (not raw_matches or not blob_matches)
+        )
+
+        if not blob_matches and not eol_drift:
+            add_issue(
+                issues,
+                "GIT_BLOB_MISMATCH",
+                rel,
+                "raw Git blob SHA-1 differs from manifest",
+            )
+
+        if eol_drift:
             warning = {
                 "code": "EOL_DRIFT",
                 "path": rel,
-                "detail": "raw SHA-256 differs; CRLF-normalized content matches",
+                "detail": (
+                    "raw bytes or Git blob identity differs; "
+                    "CRLF-normalized content matches"
+                ),
             }
             if strict:
                 issues.append(warning)
@@ -231,11 +307,24 @@ def verify(
             add_issue(issues, "BYTE_COUNT_MISMATCH", rel,
                       "LF-normalized byte count differs from manifest")
 
-    # A manifest entry not seen in the tree is missing.
+        # checked_files means successfully read AND passed all per-file
+        # checks. A non-strict EOL warning does not fail the file.
+        if len(issues) == file_issue_start:
+            checked_files += 1
+        else:
+            failed_files += 1
+
+    # Every expected entry must have been read, or explicitly accounted
+    # for as skipped. This also catches entries hidden by missing dirs.
     for rel in sorted(expected):
-        if not (root / rel).is_file():
-            add_issue(issues, "MISSING_FILE", rel,
-                      "manifest-managed file is absent")
+        if rel in read_paths or rel in skipped_paths:
+            continue
+
+        add_issue(issues, "MISSING_FILE", rel,
+                  "manifest-managed file is absent")
+        skipped_paths.add(rel)
+
+    skipped_files = len(skipped_paths)
 
     for obj in manifest.get("external_objects", []):
         path_text = obj.get("path", "")
@@ -263,7 +352,11 @@ def verify(
         "manifest": str(manifest_path),
         "commit": commit,
         "strict": strict,
-        "checked_files": len(expected),
+        "expected_files": len(expected),
+        "read_files": read_files,
+        "checked_files": checked_files,
+        "failed_files": failed_files,
+        "skipped_files": skipped_files,
         "checked_external_objects": len(manifest.get("external_objects", [])),
         "database": database_result,
         "issues": issues,
@@ -296,9 +389,10 @@ def main() -> int:
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if result["ok"]:
         print(
-            "DEPLOY VERIFY OK: %d files, %d external objects"
+            "DEPLOY VERIFY OK: %d/%d files verified, %d external objects"
             % (
                 result.get("checked_files", 0),
+                result.get("expected_files", 0),
                 result.get("checked_external_objects", 0),
             )
         )
