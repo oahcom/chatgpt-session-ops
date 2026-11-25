@@ -37,18 +37,25 @@ python -m unittest tests.test_mcp_alg_confusion          # 7
 python -m unittest tests.test_mcp_rs256                  # 8
 python -m unittest tests.test_mcp_sdk_integration        # 4 (skips without mcp)
 python -m unittest tests.test_cdp_import_order           # 13
+python -m unittest tests.test_security_matrix            # 7 (this file)
 python -m pytest -q                                      # must be green; total not restated
 ```
 
 The module counts above are the ones a reader can check in a single command: the
-seven that back this table's rows, plus `test_cdp_import_order`, which backs no
-row here and is listed only because it is the module whose arrival moved the
-number this block used to carry. The whole-suite total is deliberately not
-restated. It moves whenever any test anywhere is added, and the previous version
-of this block shows what that costs — it was measured at `ac2b50c`, correct then,
-and wrong three hours later when #50 added those same CDP import-order cases.
-The last recorded full-suite snapshot is in `references/baselines.md` §G, with
-its own as-of date and commit; it describes that commit and nothing after it.
+seven that back this table's rows, `test_security_matrix`, which validates the
+table itself, and `test_cdp_import_order`, which backs no row here and is listed
+only because it is the module whose arrival moved the number this block used to
+carry. The whole-suite total is deliberately not restated. It moves whenever any
+test anywhere is added, and the previous version of this block shows what that
+costs — it was measured at `ac2b50c`, correct then, and wrong three hours later
+when #50 added those same CDP import-order cases. The last recorded full-suite
+snapshot is in `references/baselines.md` §G, with its own as-of date and commit;
+it describes that commit and nothing after it.
+
+These counts are checked by running the commands, not by reading the files:
+`test_work_item_authority` builds its cases in loops, so counting `def test_`
+in the source returns 8 for a module that reports 50, and a guard built on that
+count would have been born red.
 
 **What PROVEN means here, and what it does not.** PROVEN means the named case
 asserts the behaviour *and* the case goes red when the behaviour is deleted.
@@ -94,6 +101,15 @@ neither would have been found by counting marks.
 | 3 | A structurally valid JWT whose `aud` is another service | Rejected at claim validation, and again in `principal_from_claims`. | `test:test_claim_mapping_rejects_wrong_audience` | PROVEN `mutation-checked` for the claiming layer; see note |
 | 4 | `alg: none`, `alg: HS256`, or a `crit` header | Rejected before key lookup. Algorithm confusion is not reachable. | `test:test_none_algorithm_with_forged_signature` `test:test_hs256_using_rsa_public_modulus_as_hmac_key` `test:test_lowercase_rs256_is_rejected` `test:test_missing_alg_is_rejected` `test:test_crit_header_is_rejected_before_key_lookup` `test:test_unexpected_typ_is_rejected_before_key_lookup` (test_mcp_alg_confusion) | PROVEN `mutation-checked` |
 | 4b | The signature itself: forged, wrong key, wrong hash, undersized or malformed key material | Rejected at verification. A genuine RS256 token is accepted and maps to the right principal. | `test:test_valid_rs256_signature_returns_claim_mapped_auth_context` `test:test_one_byte_signature_tampering_is_rejected` `test:test_signature_from_another_rsa_key_is_rejected` `test:test_sha1_signature_is_not_accepted_as_rs256` `test:test_1024_bit_rsa_modulus_is_rejected` `test:test_even_rsa_public_exponent_is_rejected` `test:test_rsa_public_exponent_one_is_rejected` `test:test_missing_cryptography_is_classified_as_dependency_unavailable` (test_mcp_rs256) | PROVEN `mutation-checked` |
+
+**Row 2 note — where "No tool dispatch" is actually asserted.** The named case
+calls `dispatch("work_item.create", {}, None, ...)` and asserts the error code;
+`assert_error` checks four fields of the envelope and never looks at whether the
+tool ran. The clause is true — `assert_error` sits behind the auth check — but
+for the service path it is read from the code. The middleware path is the one
+that asserts it: row 21's cases compare `inner_calls` against `[]` after a 401,
+so a request that reached the inner app would turn them red. Row 1, which
+asserts `self.store.calls == []` directly, is the shape this row is missing.
 
 **Row 3 note.** `aud` is checked twice: once in `validate_registered_claims`
 and again in `principal_from_claims`. The cited test exercises
@@ -191,7 +207,7 @@ listed as an uncovered branch rather than counted as evidence.
 | # | Scenario | Expected | Evidence | Status |
 |---|---|---|---|---|
 | 12 | Caller constructs its own landing evidence and passes it to `link_session` | Rejected outright **even when a valid unclaimed landing event exists**. `LandingEvidence` no longer exists in the source; any non-`None` `evidence` raises. | `test:test_caller_supplied_evidence_is_rejected_even_with_valid_landing` `test:test_caller_supplied_evidence_is_rejected` `test:test_caller_supplied_evidence_is_rejected_by_authority` `test:test_plain_ids_convref_and_booleans_are_not_evidence_inputs` `code:link_session` (`if evidence is not None: raise`) | PROVEN `mutation-checked` |
-| 13 | No server-recorded landing event exists for the conversation | `QuarantineNotCleared`. Nothing is written. | `test:test_link_requires_server_recorded_landing` `test:test_unconfirmed_f13_evidence_is_rejected` | PROVEN `mutation-checked` |
+| 13 | No server-recorded landing event exists for the conversation | `QuarantineNotCleared`. | `test:test_link_requires_server_recorded_landing` `test:test_unconfirmed_f13_evidence_is_rejected` | PROVEN `mutation-checked` |
 | 14 | A confirmed event is consumed, then replayed | Second attempt fails. Consumption and link creation happen in one transaction. | `test:test_confirmed_complete_landing_can_be_consumed_once` `test:test_event_replay_cannot_create_a_second_link` `code:link_session` (`consumed_at IS NULL` → `UPDATE consumed_at` → `INSERT session_links`) | PROVEN `mutation-checked` |
 | 15 | Landing is `mismatch`, `ambiguous`, or evidence incomplete; or the send returned 409 | No event recorded, no link. Fail closed. | `test:test_mismatch_ambiguous_and_incomplete_landing_fail_closed` `test:test_mismatch_409_does_not_record_or_link` `test:test_ambiguous_multiple_ids_do_not_record_or_link` `test:test_incomplete_reply_does_not_record_or_link` `test:test_missing_archive_file_does_not_record_a_landing_event` | PROVEN `mutation-checked` |
 
@@ -206,6 +222,18 @@ refusal, asserts the event is still unconsumed and no `session_links` row was
 written, and then links the same session without evidence to prove the seeded
 event was usable. Mutation check: with the guard deleted, the old case stays
 green and only the new one fails.
+
+**Row 13 note — a clause that no case watched.** The Expected cell used to add
+"Nothing is written." Both named cases assert the refusal and stop there:
+`test_link_requires_server_recorded_landing` raises and never looks at
+`session_links`, and `test_unconfirmed_f13_evidence_is_rejected` asserts the
+error string `QUARANTINED_SESSION`. Delete the landing requirement and both go
+red, so the refusal is held. Reverse the order inside `link_session` — insert the
+link, then raise — and both stay green while a quarantined session is linked.
+The property is true of the code: the guard returns before the first `INSERT`.
+It was never true of a test, so it is not in the table any more. Row 12's landing
+case does assert `link_count == 0`, for its own path; nothing does so for this
+one, and that asymmetry is now visible in how the two rows read.
 
 **Row 15 note — nine conjuncts, two of them load-bearing.** The landing
 decision in `scripts/chatgpt_send.py` is a conjunction of nine conditions.
@@ -445,6 +473,7 @@ the row was downgraded.
 | `streamable_http_path=endpoint_path` → `"/wrong"` | 1 failed — the audience-path case | Row 22 route claim is held. |
 | `is_error=not envelope["ok"]` → `is_error=False` | 1 failed — the unauthenticated `tools/call` case | Row 22 envelope claim is held. |
 | `structured_content=envelope` → `structuredResult=envelope` | 1 failed — pydantic rejects the unknown field | Row 22 field-name claim is held. |
+| `structured_content=envelope` → `structured_content=None` | 1 failed — the client asserts the field is a dict | Spelling is not the claim; the envelope must arrive. |
 | `for name in TOOL_SCHEMAS` → `list(TOOL_SCHEMAS)[:-1]` | 1 failed — the tool-surface case | Row 22 surface claim is held. |
 | `structured_content` → `structuredContent` | **all 4 green** | Equivalent mutant: SDK sets `alias_generator=to_camel` with `populate_by_name=True`. Both spellings are valid. Not a gap. |
 
