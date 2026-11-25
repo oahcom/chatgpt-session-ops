@@ -30,8 +30,10 @@ from src.session_ops.mcp_server import (
     MAX_CONTEXT_ENTRIES,
     MAX_CURSOR_CHARS,
     MAX_PAGE_SIZE,
+    MAX_QUERY_CHARS,
     MAX_STRUCTURED_CONTENT_BYTES,
     MCPToolService,
+    _validate_arguments,
 )
 
 
@@ -577,6 +579,93 @@ class MCPContractTests(unittest.TestCase):
             },
         )
         self.assert_error(result, "INVALID_ARGUMENT")
+
+    # --------------------------------------------------------------
+    # Argument validation branches
+    # --------------------------------------------------------------
+
+    def assert_argument_rejected(self, tool, arguments, fragment):
+        with self.assertRaises(ValueError) as caught:
+            _validate_arguments(tool, arguments)
+        self.assertIn(fragment, str(caught.exception))
+
+    def test_required_argument_missing_is_rejected(self):
+        self.assert_argument_rejected(
+            "work_item.get", {}, "required argument missing"
+        )
+
+    def test_string_argument_required_is_rejected(self):
+        self.assert_argument_rejected(
+            "work_item.get",
+            {"work_item_id": 123},
+            "string argument required",
+        )
+
+    def test_string_argument_too_short_is_rejected(self):
+        self.assert_argument_rejected(
+            "work_item.grant",
+            {
+                "work_item_id": WORK_ITEM_ID,
+                "target_principal_id": "",
+                "scope": "read",
+            },
+            "string argument too short",
+        )
+
+    def test_string_argument_too_long_is_rejected(self):
+        # The schema maxLength fires before the dedicated cursor bound,
+        # which makes the later "cursor is too long" branch unreachable.
+        self.assert_argument_rejected(
+            "work_item.list",
+            {"cursor": "x" * (MAX_CURSOR_CHARS + 1)},
+            "string argument too long",
+        )
+
+    def test_string_argument_not_in_enum_is_rejected(self):
+        self.assert_argument_rejected(
+            "work_item.list",
+            {"status": "definitely-not-in-enum"},
+            "string argument is not an allowed value",
+        )
+
+    def test_string_argument_invalid_format_is_rejected(self):
+        self.assert_argument_rejected(
+            "session.link",
+            {
+                "session_id": SESSION_ID,
+                "work_item_id": WORK_ITEM_ID,
+                "attempt_id": "att_not-a-uuid",
+            },
+            "string argument has invalid format",
+        )
+
+    def test_integer_argument_required_is_rejected(self):
+        for value in ("10", True):
+            with self.subTest(value=value):
+                self.assert_argument_rejected(
+                    "work_item.list",
+                    {"page_size": value},
+                    "integer argument required",
+                )
+
+    def test_integer_argument_below_minimum_is_rejected(self):
+        self.assert_argument_rejected(
+            "work_item.list",
+            {"page_size": 0},
+            "integer argument below minimum",
+        )
+
+    def test_boolean_argument_required_is_rejected(self):
+        for value in (0, 1, "true"):
+            with self.subTest(value=value):
+                self.assert_argument_rejected(
+                    "session.list",
+                    {
+                        "work_item_id": WORK_ITEM_ID,
+                        "include_unlinked": value,
+                    },
+                    "boolean argument required",
+                )
 
     # --------------------------------------------------------------
     # Non-disclosure and trusted evidence
