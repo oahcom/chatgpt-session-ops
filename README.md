@@ -125,7 +125,9 @@ python scripts/continue_full.py <old_conv_id> prompts/02-next.md
 
 ```bash
 # 起有头临时 profile（脚本在 browser-automation-cdp 技能目录下；无头模式会被 Cloudflare 挡）
-python <CDP_DIR>/start_chrome.py --temp --port 9333
+# 注意：占位符必须整段替换，不能连尖括号一起粘贴——bash 会把 `<...>` 当成输入重定向
+CDP_DIR="$HOME/.workbuddy/skills/browser-automation-cdp/scripts"
+python "$CDP_DIR/start_chrome.py" --temp --port 9333
 
 python scripts/chatgpt_send.py --account nologin --new prompts/x.md
 python scripts/chatgpt_send.py --anon-list                 # 对照表：live / archived / 设备是否留存

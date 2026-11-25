@@ -39,7 +39,7 @@ python -m unittest tests.test_mcp_sdk_integration        # 4 (skips without mcp)
 python -m unittest tests.test_cdp_import_order           # 13
 python -m unittest tests.test_security_matrix            # 7 (this file)
 python -m unittest tests.test_landing_identity_contract  # 6
-python -m pytest -q                                      # must be green; total not restated
+python -m unittest discover -s tests -q            # must be green; total not restated
 ```
 
 The module counts above are the ones a reader can check in a single command: the
