@@ -176,12 +176,13 @@ class ReadStreamIncompleteReadTests(unittest.TestCase):
         printed = out.getvalue()
 
         self.assertEqual(status, 200)
-        # 已收字节不得丢：req() 的 IncompleteRead 分支会把 e.partial 再 append 一次
-        # （现有实现如此，见其 except 分支），所以这里不钉总长度，只钉「partial 确实
-        # 到了返回值与落盘件」——真实字节数由 last_partial_bytes 与文件长度自证一致。
-        self.assertIn(self.PARTIAL.decode("utf-8"), text)
+        # partial 只在 _read_stream() 里 append 一次（抛空前），req() 的 IncompleteRead
+        # 分支不再追加——这是 #151 修复后的实际行为。正因如此总长度可以精确钉死：
+        # 多一个字节意味着又重复追加了，少一个字节意味着 partial 被丢了。
+        # （旧版用 >= 是为了容忍 req() 的二次追加；那个放宽现在已无必要。）
+        self.assertEqual(text, self.PARTIAL.decode("utf-8"))
         self.assertIs(api.last_truncated, True)
-        self.assertGreaterEqual(api.last_partial_bytes, len(self.PARTIAL))
+        self.assertEqual(api.last_partial_bytes, len(self.PARTIAL))
         self.assertTrue(api.last_partial_path)
         self.assertTrue(api.last_partial_path.startswith(
             os.path.join(tmp, "timeouts") + os.sep))
