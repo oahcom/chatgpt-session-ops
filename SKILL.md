@@ -565,7 +565,7 @@ python scripts/chatgpt_send.py --work-item wi_<uuid> \
 | 匿名会话续聊报「标签页已不存在」 | 匿名会话只在原标签页可写，重开必被重定向 | 用 `--anon-read <id>` 读全文归档；继续对话请用登录态账号 |
 | 匿名续聊报「CDP 端口未运行」 | 浏览器没起，无法确认标签页（会话未必丢） | 先 `start_chrome.py --temp --port 9333` 再试；只读需求直接用 `--anon-read` |
 | 匿名续聊报「暂时读不到（429/0/5xx）」 | 限速或网络抖动，**不是**会话失效 | 等几分钟重试；`--anon-read` 直接读 |
-| 状态文件出现 `*.lock` 残留 | 持有者进程已退出，锁文件没清 | 不用等：下一次抢锁发现持有者已死会立即回收。判据是**持有者死活**，不是年龄——锁文件里写着 `pid` 与 `process_start_time`，两者一致且进程在跑就绝不可回收（等多久都不会失效，手工删等于破坏跨进程互斥）。删不掉时内容会变成 `{"released": true}`，下一次抢锁同样立即回收 |
+| 状态文件出现 `*.lock` 残留 | 持有者进程已退出，锁文件没清 | 不用等：下一次抢锁发现持有者已死会立即回收。判据是**持有者死活**，不是年龄——锁文件里写着 `pid` 与 `process_start_time`，两者一致且进程在跑就绝不可回收（等多久都不会失效，手工删等于破坏跨进程互斥）。删不掉时内容会变成 `{"released": true}`，下一次抢锁同样立即回收。唯一仍看年龄的是**读不出身份**的老格式锁（空文件，或 JSON 里没有 `pid` 字段）：它们按 mtime 判，超过 `LOCK_STALE_SEC`(60s) 才算残留 |
 | 出现 `conv-accounts.json.corrupt-<ts>` | 上次写入被强杀，json 只写了一半 | 损坏件已隔离，状态按空重建；需要旧数据就从隔离文件里捞（它是合法前缀时手工补 `}`） |
 | 报 `conv_id 非法：'…'` | id 含 `/`、`..`、空格或超长 | 复制完整 id（形如 `11111111-2222-4333-8444-555555555555`），别手改 |
 | 回复文件明显比预期短 | 设了 `CHATGPT_REPLY_MAX_CHARS` | 取消该变量即全文落盘；文件头有截断标注 |
@@ -603,7 +603,7 @@ python scripts/chatgpt_send.py --work-item wi_<uuid> \
 - `conv-accounts.json` — `conv_id → 归属账号` 登记表，驱动自动路由。
 - `anon-sessions.json` — 匿名会话 id 对照表（标签页、prompt、回复摘要、设备号、状态），是匿名会话的唯一留存索引。
 - `anon-sessions/<conv_id8>.md` — 匿名会话全文归档（`--anon-read` 生成）；8 位前缀撞车时自动加 `-<后4位>` 后缀，不会互相覆盖。
-- `*.lock` — 上面三个 json 的跨进程写锁（O_EXCL），正常用完即删；残留锁按**持有者死活**判定，不按年龄：进程已退出（DEAD）的下一次抢锁立即回收，进程仍在的永不回收。释放时若因别的进程正读该文件而删不掉，锁内容会被改写成 `{"released": true}`，效果同上。
+- `*.lock` — 上面三个 json 的跨进程写锁（O_EXCL），正常用完即删；残留锁按**持有者死活**判定，不按年龄：进程已退出（DEAD）的下一次抢锁立即回收，进程仍在的永不回收。释放时若因别的进程正读该文件而删不掉，锁内容会被改写成 `{"released": true}`，效果同上。例外：**读不出身份的老格式锁**（空文件，或 JSON 里没有 `pid` 字段）没有持有者可判，仍走 mtime 判据，超过 `LOCK_STALE_SEC`(60s) 才算残留。
 - `proxy.json` — 出口代理配置（`{"url": "socks5h://..."}`，可带账号密码 → chmod 600 且不入库）。没有它时走上表第 3/4 档。
 - `accounts/nologin/device-cookie.txt` — 匿名态最新 device cookie（`oai-did` 等），使 API 侧 `GET /backend-anon/conversation/<id>` 可持续收割。
 - `accounts/nologin/devices/<oai-did>.txt` — 按设备分档的 Cookie 头快照；`--anon-read` 优先用它，保证浏览器换 profile 后旧会话仍可读。
