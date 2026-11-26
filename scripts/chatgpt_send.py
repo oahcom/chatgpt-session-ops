@@ -3,6 +3,7 @@
 
 用法：
     python chatgpt_send.py <conv_id> <prompt_file>          # 投递到既有会话
+    python chatgpt_send.py [--timeout SECONDS] <conv_id> <prompt_file>  # 显式覆盖客户端超时（否则按 --thinking 分档）
     python chatgpt_send.py --new <prompt_file>              # 开全新会话（默认按身份轮转均分）
     python chatgpt_send.py --tail <conv_id>                 # 只收割末条 assistant 回复
     python chatgpt_send.py --account acct2 --tail <conv_id> # 显式选择账号
@@ -31,6 +32,7 @@
     python chatgpt_send.py --check-name "<名称>" [--argv "<命令串>"]  # B10/B11 命名与权限
     python chatgpt_send.py --check-schedule "FREQ=HOURLY;INTERVAL=1"  # B1 排程口径
     python chatgpt_send.py --check-oneshot 2026-11-19T16:00:00+08:00  # B4/B5 一次性窗口
+    python chatgpt_send.py --check-send-log <log> [--prompt <pfile>]  # 投递日志：SENT/TRUNCATED/IN_FLIGHT/NOT_SENT
 
 交付正文托管（A1/A2/A4 的机器判定，纯本地不触网）：
     定位器必须显式给：--between 两行标记（strip 后整行相等，各恰好 1 处）或 --fence 第 n 块。
@@ -100,10 +102,33 @@
       可用 conv-api/<id8>.json 缓存 tail 兜底 parent_message_id。
     - POST 200 即消息已提交；SSE 流只用于收割，需读到 EOF（勿提前关连接）。
     - HTTP 413 Payload Too Large → 本次发送终止；不轮换账号、不自动重试；检查实际请求体及服务端错误响应。
+
+投递超时（--timeout，优先级：命令行 > CHATGPT_SEND_TIMEOUT > --thinking 分档）：
+    作用于发送/收割这条 HTTP 读写路径的 socket 超时，不改变 --thinking 选择模型的语义。
+    **只有显式配置（--timeout 或 CHATGPT_SEND_TIMEOUT）才覆盖分档**；两者都没有时按
+    --thinking 分档（非思考 420s / 思考 1800s）。CLI 不再无条件写 600——那会把
+    思考模式的 1800s 分档在唯一可被操作者触达的路径上打死（DEF-ops-04）。
+    超时一律打印可机读标记，便于事后 grep 统计：
+      TIMEOUT_PARTIAL after Ns, M bytes buffered, saved to <path>   # 已收内容落盘（<auth>/timeouts/）
+      TIMEOUT_EMPTY after Ns                                       # 零字节
+    IncompleteRead（流被截断）同路：PARTIAL after Ns, M bytes buffered, saved to <path>，同样落盘。
+
+送达凭证（截断与完整必须分得开）：
+    完整响应      → `SEND <pfile> -> 200 respLen=<n> in <s>s`，exit 0（格式与旧版一致）
+    截断/超时     → `SEND_TRUNCATED pfile=<pfile> st=<st> bytes=<n>`，exit 3
+    截断路径仍走既有链路（GET 补全文 + 归档，不丢字节），但**绝不打 `SEND ... -> 200`**：
+    那行是唯一送达凭证，被截断响应冒充就等于门禁假绿（DEF-ops-01）。
+
+投递日志判定（NOT_SENT 的机读版）：
+    `--check-send-log <log> [--prompt <prompt_file>]` 按 CB-B8 判一次投递是否「没发出去」。
+    三合取（无 SEND + <200 字节 + mtime>5 分钟）之前必须**先看进程死活**：在飞投递的静默期
+    （tail GET + 最长 3600s 退避）同时满足三条，按三合取判死就会重复投递（DEF-ops-02）。
+    verdict：SENT / TRUNCATED / IN_FLIGHT / NOT_SENT；exit 0/3/0/1。
 """
 import base64
 import contextlib
 import copy
+import csv
 import gzip
 import hashlib
 import http.client
@@ -143,6 +168,265 @@ _OPENAI_COOKIE_DOMAINS = ("chatgpt.com", "openai.com")
 # CHATGPT_BASE：API 根。默认直连；指向闸口时走 asip/chatgpt_l7.py
 #   （http://127.0.0.1:17892，429 适配：账号层退避短路 + transport 换 ok）。
 API_BASE = os.environ.get("CHATGPT_BASE", "https://chatgpt.com").rstrip("/")
+
+# ---------- 投递超时（可配置） ----------
+# 实测依据（162 次投递）：19 次卡在 ~1700s（16 次落在 1769–1773s，正是 1800s 客户端超时），
+# in-flight 累计 9.33h = 整段墙钟 18.12h 的 24.7%，其中 17 次最终 FAIL「回复完整性未证明」。
+# 正常投递中位数 182.5s，P90 完全由这个超时决定而非真实分布——所以它必须可配。
+# 注意：CLI 未显式给 --timeout / CHATGPT_SEND_TIMEOUT 时**不再**把它写进 SEND_TIMEOUT
+# （否则 --thinking 的 1800s 分档在 CLI 上会被 600s 无条件覆盖，DEF-ops-04）。
+# 保留常量是为了文档与外部导入兼容；实际分档见 _send_prompt_impl。
+DEFAULT_SEND_TIMEOUT = 600
+# None = 未覆盖（沿用 --thinking 的 420/1800 分档）；int = 覆盖值。
+# 只有 CLI（main）或环境变量会把它变成 int，库调用方直接调 send_prompt 仍保持旧行为。
+SEND_TIMEOUT = None
+
+
+def _parse_timeout(raw):
+    """把一次超时配置收敛成正整数秒；不可用返回 None（由调用方决定回退到哪个默认）。"""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    try:
+        v = int(s, 10)
+    except (TypeError, ValueError):
+        print("WARN: 超时值不是整数：%r —— 按未指定处理" % (raw,), flush=True)
+        return None
+    if v <= 0:
+        print("WARN: 超时必须 > 0（收到 %r）—— 按未指定处理" % (raw,), flush=True)
+        return None
+    return v
+
+
+def _extract_timeout_flag(argv):
+    """从 argv 里摘出 `--timeout N` / `--timeout=N`，返回 (原始值或 None, 剩余 argv)。
+
+    为什么要先摘出来：这个脚本没有 argparse，`<conv_id> <prompt_file>` 的位置校验
+    是 `len(args) != 2`——`--timeout 600` 留在 args 里会被当成第三个位置参数，
+    所有既有调用方式（不带 --timeout）必须继续可用，带 --timeout 也不能变位置语义。
+    """
+    out, value, seen = [], None, False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--timeout" or a.startswith("--timeout="):
+            if seen:
+                raise ValueError("--timeout 重复指定")
+            if a == "--timeout":
+                if i + 1 >= len(argv):
+                    raise ValueError("--timeout 需要秒数（形如 --timeout 600）")
+                value = argv[i + 1]
+                i += 2
+            else:
+                value = a.split("=", 1)[1]
+                i += 1
+            seen = True
+            continue
+        out.append(a)
+        i += 1
+    return value, out
+
+
+SEND_TIMEOUT = _parse_timeout(os.environ.get("CHATGPT_SEND_TIMEOUT"))
+SEND_TIMEOUT_SOURCE = "env" if SEND_TIMEOUT is not None else ""
+
+
+def _cap_timeout(default):
+    """辅助请求（tail/GET 全文）的超时上限：只允许 --timeout 收紧，绝不放宽。
+
+    为什么不直接全用 --timeout：这些 GET 本来是 90/120s 的短请求，给 600s 只会让
+    卡死的 GET 更慢；给 --timeout 60 时它们必须跟着一起变短，否则探针仍会拖满 90s。
+    """
+    if SEND_TIMEOUT is None:
+        return default
+    return min(default, SEND_TIMEOUT)
+
+
+# ---------- 送达判定（CB-B8 三合取的机读版） ----------
+# 旧判据（无 SEND + <200 字节 + mtime>5 分钟）在**在飞**投递上三个条件全部成立：
+#   <conv_id> 路径发送前先 live_tail（两次 GET，各 ≤90s），失败后 _retry_after 最长退避
+#   3600s；这段静默期日志一个字节都不写，进程却在推进。按三合取判死 → 重投 →
+#   同一提示词两条回复、两个工作项。所以判死之前必须先看「进程是否还在」。
+NOT_SENT_MAX_BYTES = 200        # 旧判据：文件小于 200 字节
+NOT_SENT_MIN_AGE_SEC = 300      # 旧判据：mtime 超过 5 分钟
+INFLIGHT_BACKOFF_WINDOW = 3600  # api._retry_after 的退避上限＝最长零输出窗口
+
+# 完整投递的唯一送达凭证。SEND_TRUNCATED 不是它：截断只证明「发出去了一部分」。
+SEND_OK_RE = re.compile(r"^SEND .+ -> 200\b")
+SEND_TRUNCATED_RE = re.compile(r"^SEND_TRUNCATED\b")
+
+
+def read_log_text(path):
+    """按 BOM 读日志：UTF-8（含 BOM）默认，UTF-16LE/BE 也认。
+
+    为什么不能写死 utf-8：本机 PowerShell 重定向产出 UTF-16LE+BOM，按 utf-8 硬读时
+    每个 ASCII 字节前都有 0x00，`SEND` 这类判据全部漏匹配（CB-B10 / DEF-ops-08）。
+    """
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw.startswith(b"\xff\xfe\x00\x00") or raw.startswith(b"\xff\xfe"):
+        enc = "utf-16"
+    elif raw.startswith(b"\xfe\xff"):
+        enc = "utf-16-be"
+    elif raw.startswith(b"\xef\xbb\xbf"):
+        enc = "utf-8-sig"
+    else:
+        enc = "utf-8"
+    return raw.decode(enc, "replace")
+
+
+def _iter_process_cmdlines():
+    """枚举 (pid, 命令行) 的尽力而为实现；返回 None 表示**枚举能力不可用**。
+
+    None ≠ 没有进程：读不到就按「可能还活着」处理（fail-closed），否则一次权限/工具
+    缺失就会把在飞投递判死并触发重投。顺序：/proc（精确、零依赖）→ psutil → wmic。
+    """
+    if os.path.isdir("/proc"):
+        rows = []
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open("/proc/%s/cmdline" % entry, "rb") as f:
+                    raw = f.read()
+            except OSError:
+                continue
+            rows.append((int(entry),
+                         raw.replace(b"\x00", b" ").decode("utf-8", "replace")))
+        return rows
+    try:
+        import psutil
+    except Exception:
+        psutil = None
+    if psutil is not None:
+        rows = []
+        for proc in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                info = proc.info
+                cmd = info.get("cmdline") or []
+                rows.append((info.get("pid"), " ".join(str(c) for c in cmd)))
+            except Exception:
+                continue
+        return rows
+    if os.name == "nt":
+        try:
+            done = subprocess.run(
+                ["wmic", "process", "get", "ProcessId,CommandLine", "/format:csv"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if done.returncode != 0:
+            return None
+        rows = []
+        for row in csv.reader(done.stdout.decode("utf-8", "replace").splitlines()):
+            if len(row) >= 3 and row[-1].strip().isdigit():
+                rows.append((int(row[-1]), ",".join(row[1:-1])))
+        return rows
+    return None
+
+
+def live_senders(prompt_file):
+    """命令行里提到该 pfile 的存活 pid 列表；None = 枚举不可用（当作「可能活着」）。"""
+    if not prompt_file:
+        return []
+    target = os.path.basename(str(prompt_file))
+    rows = _iter_process_cmdlines()
+    if rows is None:
+        return None
+    me = os.getpid()
+    out = []
+    for pid, cmdline in rows:
+        # 必须排除自己：判定器常以 `--check-send-log <log> --prompt <pfile>` 被调用，
+        # 自己的命令行里就含着 pfile——不排除的话每次都「找到存活进程」，
+        # NOT_SENT 永远判不出来（恒 IN_FLIGHT 的假红变假绿）。
+        if pid == me:
+            continue
+        if target and target in (cmdline or ""):
+            out.append(pid)
+    return out
+
+
+def judge_send_log(log_path, prompt_file=None, now=None, live_pids=None):
+    """判定一次投递日志：SENT / TRUNCATED / IN_FLIGHT / NOT_SENT。
+
+    顺序是有意为之，每一步都在堵一个已实测的假绿/假红：
+      ① `SEND ... -> 200` → SENT（唯一送达凭证；`SEND_TRUNCATED` 不匹配这个正则）
+      ② `SEND_TRUNCATED` → TRUNCATED（已发但完整性未证明，不能算 SENT，也不该重投）
+      ③ 三合取不成立（有 SEND/够大/够新）→ IN_FLIGHT（还可能成功）
+      ④ 三合取成立 → **先查进程死活**：
+         - 同 pfile 的进程还在 → IN_FLIGHT（静默期，最长 3600s）
+         - 枚举不到进程时按「可能活着」→ IN_FLIGHT（fail-closed）
+         - mtime 仍在 3600s 退避窗口内且首行是 `timeout:` → IN_FLIGHT
+         - 以上都不成立 → NOT_SENT（真的死了，可以重投）
+    `live_pids` 是给测试/调用方注入「已知存活 pid」的口子；None = 现场枚举。
+    """
+    if not os.path.isfile(log_path):
+        raise FileNotFoundError(log_path)
+    text = read_log_text(log_path)
+    lines = text.splitlines()
+    size = os.path.getsize(log_path)
+    mtime = os.path.getmtime(log_path)
+    base_now = time.time() if now is None else float(now)
+    age = max(0.0, base_now - mtime)
+
+    has_send = any(SEND_OK_RE.match(ln.strip()) for ln in lines)
+    has_truncated = any(SEND_TRUNCATED_RE.match(ln.strip()) for ln in lines)
+    first_line = ""
+    for ln in lines:
+        if ln.strip():
+            first_line = ln.strip()
+            break
+    window_open = age <= INFLIGHT_BACKOFF_WINDOW and first_line.startswith("timeout:")
+
+    pids = live_senders(prompt_file) if live_pids is None else list(live_pids)
+    alive_unknown = pids is None
+    alive = alive_unknown or bool(pids)
+
+    verdict, reasons = "IN_FLIGHT", []
+    if has_send:
+        verdict, reasons = "SENT", ["send_line"]
+    elif has_truncated:
+        verdict, reasons = "TRUNCATED", ["send_truncated_line"]
+    elif size >= NOT_SENT_MAX_BYTES:
+        reasons = ["log_has_bytes"]
+    elif age <= NOT_SENT_MIN_AGE_SEC:
+        reasons = ["log_is_fresh"]
+    elif alive:
+        reasons = ["sender_process_alive" if not alive_unknown else "liveness_unknown"]
+    elif window_open:
+        reasons = ["inside_backoff_window"]
+    else:
+        verdict, reasons = "NOT_SENT", ["no_send_line", "log_empty", "log_stale",
+                                        "no_sender_process"]
+
+    return {
+        "verdict": verdict,
+        "sent": verdict == "SENT",
+        "truncated": verdict == "TRUNCATED",
+        "not_sent": verdict == "NOT_SENT",
+        "in_flight": verdict == "IN_FLIGHT",
+        "bytes": size,
+        "age_sec": int(age),
+        "first_line": first_line,
+        "live_pids": [] if pids is None else pids,
+        "liveness_unknown": alive_unknown,
+        "reasons": reasons,
+        "log": os.path.abspath(log_path),
+        "prompt_file": os.path.abspath(prompt_file) if prompt_file else None,
+    }
+
+
+def _send_exit_code(status, conv=None):
+    """投递类命令的退出码：截断优先于 200（SEND_TRUNCATED 绝不能以 0 收场）。
+
+    只判 conv 上的 send_truncated 标记，不判完整性：GET 之后 reply_complete 可能变 True，
+    但「发送时被截断」是既成事实，送达凭证已经缺失，exit 0 会让门禁假绿。
+    """
+    if getattr(conv, "send_truncated", False):
+        return 3
+    return 0 if status == 200 else 1
 
 # ---------- 建会话身份轮转 ----------
 # 优先登录态：acct1 / acct2 / acct3 / acct4 / acct5 / acct6 均分轮转；nologin（匿名）只作兜底——
@@ -4253,6 +4537,9 @@ def device_summary():
 
 # 思考模型解析：只缓存成功结果，失败必须允许后续重新解析。
 _THINKING_MODEL_CACHE = {}
+# 默认思考模型优先级：清单里存在该 slug 时优先选它（用户裁定 2026-11-26）。
+# 只影响“自动选择”的排序；CHATGPT_MODEL 显式指定仍然最高优先。
+_PREFERRED_THINKING_SLUG = "gpt-6-t-mini"
 
 class ThinkingModelUnavailable(RuntimeError):
     """当前账号无法满足强制思考模式要求。
@@ -4346,6 +4633,9 @@ class ChatGPTAPI:
         self.last_body = ""
         self.last_status = 0
         self.quota = {}  # 观测用：最近一次响应的限速相关头
+        self.last_truncated = False   # 上一次响应是否被截断（IncompleteRead / 超时）
+        self.last_partial_path = None  # 截断/超时已收内容的落盘路径（无则 None）
+        self.last_partial_bytes = 0    # 截断/超时实际收到的原始字节数（SEND_TRUNCATED 用）
 
     # ---------- 匿名态设备身份 ----------
     def device_cookie_path(self):
@@ -4590,10 +4880,16 @@ class ChatGPTAPI:
             rq.add_header("Content-Type", "application/json")
         for k, v in (extra_headers or {}).items():
             rq.add_header(k, v)
+        t0 = time.time()
+        # 已收到的原始字节：超时/断流时这是唯一副本，必须边读边留（旧版 resp.read() 一次读完，
+        # 中途超时异常里没有已读字节 → 已收内容全丢，19 次卡死全部零留存）。
+        sink = []
+        self.last_partial_path = None
+        self.last_partial_bytes = 0
         try:
             with self._opener.open(rq, timeout=timeout) as resp:
-                data = resp.read()  # 读到 EOF，勿提前 close
-                data = self._decompress(data, resp.headers.get("Content-Encoding"))
+                self._read_stream(resp, sink)   # 读到 EOF，勿提前 close
+                data = self._decompress(b"".join(sink), resp.headers.get("Content-Encoding"))
                 self.last_headers = {k.lower(): v for k, v in resp.headers.items()}
                 self.quota = self._quota_from_headers(self.last_headers)
                 text = data.decode("utf-8", "replace")
@@ -4613,21 +4909,116 @@ class ChatGPTAPI:
             # 流被截断（实测：思考模式单条 SSE 可达 23MB，隧道中途断流）。
             # 关键：已收到的字节里通常已包含 conversation_id 与大部分回复，
             # 整包当失败会导致「换身份重投 → 同一 prompt 建出两个会话」。
-            partial = getattr(e, "partial", b"") or b""
-            self.last_truncated = True
+            # 现在与超时同路：明确标记 + 落盘，字节不丢。
+            part = getattr(e, "partial", b"") or b""
+            if part:
+                sink.append(part)
+            return self._partial_result(
+                b"".join(sink), t0, "IncompleteRead: %s" % (e,), marker="PARTIAL")
+        except (socket.timeout, TimeoutError) as e:
+            return self._timeout_result(sink, t0, timeout, str(e) or type(e).__name__)
+        except urllib.error.URLError as e:
+            reason = getattr(e, "reason", None)
+            if isinstance(reason, (socket.timeout, TimeoutError)) or "timed out" in str(reason):
+                return self._timeout_result(sink, t0, timeout, "urlopen: %s" % (reason,))
             self.last_headers = {}
             self.quota = {}
             self.last_body = ""
-            self.last_status = 200
-            print("WARN: 响应流被截断（IncompleteRead，已收 %d 字节），按已收内容解析，稍后用 GET 补全文"
-                  % len(partial), flush=True)
-            return 200, partial.decode("utf-8", "replace")
+            self.last_status = 0
+            return 0, "EXC " + str(e)
         except Exception as e:
             self.last_headers = {}
             self.quota = {}
             self.last_body = ""
             self.last_status = 0
             return 0, "EXC " + str(e)
+
+    @staticmethod
+    def _read_stream(resp, sink):
+        """分块读到 EOF，边读边把字节追加进 sink。
+
+        为什么不用 `resp.read()`：一次性读到底，中途 socket 超时抛出时异常对象里没有
+        已读到的字节——已收内容全部白丢（xhttp 层也无法回捞）。分块读后，除「正在读的
+        那一块」（≤16KB）之外全部留在 sink 里，可以落盘保全。
+        """
+        while True:
+            try:
+                chunk = resp.read(16384)
+            except http.client.IncompleteRead as e:
+                part = getattr(e, "partial", b"") or b""
+                if part:
+                    sink.append(part)
+                raise
+            if not chunk:
+                return
+            sink.append(chunk)
+
+    def _save_partial(self, data):
+        """把已收到的原始字节落盘（不经过文本层，保持可再次解析）。"""
+        d = os.path.join(self.base_dir, "timeouts")
+        base = "partial-%s-%s-%d" % (self.account, datetime.now().strftime("%Y%m%d-%H%M%S"),
+                                     os.getpid())
+        for seq in range(0, 100):
+            name = base + ("" if seq == 0 else "-%d" % seq) + ".txt"
+            path = os.path.join(d, name)
+            if os.path.exists(path):
+                continue
+            try:
+                _atomic_write_bytes(path, data)
+                return path
+            except OSError as e:
+                print("WARN: 部分内容落盘失败（%s）" % e, flush=True)
+                return None
+        return None
+
+    def _timeout_result(self, sink, t0, budget, why):
+        """超时统一收敛点：可机读标记 + 部分内容保全，绝不静默丢字节。
+
+        标记格式固定（事后统计只认这两行）：
+          TIMEOUT_PARTIAL after Ns, M bytes buffered, saved to <path>
+          TIMEOUT_EMPTY after Ns
+        有部分内容时按 200 返回，让既有链路照常解析/对账——最终仍会落到
+        「FAIL: 回复完整性未证明」，标记只加在前面，判定口径不放宽。
+        """
+        elapsed = time.time() - t0
+        self.last_truncated = True
+        self.last_headers = {}
+        self.quota = {}
+        self.last_body = ""
+        if not sink:
+            self.last_status = 0
+            print("TIMEOUT_EMPTY after %.0fs" % elapsed, flush=True)
+            print("WARN: 超时边界 %ss（%s）——零字节返回，按连接层失败处理"
+                  % (budget, why), flush=True)
+            return 0, "TIMEOUT_EMPTY after %.0fs" % elapsed
+        return self._partial_result(b"".join(sink), t0, why,
+                                    marker="TIMEOUT_PARTIAL", budget=budget)
+
+    def _partial_result(self, data, t0, why, marker="PARTIAL", budget=None):
+        """部分内容的统一出口：落盘 + 打标记 + 按 200 交回既有解析链路。"""
+        elapsed = time.time() - t0
+        self.last_truncated = True
+        self.last_headers = {}
+        self.quota = {}
+        path = self._save_partial(data) if data else None
+        self.last_partial_path = path
+        self.last_partial_bytes = len(data) if data else 0
+        if path:
+            print("%s after %.0fs, %d bytes buffered, saved to %s"
+                  % (marker, elapsed, len(data), path), flush=True)
+        else:
+            print("%s after %.0fs, %d bytes buffered, saved to <FAILED>"
+                  % (marker, elapsed, len(data)), flush=True)
+        if budget is not None:
+            print("WARN: 超时边界 %ss（%s）——按已收内容解析，完整性仍由后续对账判定"
+                  % (budget, why), flush=True)
+        else:
+            print("WARN: 响应流被截断（%s）——按已收内容解析，稍后用 GET 补全文" % why,
+                  flush=True)
+        self.last_status = 200
+        text = data.decode("utf-8", "replace")
+        self.last_body = text
+        return 200, text
 
     # ---------- tail ----------
     @staticmethod
@@ -4676,7 +5067,8 @@ class ChatGPTAPI:
 
     def live_tail(self, conv_id, tries=2):
         for attempt in range(tries):
-            st, body = self.req("GET", API_BASE + "/backend-api/conversation/" + conv_id, timeout=90)
+            st, body = self.req("GET", API_BASE + "/backend-api/conversation/" + conv_id,
+                                timeout=_cap_timeout(90))
             if st == 200:
                 return self.tail_from_mapping(body), body
             kind = self.classify_failure(st, body)
@@ -4888,11 +5280,15 @@ class ChatGPTAPI:
 
         chosen = ""
 
+        # 优先级 0：清单里存在 gpt-6-t-mini 时默认选它。
+        if _PREFERRED_THINKING_SLUG in by_slug:
+            chosen = _PREFERRED_THINKING_SLUG
+
         # 优先级 1：默认模型本身就是思考模型。
-        if "-t-" in default:
+        if not chosen and "-t-" in default:
             chosen = default
 
-        else:
+        elif not chosen:
             # 优先级 2：同标题的 -t- 变体。
             want_title = _as_dict(by_slug.get(default)).get("title")
 
@@ -5724,7 +6120,8 @@ class ConvRef(str):
     """
 
     def __new__(cls, conv_id, actual_conv_id=None, mismatch=False, reason="",
-                candidate_ids=None, evidence_complete=None, reply_complete=None):
+                candidate_ids=None, evidence_complete=None, reply_complete=None,
+                send_truncated=None):
         obj = super().__new__(cls, conv_id or "")
         obj.target_conv_id = conv_id or ""
         obj.actual_conv_id = actual_conv_id or ""
@@ -5735,6 +6132,9 @@ class ConvRef(str):
         # False = 隔离三件事有失败，机器调用方必须据此判「证据不完整」。
         obj.evidence_complete = evidence_complete
         obj.reply_complete = reply_complete
+        # 发送时响应是否被截断/超时（SEND_TRUNCATED）。只有完整响应才允许算送达凭证，
+        # 所以这个标记必须一路带到 CLI 退出码（exit 3），不能被 st=200 吞掉。
+        obj.send_truncated = send_truncated
         return obj
 
 
@@ -6560,6 +6960,8 @@ def _send_prompt_impl(
 
     返回 (status, reply_path, real_conv_id)；real_conv_id 用于登记会话归属。
     thinking=True 时用思考模型（`-t-` 变体）；None = 读 CHATGPT_THINKING 环境变量。
+    超时取模块级 SEND_TIMEOUT（--timeout / CHATGPT_SEND_TIMEOUT），只改 socket 超时，
+    不改模型选择。
     text 已给定时**不再读文件**——保证发送内容与日志留存内容是同一份。
     """
     if conv_id:
@@ -6638,9 +7040,31 @@ def _send_prompt_impl(
         t0 = time.time()
         # A16：思考模式单条实测可达 19 分钟，7 分钟会误杀；分档超时按是否思考给
         send_timeout = 1800 if (thinking and model) else 420
+        # --timeout / CHATGPT_SEND_TIMEOUT：在分档**之后**覆盖。
+        # 分档逻辑本身一字不动（--thinking 的语义不变），只是给这条 socket 超时一个可配值。
+        # 未显式配置时不打印 `timeout:` 行（分档值由 SEND 行的 `in Ns` 体现）——那行只是
+        # 人工排障用的旁证，不得反过来成为「必须打印」的默认值来源。
+        override = SEND_TIMEOUT
+        if override is not None:
+            send_timeout = override
+            print("timeout: %ss (source=%s)"
+                  % (send_timeout, SEND_TIMEOUT_SOURCE or "env"), flush=True)
         st, resp = api.send(conv_id, text, tail, req_token, proof, model=model,
                             timeout=send_timeout)
-        print("SEND %s -> %s respLen=%d in %.0fs" % (pfile, st, len(resp), time.time() - t0), flush=True)
+        # 截断/超时被 _partial_result 折成 200 交回既有解析链路（不丢字节），但
+        # `SEND ... -> 200` 是唯一送达凭证——截断响应绝不能打它，否则一次超时
+        # 在日志、退出码、会话登记三个门禁上同时是绿的（DEF-ops-01）。
+        send_truncated = bool(getattr(api, "last_truncated", False))
+        if send_truncated:
+            print("SEND_TRUNCATED pfile=%s st=%s bytes=%s"
+                  % (pfile, st, getattr(api, "last_partial_bytes", 0)), flush=True)
+        else:
+            print("SEND %s -> %s respLen=%d in %.0fs"
+                  % (pfile, st, len(resp), time.time() - t0), flush=True)
+        if send_truncated or "TIMEOUT_" in (resp or "") or getattr(api, "last_partial_path", None):
+            print("SEND_TIMEOUT_MARK pfile=%s budget=%ss st=%s partial_path=%s"
+                  % (pfile, send_timeout, st,
+                     getattr(api, "last_partial_path", None) or "-"), flush=True)
         if st == 403 and "Unusual activity" in (resp or "") and attempt == 1:
             print("403 Unusual activity —— 补 Cloudflare cookie 并重跑 requirements + PoW 重试一次", flush=True)
             api.warm_cookies()
@@ -6725,7 +7149,7 @@ def _send_prompt_impl(
         full = ""
         digest_ok = False
         gst, gbody = api.req("GET", API_BASE + "/backend-api/conversation/" + real_conv,
-                             timeout=120)
+                             timeout=_cap_timeout(120))
         if gst == 200:
             full, gcomplete = api.harvest_mapping_checked(gbody)
             if not gcomplete:
@@ -6807,7 +7231,8 @@ def _send_prompt_impl(
         return (LANDING_MISMATCH_STATUS, qpath,
                 ConvRef(conv_id, actual_conv_id=real_conv, mismatch=True,
                         reason="landing_mismatch: 投递目标与服务器实际落点不一致",
-                        evidence_complete=evidence_complete))
+                        evidence_complete=evidence_complete,
+                        send_truncated=send_truncated))
 
     # F-23：不完整的回复照归档（保住唯一副本），但归档文本自带醒目声明——
     # 下游看到这个标记就知道「这不是定稿」，不会把它当完整回复继续操作。
@@ -6836,6 +7261,7 @@ def _send_prompt_impl(
 
             landing_confirmed = (
                 st == 200
+                and not send_truncated
                 and first_cid == real_conv
                 and len(all_cids) == 1
                 and all_cids[0] == real_conv
@@ -6861,7 +7287,8 @@ def _send_prompt_impl(
                 % exc,
                 flush=True,
             )
-    return st, path, ConvRef(real_conv, reply_complete=reply_complete)
+    return st, path, ConvRef(real_conv, reply_complete=reply_complete,
+                             send_truncated=send_truncated)
 
 
 def _reply_state_of(status, reply, conv):
@@ -7253,7 +7680,7 @@ def create_chat_rotating(prompt_file, thinking=None):
 
         if conv:
             _mark_success(st, name, conv, prompt_file, attempts)
-            return 0
+            return _send_exit_code(status, conv)
 
         if status == 200:
             print(
@@ -7328,7 +7755,7 @@ def create_chat_rotating(prompt_file, thinking=None):
                 "勿用于需留存的长任务",
                 flush=True,
             )
-            return 0
+            return _send_exit_code(status, conv)
 
         if status == 200:
             print(
@@ -7761,6 +8188,21 @@ def require_trusted_worktree_root():
     return root
 
 def main():
+    """CLI 入口：投递超时是**进程级**配置，跑完必须还原。
+
+    为什么要还原：同进程内的库调用（以及测试）不该被一次 CLI 调用留下的 600s 影响——
+    A16 的分档（非思考 420 / 思考 1800）在库调用路径上必须原样成立。
+    """
+    prev_timeout, prev_source = SEND_TIMEOUT, SEND_TIMEOUT_SOURCE
+    try:
+        return _main_impl()
+    finally:
+        globals()["SEND_TIMEOUT"] = prev_timeout
+        globals()["SEND_TIMEOUT_SOURCE"] = prev_source
+
+
+def _main_impl():
+    global SEND_TIMEOUT, SEND_TIMEOUT_SOURCE   # CLI 解析结果（用完由 main 还原）
     args = sys.argv[1:]
     thinking_flag = "--thinking" in args
     if thinking_flag:
@@ -7807,6 +8249,30 @@ def main():
         i += 2
     args = parsed_args
 
+    # ---- 投递超时：命令行 > 环境变量 > --thinking 分档 ----
+    # 位置不固定（`--timeout 600` 可以在任何地方），必须先摘出，否则会被
+    # `<conv_id> <prompt_file>` 的 `len(args) != 2` 位置校验当成第三个位置参数干掉。
+    try:
+        timeout_raw, args = _extract_timeout_flag(args)
+    except ValueError as e:
+        print("ERROR: %s" % e, flush=True)
+        return 2
+    if timeout_raw is not None:
+        cli_timeout = _parse_timeout(timeout_raw)
+        if cli_timeout is None:
+            print("ERROR: --timeout 需要正整数秒（收到 %r）" % (timeout_raw,), flush=True)
+            return 2
+        SEND_TIMEOUT, SEND_TIMEOUT_SOURCE = cli_timeout, "cli"
+    elif SEND_TIMEOUT is not None:
+        # 环境变量是显式配置：只补来源标签，值早就在 import 时解析好了。
+        SEND_TIMEOUT_SOURCE = "env"
+    else:
+        # **没有显式配置就保持 None**，让 _send_prompt_impl 按 --thinking 分档
+        # （非思考 420s / 思考 1800s）。旧版在这里无条件写 DEFAULT_SEND_TIMEOUT=600，
+        # 等于把 1800s 分档在唯一可被操作者触达的 CLI 路径上打死（DEF-ops-04）：
+        # `--thinking` 拿到的是 600s，日志里只看得到 source=default。
+        SEND_TIMEOUT_SOURCE = ""
+
     work_item_id = work_item_options.get("work_item_id")
     if work_item_id is None and any(
         key in work_item_options
@@ -7835,6 +8301,40 @@ def main():
         if not args:
             print(__doc__)
             return 1
+    # ---- 投递日志判定（纯本地，不触网；CB-B8 的机读版）----
+    if args and args[0] == "--check-send-log":
+        rest, prompt_arg, positional = args[1:], None, []
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a == "--prompt":
+                if i + 1 >= len(rest):
+                    print(json.dumps({"result": "error",
+                                      "error": "--prompt 需要一个提示词文件路径"},
+                                     ensure_ascii=False))
+                    return 2
+                prompt_arg = rest[i + 1]
+                i += 2
+            elif a.startswith("--prompt="):
+                prompt_arg = a.split("=", 1)[1]
+                i += 1
+            else:
+                positional.append(a)
+                i += 1
+        if len(positional) != 1:
+            print(json.dumps({"result": "error",
+                              "error": "--check-send-log 需要且只需要一个日志文件（收到 %d 个）"
+                                       % len(positional)},
+                             ensure_ascii=False))
+            return 2
+        try:
+            verdict = judge_send_log(positional[0], prompt_arg)
+        except OSError as e:
+            print(json.dumps({"result": "error", "error": str(e)}, ensure_ascii=False))
+            return 2
+        print(json.dumps(verdict, ensure_ascii=False, indent=2))
+        # 0 = 已送达/仍在飞（不许重投），1 = NOT_SENT（可重投），3 = 已发但截断。
+        return {"SENT": 0, "IN_FLIGHT": 0, "NOT_SENT": 1, "TRUNCATED": 3}[verdict["verdict"]]
     # ---- 交付正文托管（纯本地，不触网；A1/A2/A4）----
     if args and args[0] == "--extract":
         rest, begin, end, fence, out, positional = args[1:], None, None, None, None, []
@@ -8366,7 +8866,7 @@ def main():
             if getattr(conv, "candidate_ids", None):
                 out["candidate_conv_ids"] = list(conv.candidate_ids)
         print(json.dumps(out, ensure_ascii=False))
-        return 0 if status == 200 else 1
+        return _send_exit_code(status, conv)
     # ---- 会话清单 ----
     if args and args[0] == "--list-all":
         allowed_flags = {"--apply", "--include-nologin"}
@@ -8772,6 +9272,9 @@ def main():
             )
 
         print(json.dumps(output, ensure_ascii=False), flush=True)
+        if getattr(conv, "send_truncated", False):
+            # 截断优先于 link：SEND_TRUNCATED 没有送达凭证，exit 0 会让门禁假绿。
+            return 3
         return 0 if status == 200 and link is not None else 1
 
     # ---- 开新会话 ----
@@ -8845,7 +9348,7 @@ def main():
                     mark_unavailable(s, account, "HTTP 429 限速冷却", COOLDOWN_429)
                 mutate_rotation(mark)
                 return create_chat_rotating(args[1], thinking=True if thinking_flag else None)
-            return 0 if status == 200 else 1
+            return _send_exit_code(status, conv)
         # 默认：acct1/acct2/acct3/acct4/acct5/acct6 均分轮转，全部 429 才匿名兜底
         return create_chat_rotating(args[1], thinking=True if thinking_flag else None)
 
@@ -8997,7 +9500,7 @@ def main():
             # F-17：id 歧义时把候选 id 列表也报出来
             "candidate_conv_ids": list(getattr(conv, "candidate_ids", []) or []),
         }, ensure_ascii=False), flush=True)
-    return 0 if status == 200 else 1
+    return _send_exit_code(status, conv)
 
 
 if __name__ == "__main__":
