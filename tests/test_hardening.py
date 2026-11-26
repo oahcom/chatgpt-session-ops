@@ -47,9 +47,10 @@ m = load_module()
 
 # `_replace_with_bounded_retry` 的退避预算是 0.05+0.10+0.20+0.40+0.80+1.00 = 2.55s：
 # Windows 上 AV/索引器短暂持有目标文件时，一次**合法**的 replace 重试就能吃掉整个
-# 预算，CI 负载高时更久。所以锁路径的墙钟断言只做 10s「挂死保护」——它抓的是
-# 病理性变慢（真的等满 LOCK_TIMEOUT_SEC 或死锁），不承担毫秒级 SLA。
-# 原先的 1.0s/3s 上界低于 2.55s 预算，一次瞬时 WinError 32/5 就会误红。
+# 预算，CI 负载高时更久。所以锁路径的墙钟断言只做 10s「死锁/挂死保护」：真正等满
+# LOCK_TIMEOUT_SEC=3s 的情况由 `_file_lock(strict=True)` 抛 LockTimeout 兜住，
+# 不靠这条上界；这条只兜死锁或超出 timeout 的挂死。原先的 1.0s/3s 上界低于
+# 2.55s 预算，一次瞬时 WinError 32/5 就会误红。
 LOCK_WALL_CLOCK_GUARD_SEC = 10.0
 
 
