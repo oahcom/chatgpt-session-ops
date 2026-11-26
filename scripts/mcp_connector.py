@@ -21,9 +21,15 @@ Usage:
 
 Exit codes:
     0  every requested check completed (including a clean "denied" verdict)
-    1  one or more checks failed for an operational reason
-    2  bad arguments or missing credential files
+    1  one or more checks failed for an operational reason; this includes a
+       missing or empty credential file, reported as AUTH_MISSING
+    2  bad arguments only -- produced by argparse, not by main()
     4  eligibility could not be determined
+
+    AUTH_MISSING exits 1 on purpose, not 2. The 2 above covers argparse usage
+    errors alone (argparse calls sys.exit(2) itself, before main() returns).
+    Do not renumber AUTH_MISSING to 2: callers key on the exit code, so that
+    would silently change existing behaviour.
 """
 from __future__ import annotations
 
