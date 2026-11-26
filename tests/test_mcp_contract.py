@@ -775,6 +775,60 @@ class MCPContractTests(unittest.TestCase):
         self.assert_error(result, "DEPENDENCY_UNAVAILABLE")
         self.assertEqual(self.store.calls, [])
 
+    # --------------------------------------------------------------
+    # MemoryAdapterError code -> MCP error code mapping (#130)
+    # --------------------------------------------------------------
+
+    def dispatch_with_adapter_error(self, adapter_code):
+        """Send a MemoryAdapterError(code) through the real MCP boundary."""
+        from src.session_ops.memory_adapter_client import MemoryAdapterError
+
+        adapter_module = importlib.import_module(
+            "src.session_ops.memory_adapter_client"
+        )
+
+        class RaisingMemoryAdapterClient(FakeMemoryAdapterClient):
+            def retrieve(self, *, work_item_id, session_id, query, limit):
+                raise MemoryAdapterError(
+                    adapter_code,
+                    "adapter-request",
+                    f"adapter error: {adapter_code}",
+                )
+
+        with patch.object(
+            adapter_module,
+            "MemoryAdapterClient",
+            RaisingMemoryAdapterClient,
+        ):
+            configured = MCPToolService(
+                self.store,
+                memory_adapter=["python", "-m", "memory_adapter"],
+            )
+            return self.dispatch(
+                "session.context",
+                {
+                    "session_id": SESSION_ID,
+                    "query": "mapping test",
+                    "limit": 1,
+                },
+                service=configured,
+            )
+
+    def test_adapter_error_codes_map_to_exact_mcp_codes(self):
+        for adapter_code, expected_code in (
+            ("ADAPTER_TIMEOUT", "TIMEOUT"),
+            ("ADAPTER_UNAVAILABLE", "DEPENDENCY_UNAVAILABLE"),
+            ("ADAPTER_CRASHED", "DEPENDENCY_UNAVAILABLE"),
+            ("SCOPE_VIOLATION", "INTERNAL"),
+        ):
+            with self.subTest(adapter_code=adapter_code):
+                result = self.dispatch_with_adapter_error(adapter_code)
+                self.assert_error(result, expected_code)
+
+    def test_unknown_adapter_error_code_falls_through_to_internal(self):
+        result = self.dispatch_with_adapter_error("ADAPTER_CODE_UNSPECIFIED")
+        self.assert_error(result, "INTERNAL")
+
     def test_oversized_response_becomes_resource_exhausted(self):
         class OversizedStore(FakeStore):
             def create_work_item(self, principal):
