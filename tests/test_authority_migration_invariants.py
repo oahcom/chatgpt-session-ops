@@ -3,20 +3,22 @@
 Issue #115 tracked ``raise`` statements in ``src/session_ops/authority.py``
 whose deletion no test noticed.  This module closes the last of them.
 
-Reachability, measured rather than assumed (each guard was mutated to ``pass``
-by AST line span and the whole suite re-run; see the table in the commit
-message):
+Reachability, measured rather than assumed.  Each guard was mutated to
+``pass`` by AST line span and the tests below were re-run; the mutants that
+survive are reported as unreachable instead of being papered over.
 
 Reachable through the public API
     L1333  ``link_session`` -- a same-session active link is a deterministic
-           rejection.  Deleting the guard does NOT change the exception type
-           or message, because the INSERT that follows then trips
+           rejection.  Measured: deleting the guard still yields
+           ``SessionAlreadyLinked`` with the identical message, because the
+           INSERT that follows trips
            ``ux_session_links_one_active_work_item_per_session`` and the
-           ``except sqlite3.IntegrityError`` handler reclassifies it to the
-           same ``SessionAlreadyLinked``.  The observable difference is
-           *ordering*: the guard rejects before the landing evidence is
-           consumed.  ``test_active_link_conflict_is_rejected_before_consuming``
-           fails the consume UPDATE and asserts the conflict still wins.
+           ``except sqlite3.IntegrityError`` handler reclassifies it.  The only
+           observable differences are (a) ordering -- the guard rejects before
+           the landing evidence is consumed -- and (b) ``__cause__`` (``None``
+           from the guard, the ``IntegrityError`` from the handler).
+           ``test_active_link_conflict_is_rejected_before_consuming`` fails
+           the consume UPDATE, so only the guard can produce the rejection.
 
 Reachable only after stubbing the upstream authorization check
     L1290  ``link_session`` -- ``_require`` already rejects an unknown
@@ -41,16 +43,20 @@ Unreachable: post-hoc invariants of a single transaction
               the same number the UPDATE moved.
         L633  ``consumed_at`` / ``linked_at`` correspondence: neither column
               is written by the migration.
-        L651  ``invalid_legacy_rows`` is a strict SUPERSET of the rows the
-              UPDATE just touched (it also matches pre-existing ambiguous
-              rows), so it can only be ``< legacy_pending_count`` if the
-              UPDATE failed to apply.
+        L651  ``invalid_legacy_rows`` counts a SUPERSET of the rows the UPDATE
+              just touched: every touched row satisfies all of its terms
+              (``rejected_at IS NULL`` implies ``rejection_reason IS NULL``
+              through the table's own CHECK), and it additionally matches
+              pre-existing ambiguous rows, so the COUNT can only be
+              ``< legacy_pending_count`` if the UPDATE failed to apply.
 
-        No caller can break any of these without a concurrent writer, and
-        ``BEGIN IMMEDIATE`` excludes one.  No test here claims to kill them;
-        the tests instead pin the *post-migration state* they protect, which
-        does catch a real regression in the migration SQL (verified by
-        mutating the UPDATE's WHERE and SET clauses).
+        ``BEGIN IMMEDIATE`` plus a single connection means no concurrent
+        writer can break any of these.  No test here claims to kill the guard.
+        Instead they pin the *post-migration state* the guards protect, and
+        that does catch a real regression in the migration SQL: with all four
+        guards at L564/L578/L622/L651 mutated to ``pass``, widening the
+        UPDATE's WHERE (dropping the ``match = 'confirmed'`` term) or retargeting
+        its SET still fails two or more tests on an assertion.
 
     L678  ``initialize`` terminal-link reconciliation: the loop re-reads rows
           it selected in the same transaction, so ``rowcount`` is always 1.
