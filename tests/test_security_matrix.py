@@ -233,7 +233,14 @@ class TestSecurityMatrix(unittest.TestCase):
                 )
 
     def test_every_row_has_evidence_reference(self):
-        """每条安全场景必须有显式证据引用，不能退化成无证据意图。"""
+        """每条安全场景必须有显式证据引用，不能退化成无证据意图。
+
+        PROVEN 额外要求至少一条 `test:`。理由就在本文件自己的词汇里：
+        `human:` 的定义是「无法用离线用例判定」，`code:` 只说明代码做了这件事、
+        不说明有人验过它；而 PROVEN（矩阵里写作 PROVEN 加 mutation-checked）
+        的含义是「删掉实现会有测试变红」。只挂 `human:` 却标 PROVEN，等于
+        把「没人验」写成「验过了」——正是这个矩阵存在的目的。
+        """
         rows = self._rows()
 
         for row in rows:
@@ -244,6 +251,15 @@ class TestSecurityMatrix(unittest.TestCase):
                     "安全矩阵第 %s 行（文件第 %d 行）没有任何证据引用"
                     % (row["id"], row["line"]),
                 )
+                if row["status"].startswith("PROVEN"):
+                    self.assertRegex(
+                        row["evidence"],
+                        r"\btest:",
+                        "安全矩阵第 %s 行（文件第 %d 行）标了 PROVEN 却没有"
+                        "任何 test: 引用——PROVEN 的含义是「删掉实现会有测试变红」，"
+                        "只挂 code:/human: 不构成它"
+                        % (row["id"], row["line"]),
+                    )
 
     def test_every_row_stays_inside_a_real_table(self):
         """数据行必须处在一条连续表格内，不能被行间说明文字截断。

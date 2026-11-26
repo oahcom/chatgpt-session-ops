@@ -32,6 +32,22 @@ def matches_any(path: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
 
 
+def is_catch_all(pattern: str) -> bool:
+    """True if `pattern` matches every path, not just a family of them.
+
+    `fnmatch.fnmatchcase` treats `*` as "anything including `/`", so `*`, `**`
+    and `*/*` all match a path of any depth. That makes an allow-list entry
+    into an exemption for the entire tree — which is not what an operator
+    writing `pkg*` or `*.pyc` means, and is a very easy typo to make.
+
+    Detected by construction rather than by string comparison: a pattern is a
+    catch-all if it matches a set of paths chosen so that no narrower pattern
+    can match all of them.
+    """
+    probes = ("a", "a/b", "a/b/c", ".hidden", "deep/x/y/z.py", "pkg/cache/x")
+    return all(fnmatch.fnmatchcase(probe, pattern) for probe in probes)
+
+
 def add_issue(
     issues: list[dict[str, Any]],
     code: str,
@@ -165,6 +181,27 @@ def verify(
     allowed = manifest.get("allowed_unmanaged", [])
     forbidden = manifest.get("forbidden", [])
 
+    # A manifest that manages nothing verifies nothing, and `ok` is `not
+    # issues`, so it used to report `OK: 0/0 files verified` and exit 0. That
+    # is the failure this tool exists to prevent: `0/0` reads as success at a
+    # glance. `gen_manifest.py` refuses to build such a manifest, so this
+    # arrives only through a truncated download or a hand-edited file — which
+    # is exactly when you want the verifier to say so rather than agree.
+    if not expected:
+        add_issue(issues, "MANIFEST_EMPTY", str(manifest_path),
+                  "manifest manages no files; nothing would be verified")
+
+    # `fnmatch` lets `*` cross `/`, so one allow-list entry can exempt the
+    # whole tree. The manifest is untrusted input and the reviewed pattern set
+    # lives in a document, not in the tool, so this is reported rather than
+    # silently honoured: an operator who wrote `*` to ignore a build directory
+    # has exempted every file in the deployment root and nothing said so.
+    for pattern in allowed:
+        if is_catch_all(pattern):
+            add_issue(issues, "ALLOW_LIST_CATCH_ALL", str(pattern),
+                      "allow-list pattern matches every path, including "
+                      "unmanaged files at any depth")
+
     # Forbidden artifacts are reported even if an allow-list could match them.
     for pattern in forbidden:
         if pattern == ".git" or pattern == "tests" or pattern == "deploy":
@@ -227,12 +264,6 @@ def verify(
             if not matches_any(rel, allowed):
                 add_issue(issues, "UNMANAGED_FILE", rel,
                           "file is not listed in manifest")
-            continue
-
-        if path.is_symlink():
-            add_issue(issues, "UNEXPECTED_SYMLINK", rel,
-                      "managed files must be regular files")
-            skipped_paths.add(rel)
             continue
 
         entry = expected[rel]

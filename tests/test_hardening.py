@@ -307,6 +307,65 @@ class TestStateFiles(TmpBase):
         self.assertLess(time.time() - t0, 3, "残留锁应被立即回收，不该等到超时")
         self.assertFalse(os.path.exists(lock))
 
+    def test_lock_dead_holder_reclaimed_before_stale_age(self):
+        """持有者确认已死 → 立即可回收，与锁的年龄无关。
+
+        年龄门槛 LOCK_STALE_SEC=60 比等待上限 LOCK_TIMEOUT_SEC=3 大一个数量级，
+        「先看年龄再看死活」等于「崩在 60 秒内留下的锁谁都回收不了」。
+        """
+        p = os.path.join(self.tmp, "young-dead.json")
+        lock = p + ".lock"
+        with open(lock, "w", encoding="utf-8") as f:
+            json.dump({"pid": 999999, "process_start_time": 1,
+                       "created_at": time.time()}, f)   # 刚创建，远未满 60s
+        self.assertTrue(m._lock_holder_stale(lock),
+                        "确认已死的锁与年龄无关，必须可回收")
+        t0 = time.time()
+        with m._file_lock(p, timeout=2, strict=True):
+            pass
+        self.assertLess(time.time() - t0, 1.0, "回收已死的锁必须是毫秒级")
+        self.assertFalse(os.path.exists(lock))
+
+    @unittest.skipUnless(os.name == "nt", "WinError 32（共享冲突）是 Windows 独有")
+    def test_lock_released_while_waiter_holds_it_open_is_reclaimable(self):
+        """事故复现：释放的瞬间恰好有等待者 open 着锁文件。
+
+        `_lock_holder_stale` 每次抢锁失败都会 open(lock) 读身份——等待者的句柄
+        让 `os.remove` 抛 WinError 32。旧实现 `except OSError: pass` 吞掉它，
+        留下「活 pid + 匹配启动时间」的锁：判定永远为活，之后每次抢锁都要等满
+        timeout 抛 LockTimeout，跨进程永久死锁（不是等 60 秒就能好）。
+        """
+        p = os.path.join(self.tmp, "hold.json")
+        lock = p + ".lock"
+        opened, done = threading.Event(), threading.Event()
+
+        def waiter():                     # 与 _lock_holder_stale 的读法一致
+            while not os.path.exists(lock):
+                time.sleep(0.001)
+            with open(lock, "r", encoding="utf-8") as f:
+                opened.set()
+                done.wait(1.0)            # 把句柄横跨整个释放过程
+                f.read()
+
+        t = threading.Thread(target=waiter)
+        t.start()
+        try:
+            with m._file_lock(p, timeout=5, strict=True):
+                self.assertTrue(opened.wait(2.0), "等待者应已打开锁文件")
+                time.sleep(0.05)
+            # 删不掉也必须放弃持有者身份，否则就是永久死锁
+            self.assertTrue(m._lock_holder_stale(lock),
+                            "删不掉的残留锁必须立刻可回收，而不是继续宣称活持有者")
+        finally:
+            done.set()
+            t.join()
+        t0 = time.time()
+        with m._file_lock(p, timeout=2, strict=True):
+            pass
+        self.assertLess(time.time() - t0, 1.0,
+                        "释放后重新抢锁应是毫秒级，不该等满 timeout")
+        self.assertFalse(os.path.exists(lock), "重新抢锁并释放后不该残留锁文件")
+
     def test_concurrent_updates_do_not_lose_writes(self):
         p = os.path.join(self.tmp, "cnt.json")
         m._save_json(p, {"n": 0})
@@ -4815,6 +4874,27 @@ class TestRegistryMonotonicGuard(TmpBase):
         on_disk = m._load_json(m.CONV_MAP_FILE, {})
         self.assertIn("6afd0001-1111-83ee-8000-000000000001", on_disk)
         self.assertIn("6afd0002-2222-83ee-8000-000000000002", on_disk)
+
+        # 第二层（高水位）在场时，上面那两条断言其实是被它兜住的，不是被
+        # `lost` 兜住的——把 `if lost:` 改成永假，这一半仍然绿。`lost` 唯一
+        # 不可替代的场景是 A 态：高水位基准还不存在。删掉基准再测一次，
+        # 才能让那个分支真的被覆盖。
+        #
+        # 这一段的现实意义：A 态意味着这是本机第一次跑带守卫的版本。基准用
+        # 当前注册表初始化，所以如果没有 `lost`，删除会静默落盘，而且基准会
+        # 用**删完之后**的集合写下去——高水位从此永久抹平，后面再也发现不了。
+        os.remove(m.CONV_MAP_FILE + ".highwater.json")
+
+        with self.assertRaises(m.RegistryShrinkRefused):
+            m._update_json(m.CONV_MAP_FILE, shrink, {})
+
+        self.assertIn("6afd0001-1111-83ee-8000-000000000001",
+                      m._load_json(m.CONV_MAP_FILE, {}),
+                      "A 态下删除被放行——lost 守卫不是冗余的")
+        self.assertFalse(
+            os.path.exists(m.CONV_MAP_FILE + ".highwater.json"),
+            "守卫必须在初始化基准之前就拒绝，否则基准会用删完的集合落盘",
+        )
 
     def test_guard_detects_cross_process_deletion_via_highwater(self):
         path = m.CONV_MAP_FILE

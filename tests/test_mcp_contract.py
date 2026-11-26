@@ -30,8 +30,10 @@ from src.session_ops.mcp_server import (
     MAX_CONTEXT_ENTRIES,
     MAX_CURSOR_CHARS,
     MAX_PAGE_SIZE,
+    MAX_QUERY_CHARS,
     MAX_STRUCTURED_CONTENT_BYTES,
     MCPToolService,
+    _validate_arguments,
 )
 
 
@@ -579,6 +581,93 @@ class MCPContractTests(unittest.TestCase):
         self.assert_error(result, "INVALID_ARGUMENT")
 
     # --------------------------------------------------------------
+    # Argument validation branches
+    # --------------------------------------------------------------
+
+    def assert_argument_rejected(self, tool, arguments, fragment):
+        with self.assertRaises(ValueError) as caught:
+            _validate_arguments(tool, arguments)
+        self.assertIn(fragment, str(caught.exception))
+
+    def test_required_argument_missing_is_rejected(self):
+        self.assert_argument_rejected(
+            "work_item.get", {}, "required argument missing"
+        )
+
+    def test_string_argument_required_is_rejected(self):
+        self.assert_argument_rejected(
+            "work_item.get",
+            {"work_item_id": 123},
+            "string argument required",
+        )
+
+    def test_string_argument_too_short_is_rejected(self):
+        self.assert_argument_rejected(
+            "work_item.grant",
+            {
+                "work_item_id": WORK_ITEM_ID,
+                "target_principal_id": "",
+                "scope": "read",
+            },
+            "string argument too short",
+        )
+
+    def test_string_argument_too_long_is_rejected(self):
+        # maxLength is the single source of the cursor bound; the dedicated
+        # "cursor is too long" branch was deleted in #125.
+        self.assert_argument_rejected(
+            "work_item.list",
+            {"cursor": "x" * (MAX_CURSOR_CHARS + 1)},
+            "string argument too long",
+        )
+
+    def test_string_argument_not_in_enum_is_rejected(self):
+        self.assert_argument_rejected(
+            "work_item.list",
+            {"status": "definitely-not-in-enum"},
+            "string argument is not an allowed value",
+        )
+
+    def test_string_argument_invalid_format_is_rejected(self):
+        self.assert_argument_rejected(
+            "session.link",
+            {
+                "session_id": SESSION_ID,
+                "work_item_id": WORK_ITEM_ID,
+                "attempt_id": "att_not-a-uuid",
+            },
+            "string argument has invalid format",
+        )
+
+    def test_integer_argument_required_is_rejected(self):
+        for value in ("10", True):
+            with self.subTest(value=value):
+                self.assert_argument_rejected(
+                    "work_item.list",
+                    {"page_size": value},
+                    "integer argument required",
+                )
+
+    def test_integer_argument_below_minimum_is_rejected(self):
+        self.assert_argument_rejected(
+            "work_item.list",
+            {"page_size": 0},
+            "integer argument below minimum",
+        )
+
+    def test_boolean_argument_required_is_rejected(self):
+        for value in (0, 1, "true"):
+            with self.subTest(value=value):
+                self.assert_argument_rejected(
+                    "session.list",
+                    {
+                        "work_item_id": WORK_ITEM_ID,
+                        "include_unlinked": value,
+                    },
+                    "boolean argument required",
+                )
+
+    # --------------------------------------------------------------
     # Non-disclosure and trusted evidence
     # --------------------------------------------------------------
 
@@ -686,6 +775,60 @@ class MCPContractTests(unittest.TestCase):
         self.assert_error(result, "DEPENDENCY_UNAVAILABLE")
         self.assertEqual(self.store.calls, [])
 
+    # --------------------------------------------------------------
+    # MemoryAdapterError code -> MCP error code mapping (#130)
+    # --------------------------------------------------------------
+
+    def dispatch_with_adapter_error(self, adapter_code):
+        """Send a MemoryAdapterError(code) through the real MCP boundary."""
+        from src.session_ops.memory_adapter_client import MemoryAdapterError
+
+        adapter_module = importlib.import_module(
+            "src.session_ops.memory_adapter_client"
+        )
+
+        class RaisingMemoryAdapterClient(FakeMemoryAdapterClient):
+            def retrieve(self, *, work_item_id, session_id, query, limit):
+                raise MemoryAdapterError(
+                    adapter_code,
+                    "adapter-request",
+                    f"adapter error: {adapter_code}",
+                )
+
+        with patch.object(
+            adapter_module,
+            "MemoryAdapterClient",
+            RaisingMemoryAdapterClient,
+        ):
+            configured = MCPToolService(
+                self.store,
+                memory_adapter=["python", "-m", "memory_adapter"],
+            )
+            return self.dispatch(
+                "session.context",
+                {
+                    "session_id": SESSION_ID,
+                    "query": "mapping test",
+                    "limit": 1,
+                },
+                service=configured,
+            )
+
+    def test_adapter_error_codes_map_to_exact_mcp_codes(self):
+        for adapter_code, expected_code in (
+            ("ADAPTER_TIMEOUT", "TIMEOUT"),
+            ("ADAPTER_UNAVAILABLE", "DEPENDENCY_UNAVAILABLE"),
+            ("ADAPTER_CRASHED", "DEPENDENCY_UNAVAILABLE"),
+            ("SCOPE_VIOLATION", "INTERNAL"),
+        ):
+            with self.subTest(adapter_code=adapter_code):
+                result = self.dispatch_with_adapter_error(adapter_code)
+                self.assert_error(result, expected_code)
+
+    def test_unknown_adapter_error_code_falls_through_to_internal(self):
+        result = self.dispatch_with_adapter_error("ADAPTER_CODE_UNSPECIFIED")
+        self.assert_error(result, "INTERNAL")
+
     def test_oversized_response_becomes_resource_exhausted(self):
         class OversizedStore(FakeStore):
             def create_work_item(self, principal):
@@ -746,6 +889,122 @@ class MCPContractTests(unittest.TestCase):
                 expected_audience="https://mcp.example.test/mcp",
                 realm_namespace="realm-a",
             )
+
+
+class ArgumentValidationTests(unittest.TestCase):
+    """One case per rejection branch in _validate_arguments (#76).
+
+    Every branch raises ValueError, and _error_code_for maps all of them to
+    the same INVALID_ARGUMENT with empty details, so the caller cannot tell
+    them apart. That is deliberate non-disclosure, and it is also why a
+    dispatch-level test cannot watch these branches: deleting one leaves
+    another raising, and the response looks identical. The message is the
+    only observable, so these cases assert it directly.
+    """
+
+    def assert_rejected(self, tool, arguments, message):
+        with self.assertRaises(ValueError) as ctx:
+            _validate_arguments(tool, arguments)
+        self.assertEqual(str(ctx.exception), message)
+
+    def test_unknown_tool(self):
+        self.assert_rejected("no.such.tool", {}, "unknown tool")
+
+    def test_arguments_must_be_an_object(self):
+        # None is coerced to {} before the type check, so it never reaches
+        # this branch; only a non-None non-Mapping does.
+        for value in ([], "x", 5):
+            with self.subTest(value=value):
+                self.assert_rejected(
+                    "work_item.get", value, "arguments must be an object"
+                )
+
+    def test_required_argument_missing(self):
+        self.assert_rejected("work_item.get", {}, "required argument missing")
+
+    def test_string_argument_required(self):
+        self.assert_rejected(
+            "work_item.get", {"work_item_id": 5}, "string argument required"
+        )
+
+    def test_string_argument_too_short(self):
+        self.assert_rejected(
+            "session.context",
+            {"session_id": SESSION_ID, "query": ""},
+            "string argument too short",
+        )
+
+    def test_string_argument_too_long(self):
+        self.assert_rejected(
+            "session.context",
+            {"session_id": SESSION_ID, "query": "a" * 2049},
+            "string argument too long",
+        )
+
+    def test_query_must_not_be_blank(self):
+        # Whitespace passes minLength and maxLength, so this is the only
+        # branch that rejects it.
+        self.assert_rejected(
+            "session.context",
+            {"session_id": SESSION_ID, "query": "   "},
+            "query must not be blank",
+        )
+
+    def test_string_argument_is_not_an_allowed_value(self):
+        self.assert_rejected(
+            "work_item.list",
+            {"status": "definitely-not-in-enum"},
+            "string argument is not an allowed value",
+        )
+
+    def test_string_argument_has_invalid_format(self):
+        self.assert_rejected(
+            "work_item.get",
+            {"work_item_id": "wi_not-a-uuid"},
+            "string argument has invalid format",
+        )
+
+    def test_integer_argument_required(self):
+        for value in ("5", 5.0, True):
+            with self.subTest(value=value):
+                self.assert_rejected(
+                    "work_item.list",
+                    {"page_size": value},
+                    "integer argument required",
+                )
+
+    def test_integer_argument_below_minimum(self):
+        self.assert_rejected(
+            "session.context",
+            {"session_id": SESSION_ID, "query": "x", "limit": 0},
+            "integer argument below minimum",
+        )
+
+    def test_boolean_argument_required(self):
+        self.assert_rejected(
+            "session.list",
+            {"work_item_id": WORK_ITEM_ID, "include_unlinked": "yes"},
+            "boolean argument required",
+        )
+
+    def test_cursor_bound_is_the_schema_max_length(self):
+        # #125 deleted the "cursor is too long" branch because the schema
+        # maxLength is identical and strictly earlier. This pins the schema as
+        # the single source: the limit is enforced, and the message names the
+        # generic string branch, not a cursor-specific one.
+        self.assertEqual(MAX_CURSOR_CHARS, 2048)
+
+        for tool in ("work_item.list", "session.list"):
+            with self.subTest(tool=tool):
+                arguments = {"cursor": "x" * (MAX_CURSOR_CHARS + 1)}
+                if tool == "session.list":
+                    arguments["work_item_id"] = WORK_ITEM_ID
+                self.assert_rejected(tool, arguments, "string argument too long")
+
+        accepted = _validate_arguments(
+            "work_item.list", {"cursor": "x" * MAX_CURSOR_CHARS}
+        )
+        self.assertEqual(len(accepted["cursor"]), MAX_CURSOR_CHARS)
 
 
 if __name__ == "__main__":

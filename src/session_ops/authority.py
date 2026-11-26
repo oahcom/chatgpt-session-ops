@@ -1,6 +1,6 @@
 """Transactional authorization boundary for WorkItem and Session resources.
 
-Python 3.8+, standard library only. MCP handlers must call this module rather
+Python 3.11+, standard library only. MCP handlers must call this module rather
 than WorkItemStore directly.
 
 Landing evidence is deliberately not accepted as a caller-created object.
@@ -27,6 +27,7 @@ from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple, Union
 
 from src.session_ops.work_items import (
     ALLOWED_TRANSITIONS,
+    CONVERSATION_ID_RE,
     STATUSES,
     InvalidTransition,
     SessionAlreadyLinked,
@@ -40,9 +41,6 @@ from src.session_ops.work_items import (
 Scope = str
 SCOPES = ("read", "write")
 
-CONVERSATION_ID_RE = re.compile(
-    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-)
 PRINCIPAL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}")
 WORK_ITEM_ID_RE = re.compile(r"wi_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 LINK_ID_RE = re.compile(r"sl_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
@@ -298,6 +296,12 @@ def _validate_principal_id(value: str, field: str = "principal_id") -> str:
 
 
 def validate_conversation_id(session_id: str) -> str:
+    """Validate a canonical lowercase UUID Session ID at the MCP boundary.
+
+    Uses the same CONVERSATION_ID_RE rule as the raw store's
+    work_items.validate_session_id (issue #109). Only the exception type
+    differs, because the secure layer maps it to an MCP error.
+    """
     if not isinstance(session_id, str) or not CONVERSATION_ID_RE.fullmatch(session_id):
         raise UnconfirmedSession("session_id must be a canonical lowercase UUID")
     return session_id

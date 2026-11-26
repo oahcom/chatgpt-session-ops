@@ -1,5 +1,11 @@
 # Session Ops MCP Tools — v0.1
 
+Version: 0.1.0
+Protocol version: 0.1
+Status: FROZEN FOR DEVELOPMENT
+Owner: Session Ops (protocol provider)
+Counterparty: ChatGPT custom MCP / Memory Adapter (protocol consumer / provider)
+
 Source of truth:
 - `src/session_ops/mcp_server.py`
 - `src/session_ops/mcp_auth.py`
@@ -664,3 +670,84 @@ SELECT action, link_id, principal_id, request_id
 FROM authority_audit_events
 WHERE action = 'session.auto_unlink_terminal';
 ```
+
+---
+
+## 13. Retention
+
+SO-owned state is retained indefinitely. There is no purge path and no expiry.
+
+The tables involved:
+
+| Table | Defined in |
+|---|---|
+| `work_items` | `src/session_ops/work_items.py` |
+| `session_links` | `src/session_ops/work_items.py` |
+| `work_item_grants` | `src/session_ops/authority.py` |
+| `authority_landing_events` | `src/session_ops/authority.py` |
+| `authority_audit_events` | `src/session_ops/authority.py` |
+
+There is no deletion of WorkItems or Session links:
+
+```bash
+grep -rn "DELETE FROM work_items\|DELETE FROM session_links" src/session_ops/
+# no output
+```
+
+The only `DELETE` in the domain is grant revocation at `authority.py:1065`
+(`DELETE FROM work_item_grants`), which shrinks an access grant, not history.
+
+Audit rows are append-only by trigger (`authority.py:164`, `:170`):
+`trg_authority_audit_no_update` and `trg_authority_audit_no_delete` abort any
+`UPDATE` or `DELETE` on `authority_audit_events`. Audit can therefore never be
+the thing that shrinks.
+
+Growth is bounded by the WorkItem creation rate per principal, not by session
+count. `session_links` rows are never removed on unlink; they are tombstoned by
+setting `unlinked_at` rather than deleted.
+
+Rationale: the store is per-principal and local, and the audit trail is the
+point of the subsystem, so deleting it would defeat the purpose. If growth ever
+becomes a real problem, archiving or export is the answer rather than deletion,
+and that would be a separate decision.
+
+## 14. Transport
+
+Streamable HTTP is the only transport. The server builds its ASGI application
+with `server.streamable_http_app(...)` (`mcp_server.py:863`), and the module
+docstring names itself "MCP tool service and Streamable HTTP binding". Nothing
+in `src/` or `tests/` starts a stdio server:
+
+```bash
+grep -rn -i "stdio" src/ tests/ | grep -vi memory
+# no output
+```
+
+stdio is therefore not implemented. It appeared in the original checklist for
+development-time Inspector use only. That need is covered at the handler level,
+not over the wire: `tests/test_mcp_sdk_integration.py:159` locates the real
+`mcp.server.Server` inside the built application and invokes its registered
+`tools/list` handler with a real SDK `ServerRequestContext`, asserting the
+result matches the frozen `TOOL_SCHEMAS` surface.
+
+No `ClientSession` appears anywhere in the repository:
+
+```bash
+grep -rn "ClientSession" --include=*.py .
+# no output
+```
+
+An in-process ASGI request harness does exist at
+`tests/test_mcp_transport.py:541` (`asgi_request`), but it issues `GET`
+requests with an empty body and asserts authentication status codes only
+(`401` for `/mcp` and `/mcp/anything`, `204` for `/healthz` and the
+protected-resource metadata path). It never sends a JSON-RPC body and never
+inspects a tool list, so it does not exercise tool dispatch over the wire.
+
+The discovery contract is therefore pinned at the handler level by
+`tests/test_mcp_sdk_integration.py:159`, and neither that test nor the ASGI
+harness carries a `tools/list` call over an actual HTTP request. That is a
+known, recorded gap rather than covered ground.
+
+`SO_MCP_MEMORY_STDIO` in `scripts/run_mcp_server.py` is unrelated: it configures
+the Memory Adapter client's stdio command, not an MCP transport.

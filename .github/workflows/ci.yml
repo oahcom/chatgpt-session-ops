@@ -149,8 +149,8 @@ jobs:
 
           # Expected skips are derived from the tree, not from a magic number.
           # On a base without the E2E suite the only legitimate skip is the
-          # POSIX-only directory-fsync test. Once the E2E suite lands it adds
-          # 5 conditional skips (1 gate test + 4 adapter tests).
+          # one POSIX-only directory-fsync test. Once the E2E suite lands it
+          # adds 5 conditional skips (1 gate test + 4 adapter tests).
           #
           # This job installs requirements-mcp.txt above, so both the RS256
           # suite and the real-SDK integration suite must execute here. If
@@ -158,13 +158,31 @@ jobs:
           # this count moves. That is the whole assertion: a skipped security
           # or compatibility test reads as green in a log, a wrong number does
           # not. The reasons are printed so the failure names the culprit.
+          #
+          # The number used to be the literals 6 / 1. Those are wrong the
+          # moment a legitimate platform skip is added, and it fails as
+          # "skipped 7 but 6 expected", which reads like a lost test rather
+          # than a new one. The platform skips are counted from the decorators
+          # themselves; the runner is Linux, so the Windows-only cases are the
+          # ones that skip and the POSIX-only case is the one that runs.
           e2e_present = os.path.isfile("tests/test_memory_adapter_e2e.py")
-          expected = 6 if e2e_present else 1
+
+          platform_skips = 0
+          for name in sorted(os.listdir("tests")):
+              if not name.endswith(".py"):
+                  continue
+              body = open(os.path.join("tests", name),
+                          encoding="utf-8", errors="replace").read()
+              platform_skips += len(re.findall(
+                  r'@unittest\.skipIf\(os\.name != "nt"'
+                  r'|@unittest\.skipUnless\(os\.name == "nt"', body))
+
+          expected = platform_skips + (5 if e2e_present else 0)
 
           found = re.search(r"skipped=(\d+)", text)
           skipped = int(found.group(1)) if found else 0
-          print("ran=%d skipped=%d expected=%d e2e_present=%s"
-                % (ran, skipped, expected, e2e_present))
+          print("ran=%d skipped=%d expected=%d e2e_present=%s platform_skips=%d"
+                % (ran, skipped, expected, e2e_present, platform_skips))
 
           if skipped != expected:
               reasons = sorted(
@@ -177,6 +195,90 @@ jobs:
                   "skip appeared without updating this check."
                   % (skipped, expected, e2e_present, reasons)
               )
+          PY
+
+  # tools/gen_manifest.py and tools/verify_deploy.py had 58 tests in
+  # tools/tests/ that no job ever ran: every other invocation here is scoped to
+  # tests/, so a broken manifest generator or a verifier that "verified nothing"
+  # shipped green. A mutation sweep on gen_manifest.py killed 15 of 22 guards,
+  # so the tests do bite -- they were dead weight only because nobody asked them.
+  #
+  # Independent of `unit` on purpose: it guards different files (the unit job
+  # never imports tools/), so neither job's failure implies the other's, and
+  # running them in parallel gives feedback sooner.
+  tools:
+    name: tools/tests guards
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Explicit module names, NOT `discover -s tools/tests` and NOT
+      # unittest.TestLoader().loadTestsFromName("tools.tests").
+      #
+      # tools/ and tools/tests/ carried no __init__.py, and the loadTestsFromName
+      # form then returns 0 tests WITHOUT raising -- a step that runs nothing and
+      # reports success. `discover -s tools/tests` raised ImportError on the same
+      # tree, so it failed loudly, but it failed for the wrong reason (packaging,
+      # not test health). Naming the three modules turns a rename into an
+      # ImportError instead of a silent zero, and works whether or not the
+      # packages are importable. tools/tests/__init__.py now also carries a
+      # load_tests shim so the loader form reports 58 rather than 0.
+      - name: Run tools/tests guards
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest -v \
+            tools.tests.test_gen_manifest \
+            tools.tests.test_gen_manifest_validation \
+            tools.tests.test_verify_deploy 2>&1 | tee tools-tests.log
+
+      # Same discipline as the unit job's audit: a run that executed nothing is
+      # green in a log and a wrong number is not. The expected count is derived
+      # from the test modules, not hardcoded, so adding a test is not a failure
+      # and losing one is. No skip is expected here; a skip would mean a guard
+      # silently stopped guarding.
+      - name: Assert the tools run is real and did not lose tests
+        shell: bash
+        run: |
+          python - <<'PY'
+          import glob, re, sys
+
+          text = open("tools-tests.log", encoding="utf-8", errors="replace").read()
+
+          ran = re.search(r"^Ran (\d+) tests?", text, re.M)
+          if not ran:
+              sys.exit("tools run printed no 'Ran N tests' summary; see tools-tests.log")
+          ran = int(ran.group(1))
+          if ran == 0:
+              sys.exit("tools run executed no tests; see tools-tests.log")
+
+          if not re.search(r"^OK", text, re.M):
+              sys.exit("tools run did not report OK; see tools-tests.log")
+
+          expected = 0
+          for path in sorted(glob.glob("tools/tests/test_*.py")):
+              body = open(path, encoding="utf-8", errors="replace").read()
+              expected += len(re.findall(r"^\s+def test_", body, re.M))
+
+          print("ran=%d expected=%d" % (ran, expected))
+          if ran != expected:
+              sys.exit(
+                  "tools run executed %d tests but the tree defines %d. A module "
+                  "was dropped from the command above, an import broke, or a "
+                  "test vanished." % (ran, expected)
+              )
+
+          skipped = re.search(r"skipped=(\d+)", text)
+          if skipped and int(skipped.group(1)):
+              sys.exit(
+                  "tools run skipped %s tests; no skip is expected here, so a "
+                  "guard stopped guarding." % skipped.group(1)
+              )
+          print("PASS: tools/tests ran for real")
           PY
 
   # The unit job proves the core package imports without the optional SDK.

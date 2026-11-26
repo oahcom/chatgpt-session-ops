@@ -41,7 +41,7 @@
 ```bash
 git clone https://github.com/oahcom/chatgpt-session-ops.git
 cd chatgpt-session-ops
-python --version   # 需要 3.8+
+python --version   # 需要 3.11+（fromisoformat 的紧凑/无秒形式在 3.11 才有）
 ```
 
 只需 Python 标准库。`continue_full.py` / `extract_auth.py` 额外依赖 CDP 助手模块（`from cdp import CDPClient`），按下面任一方式提供：
@@ -169,7 +169,7 @@ python scripts/chatgpt_send.py --anon-restore <device>     # 把留存身份回�
 | 回复全文 | 默认不截断，只有显式设 `CHATGPT_REPLY_MAX_CHARS` 才截并在文件头标注 |
 | 凭据权限 | POSIX 上落盘后 chmod 600 |
 | 429 退避 | 优先服从 `Retry-After`，夹在 [5,180] 秒 |
-| 文件锁 | 跨进程 `O_EXCL` + stale 60s，重入按**线程**判定（按路径记会让同进程第二个线程跳过加锁，实测丢 21/80 次更新） |
+| 文件锁 | 跨进程 `O_EXCL` + 持有者死活判定（DEAD 立即回收，存活永不回收；带 `pid` 的锁年龄不参与，无 `pid` 的老格式仍按 mtime 60s），重入按**线程**判定（按路径记会让同进程第二个线程跳过加锁，实测丢 21/80 次更新） |
 | 设备身份 | CDP 抓完整 jar 落 `.txt` + `.json`，读旧会话时多设备回退并自愈归属；jar 落盘前剔除 session token |
 | 出口代理 | API / 匿名浏览器 / 自启动 Chrome / git push 共用一次解析结果；取不到出口就拒绝联网（`CHATGPT_ALLOW_DIRECT=1` 才放行直连） |
 | 代理探活 | 自动探测先做 CONNECT/SOCKS 隧道 + TLS 握手，失败即跳过（端口在听 ≠ 能用：实测 7890 通 200 后断流、7897 才活） |
@@ -227,7 +227,7 @@ python scripts/chatgpt_send.py --proxy-set socks5h://user:pass@1.2.3.4:1080
 | `anon-sessions.json` | 匿名会话唯一索引 |
 | `replies/` | 收割的回复全文 |
 | `proxy.json` | 出口代理配置（可能含账号密码，chmod 600、不入库） |
-| `*.lock` | 三个 json 的跨进程写锁（`O_EXCL`，stale 60s 自动回收） |
+| `*.lock` | 三个 json 的跨进程写锁（`O_EXCL`；持有者已死下一次抢锁立即回收，持有者存活永不回收；无 `pid` 的老格式仍按 mtime 60s） |
 
 三个状态文件的读-改-写都走 `_file_lock` + `_update_json`，并发建会话不会互相覆盖计数或游标。
 

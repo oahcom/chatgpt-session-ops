@@ -3,7 +3,7 @@
 The service layer is independent of the MCP SDK. Only build_mcp_server()
 imports the optional SDK.
 
-Python source syntax: 3.8+
+Python source syntax: 3.11+
 MCP SDK runtime: mcp==2.3.0
 """
 
@@ -53,6 +53,10 @@ MAX_CONTEXT_ENTRIES = 6
 MAX_CONTEXT_CONTENT_CHARS = 2048
 MAX_CONTEXT_CONTENT_BYTES = 8192
 MAX_QUERY_CHARS = 2048
+# Kept for parity with authority.py, but unused here: 4 * MAX_QUERY_CHARS ==
+# MAX_QUERY_BYTES, so a UTF-8 byte check could never fire on a query that the
+# schema maxLength already accepted. _validate_arguments bounds query length
+# with the schema alone.
 MAX_QUERY_BYTES = 8192
 
 MAX_HTTP_BODY_BYTES = 65536
@@ -136,6 +140,7 @@ _PAGE_SIZE = {
     "maximum": MAX_PAGE_SIZE,
     "default": DEFAULT_PAGE_SIZE,
 }
+# maxLength is the single source of the cursor length limit.
 _CURSOR = {"type": "string", "maxLength": MAX_CURSOR_CHARS}
 _STATUS = {
     "type": "string",
@@ -210,6 +215,9 @@ TOOL_SCHEMAS = {
             "query": {
                 "type": "string",
                 "minLength": 1,
+                # Single source of the query length limit: the validator's
+                # string branch enforces this maxLength, so no separate
+                # char/byte guard exists in _validate_arguments.
                 "maxLength": MAX_QUERY_CHARS,
             },
             "limit": {
@@ -366,18 +374,12 @@ def _validate_arguments(name: str, arguments: Any) -> Dict[str, Any]:
     if name == "session.context" and "limit" not in supplied:
         supplied["limit"] = MAX_CONTEXT_ENTRIES
 
-    cursor = supplied.get("cursor")
-    if cursor is not None and len(cursor) > MAX_CURSOR_CHARS:
-        raise ValueError("cursor is too long")
-
+    # cursor and query length are bounded by the schema maxLength enforced in
+    # the per-type string branch above, so there is no separate check here.
     if name == "session.context":
         query = supplied["query"]
         if not query.strip():
             raise ValueError("query must not be blank")
-        if len(query) > MAX_QUERY_CHARS:
-            raise ValueError("query is too long")
-        if len(query.encode("utf-8")) > MAX_QUERY_BYTES:
-            raise ValueError("query is too large")
 
     return supplied
 

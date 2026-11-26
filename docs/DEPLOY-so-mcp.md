@@ -262,6 +262,238 @@ Keep only the current tree and the immediately previous complete tree
 under `/opt`. Remove older previous trees only after the new version
 has passed its observation period and rollback retention policy.
 
+## 2a. Where the listener is allowed to be
+
+`SO_MCP_HOST` defaults to `127.0.0.1` and `SO_MCP_PORT` to `8791`. The default
+is the contract, not a convenience: the process is a private service behind a
+TLS-terminating reverse proxy, and nothing else. The code enforces this
+contract at startup: `load_config()` in `scripts/run_mcp_server.py` accepts
+only `127.0.0.1` or `::1` for `SO_MCP_HOST` and refuses to start on any other
+value, before the bind ever reaches `uvicorn`.
+
+| Setting | Required | Why |
+|---|---|---|
+| `SO_MCP_HOST` | `127.0.0.1` or `::1` | A loopback bind cannot be reached from another host even if the proxy is misconfigured or stopped. |
+| `SO_MCP_PORT` | any free port | The port is local to the host; the proxy decides what is published. |
+| `SO_MCP_ORIGIN` | the public HTTPS origin | Operator shell variable for the probes in section 4 and for `SO_MCP_AUDIENCE` below. The service never reads it. It is not a bind address. |
+
+Binding to `0.0.0.0` or a public interface is not a supported deployment
+shape for this service. It removes the only layer that still holds when the
+proxy is misconfigured: the authentication boundary in `mcp_auth.py` would
+then be the sole control, exposed directly to the network. If a future
+deployment genuinely requires a non-loopback bind, that is a new exposure
+decision — what the listener is reachable from, which firewall rule admits it,
+and which release authorises it — and it belongs in a record like the
+`/so-mcp/healthz` exemption decision in section 4, not in an ad-hoc unit edit.
+
+Verify the bind after every restart, before the health probes:
+
+```bash
+# There must be exactly one listener, and it must be loopback.
+LISTENERS="$(ss -ltnp | grep ':8791' || true)"
+test -n "$LISTENERS"                       # nothing listening is also a failure
+! printf '%s\n' "$LISTENERS" | grep -Ev '127\.0\.0\.1:8791|\[::1\]:8791'
+```
+
+`ss -ltnp` prints the bind address of each listening socket. The first `test`
+catches the case the second check would otherwise wave through: with no
+listener at all, `grep` finds nothing, and a bare negated `grep` would report
+success for a service that is not running. The second command then fails when
+any line for the port is neither `127.0.0.1:8791` nor `[::1]:8791`, which is
+the only case that matters — a listener on any other address is reachable from
+off-host regardless of what the proxy intends.
+
+Reaching the service from a ChatGPT custom MCP client requires an HTTPS origin
+the client can reach. Publish it through the existing reverse proxy and its
+TLS certificate. Do not open the application port to the internet to avoid
+configuring the proxy, and do not substitute a plaintext `http://` origin: the
+`Authorization` header carries the bearer token, so TLS is part of the
+authentication boundary rather than transport hygiene.
+
+For a private origin that cannot be published directly, use an approved secure
+tunnel. An improvised forwarder — `ssh -L` left running, a `socat` relay, a
+temporary Cloudflare quick tunnel — is not an approved path: it usually
+bypasses the proxy's TLS and access rules while appearing to work, and it
+leaves no record of who authorised the exposure.
+
+`SO_MCP_ORIGIN` in the table above is an operator shell variable used by the
+probes in section 4. The service never reads it; it is not part of the
+environment file described next.
+
+## 2b. The environment file
+
+`deploy/so-mcp.service` starts the service with
+
+```
+EnvironmentFile=/etc/so-mcp/so-mcp.env
+ExecStart=/opt/so-mcp/.venv/bin/python -m scripts.run_mcp_server
+```
+
+`scripts/run_mcp_server.py` `load_config()` reads its configuration only from
+the process environment. The unit sets nothing else that affects it, so every
+value below must come from `/etc/so-mcp/so-mcp.env`. Two distinct failures:
+
+- The file is absent: `EnvironmentFile=` has no `-` prefix, so the missing file
+  is a start failure rather than being ignored, and the unit never reaches
+  `ExecStart`.
+- The file exists but a required variable is missing: the unit starts, the
+  process exits during `load_config()`, and because the unit is
+  `Restart=on-failure` it retries until the start limit is reached:
+
+```text
+Session Ops MCP startup failed
+RuntimeError: required environment variable is missing: SO_MCP_ISSUER
+```
+
+Create the file as `root:root` mode `0600`. systemd reads it before the service
+process starts, while it still has the privileges to read a root-only file, so
+`0600` does not stop `User=ubuntu` from receiving the values.
+
+```bash
+sudo install -d -o root -g root -m 0755 /etc/so-mcp
+sudo install -o root -g root -m 0600 /dev/null /etc/so-mcp/so-mcp.env
+sudoedit /etc/so-mcp/so-mcp.env
+```
+
+Create this file before the manifest generation in section 7: the manifest
+hashes `/etc/so-mcp/so-mcp.env` as an external object, so an empty or absent
+file produces a hash for something that cannot start the service.
+
+### Example file
+
+Copy this to `/etc/so-mcp/so-mcp.env` and replace the four required values.
+The optional lines are commented out and show each variable's default.
+
+```ini
+# /etc/so-mcp/so-mcp.env
+# Read by systemd as EnvironmentFile=, not sourced by a shell.
+# One KEY=value per line. No export, no $(...), no $VAR expansion.
+
+# --- required ---
+SO_MCP_ISSUER=https://auth.example.com/realms/so-mcp
+SO_MCP_AUDIENCE=https://mcp.example.com/so-mcp
+SO_MCP_DB=/var/lib/so-mcp/work-items.sqlite3
+SO_MCP_TENANT_CLAIM=tenant_id
+
+# --- optional; uncomment only to override the default shown ---
+#SO_MCP_REALM_NAMESPACE=so-mcp
+#SO_MCP_HOST=127.0.0.1
+#SO_MCP_PORT=8791
+#UVICORN_LOG_LEVEL=info
+#SO_MCP_DISCOVERY_URL=http://127.0.0.1:8080/realms/so-mcp/.well-known/openid-configuration
+#SO_MCP_MEMORY_STDIO='["/opt/so-mcp/bin/mem-adapter","--token=<redacted>"]'
+```
+
+### What each variable must contain
+
+| Variable | Required | Default | Must contain | Failure mode |
+|---|---|---|---|---|
+| `SO_MCP_ISSUER` | required | none | Absolute `https://` URL with a path below `/`. No credentials, query, or fragment. A trailing `/` is stripped. | `required environment variable is missing: SO_MCP_ISSUER` / `SO_MCP_ISSUER must be an absolute HTTPS URL` / `SO_MCP_ISSUER must contain a non-root resource path` / `SO_MCP_ISSUER must not contain a query or fragment` / `SO_MCP_ISSUER must not contain URL credentials` |
+| `SO_MCP_AUDIENCE` | required | none | Absolute `https://` URL with a path below `/`. No credentials, query, or fragment. | `required environment variable is missing: SO_MCP_AUDIENCE` / `SO_MCP_AUDIENCE must be an absolute HTTPS URL` / `SO_MCP_AUDIENCE must contain a non-root resource path` / `SO_MCP_AUDIENCE must not contain a query or fragment` |
+| `SO_MCP_DB` | required | none | Path to a persistent SQLite file. The literal string `:memory:` is rejected. | `required environment variable is missing: SO_MCP_DB` / `SO_MCP_DB must be a persistent filesystem path` |
+| `SO_MCP_TENANT_CLAIM` | required | none | Name of the access-token claim that carries the tenant identifier. Only checked non-empty at load time. | `required environment variable is missing: SO_MCP_TENANT_CLAIM` |
+| `SO_MCP_REALM_NAMESPACE` | optional | derived from `SO_MCP_ISSUER` | Keycloak realm name: `[A-Za-z0-9][A-Za-z0-9._-]{0,47}`. | omitted and underivable: `cannot derive realm namespace from SO_MCP_ISSUER; set SO_MCP_REALM_NAMESPACE explicitly`; set but malformed: `valid realm_namespace is required` |
+| `SO_MCP_HOST` | optional | `127.0.0.1` | Bind address. Section 2a constrains this to loopback; only `127.0.0.1` or `::1` are accepted at startup. | `SO_MCP_HOST must not be empty and must be loopback-only; only 127.0.0.1 or ::1 are allowed` |
+| `SO_MCP_PORT` | optional | `8791` | Integer 1–65535. | `SO_MCP_PORT must be an integer` / `SO_MCP_PORT must be between 1 and 65535` |
+| `UVICORN_LOG_LEVEL` | optional | `info` | One of `critical`, `error`, `warning`, `info`, `debug`, `trace`; case-insensitive. | `UVICORN_LOG_LEVEL is invalid` |
+| `SO_MCP_DISCOVERY_URL` | optional | `<issuer>/.well-known/openid-configuration` | Internal discovery endpoint. Must end with `/.well-known/openid-configuration`; its path must equal the issuer's path plus that suffix, while the host may differ (that is the point of the override). `http://` only for a loopback host. | `discovery URL must end with /.well-known/openid-configuration` / `discovery URL path does not match configured issuer path` / `plain HTTP discovery is allowed only on loopback` |
+| `SO_MCP_MEMORY_STDIO` | optional | unset | JSON array of strings: the adapter's argv. See below. | `SO_MCP_MEMORY_STDIO must contain a valid JSON array of strings` / `must be a non-empty JSON array of command arguments` / `argument N must be a non-empty string` / `memory adapter executable was not found on PATH: …`. Unset is not an error: `session.context` answers `required dependency is unavailable` at request time. |
+
+Where each check runs:
+
+- `load_config()` in `scripts/run_mcp_server.py` validates `SO_MCP_ISSUER`,
+  `SO_MCP_AUDIENCE`, `SO_MCP_DB`, `SO_MCP_TENANT_CLAIM`, `SO_MCP_HOST`,
+  `SO_MCP_PORT` and `UVICORN_LOG_LEVEL`, derives `SO_MCP_REALM_NAMESPACE`, and
+  calls `load_memory_adapter_command()` for `SO_MCP_MEMORY_STDIO`.
+- The realm-name syntax and `SO_MCP_DISCOVERY_URL` are validated when
+  `JWTVerifier` is constructed in `create_application()`.
+
+Both run before `uvicorn.run()`, so a bad value in any row is a failed start;
+only the message and the traceback frame differ.
+
+`SO_MCP_DB` is only checked against the literal `:memory:`, not for being
+absolute; a relative path resolves against `WorkingDirectory=/opt/so-mcp`. The
+unit is `ProtectSystem=strict` with `ReadWritePaths=/var/lib/so-mcp`, so the
+database must live under `/var/lib/so-mcp` or SQLite fails to create its WAL
+files at runtime. Use the path shown above. The same file is also what
+`scripts/chatgpt_send.py` opens for trusted WorkItem delivery (`--db`, or the
+`SO_MCP_DB` environment variable in that process), so both must name one path.
+
+`scripts/run_mcp_server.py` also reads `LOG_LEVEL` for the Python logger
+(`logging.basicConfig`). It is not validated, has no failure mode, and is not
+required; it is not part of the set above because `load_config()` does not
+read it.
+
+### Deriving the realm namespace
+
+When `SO_MCP_REALM_NAMESPACE` is unset, the realm is taken from the issuer: the
+path is split on `/`, the segment after the one equal to `realms` is used. For
+`https://auth.example.com/realms/so-mcp` the derived value is `so-mcp`.
+
+An issuer that does not contain a `/realms/<name>` segment fails startup with
+`cannot derive realm namespace from SO_MCP_ISSUER; set SO_MCP_REALM_NAMESPACE
+explicitly`. Such a deployment must set the variable. The value is used to
+namespace the subject (`<realm>:<sub>`) so identical `sub` values in different
+realms cannot collide in the authority database, so it must match the realm the
+tokens actually come from.
+
+### What the issuer, audience and tenant claim are
+
+`SO_MCP_ISSUER` is the `iss` value of the access tokens, which is also the base
+URL for discovery. `SO_MCP_AUDIENCE` is the `aud` value; for this service it is
+the resource URL, the same `<origin>/so-mcp` that section 4 probes. Both are
+compared verbatim against the token. A mismatch is not a startup error: the
+service starts, and requests are rejected as `UNAUTHENTICATED` /
+`authentication failed`, with `issuer mismatch` or `audience mismatch` in the
+journal. Both are deployment errors even though the unit looks healthy.
+`SO_MCP_TENANT_CLAIM` names the claim the tenant is read from; the value is not
+the tenant id, it is the claim's key, typically `tenant_id`. It is only checked
+for being non-empty at startup. A token without that claim is rejected at
+request time as an authentication failure (`UNAUTHENTICATED`, message
+`authentication failed`); the specific reason is in the service journal.
+
+### systemd parsing, not shell parsing
+
+The file is an `EnvironmentFile=`, so the quoting rules are systemd's, not the
+shell's. Per `systemd.exec(5)` and `src/basic/env-file.c`:
+
+- Empty lines, lines with no `=`, and lines starting with `#` or `;` are
+  ignored. A `#` later in a line is not a comment.
+- Quotes around a value are removed. Single quotes are fully literal, including
+  backslashes; inside double quotes a `\` before a shell-special character
+  removes that character, and before anything else the backslash is kept.
+  Unquoted values have leading and trailing whitespace stripped, and interior
+  spaces are kept.
+- A line ending in `\` is joined to the next line.
+- **No variable or command expansion is performed.** `$HOME` and `$(cmd)` are
+  passed to the process as those literal strings. There is no `export`.
+
+Confirm what the process actually received after a change:
+
+```bash
+sudo systemctl show so-mcp -p Environment
+```
+
+### `SO_MCP_MEMORY_STDIO` is JSON, not a command line
+
+This variable is a JSON array of strings, parsed with `json.loads` and passed as
+an argv vector to the adapter process — never split by a shell. `argv[0]` must
+be an absolute path, or a bare name that resolves on the service's `PATH`, and
+must be an executable file.
+
+```bash
+# valid: JSON array of strings
+SO_MCP_MEMORY_STDIO='["/opt/so-mcp/bin/mem-adapter","--token=abc"]'
+
+# invalid: a shell command line is not JSON, startup fails
+SO_MCP_MEMORY_STDIO=mem-adapter --token=abc
+```
+
+The value contains double quotes and may contain spaces, so single-quote the
+whole value when writing it into the file by hand. Arguments whose flag names
+look secret (`--token`, `--password`, `--api-key`, …) are redacted in the
+startup log; they are not redacted in the file.
+
 ## 3. Database backup and migration accounting
 
 The production authority data is in:
@@ -404,6 +636,10 @@ Also inspect the service journal for startup errors:
 ```bash
 sudo journalctl -u so-mcp --since '-5 minutes' --no-pager
 ```
+
+A `RuntimeError` from `load_config()` here means the environment file is wrong,
+not that the code is wrong. The variable named in the message and section 2b
+identify what to fix.
 
 ## 5. Rollback
 
@@ -619,6 +855,7 @@ The following external-object values were observed on the production host when
 this procedure was written. They are reference values for review, not
 constants: a legitimate operations change to a unit, snippet, or environment
 file changes its hash and requires regenerating and reviewing the manifest.
+Section 2b says what belongs in the environment file.
 
 | Kind | Path | SHA-256 | Bytes | Observed mode |
 |---|---|---|---:|---|
@@ -710,6 +947,22 @@ manifest's bytes". Do not derive it by subtracting warnings from
 `checked_files`: a warning need not be EOL drift, and under `--strict` the same
 drift is an issue rather than a warning.
 
+The independence runs in both directions, and the second direction is the one
+that misleads. A high `byte_identical_files` does not mean the run passed: the
+count answers "how many read files have the manifest's raw bytes", and a run
+can fail for reasons that leave it non-zero. Measured with a manifest whose
+`sha256_lf` is wrong while `git_blob_sha1` and `sha256_raw` are correct,
+against a file holding exactly those raw bytes:
+
+```text
+exit=1  byte_identical_files=1  checked_files=0  failed_files=1  CONTENT_MISMATCH
+```
+
+The file is byte-identical and the deployment is rejected. Read the banner and
+the exit status for the verdict, and read `byte_identical_files` only as the
+count it names. Neither number substitutes for the other, which is why they are
+printed separately instead of being collapsed into one figure.
+
 ### What a passing run does not prove
 
 `DEPLOY VERIFY OK` means the files the verifier could see matched the hashes in
@@ -738,6 +991,29 @@ keeps a real `.venv` deployable. The exemption is about unmanaged paths: it
 does not apply to an ancestor of a managed one. A link that the allow-list
 covers is reported nowhere and its target is not content-verified, so the
 allow-list is part of the reviewed contract, not a convenience.
+
+The exemption is wider than "unmanaged paths" suggests, and the difference is
+worth stating because it inverts the intuition that a managed directory is
+safe. A link *inside* a managed directory is exempt too, provided the link's
+own path matches a pattern. Measured on a manifest managing `pkg/auth.py`,
+against a root where `pkg/auth.py` is correct:
+
+```text
+pkg/c.py    -> /external/evil.py      allow 'pkg/*'   exit 0, checked 1, no issue
+pkg/c.py    -> /external/evil.py      allow '*'       exit 0, checked 1, no issue
+pkg/c.py    -> /external/evil.py      no allow        exit 1, UNEXPECTED_SYMLINK
+pkg/cache   -> /external (directory)  allow 'pkg/cache*'  exit 0, checked 1, no issue
+pkg/cache   -> /external (directory)  no allow        exit 1, UNEXPECTED_SYMLINK
+```
+
+So a pattern written to ignore build output, such as `pkg/cache*` or the
+natural-looking `pkg/*`, silently admits links that point outside the
+deployment root. Being inside a managed directory does not protect a path; only
+being *on* a managed path does, and only when no pattern matches it.
+
+This is why the `find … -type l` check below is not redundant with the
+verifier, and why the reviewed allow-list should name directories, not
+wildcards that happen to cover a subtree.
 
 Confirm the deployed tree holds no links before trusting a pass:
 
@@ -777,19 +1053,30 @@ the LF-normalized content matches; the blob says the exact bytes match. Neither
 substitutes for the other, which is why the comparison sits outside the branch
 that records `CONTENT_MISMATCH`.
 
-**An empty managed list fails.** `files: []` is rejected: with nothing managed,
-every file in the root is `UNMANAGED_FILE`, so the run exits 1. Verified on
-15dca1a with `files: []` and one file in the root: exit 1, `UNMANAGED_FILE`.
-`tools/gen_manifest.py` additionally refuses to produce such a manifest
-(`the explicit managed path list is empty`). An empty allow-list is what makes
-the rejection work — a manifest that also sets `allowed_unmanaged: ["*"]` still
-suppresses `UNMANAGED_FILE` and passes with `checked_files: 0`, which is the
-entry below.
+**An empty managed list fails on its own.** `files: []` is rejected by a
+dedicated check: `MANIFEST_EMPTY`, exit 1. It used to be rejected only
+incidentally — with nothing managed, every file in the root became
+`UNMANAGED_FILE` — which meant an empty manifest over an *empty* root verified
+nothing and reported `DEPLOY VERIFY OK: 0/0 files verified`, exit 0. `0/0`
+reads as success at a glance, and that is the failure this document exists to
+prevent. `tools/gen_manifest.py` also refuses to produce such a manifest
+(`the explicit managed path list is empty`), so this arrives only through a
+truncated download or a hand-edited file.
 
-**`allowed_unmanaged` is taken from the manifest.** A `*` entry matches every
-path, including across `/`, and suppresses `UNMANAGED_FILE` for the whole tree.
-The patterns in the command above are the reviewed set; any other entry is an
-unreviewed exclusion.
+**A catch-all `allowed_unmanaged` entry fails.** `fnmatch` lets `*` cross `/`,
+so one entry exempts the whole tree. The verifier now reports
+`ALLOW_LIST_CATCH_ALL` for any pattern that matches a path of every depth —
+detected by matching the pattern against a set of probe paths rather than by
+looking for a `*` character, so `pkg*` and `pkg/cache/*` stay allowed. The
+patterns in the command above are the reviewed set; an entry that swallows the
+tree is now a failure instead of a silent exclusion.
+
+Both used to be silent. Measured on the verifier before these checks, with a
+manifest that manages `app.py` and sets `allowed_unmanaged: ["*"]`, against a
+root holding a correct `app.py` and an unmanaged `backdoor.py`: exit 0,
+`DEPLOY VERIFY OK: 1/1 files verified`, `UNMANAGED_FILE` not reported. That is
+the shape to keep in mind when reading any green result: the verifier can only
+tell you about the paths it was told to look at.
 
 None of this argues against running the verifier. It argues for running it on a
 tree extracted from the recorded commit, with a manifest generated on the
