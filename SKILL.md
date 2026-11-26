@@ -565,7 +565,7 @@ python scripts/chatgpt_send.py --work-item wi_<uuid> \
 | 匿名会话续聊报「标签页已不存在」 | 匿名会话只在原标签页可写，重开必被重定向 | 用 `--anon-read <id>` 读全文归档；继续对话请用登录态账号 |
 | 匿名续聊报「CDP 端口未运行」 | 浏览器没起，无法确认标签页（会话未必丢） | 先 `start_chrome.py --temp --port 9333` 再试；只读需求直接用 `--anon-read` |
 | 匿名续聊报「暂时读不到（429/0/5xx）」 | 限速或网络抖动，**不是**会话失效 | 等几分钟重试；`--anon-read` 直接读 |
-| 状态文件出现 `*.lock` 残留 | 进程被强杀，锁文件没清 | 超过 60 秒自动视为 stale 并回收；急用可手动删 `*.lock` |
+| 状态文件出现 `*.lock` 残留 | 进程被强杀，锁文件没清 | **先判断持有者死活，不要看时长**：`pid` 已不存在 → 下一次抢锁立即回收，无需等待；`pid` 仍存活 → 任何时长都不回收（年龄不参与判定）。确认已死仍删不掉时，文件内容会变成 `{"released": true}`，同样立即回收。只有「持有者确实活着但你要抢锁」才需要人工介入 |
 | 出现 `conv-accounts.json.corrupt-<ts>` | 上次写入被强杀，json 只写了一半 | 损坏件已隔离，状态按空重建；需要旧数据就从隔离文件里捞（它是合法前缀时手工补 `}`） |
 | 报 `conv_id 非法：'…'` | id 含 `/`、`..`、空格或超长 | 复制完整 id（形如 `11111111-2222-4333-8444-555555555555`），别手改 |
 | 回复文件明显比预期短 | 设了 `CHATGPT_REPLY_MAX_CHARS` | 取消该变量即全文落盘；文件头有截断标注 |
@@ -603,7 +603,7 @@ python scripts/chatgpt_send.py --work-item wi_<uuid> \
 - `conv-accounts.json` — `conv_id → 归属账号` 登记表，驱动自动路由。
 - `anon-sessions.json` — 匿名会话 id 对照表（标签页、prompt、回复摘要、设备号、状态），是匿名会话的唯一留存索引。
 - `anon-sessions/<conv_id8>.md` — 匿名会话全文归档（`--anon-read` 生成）；8 位前缀撞车时自动加 `-<后4位>` 后缀，不会互相覆盖。
-- `*.lock` — 上面三个 json 的跨进程写锁（O_EXCL），正常用完即删；进程被强杀留下的锁 60 秒后自动失效。
+- `*.lock` — 上面三个 json 的跨进程写锁（O_EXCL），正常用完即删。**回收看持有者死活，不看锁的年龄**：持有者 `pid` 已确认不存在（DEAD）→ 下一次抢锁立即回收；持有者仍存活 → 600 秒也不会回收。`LOCK_STALE_SEC`(60s) 已不参与判定——它比 `LOCK_TIMEOUT_SEC`(3s) 大一个数量级，按年龄先卡的话，崩在 60 秒内留下的锁任何调用方都等不到可回收的那一刻。确认已死却删不掉（Windows 共享冲突）时，释放方会把内容改写成 `{"released": true}`，下一次抢锁同样立即回收。
 - `proxy.json` — 出口代理配置（`{"url": "socks5h://..."}`，可带账号密码 → chmod 600 且不入库）。没有它时走上表第 3/4 档。
 - `accounts/nologin/device-cookie.txt` — 匿名态最新 device cookie（`oai-did` 等），使 API 侧 `GET /backend-anon/conversation/<id>` 可持续收割。
 - `accounts/nologin/devices/<oai-did>.txt` — 按设备分档的 Cookie 头快照；`--anon-read` 优先用它，保证浏览器换 profile 后旧会话仍可读。
