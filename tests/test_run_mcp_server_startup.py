@@ -32,8 +32,11 @@ Platform notes (Windows, the CI host):
   platform; L95/L101 are driven by patching ``shutil.which``.
 * L245 (``if not realm``) is unreachable: ``parts`` is built with
   ``if part`` so every element is non-empty, and the ``realms``-at-the-end
-  case raises ``IndexError`` which is caught by the L239 handler. Reported,
-  not faked.
+  case raises ``IndexError`` which is caught by the L239 handler. The gap is
+  pinned rather than skipped: ``test_trailing_slash_still_cannot_derive``
+  asserts the L239 message for ``.../realms/`` and fails if the ``if part``
+  filter is removed, since the input then reaches L245 and raises
+  "derived Keycloak realm namespace is empty" instead.
 
 ``import uvicorn`` at module scope is stubbed below; uvicorn is not installed
 on this host and cannot be installed. The stub never lives in the source or in
@@ -247,7 +250,11 @@ class TestResolveMemoryExecutable(unittest.TestCase):
         )
 
     def test_bare_name_resolved_through_path(self):
-        path = self._make_file("bare-tool.exe")
+        # shutil.which consults PATHEXT on Windows, so only there does a file
+        # named "bare-tool.exe" satisfy a lookup for "bare-tool". On POSIX the
+        # filename must match exactly, so the suffix must not be appended.
+        name = "bare-tool" + (".exe" if os.name == "nt" else "")
+        path = self._make_file(name)
         with mock.patch.dict(os.environ, {"PATH": str(self.tmp)}):
             resolved = _resolve_memory_executable("bare-tool")
         self.assertEqual(resolved, str(path.resolve()))
@@ -434,11 +441,20 @@ class TestRealmNamespaceFromIssuer(unittest.TestCase):
             "set SO_MCP_REALM_NAMESPACE explicitly",
         )
 
-    # L245 is unreachable: see module docstring. Documented via a skipped test
-    # so the gap is visible in the suite rather than silently absent.
-    @unittest.skip("L245 unreachable: parts are pre-filtered non-empty")
-    def test_empty_realm_unreachable(self):
-        _realm_namespace_from_issuer("https://kc.example.com/realms/")
+    # L245 is unreachable because the `if part` filter at L233 drops the empty
+    # segment a trailing slash would produce, so parts == ["realms"] and
+    # parts[1] raises IndexError into the L239 handler. This test pins that:
+    # remove the filter and "/realms/" yields parts == ["realms", ""], reaches
+    # L245, and raises "derived Keycloak realm namespace is empty" instead --
+    # so this assertion is a mutation detector for the filter, not a fake pass.
+    def test_trailing_slash_still_cannot_derive(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            _realm_namespace_from_issuer("https://kc.example.com/realms/")
+        self.assertEqual(
+            str(ctx.exception),
+            "cannot derive realm namespace from SO_MCP_ISSUER; "
+            "set SO_MCP_REALM_NAMESPACE explicitly",
+        )
 
 
 class TestLoadConfig(unittest.TestCase):
