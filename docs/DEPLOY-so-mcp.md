@@ -266,7 +266,10 @@ has passed its observation period and rollback retention policy.
 
 `SO_MCP_HOST` defaults to `127.0.0.1` and `SO_MCP_PORT` to `8791`. The default
 is the contract, not a convenience: the process is a private service behind a
-TLS-terminating reverse proxy, and nothing else.
+TLS-terminating reverse proxy, and nothing else. The code enforces this
+contract at startup: `load_config()` in `scripts/run_mcp_server.py` accepts
+only `127.0.0.1` or `::1` for `SO_MCP_HOST` and refuses to start on any other
+value, before the bind ever reaches `uvicorn`.
 
 | Setting | Required | Why |
 |---|---|---|
@@ -390,7 +393,7 @@ SO_MCP_TENANT_CLAIM=tenant_id
 | `SO_MCP_DB` | required | none | Path to a persistent SQLite file. The literal string `:memory:` is rejected. | `required environment variable is missing: SO_MCP_DB` / `SO_MCP_DB must be a persistent filesystem path` |
 | `SO_MCP_TENANT_CLAIM` | required | none | Name of the access-token claim that carries the tenant identifier. Only checked non-empty at load time. | `required environment variable is missing: SO_MCP_TENANT_CLAIM` |
 | `SO_MCP_REALM_NAMESPACE` | optional | derived from `SO_MCP_ISSUER` | Keycloak realm name: `[A-Za-z0-9][A-Za-z0-9._-]{0,47}`. | omitted and underivable: `cannot derive realm namespace from SO_MCP_ISSUER; set SO_MCP_REALM_NAMESPACE explicitly`; set but malformed: `valid realm_namespace is required` |
-| `SO_MCP_HOST` | optional | `127.0.0.1` | Bind address. Section 2a constrains this to loopback. | `SO_MCP_HOST must not be empty` |
+| `SO_MCP_HOST` | optional | `127.0.0.1` | Bind address. Section 2a constrains this to loopback; only `127.0.0.1` or `::1` are accepted at startup. | `SO_MCP_HOST must not be empty and must be loopback-only; only 127.0.0.1 or ::1 are allowed` |
 | `SO_MCP_PORT` | optional | `8791` | Integer 1–65535. | `SO_MCP_PORT must be an integer` / `SO_MCP_PORT must be between 1 and 65535` |
 | `UVICORN_LOG_LEVEL` | optional | `info` | One of `critical`, `error`, `warning`, `info`, `debug`, `trace`; case-insensitive. | `UVICORN_LOG_LEVEL is invalid` |
 | `SO_MCP_DISCOVERY_URL` | optional | `<issuer>/.well-known/openid-configuration` | Internal discovery endpoint. Must end with `/.well-known/openid-configuration`; its path must equal the issuer's path plus that suffix, while the host may differ (that is the point of the override). `http://` only for a loopback host. | `discovery URL must end with /.well-known/openid-configuration` / `discovery URL path does not match configured issuer path` / `plain HTTP discovery is allowed only on loopback` |

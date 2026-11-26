@@ -272,8 +272,16 @@ def load_config() -> dict[str, Any]:
         realm_namespace = _realm_namespace_from_issuer(issuer)
 
     host = os.environ.get("SO_MCP_HOST", "127.0.0.1").strip()
-    if not host:
-        raise RuntimeError("SO_MCP_HOST must not be empty")
+    # Loopback-only is a security contract (docs/DEPLOY-so-mcp.md section 2a):
+    # this process is a private service behind a TLS-terminating reverse proxy
+    # and must never be reachable from another host. Reject everything except
+    # the two loopback spellings before the value can reach uvicorn.run().
+    if host not in {"127.0.0.1", "::1"}:
+        raise RuntimeError(
+            "SO_MCP_HOST must not be empty and must be loopback-only; "
+            "only 127.0.0.1 or ::1 are allowed by the deployment security "
+            f"contract (got {host!r})"
+        )
 
     try:
         port = int(os.environ.get("SO_MCP_PORT", "8791"))
