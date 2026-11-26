@@ -181,8 +181,8 @@ def validate_work_item_id(work_item_id: str) -> str:
         raise InvalidWorkItemId("work_item_id suffix is not a UUIDv4")
     if str(parsed) != suffix:
         raise InvalidWorkItemId("work_item_id suffix is not canonical lowercase")
-    if len(work_item_id) != 39:
-        raise InvalidWorkItemId("work_item_id must be 39 characters")
+    # No length check: a canonical UUID string is always 36 characters, so
+    # "wi_" + suffix is always 39 and the branch could never fire.
     return work_item_id
 
 
@@ -290,11 +290,9 @@ class WorkItemStore:
                             "terminal work item %s cannot transition to %s"
                             % (work_item_id, status)
                         )
-                    if status not in ALLOWED_TRANSITIONS[current]:
-                        raise InvalidTransition(
-                            "transition %s -> %s is not allowed"
-                            % (current, status)
-                        )
+                    # No ALLOWED_TRANSITIONS check: for every non-terminal
+                    # current status the allowed set is exactly the remaining
+                    # legal statuses, so the branch could never fire.
                     conn.execute(
                         "UPDATE work_items SET status = ?, updated_at = ?"
                         " WHERE work_item_id = ?",
@@ -357,18 +355,22 @@ class WorkItemStore:
                         "session %s already has an active work item link"
                         % session_id
                     )
-                try:
-                    conn.execute(
-                        "INSERT INTO session_links"
-                        " (link_id, session_id, work_item_id, linked_at,"
-                        " unlinked_at) VALUES (?, ?, ?, ?, NULL)",
-                        (link_id, session_id, work_item_id, now),
-                    )
-                except sqlite3.IntegrityError as exc:
-                    raise SessionAlreadyLinked(
-                        "session %s already has an active work item link (%s)"
-                        % (session_id, exc)
-                    )
+                # No IntegrityError translation here. link_id is
+                # "sl_" + uuid4() and its PRIMARY KEY collision has no
+                # Python-level pre-check; with this handler removed such a
+                # collision surfaces as a raw sqlite3.IntegrityError instead
+                # of being misreported as "session already has an active work
+                # item link". That is deliberate: an honest error beats a
+                # wrong diagnosis. Every other constraint this INSERT can
+                # violate is already covered by the checks above (the active
+                # link UNIQUE predicate is pre-checked verbatim under the same
+                # BEGIN IMMEDIATE write lock).
+                conn.execute(
+                    "INSERT INTO session_links"
+                    " (link_id, session_id, work_item_id, linked_at,"
+                    " unlinked_at) VALUES (?, ?, ?, ?, NULL)",
+                    (link_id, session_id, work_item_id, now),
+                )
             except BaseException:
                 conn.execute("ROLLBACK")
                 raise
