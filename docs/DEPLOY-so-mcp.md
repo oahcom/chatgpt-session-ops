@@ -262,6 +262,57 @@ Keep only the current tree and the immediately previous complete tree
 under `/opt`. Remove older previous trees only after the new version
 has passed its observation period and rollback retention policy.
 
+## 2a. Where the listener is allowed to be
+
+`SO_MCP_HOST` defaults to `127.0.0.1` and `SO_MCP_PORT` to `8791`. The default
+is the contract, not a convenience: the process is a private service behind a
+TLS-terminating reverse proxy, and nothing else.
+
+| Setting | Required | Why |
+|---|---|---|
+| `SO_MCP_HOST` | `127.0.0.1` or `::1` | A loopback bind cannot be reached from another host even if the proxy is misconfigured or stopped. |
+| `SO_MCP_PORT` | any free port | The port is local to the host; the proxy decides what is published. |
+| `SO_MCP_ORIGIN` | the public HTTPS origin | Used for issuer/audience checks and for the probes in section 4. It is not a bind address. |
+
+Binding to `0.0.0.0` or a public interface is not a supported deployment
+shape for this service. It removes the only layer that still holds when the
+proxy is misconfigured: the authentication boundary in `mcp_auth.py` would
+then be the sole control, exposed directly to the network. If a future
+deployment genuinely requires a non-loopback bind, that is a new exposure
+decision — what the listener is reachable from, which firewall rule admits it,
+and which release authorises it — and it belongs in a record like the
+`/so-mcp/healthz` exemption decision in section 4, not in an ad-hoc unit edit.
+
+Verify the bind after every restart, before the health probes:
+
+```bash
+# There must be exactly one listener, and it must be loopback.
+LISTENERS="$(ss -ltnp | grep ':8791' || true)"
+test -n "$LISTENERS"                       # nothing listening is also a failure
+! printf '%s\n' "$LISTENERS" | grep -Ev '127\.0\.0\.1:8791|\[::1\]:8791'
+```
+
+`ss -ltnp` prints the bind address of each listening socket. The first `test`
+catches the case the second check would otherwise wave through: with no
+listener at all, `grep` finds nothing, and a bare negated `grep` would report
+success for a service that is not running. The second command then fails when
+any line for the port is neither `127.0.0.1:8791` nor `[::1]:8791`, which is
+the only case that matters — a listener on any other address is reachable from
+off-host regardless of what the proxy intends.
+
+Reaching the service from a ChatGPT custom MCP client requires an HTTPS origin
+the client can reach. Publish it through the existing reverse proxy and its
+TLS certificate. Do not open the application port to the internet to avoid
+configuring the proxy, and do not substitute a plaintext `http://` origin: the
+`Authorization` header carries the bearer token, so TLS is part of the
+authentication boundary rather than transport hygiene.
+
+For a private origin that cannot be published directly, use an approved secure
+tunnel. An improvised forwarder — `ssh -L` left running, a `socat` relay, a
+temporary Cloudflare quick tunnel — is not an approved path: it usually
+bypasses the proxy's TLS and access rules while appearing to work, and it
+leaves no record of who authorised the exposure.
+
 ## 3. Database backup and migration accounting
 
 The production authority data is in:
