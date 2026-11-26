@@ -822,22 +822,20 @@ class VerifyDeployTests(unittest.TestCase):
         self.assert_code(result, "INVALID_FILE_ENTRY", "files")
 
     # ------------------------------------------------------------------
-    # Two fails recorded, not fixed.
+    # Two fails that used to be recorded as `expectedFailure`.
     #
-    # `expectedFailure` is deliberate: these pin the safe behaviour while the
-    # production code still does the unsafe thing, so the suite stays green
-    # and the defect stays visible in the source. When the tool is fixed, the
-    # case turns into an unexpected success and the suite fails — that is the
-    # signal to delete the decorator, not to widen the assertion.
+    # While the production code did the unsafe thing these cases were
+    # decorated so the suite stayed green and the defect stayed visible. The
+    # decorators are gone because the tool now refuses both inputs, which is
+    # exactly the signal those decorators were there to produce.
     # ------------------------------------------------------------------
 
-    @unittest.expectedFailure
     def test_empty_managed_list_is_not_a_pass(self) -> None:
         """A manifest managing nothing must not report OK.
 
-        `ok` is `not issues`; an empty `expected` produces no issues, so the
-        tool reports `DEPLOY VERIFY OK: 0/0 files verified` and exits 0.
-        `gen_manifest.py` refuses to build such a manifest, so this arrives
+        `ok` is `not issues`; an empty `expected` used to produce no issues,
+        so the tool reported `DEPLOY VERIFY OK: 0/0 files verified` and exited
+        0. `gen_manifest.py` refuses to build such a manifest, so this arrives
         only through a truncated download or a hand-edited file — but
         "verified nothing, reported success" is the exact failure the deploy
         document exists to prevent, and `0/0` reads as success at a glance.
@@ -853,19 +851,15 @@ class VerifyDeployTests(unittest.TestCase):
         result = verify(self.root, self.manifest_path)
 
         self.assertEqual(result["checked_files"], 0)
-        self.assertFalse(
-            result["ok"],
-            "a manifest that manages no files reported OK: %r" % (result,),
-        )
+        self.assert_code(result, "MANIFEST_EMPTY", str(self.manifest_path))
 
-    @unittest.expectedFailure
     def test_star_allow_list_does_not_exempt_the_whole_tree(self) -> None:
         """`allowed_unmanaged: ["*"]` must not silently accept every file.
 
         `fnmatch.fnmatchcase` lets `*` cross `/`, so a single entry suppresses
         `UNMANAGED_FILE` everywhere. The manifest is untrusted input; an
         operator who writes `*` to ignore a build directory has exempted the
-        entire deployment root, and nothing says so.
+        entire deployment root, and nothing said so.
         """
         (self.root / "backdoor.py").write_bytes(b"raise SystemExit\n")
         manifest = self.load_manifest()
@@ -875,10 +869,27 @@ class VerifyDeployTests(unittest.TestCase):
 
         result = verify(self.root, self.manifest_path)
 
-        self.assertIn(
-            "UNMANAGED_FILE",
+        self.assert_code(result, "ALLOW_LIST_CATCH_ALL", "*")
+
+    def test_narrow_allow_list_is_not_reported_as_catch_all(self) -> None:
+        """The check has to be about the whole tree, not about `*` in a string.
+
+        A pattern that only matches one family of paths is the normal, safe
+        case — `pkg*` to ignore `pkg/cache/`. Reporting those would make the
+        new code useless noise and train operators to ignore it.
+        """
+        (self.root / "pkg").mkdir()
+        (self.root / "pkg" / "cache.bin").write_bytes(b"junk\n")
+        manifest = self.load_manifest()
+        manifest["allowed_unmanaged"] = ["pkg*"]
+        self.store_manifest(manifest)
+
+        result = verify(self.root, self.manifest_path)
+
+        self.assertTrue(result["ok"], result["issues"])
+        self.assertNotIn(
+            "ALLOW_LIST_CATCH_ALL",
             [issue["code"] for issue in result["issues"]],
-            "a '*' allow-list exempted the whole tree: %r" % (result["issues"],),
         )
 
     def test_empty_managed_list_reports_every_root_file_as_unmanaged(self) -> None:
@@ -901,9 +912,14 @@ class VerifyDeployTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["expected_files"], 0)
         self.assertEqual(result["checked_files"], 0)
-        self.assertEqual(
+        # Asserted by membership, not by whole-list equality: the empty list
+        # is now also reported as `MANIFEST_EMPTY`, and pinning the exact list
+        # would make every future code that fires on this tree a failure here
+        # for the wrong reason. What this case is about is that the root file
+        # is still named.
+        self.assertIn(
+            ("UNMANAGED_FILE", "app.py"),
             [(issue["code"], issue["path"]) for issue in result["issues"]],
-            [("UNMANAGED_FILE", "app.py")],
         )
 
 
