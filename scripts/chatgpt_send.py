@@ -4934,8 +4934,16 @@ class ChatGPTAPI:
         """分块读到 EOF，边读边把字节追加进 sink。
 
         为什么不用 `resp.read()`：一次性读到底，中途 socket 超时抛出时异常对象里没有
-        已读到的字节——已收内容全部白丢（xhttp 层也无法回捞）。分块读后，除「正在读的
-        那一块」（≤16KB）之外全部留在 sink 里，可以落盘保全。
+        已读到的字节——已收内容全部白丢（xhttp 层也无法回捞）。分块读保证已经返回的
+        chunk 都留在 sink 里，可以落盘保全。
+
+        `IncompleteRead` 的处理：异常携带的 `e.partial`（本次没读完整的那一块）由本函数
+        追加进 sink 后原样 re-raise，所以调用方（req()）直接拿 sink 落盘即可，**不得再
+        追加一次**，否则同一段字节会出现两遍。
+
+        注意：这里只覆盖 `read()` 阶段抛出的截断；若 `open()` / `__enter__` 阶段就抛
+        `IncompleteRead`，此时 sink 还是空的，本函数无从保全。stdlib 的 chunked 解码错误
+        都在 `read()` 内抛出，因此该分支现实不可达，无需额外处理。
         """
         while True:
             try:

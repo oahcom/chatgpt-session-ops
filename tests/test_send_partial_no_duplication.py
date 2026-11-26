@@ -52,6 +52,36 @@ class _FakeResp(object):
         return False
 
 
+class _CleanChunkThenPartialResp(object):
+    """先正常返回一个干净 chunk，下一次 read 才抛 IncompleteRead。
+
+    专门挡「仅当 sink 为空才追加 partial」这类回归：首次 read 就抛的形状里 sink 本来
+    就是空的，那种改动照样能过；只有先收到过干净 chunk，才会暴露 partial 被吞掉。
+    """
+
+    def __init__(self, clean, partial, expected=100):
+        self._clean = clean
+        self._partial = partial
+        self._expected = expected
+        self.read_calls = 0
+        self.status = 200
+        self.headers = {}
+
+    def read(self, amt=None):
+        self.read_calls += 1
+        if self.read_calls == 1:
+            return self._clean
+        if self.read_calls == 2:
+            raise http.client.IncompleteRead(self._partial, self._expected)
+        return b""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
 class _FakeOpener(object):
     def __init__(self, resp):
         self._resp = resp
@@ -81,14 +111,14 @@ class PartialNotDuplicatedTests(unittest.TestCase):
         except OSError:
             pass
 
-    def _make_api(self):
+    def _make_api(self, resp=None):
         api = object.__new__(MODULE.ChatGPTAPI)
         api.account = "default"
         api.base_dir = self.tmp
         api.is_anon = False
         api.cookie = ""
         api.token = ""
-        api._opener = _FakeOpener(_FakeResp(PARTIAL))
+        api._opener = _FakeOpener(_FakeResp(PARTIAL) if resp is None else resp)
         api.last_headers = {}
         api.last_body = ""
         api.last_status = 0
@@ -121,6 +151,26 @@ class PartialNotDuplicatedTests(unittest.TestCase):
 
         self.assertIn("PARTIAL after", out)
         self.assertIn("响应流被截断", out)
+
+    def test_partial_survives_after_a_clean_chunk(self):
+        # 15（干净 chunk）+ 13（partial）= 28；旧版 req() 再追加一次 partial 会变 41。
+        # 干净 chunk 只出现一次，说明重复的只有 partial，不是整段 sink 被重放。
+        clean = b"clean-chunk-15b"
+        self.assertEqual(len(clean), 15)
+        api = self._make_api(_CleanChunkThenPartialResp(clean, PARTIAL))
+
+        status, text = api.req("POST", "https://chatgpt.com/backend-api/conversation")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(api.last_partial_bytes, 28)
+        self.assertEqual(text, (clean + PARTIAL).decode())
+
+        path = api.last_partial_path
+        self.assertIsNotNone(path)
+        with open(path, "rb") as f:
+            saved = f.read()
+        self.assertEqual(len(saved), 28)
+        self.assertEqual(saved, clean + PARTIAL)
 
 
 if __name__ == "__main__":
