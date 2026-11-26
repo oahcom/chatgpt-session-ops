@@ -272,7 +272,20 @@ TLS-terminating reverse proxy, and nothing else.
 |---|---|---|
 | `SO_MCP_HOST` | `127.0.0.1` or `::1` | A loopback bind cannot be reached from another host even if the proxy is misconfigured or stopped. |
 | `SO_MCP_PORT` | any free port | The port is local to the host; the proxy decides what is published. |
-| `SO_MCP_ORIGIN` | the public HTTPS origin | Used for issuer/audience checks and for the probes in section 4. It is not a bind address. |
+
+An earlier revision of this table listed `SO_MCP_ORIGIN` here as "the public
+HTTPS origin — used for issuer/audience checks and for the probes in section
+4". That was wrong. `grep -rn SO_MCP_ORIGIN` over the tree finds it in this
+document only; `scripts/run_mcp_server.py` never reads it, and neither does the
+test suite. The variables that actually carry issuer and audience are
+`SO_MCP_ISSUER` and `SO_MCP_AUDIENCE`, documented in section 2b. An operator
+who followed the old row set the wrong variable and the service died at startup
+with `required environment variable is missing: SO_MCP_ISSUER`, naming a
+variable this runbook did not mention.
+
+Section 4's probe commands use a shell variable of the same name. That is a
+local convenience for the operator's shell, not service configuration; it is
+renamed there to `PUBLIC_ORIGIN` so the two cannot be confused again.
 
 Binding to `0.0.0.0` or a public interface is not a supported deployment
 shape for this service. It removes the only layer that still holds when the
@@ -312,6 +325,47 @@ tunnel. An improvised forwarder — `ssh -L` left running, a `socat` relay, a
 temporary Cloudflare quick tunnel — is not an approved path: it usually
 bypasses the proxy's TLS and access rules while appearing to work, and it
 leaves no record of who authorised the exposure.
+
+## 2b. Environment the service reads
+
+The unit file sets `EnvironmentFile=/etc/so-mcp/so-mcp.env` (line 16 of
+`deploy/so-mcp.service`), so every variable below comes from that file unless
+the unit's own `Environment=` lines override it. The repo ships no such file;
+`deploy/so-mcp.env.example` is the template. Copy it to
+`/etc/so-mcp/so-mcp.env`, mode `0600 root:root`, and replace every placeholder.
+
+`deploy/` is not part of the production archive — section 1 asserts
+`test ! -e "$TMP/deploy"` — so the template exists only in the repository
+checkout. Read it from there, not from `/opt/so-mcp`.
+
+Read it at startup, not at deploy time: the values are validated by
+`load_config()` in `scripts/run_mcp_server.py` and by the constructors it
+calls, and a bad value aborts the process before it binds. `systemd` reports
+that as an exit with `Session Ops MCP startup failed` in the journal.
+
+Required means: the process does not start without it.
+
+| Variable | Required | Default | Validated as | If unset or invalid |
+|---|---|---|---|---|
+| `SO_MCP_ISSUER` | yes | none | Absolute HTTPS URL with a non-root path; no credentials, query or fragment. A trailing `/` is stripped. | Startup aborts: `required environment variable is missing: SO_MCP_ISSUER`, or `SO_MCP_ISSUER must be an absolute HTTPS URL` / `must contain a non-root resource path`. |
+| `SO_MCP_AUDIENCE` | yes | none | Same rules as `SO_MCP_ISSUER`. Not normalised. | Startup aborts with the same two messages, naming `SO_MCP_AUDIENCE`. |
+| `SO_MCP_DB` | yes | none | Non-empty. `:memory:` is rejected. Nothing else: a relative path and a missing parent directory are both accepted here. | Startup aborts: `required environment variable is missing: SO_MCP_DB`, or `SO_MCP_DB must be a persistent filesystem path`. |
+| `SO_MCP_TENANT_CLAIM` | yes | none | Non-empty string, used as the JWT claim name that supplies the tenant. | Startup aborts: `required environment variable is missing: SO_MCP_TENANT_CLAIM`. If the claim is absent from a token, that request fails with `trusted tenant claim is required`. |
+| `SO_MCP_REALM_NAMESPACE` | no | realm segment of `SO_MCP_ISSUER` | `^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$`, checked by `JWTVerifier`, not by `load_config()`. | Derived from the issuer's `/realms/<name>` path. An issuer without that shape aborts startup: `cannot derive realm namespace from SO_MCP_ISSUER; set SO_MCP_REALM_NAMESPACE explicitly`. A value that fails the pattern aborts startup later with `valid realm_namespace is required`. |
+| `SO_MCP_HOST` | no | `127.0.0.1` | Stripped; must not be empty. The code does not enforce loopback — `0.0.0.0` is accepted — so section 2a's rule is a policy you have to keep, not a check that will stop you. | Defaults to `127.0.0.1`. A blank value aborts startup: `SO_MCP_HOST must not be empty`. |
+| `SO_MCP_PORT` | no | `8791` | Integer, `1`–`65535`. | Defaults to `8791`. Otherwise aborts startup: `SO_MCP_PORT must be an integer` or `must be between 1 and 65535`. |
+| `UVICORN_LOG_LEVEL` | no | `info` | Lower-cased, must be one of `critical`, `error`, `warning`, `info`, `debug`, `trace`. | Defaults to `info`. Any other value aborts startup: `UVICORN_LOG_LEVEL is invalid`. |
+| `SO_MCP_DISCOVERY_URL` | no | unset | Absolute HTTP(S) URL ending in `/.well-known/openid-configuration`; plain HTTP only for a loopback host; its path must equal the issuer path plus that suffix. Checked when the verifier is built, not by `load_config()`. | Unset or empty means discovery is fetched from `SO_MCP_ISSUER` itself. An invalid value aborts startup with the specific rule it broke. |
+| `SO_MCP_MEMORY_STDIO` | no | unset | A non-empty JSON array of non-empty strings, e.g. `["/opt/so-mcp/bin/memory-stdio","--db","/var/lib/so-mcp/ma.sqlite3"]`. Element 0 is resolved as a path if it is absolute or contains a separator, otherwise through `PATH`, and must be an existing executable regular file. | Unset means `session.context` is unavailable; calling it returns `memory adapter is not configured`. Invalid JSON, an empty array, or an unresolvable executable aborts startup rather than silently disabling the adapter. |
+| `LOG_LEVEL` | no | `INFO` | Passed straight to `logging.basicConfig(level=...)`. Not the same knob as `UVICORN_LOG_LEVEL`: this one controls the process logger, that one controls uvicorn's. | Defaults to `INFO`. An unknown level raises `ValueError` during startup. |
+
+The unit also sets `PYTHONUNBUFFERED=1` and `PYTHONDONTWRITEBYTECODE=1` itself,
+so they do not belong in the env file.
+
+Two things the table is not: it is not a claim that `SO_MCP_DB` is checked for
+existence — the parent directory is created at startup and the file is created
+if absent — and it is not a claim that `SO_MCP_HOST` is confined to loopback.
+Both were measured against this commit, not inferred from the unit file.
 
 ## 3. Database backup and migration accounting
 
@@ -414,19 +468,20 @@ test "$(systemctl show so-mcp -p ActiveEnterTimestamp --value)" != "$OLD_ENTER"
 ```
 
 Check the local health endpoint and the externally routed MCP endpoints.
-Set `SO_MCP_ORIGIN` to the real HTTPS origin before running:
+Set `PUBLIC_ORIGIN` to the real HTTPS origin before running. It is a shell
+variable for these commands only — the service reads no variable of this kind:
 
 ```bash
-SO_MCP_ORIGIN='https://<production-host>'
+PUBLIC_ORIGIN='https://<production-host>'
 
 test "$(curl -sS -o /dev/null -w '%{http_code}' \
   http://127.0.0.1:8791/healthz)" = 200
 
 test "$(curl -sS -o /dev/null -w '%{http_code}' \
-  "$SO_MCP_ORIGIN/.well-known/oauth-protected-resource/so-mcp")" = 200
+  "$PUBLIC_ORIGIN/.well-known/oauth-protected-resource/so-mcp")" = 200
 
 test "$(curl -sS -o /dev/null -w '%{http_code}' \
-  "$SO_MCP_ORIGIN/so-mcp")" = 401
+  "$PUBLIC_ORIGIN/so-mcp")" = 401
 ```
 
 The unauthenticated MCP request must return 401; a 200 response is
