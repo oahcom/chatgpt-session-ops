@@ -45,6 +45,13 @@ def load_module():
 
 m = load_module()
 
+# `_replace_with_bounded_retry` 的退避预算是 0.05+0.10+0.20+0.40+0.80+1.00 = 2.55s：
+# Windows 上 AV/索引器短暂持有目标文件时，一次**合法**的 replace 重试就能吃掉整个
+# 预算，CI 负载高时更久。所以锁路径的墙钟断言只做 10s「挂死保护」——它抓的是
+# 病理性变慢（真的等满 LOCK_TIMEOUT_SEC 或死锁），不承担毫秒级 SLA。
+# 原先的 1.0s/3s 上界低于 2.55s 预算，一次瞬时 WinError 32/5 就会误红。
+LOCK_WALL_CLOCK_GUARD_SEC = 10.0
+
 
 class TmpBase(unittest.TestCase):
     """把模块级 BASE 指到临时目录，避免测试污染真实运行态。"""
@@ -304,7 +311,8 @@ class TestStateFiles(TmpBase):
         t0 = time.time()
         with m._file_lock(p):
             m._atomic_write(p, "{}")
-        self.assertLess(time.time() - t0, 3, "残留锁应被立即回收，不该等到超时")
+        self.assertLess(time.time() - t0, LOCK_WALL_CLOCK_GUARD_SEC,
+                        "残留锁回收挂死（10s 挂死保护；正常应毫秒级，不该等满 timeout）")
         self.assertFalse(os.path.exists(lock))
 
     def test_lock_dead_holder_reclaimed_before_stale_age(self):
@@ -323,7 +331,8 @@ class TestStateFiles(TmpBase):
         t0 = time.time()
         with m._file_lock(p, timeout=2, strict=True):
             pass
-        self.assertLess(time.time() - t0, 1.0, "回收已死的锁必须是毫秒级")
+        self.assertLess(time.time() - t0, LOCK_WALL_CLOCK_GUARD_SEC,
+                        "回收已死的锁挂死（10s 挂死保护；正常应毫秒级）")
         self.assertFalse(os.path.exists(lock))
 
     @unittest.skipUnless(os.name == "nt", "WinError 32（共享冲突）是 Windows 独有")
@@ -362,8 +371,8 @@ class TestStateFiles(TmpBase):
         t0 = time.time()
         with m._file_lock(p, timeout=2, strict=True):
             pass
-        self.assertLess(time.time() - t0, 1.0,
-                        "释放后重新抢锁应是毫秒级，不该等满 timeout")
+        self.assertLess(time.time() - t0, LOCK_WALL_CLOCK_GUARD_SEC,
+                        "释放后重新抢锁挂死（10s 挂死保护；正常应毫秒级，不该等满 timeout）")
         self.assertFalse(os.path.exists(lock), "重新抢锁并释放后不该残留锁文件")
 
     def test_concurrent_updates_do_not_lose_writes(self):
@@ -4240,11 +4249,62 @@ class TestSlotsAndLease(TmpBase):
             m._atomic_write = real
 
     # ---- B15：心跳 / 续期 / 超时回收（时间参数按比例缩小，可重复）----
+    def assert_lease_released(self, path):
+        """租约已释放：文件不存在，或内容是空租约 `{}`（含空白）。
+
+        `_lease_release_locked` 在 os.remove 抛 OSError（Windows 共享冲突
+        WinError 32/5）时，会把内容改写成 `{}` 并保留文件——这是**有意降级**：
+        抢锁者读到空租约立即回收，避免「活 pid + 匹配启动时间」的锁变成永久死锁。
+        因此断言只接受「不存在 / 空租约」两种终态；内容非空必须失败并打印原文，
+        不能让一次瞬时 OSError 把用例误红。
+        """
+        if not os.path.exists(path):
+            return
+        try:
+            raw = _read(path)
+        except OSError as e:
+            self.fail("租约文件存在但读不到：%r（%s）" % (path, e))
+        if not raw.strip():
+            return
+        try:
+            info = json.loads(raw)
+        except ValueError:
+            info = raw
+        self.assertEqual(info, {}, "租约未释放：文件仍存在且内容非空（%r）" % (raw,))
+
     def test_lease_run_done(self):
         p = os.path.join(self.tmp, "run1.json")
         val, st = m.lease_run(p, "t", lambda: 42, lease_sec=0.5, heartbeat_sec=0.1, max_sec=5)
         self.assertEqual((val, st), (42, "DONE"))
-        self.assertFalse(os.path.exists(p), "结束后必须释放租约")
+        self.assert_lease_released(p)
+
+    def test_lease_release_degrades_to_empty_when_remove_fails(self):
+        """os.remove 持续失败（WinError 32/5）时，租约降级为 `{}` 且结果仍是 DONE。
+
+        这条自测覆盖 helper 的「空租约」分支：没有它，helper 放宽后可能永远
+        走不到降级路径，等于把断言改松却没证明降级仍然发生。
+        """
+        p = os.path.join(self.tmp, "run-degraded.json")
+        real_remove = os.remove
+
+        def locked(target):
+            # 只让「租约文件」的删除失败：真实场景是别的进程 open 着租约
+            # （WinError 32），锁文件本身仍可回收。若把 os.remove 全打挂，
+            # _file_lock 自己就抢不到锁，走不到 _lease_release_locked 的降级分支。
+            if os.path.abspath(target) == os.path.abspath(p):
+                raise PermissionError(13, "simulated sharing violation", target)
+            return real_remove(target)
+
+        os.remove = locked
+        try:
+            val, st = m.lease_run(p, "t", lambda: 42, lease_sec=0.5,
+                                  heartbeat_sec=0.1, max_sec=5)
+        finally:
+            os.remove = real_remove
+        self.assertEqual((val, st), (42, "DONE"))
+        self.assertTrue(os.path.exists(p), "删除被拒时应保留文件并降级，而不是假装删掉")
+        self.assert_lease_released(p)
+        self.assertEqual(json.loads(_read(p)), {}, "降级终态必须是空租约")
 
     def test_heartbeat_keeps_lease_alive(self):
         """运行时长超过租约时，心跳必须续期（否则会被判过期而重复启动）。"""
@@ -4253,7 +4313,20 @@ class TestSlotsAndLease(TmpBase):
 
         def body():
             time.sleep(1.2)                     # 远超 lease_sec=0.4
-            info = json.load(open(p, encoding="utf-8"))
+            # 心跳线程正在 os.replace 时，Windows 会让目标文件短暂「删除挂起」，
+            # 此刻 open 抛 PermissionError（不是租约丢了）。读的是同一个瞬时文件，
+            # 有界重试即可，不能让这类瞬时共享冲突把用例误红。
+            last_err = None
+            for _ in range(20):
+                try:
+                    with open(p, encoding="utf-8") as f:
+                        info = json.load(f)
+                    break
+                except OSError as e:
+                    last_err = e
+                    time.sleep(0.01)
+            else:
+                raise last_err
             seen["alive"], seen["why"] = m._lease_reclaimable(info)
             return "ok"
 
@@ -4278,7 +4351,7 @@ class TestSlotsAndLease(TmpBase):
                               max_sec=0.2, grace_sec=2)
         self.assertEqual((val, st), (None, "TIMEOUT"))
         self.assertTrue(hits["stopped"], "超时后必须通知执行体停止")
-        self.assertFalse(os.path.exists(p), "执行体已停 → 释放租约")
+        self.assert_lease_released(p)
         n = hits["side_effects"]
         time.sleep(0.2)
         self.assertEqual(hits["side_effects"], n, "返回后不得再有副作用")
@@ -4316,6 +4389,20 @@ class TestSlotsAndLease(TmpBase):
         for sp, rid in got[:3]:
             self.assertTrue(m.release_slot(sp, rid))
 
+    def _spawn_race_child(self, argv, attempts=3):
+        """Popen 有界重试：冷启动/AV 扫描下偶发 OSError 不该让用例直接 ERROR。"""
+        last_err = None
+        for i in range(attempts):
+            try:
+                return subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, text=True)
+            except OSError as e:
+                last_err = e
+                if i + 1 < attempts:
+                    time.sleep(0.2 * (i + 1))
+        self.fail("Popen 连续 %d 次失败（最后一次 OSError：%r；进程从未启动，无 stderr）"
+                  % (attempts, last_err))
+
     def test_slot_cap_under_process_race(self):
         """6 个进程同时抢，有效槽位任何时刻都不得超过 3（B8 的核心断言）。"""
         base = os.path.join(self.tmp, "slots-race")
@@ -4327,18 +4414,36 @@ class TestSlotsAndLease(TmpBase):
             "sp, rid = C.acquire_slot('race', base=sys.argv[2], lease_sec=300)\n"
             "print(sp or 'FULL')\n"
         ) % (os.path.dirname(os.path.abspath(m.__file__)),)
-        procs = [subprocess.Popen([sys.executable, "-c", script, "0.15", base],
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                 for _ in range(6)]
-        outs = []
-        for p in procs:
-            out, err = p.communicate(timeout=120)
-            outs.append((out or "").strip())
+        procs, results = [], []
+        try:
+            for _ in range(6):
+                procs.append(self._spawn_race_child(
+                    [sys.executable, "-c", script, "0.15", base]))
+            for p in procs:
+                try:
+                    out, err = p.communicate(timeout=120)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    out, err = p.communicate()
+                    self.fail("抢槽子进程 120s 未退出（stderr=%r）"
+                              % ((err or "").strip(),))
+                results.append((p.returncode, (out or "").strip(), (err or "").strip()))
+        finally:
+            for p in procs:                  # 超时/断言中断后也必须回收，不留僵尸
+                if p.poll() is None:
+                    p.terminate()
+                    try:
+                        p.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                        p.wait(timeout=5)
+        outs = [out for _rc, out, _err in results]
         # 子进程可能先打印 WARN 再打印结果：只认最后一行，且必须是槽位路径
         got = [o.strip().splitlines()[-1] for o in outs
                if o and o.strip().splitlines() and o.strip().splitlines()[-1].endswith(".slot")]
-        self.assertLessEqual(len(got), 3, "超发槽位：%r" % (outs,))
-        self.assertEqual(len(set(got)), len(got), "同一槽位被两个进程同时持有")
+        ctx = "results=%r" % (results,)
+        self.assertLessEqual(len(got), 3, "超发槽位：%s" % ctx)
+        self.assertEqual(len(set(got)), len(got), "同一槽位被两个进程同时持有：%s" % ctx)
 
 
 class TestCustody(TmpBase):
