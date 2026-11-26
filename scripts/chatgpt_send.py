@@ -260,9 +260,6 @@ def _replace_with_bounded_retry(tmp, path):
                 )
             raise
 
-    # Defensive only: the loop either returns or raises.
-    raise RuntimeError("atomic replace retry loop exited unexpectedly")
-
 
 def _atomic_write(path, text):
     """tmp → fsync → replace。状态 json 与匿名归档都只有这一份副本，写半截就全丢。
@@ -6537,8 +6534,6 @@ def load_prompt_text(prompt_file):
         raise RuntimeError("读不到提示词文件 %s：%s" % (prompt_file, e))
     validate_prompt_text(text, prompt_file)
     text = text.strip()
-    if not text:
-        raise RuntimeError("提示词没有正文：%s" % prompt_file)
     if not any(not l.strip().startswith("#") for l in text.splitlines()):
         raise RuntimeError("提示词没有正文（只有注释行）：%s" % prompt_file)
     return text
