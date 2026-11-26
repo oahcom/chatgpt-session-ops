@@ -223,7 +223,9 @@ class TestValidateHttpsUrl(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(AuthenticationError) as ctx:
                     _validate_https_url(value, "resource")
-                self.assertIn("must not contain credentials", str(ctx.exception))
+                self.assertIn(
+                    "resource URL must not contain credentials", str(ctx.exception)
+                )
 
     def test_fragment_rejected(self):
         with self.assertRaises(AuthenticationError) as ctx:
