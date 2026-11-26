@@ -1645,6 +1645,8 @@ class FakeAPI:
         self.sent = []
         self.last_headers = {}
         self.last_truncated = False
+        self.last_partial_path = None
+        self.last_partial_bytes = 0
         self.gets = []
         self.get_status = 200
         self.get_body = "{}"
@@ -1868,16 +1870,91 @@ class TestSendFlow(TmpBase):
                                  "对账器判不可用时，harvest 不得报 complete=True 完整放行"
                                  "（可尽力收割部分文本，但须标记不完整）")
 
-    def test_timeout_is_split_by_thinking(self):
-        """A16：思考模式给 30 分钟，非思考给 7 分钟；同一条预算会误杀 19 分钟的思考回复。"""
+    def _run_cli(self, argv, api):
+        """跑**真实 CLI 入口**（sys.argv → _main_impl），只把账号构造换成桩。
+
+        为什么必须走 CLI：DEF-ops-04 的缺陷在 `_main_impl` 的超时装配里（无 --timeout
+        时把 SEND_TIMEOUT 无条件写成 600），库路径 `send_prompt(...)` 根本不经过那段，
+        所以只测库路径的用例永远绿、缺陷永远在。
+        """
+        out = io.StringIO()
+        ctor = m.ChatGPTAPI
+
+        class _Ctor(ctor):
+            # 只替换「构造出哪个 api」，类上的静态解析器保持原样：
+            # FakeAPI 内部就靠 ChatGPTAPI.extract_reply_sse_checked 解析 SSE。
+            def __new__(cls, *a, **kw):
+                return api
+
+        m.ChatGPTAPI = _Ctor
+        old_argv = sys.argv
+        try:
+            sys.argv = ["chatgpt_send.py"] + argv
+            with contextlib.redirect_stdout(out):
+                code = m.main()
+        finally:
+            sys.argv = old_argv
+            m.ChatGPTAPI = ctor
+        return code, out.getvalue()
+
+    def test_cli_thinking_keeps_1800s_tier_without_timeout_flag(self):
+        """--thinking 且没给 --timeout：必须按分档拿 1800s（旧版 CLI 会压成 600s）。"""
         cid = "11111111-2222-4333-8444-555555555555"
-        api = FakeAPI(os.path.join(self.tmp, "auth"),
-                      sse='data: {"conversation_id": "%s"}\n\ndata: [DONE]' % cid)
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "deep"))
         api.resolve_thinking_model = lambda _a: "gpt-6-t-mini"
-        m.send_prompt(api, None, self._prompt("x"), new_chat=True, thinking=True)
-        self.assertEqual(api.sent[-1]["timeout"], 1800)
-        m.send_prompt(api, None, self._prompt("x"), new_chat=True, thinking=False)
+        code, out = self._run_cli(
+            ["--account", "acct1", "--thinking", "--new", self._prompt("x")], api)
+        self.assertEqual(api.sent[-1]["timeout"], 1800,
+                         "CLI 不传 --timeout 时不得覆盖 --thinking 的 1800s 分档")
+        self.assertEqual(code, 0)
+        self.assertIn("SEND prompt.md -> 200", out)
+
+    def test_cli_thinking_tier_is_420_when_not_thinking(self):
+        cid = "11111111-2222-4333-8444-555555555555"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "fast"))
+        code, _out = self._run_cli(
+            ["--account", "acct1", "--new", self._prompt("x")], api)
         self.assertEqual(api.sent[-1]["timeout"], 420)
+        self.assertEqual(code, 0)
+
+    def test_cli_explicit_timeout_still_overrides_thinking(self):
+        cid = "11111111-2222-4333-8444-555555555555"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "deep"))
+        api.resolve_thinking_model = lambda _a: "gpt-6-t-mini"
+        code, out = self._run_cli(
+            ["--account", "acct1", "--thinking", "--timeout", "900", "--new",
+             self._prompt("x")], api)
+        self.assertEqual(api.sent[-1]["timeout"], 900, "显式 --timeout 必须在分档之后覆盖")
+        self.assertIn("timeout: 900s (source=cli)", out)
+        self.assertEqual(code, 0)
+
+    def test_truncated_send_prints_no_send_line_and_exits_3(self):
+        """DEF-ops-01：截断响应不得打 `SEND ... -> 200`，且退出码必须是 3。"""
+        cid = "11111111-2222-4333-8444-555555555555"
+        # 有 conversation_id、但流没有 [DONE]：这就是被截断的半截响应
+        api = FakeAPI(os.path.join(self.tmp, "auth"),
+                      sse='data: {"conversation_id": "%s", "message": '
+                          '{"author": {"role": "assistant"}, "content": {"parts": ["半截"]}}}'
+                          % cid)
+        api.last_truncated = True
+        api.last_partial_bytes = 4096
+        api.last_partial_path = os.path.join(self.tmp, "partial.txt")
+        code, out = self._run_cli(
+            ["--account", "acct1", "--new", self._prompt("x")], api)
+        self.assertFalse(re.search(r"^SEND .* -> 200", out, re.M),
+                         "截断响应不得打印唯一送达凭证 `SEND ... -> 200`")
+        self.assertIn("SEND_TRUNCATED pfile=prompt.md st=200 bytes=4096", out)
+        self.assertEqual(code, 3, "截断投递必须以 exit 3 收场，不能 exit 0")
+
+    def test_complete_send_keeps_send_line_and_exits_0(self):
+        cid = "11111111-2222-4333-8444-555555555555"
+        api = FakeAPI(os.path.join(self.tmp, "auth"), sse=self._sse(cid, "完整回复"))
+        code, out = self._run_cli(
+            ["--account", "acct1", "--new", self._prompt("x")], api)
+        self.assertIn("SEND prompt.md -> 200", out)
+        self.assertNotIn("SEND_TRUNCATED", out)
+        self.assertEqual(code, 0)
+
 
     def test_default_keeps_auto_model(self):
         """未开启思考模式时不覆写 model（保持 auto）。"""
@@ -1938,6 +2015,91 @@ class TestSendFlow(TmpBase):
             m.send_prompt(api, "../../evil", self._prompt("x"))
         self.assertEqual(api.sent, [])
 
+
+class TestSendLogVerdict(TmpBase):
+    """CB-B8 的机读版：三合取必须先看进程死活，否则在飞投递会被判死并重复投递。"""
+
+    def _log(self, body, age=0, name="send.log"):
+        p = os.path.join(self.tmp, name)
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        with open(p, "wb") as f:
+            f.write(data)
+        stamp = time.time() - age
+        os.utime(p, (stamp, stamp))
+        return p
+
+    def test_send_line_is_sent(self):
+        p = self._log("SEND prompt.md -> 200 respLen=12 in 8s\n")
+        v = m.judge_send_log(p, None, live_pids=[])
+        self.assertEqual(v["verdict"], "SENT")
+        self.assertTrue(v["sent"])
+
+    def test_truncated_line_is_not_a_delivery_credential(self):
+        p = self._log("SEND_TRUNCATED pfile=prompt.md st=200 bytes=4096\n")
+        v = m.judge_send_log(p, None, live_pids=[])
+        self.assertEqual(v["verdict"], "TRUNCATED")
+        self.assertFalse(v["sent"], "截断不是送达凭证")
+        self.assertFalse(v["not_sent"], "已发出去的内容不该判 NOT_SENT 触发重投")
+
+    def test_dead_empty_log_is_not_sent(self):
+        p = self._log(b"", age=7200)
+        v = m.judge_send_log(p, None, live_pids=[])
+        self.assertEqual(v["verdict"], "NOT_SENT")
+        self.assertTrue(v["not_sent"])
+
+    def test_live_sender_process_blocks_not_sent(self):
+        """在飞：0 字节 + mtime 早破 5 分钟，但同 pfile 的进程还活着 → 不得判死。"""
+        p = self._log(b"", age=1200)
+        v = m.judge_send_log(p, "prompt.md", live_pids=[os.getpid()])
+        self.assertEqual(v["verdict"], "IN_FLIGHT")
+        self.assertIn("sender_process_alive", v["reasons"])
+        self.assertFalse(v["not_sent"])
+
+    def test_unknown_liveness_is_conservative(self):
+        """枚举不到进程（None）不等于没有进程：按可能活着处理，绝不判死。"""
+        p = self._log(b"", age=3600 * 3)
+        with mock.patch.object(m, "live_senders", return_value=None):
+            v = m.judge_send_log(p, "prompt.md")
+        self.assertEqual(v["verdict"], "IN_FLIGHT")
+        self.assertTrue(v["liveness_unknown"])
+        self.assertIn("liveness_unknown", v["reasons"])
+
+    def test_backoff_window_with_timeout_first_line_is_in_flight(self):
+        """`timeout:` 首行 + mtime 在 3600s 退避窗口内 → 进程可能正在退避，不得判死。"""
+        p = self._log("timeout: 1800s (source=cli)\n", age=900)
+        v = m.judge_send_log(p, None, live_pids=[])
+        self.assertEqual(v["verdict"], "IN_FLIGHT")
+        self.assertIn("inside_backoff_window", v["reasons"])
+
+    def test_same_log_past_backoff_window_is_not_sent(self):
+        """同一形态但超出 3600s 退避上限、且无存活进程 → NOT_SENT。"""
+        p = self._log("timeout: 1800s (source=cli)\n", age=4000, name="old.log")
+        v = m.judge_send_log(p, None, live_pids=[])
+        self.assertEqual(v["verdict"], "NOT_SENT")
+
+    def test_utf16_log_is_decoded_by_bom(self):
+        """PowerShell 重定向产物是 UTF-16LE；按 utf-8 硬读会漏掉 SEND 行（CB-B10）。"""
+        p = self._log("SEND prompt.md -> 200 respLen=5 in 3s\r\n".encode("utf-16"),
+                      name="utf16.log")
+        v = m.judge_send_log(p, None, live_pids=[])
+        self.assertEqual(v["verdict"], "SENT")
+
+    def test_live_senders_matches_prompt_file_in_cmdline(self):
+        rows = [
+            (101, "python chatgpt_send.py 11111111 prompt.md"),
+            (102, "python other.py --list"),
+        ]
+        with mock.patch.object(m, "_iter_process_cmdlines", return_value=rows):
+            self.assertEqual(m.live_senders("/work/prompt.md"), [101])
+        with mock.patch.object(m, "_iter_process_cmdlines", return_value=None):
+            self.assertIsNone(m.live_senders("/work/prompt.md"),
+                              "枚举不可用必须返回 None，不能返回空列表冒充「没有进程」")
+
+    def test_live_senders_never_counts_the_checker_itself(self):
+        """判定器自己的命令行里就有 pfile（--prompt），不排除自己就永远判不出 NOT_SENT。"""
+        rows = [(os.getpid(), "python chatgpt_send.py --check-send-log l.log --prompt prompt.md")]
+        with mock.patch.object(m, "_iter_process_cmdlines", return_value=rows):
+            self.assertEqual(m.live_senders("/work/prompt.md"), [])
 
 class _StubServer(object):
     """起一个只接一次连接的本地 TCP 服务，用 handler(conn) 定义协议。"""
@@ -7424,6 +7586,63 @@ class TestConversationLog(TmpBase):
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         turns = list(m.iter_turns())
         self.assertEqual(len(turns), 1, "同一 turn_id 只能算一轮")
+
+
+class ThinkingModelPreferenceTests(unittest.TestCase):
+    """默认思考模型选择：清单里存在 gpt-6-t-mini 时必须优先选它。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.m = load_module()
+
+    class _ModelsAPI:
+        account = "acct1"
+
+        def __init__(self, models, default="auto"):
+            self.payload = {"default_model_slug": default, "models": models}
+            self.calls = 0
+
+        def req(self, method, url):
+            self.calls += 1
+            return 200, json.dumps(self.payload)
+
+    @staticmethod
+    def _models():
+        return [
+            {"slug": "gpt-5-6-t-mini", "title": "GPT-5.6 Luna", "max_tokens": 262144},
+            {"slug": "gpt-5-6-t-mini-mini", "title": "GPT-5.6 Luna", "max_tokens": 262144},
+            {"slug": "gpt-6-t-mini", "title": "GPT-6", "max_tokens": 262144},
+            {"slug": "gpt-6-t-mini-mini", "title": "GPT-6", "max_tokens": 262144},
+        ]
+
+    def test_prefers_gpt_6_when_available(self):
+        api = self._ModelsAPI(self._models())
+        chosen = self.m.ChatGPTAPI.resolve_thinking_model(api, cache={})
+        self.assertEqual(chosen, "gpt-6-t-mini")
+
+    def test_falls_back_when_gpt_6_absent(self):
+        api = self._ModelsAPI(self._models()[:2])
+        chosen = self.m.ChatGPTAPI.resolve_thinking_model(api, cache={})
+        self.assertEqual(chosen, "gpt-5-6-t-mini")
+
+    def test_explicit_model_still_wins(self):
+        api = self._ModelsAPI(self._models())
+        with mock.patch.dict(os.environ, {"CHATGPT_MODEL": "gpt-5-6-t-mini"}):
+            chosen = self.m.ChatGPTAPI.resolve_thinking_model(api, cache={})
+        self.assertEqual(chosen, "gpt-5-6-t-mini")
+
+    def test_cache_separates_account_and_explicit_model(self):
+        """缓存键是 (account, CHATGPT_MODEL)：同键不重复请求清单，换显式模型必须重算。"""
+        api = self._ModelsAPI(self._models())
+        cache = {}
+        first = self.m.ChatGPTAPI.resolve_thinking_model(api, cache=cache)
+        second = self.m.ChatGPTAPI.resolve_thinking_model(api, cache=cache)
+        self.assertEqual((first, second), ("gpt-6-t-mini", "gpt-6-t-mini"))
+        self.assertEqual(api.calls, 1, "同一 (account, explicit) 必须命中缓存")
+        with mock.patch.dict(os.environ, {"CHATGPT_MODEL": "gpt-5-6-t-mini"}):
+            third = self.m.ChatGPTAPI.resolve_thinking_model(api, cache=cache)
+        self.assertEqual(third, "gpt-5-6-t-mini")
+        self.assertEqual(api.calls, 1, "显式指定不请求模型清单")
 
 
 if __name__ == "__main__":

@@ -72,6 +72,7 @@
 - 23 MB 流经隧道时容易中途断流，`urllib` 抛 `http.client.IncompleteRead`，异常对象带 `e.partial`（已收到的字节）。
 - **不能当发送失败**：字节里通常已含 `conversation_id` 与大部分回复。判失败会导致「换身份重投 → 同一 prompt 建出两个会话」。
 - 正确处置：把 `e.partial` 按 200 语义解析（`last_truncated=True`），再 `GET /backend-api/conversation/<id>` 用 mapping 取全文；只有 GET 结果更长才替换。
+- **但「按 200 解析」≠「送达凭证是 200」**：截断路径不打印 `SEND ... -> 200`，改打 `SEND_TRUNCATED pfile=<p> st=<st> bytes=<n>` 并以 exit 3 收场。`SEND ... -> 200` 只留给完整响应——否则一次超时会在日志、退出码、会话登记三个门禁上同时是绿的。
 - `harvest_mapping()` 取「`create_time` 最大的 assistant 消息」，对截断流同样适用（比 SSE 增量拼接可靠）。
 
 ## SSE 响应解析
