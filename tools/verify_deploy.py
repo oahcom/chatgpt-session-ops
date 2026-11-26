@@ -266,12 +266,6 @@ def verify(
                           "file is not listed in manifest")
             continue
 
-        if path.is_symlink():
-            add_issue(issues, "UNEXPECTED_SYMLINK", rel,
-                      "managed files must be regular files")
-            skipped_paths.add(rel)
-            continue
-
         entry = expected[rel]
         try:
             raw = path.read_bytes()
