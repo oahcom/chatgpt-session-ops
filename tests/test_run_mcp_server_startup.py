@@ -516,11 +516,47 @@ class TestLoadConfig(unittest.TestCase):
             "SO_MCP_DB must be a persistent filesystem path",
         )
 
-    # L276 -----------------------------------------------------------------
+    # host: loopback-only contract (docs/DEPLOY-so-mcp.md section 2a) -------
+    # Issue #127: every non-loopback value used to reach uvicorn.run(host=...).
+    # The old exact assertion "SO_MCP_HOST must not be empty" conflicted with
+    # the merged contract message; it is now a keyword assertion below, and
+    # the full accept/reject matrix is pinned by the two table-driven tests.
     def test_empty_host_rejected(self):
         with self.assertRaises(RuntimeError) as ctx:
             self._run(SO_MCP_HOST="   ")
-        self.assertEqual(str(ctx.exception), "SO_MCP_HOST must not be empty")
+        message = str(ctx.exception)
+        self.assertIn("must not be empty", message)
+        self.assertIn("loopback", message)
+
+    def test_host_accepts_loopback_values(self):
+        for value in ("127.0.0.1", "::1"):
+            with self.subTest(host=value):
+                config = self._run(SO_MCP_HOST=value)
+                self.assertEqual(config["host"], value)
+
+    def test_host_rejects_non_loopback_values(self):
+        rejected = (
+            "",                 # empty
+            "   ",              # whitespace-only (old L276 empty guard)
+            "0.0.0.0",          # wildcard IPv4
+            "::",               # wildcard IPv6
+            "10.0.0.5",         # private IPv4
+            "172.16.0.1",       # private IPv4
+            "8.8.8.8",          # public IPv4
+            "2001:db8::1",      # public IPv6 (documentation range)
+            "example.com",      # DNS name
+            "localhost",        # DNS name resolving to loopback
+            "127.0.0.2",        # loopback range, wrong spelling
+            "[::1]",            # bracketed IPv6, wrong spelling
+        )
+        for value in rejected:
+            with self.subTest(host=value):
+                with self.assertRaises(RuntimeError) as ctx:
+                    self._run(SO_MCP_HOST=value)
+                message = str(ctx.exception)
+                self.assertIn("loopback", message)
+                self.assertIn("127.0.0.1", message)
+                self.assertIn("::1", message)
 
     # L281 -----------------------------------------------------------------
     def test_non_integer_port_rejected(self):
