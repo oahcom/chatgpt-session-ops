@@ -816,30 +816,30 @@ the LF-normalized content matches; the blob says the exact bytes match. Neither
 substitutes for the other, which is why the comparison sits outside the branch
 that records `CONTENT_MISMATCH`.
 
-**An empty managed list fails.** `files: []` is rejected: with nothing managed,
-every file in the root is `UNMANAGED_FILE`, so the run exits 1. Verified on
-15dca1a with `files: []` and one file in the root: exit 1, `UNMANAGED_FILE`.
-`tools/gen_manifest.py` additionally refuses to produce such a manifest
-(`the explicit managed path list is empty`). An empty allow-list is what makes
-the rejection work — a manifest that also sets `allowed_unmanaged: ["*"]` still
-suppresses `UNMANAGED_FILE` and passes with `checked_files: 0`, which is the
-entry below.
+**An empty managed list fails on its own.** `files: []` is rejected by a
+dedicated check: `MANIFEST_EMPTY`, exit 1. It used to be rejected only
+incidentally — with nothing managed, every file in the root became
+`UNMANAGED_FILE` — which meant an empty manifest over an *empty* root verified
+nothing and reported `DEPLOY VERIFY OK: 0/0 files verified`, exit 0. `0/0`
+reads as success at a glance, and that is the failure this document exists to
+prevent. `tools/gen_manifest.py` also refuses to produce such a manifest
+(`the explicit managed path list is empty`), so this arrives only through a
+truncated download or a hand-edited file.
 
-**`allowed_unmanaged` is taken from the manifest.** A `*` entry matches every
-path, including across `/`, and suppresses `UNMANAGED_FILE` for the whole tree.
-The patterns in the command above are the reviewed set; any other entry is an
-unreviewed exclusion.
+**A catch-all `allowed_unmanaged` entry fails.** `fnmatch` lets `*` cross `/`,
+so one entry exempts the whole tree. The verifier now reports
+`ALLOW_LIST_CATCH_ALL` for any pattern that matches a path of every depth —
+detected by matching the pattern against a set of probe paths rather than by
+looking for a `*` character, so `pkg*` and `pkg/cache/*` stay allowed. The
+patterns in the command above are the reviewed set; an entry that swallows the
+tree is now a failure instead of a silent exclusion.
 
-The suppression is not limited to empty manifests. Measured on the current
-verifier with a manifest that manages `app.py` and sets
-`allowed_unmanaged: ["*"]`, against a root holding a correct `app.py` and an
-unmanaged `backdoor.py`: exit 0, `DEPLOY VERIFY OK: 1/1 files verified`,
-`UNMANAGED_FILE` not reported. Removing the `*` entry from the same tree
-produces exit 1 with `UNMANAGED_FILE` on `backdoor.py`. A `*` in the allow-list
-therefore converts "a file nobody reviewed was added to the deployment root"
-from a failure into a silent pass. That is why the reviewed pattern set is part
-of the contract, and why a manifest carrying `*` should be rejected in review
-rather than accepted because the run passed.
+Both used to be silent. Measured on the verifier before these checks, with a
+manifest that manages `app.py` and sets `allowed_unmanaged: ["*"]`, against a
+root holding a correct `app.py` and an unmanaged `backdoor.py`: exit 0,
+`DEPLOY VERIFY OK: 1/1 files verified`, `UNMANAGED_FILE` not reported. That is
+the shape to keep in mind when reading any green result: the verifier can only
+tell you about the paths it was told to look at.
 
 None of this argues against running the verifier. It argues for running it on a
 tree extracted from the recorded commit, with a manifest generated on the
