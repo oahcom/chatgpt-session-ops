@@ -189,7 +189,7 @@ def _redact_memory_command(command: Any) -> str:
             redact_next = False
             continue
 
-        if argument.startswith("--") and "=" in argument:
+        if argument.startswith("-") and "=" in argument:
             option, value = argument.split("=", 1)
             if _SECRET_ARGUMENT_RE.search(option):
                 redacted.append(option + "=<redacted>")

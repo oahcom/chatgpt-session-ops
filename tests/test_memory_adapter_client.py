@@ -553,7 +553,7 @@ class DegradationTestCase(MemoryAdapterClientTestCase):
         store = WorkItemStore(db_dir / "work-items.sqlite3")
         store.initialize()
         item = store.create_work_item()
-        store.link_session("session-001", item.work_item_id)
+        store.link_session("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70", item.work_item_id)
 
         client = MemoryAdapterClient([str(Path(self.tmpdir) / "absent")])
         with self.assertRaises(MemoryAdapterError):
@@ -569,13 +569,13 @@ class DegradationTestCase(MemoryAdapterClientTestCase):
         # WorkItem operations continue unaffected.
         paused = store.set_status(item.work_item_id, "paused")
         self.assertEqual(paused.status, "paused")
-        active_link = store.get_active_link("session-001")
+        active_link = store.get_active_link("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70")
         self.assertIsNotNone(active_link)
         assert active_link is not None
         self.assertEqual(active_link.work_item_id, item.work_item_id)
         self.assertEqual(
             [link.session_id for link in store.list_sessions(item.work_item_id)],
-            ["session-001"],
+            ["6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70"],
         )
 
 

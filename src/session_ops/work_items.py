@@ -6,6 +6,7 @@ uses only the Python standard library and a local SQLite database.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -33,6 +34,13 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
 
 WORK_ITEM_ID_PREFIX = "wi_"
 
+# Single source of truth for the Session ID rule (issue #109). The secure
+# authority layer imports this instead of defining its own copy, so the two
+# layers cannot drift.
+CONVERSATION_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+
 DEFAULT_DATABASE_PATH = (
     Path.home() / ".workbuddy" / "session-ops" / "work-items.sqlite3"
 )
@@ -47,7 +55,7 @@ class InvalidWorkItemId(WorkItemError):
 
 
 class InvalidSessionId(WorkItemError):
-    """Session ID is empty or whitespace only."""
+    """Session ID is not a canonical lowercase UUID."""
 
 
 class WorkItemNotFound(WorkItemError):
@@ -179,10 +187,16 @@ def validate_work_item_id(work_item_id: str) -> str:
 
 
 def validate_session_id(session_id: str) -> str:
-    if not isinstance(session_id, str):
-        raise InvalidSessionId("session_id must be a string")
-    if not session_id.strip():
-        raise InvalidSessionId("session_id must be non-empty")
+    """Validate a canonical lowercase UUID Session ID.
+
+    Shares CONVERSATION_ID_RE with the secure authority layer
+    (validate_conversation_id) so the raw store and the MCP boundary accept
+    exactly the same strings; only the exception type differs per layer.
+    """
+    if not isinstance(session_id, str) or not CONVERSATION_ID_RE.fullmatch(
+        session_id
+    ):
+        raise InvalidSessionId("session_id must be a canonical lowercase UUID")
     return session_id
 
 

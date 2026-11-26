@@ -48,6 +48,11 @@ UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
 FULL_MCP_PLANS = {'business', 'enterprise', 'edu'}
 LIMITED_MCP_PLANS = {'pro'}
 
+# RFC 6598 shared address space. is_private is False for these and is_global
+# has moved between CPython releases, so pin the range explicitly: it contains
+# cloud instance-metadata endpoints (100.100.100.200 on Alibaba Cloud).
+CGNAT_NETWORK = ipaddress.ip_network('100.64.0.0/10')
+
 
 # ---------------------------------------------------------------- errors
 
@@ -72,12 +77,17 @@ def assert_safe_url(url: str) -> None:
     if not p.hostname:
         raise CheckError('INVALID_URL', 'missing host')
     try:
-        infos = socket.getaddrinfo(p.hostname, p.port or 443, proto=socket.IPPROTO_TCP)
+        port = p.port or 443
+    except ValueError as e:
+        raise CheckError('INVALID_URL', f'malformed URL: {url!r} has an invalid port') from e
+    try:
+        infos = socket.getaddrinfo(p.hostname, port, proto=socket.IPPROTO_TCP)
     except socket.gaierror as e:
         raise CheckError('UNSAFE_ENDPOINT', f'dns resolution failed: {e}') from e
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
-        if (ip.is_private or ip.is_loopback or ip.is_link_local
+        if (ip in CGNAT_NETWORK or not ip.is_global or ip.is_private
+                or ip.is_loopback or ip.is_link_local
                 or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
             raise CheckError('UNSAFE_ENDPOINT', f'{p.hostname} resolves to {ip}')
 
@@ -461,7 +471,8 @@ assert not ipaddress.ip_address('1.1.1.1').is_private
 assert _parse_mcp_body('data: {"result":{"ok":1}}')['result']['ok'] == 1
 assert _parse_mcp_body('{"result":{"ok":2}}')['result']['ok'] == 2
 assert _parse_mcp_body('') is None
-for bad in ('http://x/mcp', 'https://user:pw@x/mcp', 'https://x/mcp#frag'):
+for bad in ('http://x/mcp', 'https://user:pw@x/mcp', 'https://x/mcp#frag',
+            'https://100.100.100.200/mcp'):
     try:
         assert_safe_url(bad)
         raise SystemExit('guard failed to reject ' + bad)

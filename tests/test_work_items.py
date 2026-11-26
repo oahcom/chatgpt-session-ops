@@ -18,12 +18,14 @@ if str(ROOT) not in sys.path:
 
 from src.session_ops.work_items import (  # noqa: E402
     DEFAULT_DATABASE_PATH,
+    InvalidSessionId,
     InvalidTransition,
     InvalidWorkItemId,
     SessionAlreadyLinked,
     WorkItemNotFound,
     WorkItemStore,
     new_work_item_id,
+    validate_session_id,
     validate_work_item_id,
 )
 
@@ -72,9 +74,28 @@ class WorkItemIdentityTestCase(WorkItemTestCase):
                 with self.assertRaises(InvalidWorkItemId):
                     validate_work_item_id(bad)
                 with self.assertRaises(InvalidWorkItemId):
-                    self.store.link_session("session-a", bad)
+                    self.store.link_session("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70", bad)
                 with self.assertRaises(InvalidWorkItemId):
                     self.store.set_status(bad, "paused")
+
+    def test_session_id_must_be_canonical_uuid(self) -> None:
+        # Issue #109: the loose "session-*" literal must no longer be accepted.
+        rejected = [
+            "session-a",
+            "",
+            "   ",
+            "Quarterly planning call",
+            str(uuid.uuid4()).upper(),
+            str(uuid.uuid4()).replace("-", ""),
+            None,
+        ]
+        item = self.store.create_work_item()
+        for bad in rejected:
+            with self.subTest(bad=bad):
+                with self.assertRaises(InvalidSessionId):
+                    validate_session_id(bad)
+                with self.assertRaises(InvalidSessionId):
+                    self.store.link_session(bad, item.work_item_id)
 
 
 class WorkItemPersistenceTestCase(WorkItemTestCase):
@@ -114,15 +135,15 @@ class SessionLinkTestCase(WorkItemTestCase):
         # Assertion 5
         unknown = "wi_" + str(uuid.uuid4())
         with self.assertRaises(WorkItemNotFound):
-            self.store.link_session("session-a", unknown)
-        self.assertIsNone(self.store.get_active_link("session-a"))
+            self.store.link_session("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70", unknown)
+        self.assertIsNone(self.store.get_active_link("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70"))
         self.assertEqual(self.store.list_sessions(unknown), [])
 
     def test_multiple_sessions_link_one_work_item(self) -> None:
         # Assertion 6
         item = self.store.create_work_item()
-        first = self.store.link_session("session-a", item.work_item_id)
-        second = self.store.link_session("session-b", item.work_item_id)
+        first = self.store.link_session("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70", item.work_item_id)
+        second = self.store.link_session("9a8b7c6d-1e2f-4a3b-8c4d-5e6f7a8b9c0d", item.work_item_id)
         self.assertNotEqual(first.link_id, second.link_id)
         self.assertEqual(first.work_item_id, item.work_item_id)
         self.assertEqual(second.work_item_id, item.work_item_id)
@@ -130,51 +151,51 @@ class SessionLinkTestCase(WorkItemTestCase):
         links = self.store.list_sessions(item.work_item_id)
         self.assertEqual(
             sorted(link.session_id for link in links),
-            ["session-a", "session-b"],
+            ["6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70", "9a8b7c6d-1e2f-4a3b-8c4d-5e6f7a8b9c0d"],
         )
 
     def test_session_cannot_have_two_active_links(self) -> None:
         # Assertion 7
         first_item = self.store.create_work_item()
         second_item = self.store.create_work_item()
-        self.store.link_session("session-a", first_item.work_item_id)
+        self.store.link_session("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70", first_item.work_item_id)
         with self.assertRaises(SessionAlreadyLinked):
-            self.store.link_session("session-a", second_item.work_item_id)
-        active = self.store.get_active_link("session-a")
+            self.store.link_session("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70", second_item.work_item_id)
+        active = self.store.get_active_link("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70")
         self.assertIsNotNone(active)
         assert active is not None
         self.assertEqual(active.work_item_id, first_item.work_item_id)
         self.assertEqual(self.store.list_sessions(second_item.work_item_id), [])
         # Linking a Session elsewhere must not auto-unlink it.
         self.assertIsNone(
-            self.store.get_active_link("session-a").unlinked_at
+            self.store.get_active_link("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70").unlinked_at
         )
 
     def test_unlink_preserves_history_row(self) -> None:
         # Assertion 8
         item = self.store.create_work_item()
-        linked = self.store.link_session("session-a", item.work_item_id)
-        unlinked = self.store.unlink_session("session-a")
+        linked = self.store.link_session("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70", item.work_item_id)
+        unlinked = self.store.unlink_session("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70")
         self.assertIsNotNone(unlinked)
         assert unlinked is not None
         self.assertEqual(unlinked.link_id, linked.link_id)
         self.assertIsNotNone(unlinked.unlinked_at)
         self.assertGreaterEqual(unlinked.unlinked_at, linked.linked_at)
-        self.assertIsNone(self.store.get_active_link("session-a"))
+        self.assertIsNone(self.store.get_active_link("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70"))
         self.assertEqual(self.store.list_sessions(item.work_item_id), [])
         history = self.store.list_sessions(
             item.work_item_id, include_unlinked=True
         )
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0].link_id, linked.link_id)
-        self.assertIsNone(self.store.unlink_session("session-a"))
+        self.assertIsNone(self.store.unlink_session("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70"))
 
     def test_relink_creates_new_link_id(self) -> None:
         # Assertion 9
         item = self.store.create_work_item()
-        first = self.store.link_session("session-a", item.work_item_id)
-        self.store.unlink_session("session-a")
-        second = self.store.link_session("session-a", item.work_item_id)
+        first = self.store.link_session("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70", item.work_item_id)
+        self.store.unlink_session("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70")
+        second = self.store.link_session("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70", item.work_item_id)
         self.assertNotEqual(first.link_id, second.link_id)
         history = self.store.list_sessions(
             item.work_item_id, include_unlinked=True
@@ -187,15 +208,17 @@ class SessionLinkTestCase(WorkItemTestCase):
 
     def test_terminal_work_item_rejects_new_session_link(self) -> None:
         # Assertion 10
-        for terminal in ("completed", "cancelled"):
+        terminal_sessions = {
+            "completed": "c1c1c1c1-1111-4111-8111-111111111111",
+            "cancelled": "c2c2c2c2-2222-4222-8222-222222222222",
+        }
+        for terminal, session_id in terminal_sessions.items():
             with self.subTest(terminal=terminal):
                 item = self.store.create_work_item()
                 self.store.set_status(item.work_item_id, terminal)
                 with self.assertRaises(InvalidTransition):
-                    self.store.link_session("session-" + terminal, item.work_item_id)
-                self.assertIsNone(
-                    self.store.get_active_link("session-" + terminal)
-                )
+                    self.store.link_session(session_id, item.work_item_id)
+                self.assertIsNone(self.store.get_active_link(session_id))
 
 
 class WorkItemLifecycleTestCase(WorkItemTestCase):
@@ -270,9 +293,9 @@ class ExistingPersistenceTestCase(WorkItemTestCase):
         self.assertTrue(before, "chatgpt_send.py must exist")
 
         item = self.store.create_work_item()
-        self.store.link_session("session-a", item.work_item_id)
+        self.store.link_session("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70", item.work_item_id)
         self.store.set_status(item.work_item_id, "paused")
-        self.store.unlink_session("session-a")
+        self.store.unlink_session("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70")
 
         after = {
             path.name: hashlib.sha256(path.read_bytes()).hexdigest()
