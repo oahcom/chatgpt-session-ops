@@ -4907,9 +4907,8 @@ class ChatGPTAPI:
             # 关键：已收到的字节里通常已包含 conversation_id 与大部分回复，
             # 整包当失败会导致「换身份重投 → 同一 prompt 建出两个会话」。
             # 现在与超时同路：明确标记 + 落盘，字节不丢。
-            part = getattr(e, "partial", b"") or b""
-            if part:
-                sink.append(part)
+            # 注意：partial 已由 _read_stream() 在抛空前追加进 sink（它保证直接调用
+            # 也不丢字节），此处不能再追加一次，否则 13 字节变 26 字节、正文重复。
             return self._partial_result(
                 b"".join(sink), t0, "IncompleteRead: %s" % (e,), marker="PARTIAL")
         except (socket.timeout, TimeoutError) as e:
