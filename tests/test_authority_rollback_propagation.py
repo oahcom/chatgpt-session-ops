@@ -161,39 +161,82 @@ class RollbackPropagationTests(unittest.TestCase):
 
     # -- initialize (660 inner migration guard, 694 outer guard) ---------
 
+    def _legacy_landing_schema(self) -> None:
+        """Replace the landing table with the pre-migration (legacy) shape."""
+        conn = self._raw()
+        try:
+            conn.execute("DROP TABLE authority_landing_events")
+            conn.execute(
+                "CREATE TABLE authority_landing_events ("
+                "event_id TEXT PRIMARY KEY NOT NULL, "
+                "session_id TEXT NOT NULL, "
+                "match TEXT NOT NULL "
+                "CHECK (match IN ('confirmed', 'mismatch', 'ambiguous')), "
+                "evidence_complete INTEGER NOT NULL "
+                "CHECK (evidence_complete IN (0, 1)), "
+                "created_at TEXT NOT NULL, "
+                "consumed_at TEXT)"
+            )
+            conn.execute(
+                "INSERT INTO authority_landing_events VALUES "
+                "('le_legacy', ?, 'confirmed', 1, '2026-01-01T00:00:00.000000Z', NULL)",
+                (SESSION_A,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _landing_columns(self) -> set:
+        conn = self._raw()
+        try:
+            return {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(authority_landing_events)"
+                ).fetchall()
+            }
+        finally:
+            conn.close()
+
     def test_initialize_migration_failure_propagates_and_rolls_back_schema(
         self,
     ) -> None:
         """Line 660: a failure inside the landing migration transaction.
 
-        The failure is injected at the CREATE INDEX that runs *after* the four
-        ``ALTER TABLE ... ADD COLUMN`` statements, so a working rollback is
-        observable: the new columns must not exist afterwards.
+        A legacy landing table is installed first, so the four
+        ``ALTER TABLE ... ADD COLUMN`` statements really execute.  The failure
+        is injected at the CREATE INDEX that runs after them: a working
+        rollback leaves the legacy schema and the legacy row untouched.
         """
+        self._legacy_landing_schema()
+        self.assertNotIn("work_item_id", self._landing_columns())
+
         with self._failing_connection(MARKER_MIGRATION_INDEX):
             with self.assertRaises(sqlite3.OperationalError):
                 self.store.initialize()
 
-        columns = {
-            row["name"]
-            for row in self._raw()
-            .execute("PRAGMA table_info(authority_landing_events)")
-            .fetchall()
-        }
+        columns = self._landing_columns()
         self.assertNotIn("work_item_id", columns)
         self.assertNotIn("attempt_id", columns)
         self.assertNotIn("rejected_at", columns)
         self.assertNotIn("rejection_reason", columns)
+        self.assertEqual(
+            self._raw_scalar(
+                "SELECT match FROM authority_landing_events WHERE event_id = 'le_legacy'"
+            ),
+            "confirmed",
+        )
 
         # The database is still usable: the migration can be retried.
         self.store.initialize()
-        columns = {
-            row["name"]
-            for row in self._raw()
-            .execute("PRAGMA table_info(authority_landing_events)")
-            .fetchall()
-        }
+        columns = self._landing_columns()
         self.assertIn("work_item_id", columns)
+        self.assertEqual(
+            self._raw_scalar(
+                "SELECT match FROM authority_landing_events WHERE event_id = 'le_legacy'"
+            ),
+            "ambiguous",
+        )
 
     def test_initialize_reconciliation_failure_propagates_and_keeps_link(
         self,
