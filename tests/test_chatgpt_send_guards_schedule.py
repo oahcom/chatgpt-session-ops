@@ -8,21 +8,24 @@ Every test here therefore pins the exception TYPE and the FULL message, and
 pairs each rejection with an acceptance case (a guard that always raised would
 fail the acceptance half).
 
-Pinned guards (line numbers on main @ de92dc1):
+Pinned guards — locate them by **function name + guard text**, not by the line
+numbers (those are "as of de92dc1" and drift as the file grows):
 
-    check_schedule      568 rrule 为空          570 rrule 含空白字符
-                        587 rrule 缺 FREQ       589 FREQ 必须 HOURLY
-                        595 INTERVAL 过长        597 INTERVAL 非十进制整数
-    check_oneshot       640 scheduledAt 非 ISO  642 scheduledAt 缺时区
-    validate_prompt_text 6508 空文件            6510 含 NUL
-    _send_prompt_impl   6609 resolver 返回无效思考模型
-    resolve_thinking_model 4810 ThinkingModelUnavailable
-    ThinkingModelUnavailable.__init__ 4274 非法 reason_code
-    ChatGPTAPI.__init__ 4314 非法 account       4333 cookies 非数组
+    check_schedule()          568 "rrule 为空"      570 "rrule 含空白字符"
+                              587 "rrule 缺 FREQ"   589 "FREQ 必须 HOURLY"
+                              595 "INTERVAL 过长"    597 "INTERVAL 不是 RFC 十进制整数"
+    check_oneshot()           640 "scheduledAt 不是 ISO 8601"  642 "scheduledAt 缺时区偏移"
+    validate_prompt_text()    6508 "提示词文件为空"  6510 "提示词文件含 NUL"
+    _send_prompt_impl()       6609 "resolver 返回了无效思考模型"
+    resolve_thinking_model()  4810 unavailable() -> ThinkingModelUnavailable
+    ThinkingModelUnavailable.__init__  4274 "invalid thinking failure reason"
+    ChatGPTAPI.__init__       4314 "account must be one of"  4333 "格式不对：应为 cookie 数组"
 """
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import tempfile
@@ -236,7 +239,9 @@ class SendPromptThinkingGuardTests(unittest.TestCase):
 
     def test_valid_thinking_model_passes_the_guard(self):
         """Acceptance pair: a -t- slug is allowed through (later failure only)."""
-        with mock.patch.object(sender.time, "sleep", lambda *_: None):
+        noise = io.StringIO()
+        with mock.patch.object(sender.time, "sleep", lambda *_: None), \
+                contextlib.redirect_stdout(noise):
             try:
                 result = sender._send_prompt_impl(
                     _InvalidThinkingResolverAPI("gpt-6-t-mini"),
@@ -326,14 +331,15 @@ class CredentialIdentityGuardTests(unittest.TestCase):
         """4314: account must be a configured identity, not a path fragment."""
         with self.assertRaises(ValueError) as ctx:
             sender.ChatGPTAPI(base_dir=self.root, account="acct7")
-        message = str(ctx.exception)
-        self.assertTrue(message.startswith("account must be one of "),
-                        message)
-        self.assertIn("acct1", message)
-        self.assertIn("nologin", message)
+        self.assertEqual(
+            str(ctx.exception),
+            "account must be one of acct1, acct2, acct3, acct4, acct5, "
+            "acct6, default, nologin",
+        )
 
     def test_accepts_configured_account(self):
-        """Acceptance pair for 4314: a known identity constructs normally."""
+        """Acceptance pair for 4314 and 4333: a known identity with an array
+        of cookies constructs normally."""
         self._write_account("acct2", [
             {"name": "a", "value": "b", "domain": ".chatgpt.com"},
         ])
@@ -352,7 +358,8 @@ class CredentialIdentityGuardTests(unittest.TestCase):
         )
 
     def test_nologin_skips_cookie_files(self):
-        """Acceptance pair for 4333: the anon identity needs no cookie array."""
+        """Branch check, not an acceptance pair for 4333 (nologin never reaches
+        the cookie-array guard): the anon identity reads no credential files."""
         api = sender.ChatGPTAPI(base_dir=self.root, account="nologin")
         self.assertEqual(api.cookies, [])
         self.assertEqual(api.token, "")
