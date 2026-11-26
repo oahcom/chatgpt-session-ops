@@ -613,8 +613,8 @@ class MCPContractTests(unittest.TestCase):
         )
 
     def test_string_argument_too_long_is_rejected(self):
-        # The schema maxLength fires before the dedicated cursor bound,
-        # which makes the later "cursor is too long" branch unreachable.
+        # maxLength is the single source of the cursor bound; the dedicated
+        # "cursor is too long" branch was deleted in #125.
         self.assert_argument_rejected(
             "work_item.list",
             {"cursor": "x" * (MAX_CURSOR_CHARS + 1)},
@@ -853,6 +853,18 @@ class ArgumentValidationTests(unittest.TestCase):
             _validate_arguments(tool, arguments)
         self.assertEqual(str(ctx.exception), message)
 
+    def test_unknown_tool(self):
+        self.assert_rejected("no.such.tool", {}, "unknown tool")
+
+    def test_arguments_must_be_an_object(self):
+        # None is coerced to {} before the type check, so it never reaches
+        # this branch; only a non-None non-Mapping does.
+        for value in ([], "x", 5):
+            with self.subTest(value=value):
+                self.assert_rejected(
+                    "work_item.get", value, "arguments must be an object"
+                )
+
     def test_required_argument_missing(self):
         self.assert_rejected("work_item.get", {}, "required argument missing")
 
@@ -873,6 +885,15 @@ class ArgumentValidationTests(unittest.TestCase):
             "session.context",
             {"session_id": SESSION_ID, "query": "a" * 2049},
             "string argument too long",
+        )
+
+    def test_query_must_not_be_blank(self):
+        # Whitespace passes minLength and maxLength, so this is the only
+        # branch that rejects it.
+        self.assert_rejected(
+            "session.context",
+            {"session_id": SESSION_ID, "query": "   "},
+            "query must not be blank",
         )
 
     def test_string_argument_is_not_an_allowed_value(self):
@@ -912,18 +933,20 @@ class ArgumentValidationTests(unittest.TestCase):
             "boolean argument required",
         )
 
-    def test_cursor_length_guard_cannot_be_reached(self):
-        # "cursor is too long" is dead code: the schema declares
-        # maxLength == MAX_CURSOR_CHARS, so the string branch rejects a
-        # longer cursor first and an equal one passes this guard. Pinned so
-        # that the branch is either removed or made reachable on purpose.
+    def test_cursor_bound_is_the_schema_max_length(self):
+        # #125 deleted the "cursor is too long" branch because the schema
+        # maxLength is identical and strictly earlier. This pins the schema as
+        # the single source: the limit is enforced, and the message names the
+        # generic string branch, not a cursor-specific one.
         self.assertEqual(MAX_CURSOR_CHARS, 2048)
 
-        self.assert_rejected(
-            "work_item.list",
-            {"cursor": "x" * (MAX_CURSOR_CHARS + 1)},
-            "string argument too long",
-        )
+        for tool in ("work_item.list", "session.list"):
+            with self.subTest(tool=tool):
+                arguments = {"cursor": "x" * (MAX_CURSOR_CHARS + 1)}
+                if tool == "session.list":
+                    arguments["work_item_id"] = WORK_ITEM_ID
+                self.assert_rejected(tool, arguments, "string argument too long")
+
         accepted = _validate_arguments(
             "work_item.list", {"cursor": "x" * MAX_CURSOR_CHARS}
         )
