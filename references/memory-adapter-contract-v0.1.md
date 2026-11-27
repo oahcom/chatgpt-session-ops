@@ -100,13 +100,27 @@ Transport uses UTF-8 JSON Lines.
 For v0.1:
 
 - One request per process invocation.
-- One JSON request line on stdin.
+- The first complete JSON request line is the only request
+  processed by that invocation.
+- A newline terminates a request line. EOF also terminates
+  a final non-empty request line without a trailing newline.
+- The process MUST NOT execute a second request from the same
+  stdin stream.
+- The process MUST NOT wait for stdin EOF after receiving a
+  complete request line.
+- Input following the first request line is never processed.
+- The client is not required to close stdin before receiving
+  the response.
 - One JSON response line on stdout.
-- EOF terminates the request.
 - stdout contains protocol data only.
 - stderr contains diagnostic information only.
 - No interactive prompts.
 - No build output on stdout.
+
+An empty stdin stream, a blank first line, or a malformed first
+request produces one INVALID_REQUEST response and no operation
+is executed. Later input is not used to repair an invalid first
+request.
 
 A successfully emitted protocol response uses process exit code 0,
 including application-level error responses.
@@ -115,6 +129,11 @@ Process launch failure, timeout or abnormal termination is
 reported by the SO client as a transport error.
 
 The SO client must never parse diagnostic stderr as a response.
+
+This is a clarification of the existing v0.1 one-request-per-process
+rule: a conforming caller already sends one request, so no protocol
+version change is required. A future persistent multi-request stream
+would require a separately versioned contract decision.
 
 ## 6. Request envelope
 
@@ -246,6 +265,7 @@ Optional:
 - session_id
 - limit, default 10
 - threshold, default 0.34
+- max_chars, optional positive integer; absent or null means unbounded
 
 Constraints:
 - work_item_id must pass identifier validation.
@@ -257,6 +277,23 @@ Constraints:
   remain restricted to the explicit work_item_id.
 - Implementations MUST NOT interpret an absent session_id as an
   unrestricted or global search.
+
+v0.1 clarification: `session_id` is optional in `retrieve`. Omitting it means
+cross-Session retrieval inside the same `work_item_id`; it is never a global
+search.
+
+v0.1 clarification: `max_chars`, when present and non-null, MUST be a
+positive integer. The budget is measured by Unicode scalar values in each
+entry's `content` only. If an entry would exceed the remaining aggregate
+budget, that whole entry is omitted; content is never truncated. An absent
+or null `max_chars` means unbounded.
+
+The current Session Ops client does not send `max_chars` in v0.1. It keeps
+its existing context entry-count and per-entry content checks. The optional
+Adapter budget remains available to other callers; it is not a hard resource
+or response-byte limit and does not bound request bytes, metadata, JSON
+envelope bytes, or Core allocations. Those hard bounds are tracked separately
+by Adapter #36 and Session Ops #165.
 
 The retrieval scope is always the explicit WorkItem.
 
@@ -335,6 +372,17 @@ several Sessions inside that WorkItem:
 }
 
 An empty entries array is a successful result.
+
+`entries_omitted` counts only entries excluded because they do not fit
+the aggregate `max_chars` character budget. It does not count entries
+excluded by the result-count `limit`; therefore it is not a count of all
+matching entries that were not returned.
+
+Every returned entry's `provenance` field is a JSON object. If the stored
+record has no object at the reserved `_so_contract.provenance` location
+(including missing, null, or non-object values), the Adapter returns an empty
+object `{}`. This shape normalization does not invent or reconstruct
+historical provenance.
 
 The score represents the MA retrieval score.
 
