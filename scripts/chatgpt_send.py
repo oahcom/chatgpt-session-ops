@@ -2615,7 +2615,10 @@ def _git_sha():
     try:
         out = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=os.path.dirname(os.path.abspath(__file__)),
-            capture_output=True, text=True, timeout=5,
+            # text=True 会按本机代码页解码（中文 Windows = cp936）；显式 UTF-8
+            # 才能与本仓库的编码约定一致，坏字节按 replace 保留而不是抛异常。
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -8133,6 +8136,8 @@ def require_trusted_worktree_root():
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
         if completed.returncode != 0:
