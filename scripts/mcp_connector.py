@@ -90,7 +90,11 @@ def _embedded_ipv4(ip):
 
 
 def _is_public_destination(ip) -> bool:
-    """True only for a globally routable address, embedded IPv4 included."""
+    """True only for a globally routable address, embedded IPv4 included.
+
+    CPython 3.11 lists 2002::/16 as private and 3.12 does not, so the envelope
+    alone is not a stable answer for 6to4; decoding the carried address is.
+    """
     if (ip in CGNAT_NETWORK or not ip.is_global or ip.is_private
             or ip.is_loopback or ip.is_link_local
             or ip.is_reserved or ip.is_multicast or ip.is_unspecified):

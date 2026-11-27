@@ -268,12 +268,28 @@ class TestTransitionFormRejections(GuardTestCase):
                         f"{ip} resolves to {shown}",
                     )
 
-    def test_public_embedded_address_allowed(self):
-        # 2002:0808:0808:: carries 8.8.8.8; 2001:4860:4860::8888 tunnels nothing.
-        for ip in ("2002:808:808::1", "2001:4860:4860::8888"):
+    def test_public_addresses_still_allowed(self):
+        # The positive control has to be public on every supported runtime.
+        # 2002:808:808::1 is not: Python 3.11 lists 2002::/16 as private, so the
+        # envelope alone already rejects it there, while 3.12 does not and the
+        # embedded 8.8.8.8 decides. That divergence is why the decode is pinned
+        # separately below instead of being asserted through the guard.
+        for ip in ("2001:4860:4860::8888", "1.1.1.1"):
+            url = f"https://[{ip}]/mcp" if ":" in ip else f"https://{ip}/mcp"
             with self.subTest(ip=ip):
                 with mock.patch.object(socket, "getaddrinfo", _resolver({ip: (ip,)})):
-                    self.assert_allowed(f"https://[{ip}]/mcp")
+                    self.assert_allowed(url)
+
+    def test_public_embedded_ipv4_is_not_itself_unsafe(self):
+        # What a 6to4 envelope carries is judged on its own merits.
+        self.assertTrue(
+            mcp_connector._is_public_destination(ipaddress.ip_address("8.8.8.8"))
+        )
+        self.assertEqual(
+            str(mcp_connector._embedded_ipv4(
+                ipaddress.ip_address("2002:808:808::1"))),
+            "8.8.8.8",
+        )
 
 
 if __name__ == "__main__":
