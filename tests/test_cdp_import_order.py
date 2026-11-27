@@ -211,6 +211,9 @@ class TestCdpImportFailureBranches(unittest.TestCase):
         self._old_env = os.environ.get("CHATGPT_CDP_DIR")
         self._old_mods = {n: sys.modules.get(n) for n in self._MODNAMES}
         self._old_cache = dict(_CACHE)
+        # 先摘掉进程里可能残留的 cdp：它优先于 sys.path，留着就永远读不到
+        # self.tmp 里的 stub，四个用例会以 "Exception not raised" 假红。
+        sys.modules.pop("cdp", None)
         sys.path.insert(0, self.tmp)
         os.environ["CHATGPT_CDP_DIR"] = self.tmp
         self.addCleanup(self._restore)
