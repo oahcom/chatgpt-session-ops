@@ -255,7 +255,7 @@ Optional:
 - session_id
 - limit, default 10
 - threshold, default 0.34
-- max_chars, no default (unbounded)
+- max_chars, optional positive integer; absent or null means unbounded
 
 Constraints:
 - work_item_id must pass identifier validation.
