@@ -30,6 +30,20 @@ from src.session_ops.work_items import (  # noqa: E402
 )
 
 
+def raised_by(callable_, *args, **kwargs):
+    """Return the exception raised by ``callable_``, or ``None``.
+
+    Guard tests capture the exception here instead of using ``assertRaises``
+    so that a removed guard surfaces as an AssertionError on the type/message
+    assertion, not as an error raised from deeper code.
+    """
+    try:
+        callable_(*args, **kwargs)
+    except BaseException as exc:  # noqa: BLE001 - asserted by the caller
+        return exc
+    return None
+
+
 class WorkItemTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmpdir = tempfile.mkdtemp(prefix="so-work-items-")
@@ -77,6 +91,21 @@ class WorkItemIdentityTestCase(WorkItemTestCase):
                     self.store.link_session("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70", bad)
                 with self.assertRaises(InvalidWorkItemId):
                     self.store.set_status(bad, "paused")
+
+    def test_non_string_work_item_id_is_rejected(self) -> None:
+        # Issue #153: pin the isinstance guard by type AND exact message.
+        # Without it, None/123 reach .startswith() and raise AttributeError.
+        bad_values = (
+            None,
+            123,
+            b"wi_" + uuid.uuid4().bytes,
+            ["wi_" + str(uuid.uuid4())],
+        )
+        for bad in bad_values:
+            with self.subTest(bad=bad):
+                exc = raised_by(validate_work_item_id, bad)
+                self.assertIs(type(exc), InvalidWorkItemId)
+                self.assertEqual(str(exc), "work_item_id must be a string")
 
     def test_session_id_must_be_canonical_uuid(self) -> None:
         # Issue #109: the loose "session-*" literal must no longer be accepted.
@@ -158,10 +187,20 @@ class SessionLinkTestCase(WorkItemTestCase):
         # Assertion 7
         first_item = self.store.create_work_item()
         second_item = self.store.create_work_item()
-        self.store.link_session("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70", first_item.work_item_id)
-        with self.assertRaises(SessionAlreadyLinked):
-            self.store.link_session("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70", second_item.work_item_id)
-        active = self.store.get_active_link("6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70")
+        session_id = "6f1c2a3e-0d4b-4c8a-9f11-2b3c4d5e6f70"
+        self.store.link_session(session_id, first_item.work_item_id)
+        # Issue #153: pin the explicit pre-check by type AND exact message.
+        # Without it the INSERT hits the partial UNIQUE index and a raw
+        # sqlite3.IntegrityError escapes instead of SessionAlreadyLinked.
+        exc = raised_by(
+            self.store.link_session, session_id, second_item.work_item_id
+        )
+        self.assertIs(type(exc), SessionAlreadyLinked)
+        self.assertEqual(
+            str(exc),
+            "session %s already has an active work item link" % session_id,
+        )
+        active = self.store.get_active_link(session_id)
         self.assertIsNotNone(active)
         assert active is not None
         self.assertEqual(active.work_item_id, first_item.work_item_id)
@@ -246,11 +285,54 @@ class WorkItemLifecycleTestCase(WorkItemTestCase):
                         )
                         self.assertEqual(updated.status, target)
                     else:
-                        with self.assertRaises(InvalidTransition):
+                        # Issue #153: every rejected pair here has a terminal
+                        # source, so assert the terminal message exactly. A
+                        # type-only assertion cannot tell the terminal guard
+                        # apart from the generic transition guard.
+                        with self.assertRaisesRegex(
+                            InvalidTransition,
+                            r"^terminal work item %s cannot transition to %s$"
+                            % (item.work_item_id, target),
+                        ):
                             self.store.set_status(item.work_item_id, target)
                         stored = self.store.get_work_item(item.work_item_id)
                         assert stored is not None
                         self.assertEqual(stored.status, source)
+
+    def test_terminal_status_cannot_transition_to_any_other_status(self) -> None:
+        # Issue #153: pin the terminal guard for every terminal source/target.
+        for terminal in ("completed", "cancelled"):
+            for target in ("active", "paused", "completed", "cancelled"):
+                if target == terminal:
+                    continue
+                with self.subTest(terminal=terminal, target=target):
+                    item = self.store.create_work_item()
+                    self.store.set_status(item.work_item_id, terminal)
+                    exc = raised_by(
+                        self.store.set_status, item.work_item_id, target
+                    )
+                    self.assertIs(type(exc), InvalidTransition)
+                    self.assertEqual(
+                        str(exc),
+                        "terminal work item %s cannot transition to %s"
+                        % (item.work_item_id, target),
+                    )
+                    stored = self.store.get_work_item(item.work_item_id)
+                    assert stored is not None
+                    self.assertEqual(stored.status, terminal)
+
+    def test_unknown_status_is_rejected(self) -> None:
+        # Issue #153: pin the STATUSES guard by type AND exact message. A
+        # type-only assertion cannot distinguish this from the SQLite CHECK
+        # constraint violation that fires once the guard is gone.
+        item = self.store.create_work_item()
+        exc = raised_by(self.store.set_status, item.work_item_id, "frozen")
+        self.assertIs(type(exc), InvalidTransition)
+        self.assertEqual(str(exc), "unknown status: 'frozen'")
+        stored = self.store.get_work_item(item.work_item_id)
+        assert stored is not None
+        self.assertEqual(stored.status, "active")
+        self.assertEqual(stored.updated_at, item.updated_at)
 
     def test_unknown_work_item_status_change_rejected(self) -> None:
         with self.assertRaises(WorkItemNotFound):
