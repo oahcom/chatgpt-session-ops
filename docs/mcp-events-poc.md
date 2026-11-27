@@ -97,10 +97,10 @@ This two-stage outbox prevents a crash between job completion and event publicat
 
 Executed with the installed MCP SDK environment (`/opt/so-mcp/.venv`):
 
-- Targeted MCP PoC + SDK + collector + worker tests: 34 passed, including Streamable HTTP lifecycle, sender-event deduplication, success/failure event delivery, resource-access revocation, transient authorization retry, retention cleanup, callback 410 deactivation, expiry, private database-directory checks, and subscribe-time race backfill/owner scoping.
+- Targeted MCP PoC + SDK + collector + worker tests: 35 passed, including Streamable HTTP lifecycle, sender-event deduplication, success/failure event delivery, resource-access revocation, transient authorization retry, retention cleanup, callback 410 deactivation, expiry, private database-directory checks, and subscribe-time race backfill/owner scoping.
 - Deployed MCP runtime snapshot tests: 4 passed, covering current deployed `mcp_server.py` protocol lifecycle, opt-in `create_application` wiring, key-file permissions, and ASGI worker startup/shutdown.
 - Isolated Sender Gateway outbox tests: 8 passed, including success/failure transaction rollback atomicity, terminal-only retention (pending and active leases survive), lease expiry/stale-ack protection, dispatcher-only routes, per-request SQLite connection cleanup across 40 HTTP requests, and an end-to-end local mTLS + HMAC identity pipeline from job completion through the deployed MCP collector to a mocked ChatGPT callback.
-- Full repository suite after authorization and retention hardening: 1285 tests passed, 7 skipped, exit code 0.
+- Full repository suite after authorization and retention hardening: 1286 tests passed, 7 skipped, exit code 0.
 - The clean-deployment patches (thread cleanup, full Sender outbox, MCP client, MCP server, MCP runtime, MCP event modules) apply in order to pristine copies of their exact deployed bases and compile. The incremental failure-event patch applies to the current production sender base and compiles. The new terminal-retention patch separately applies to the exact current production sender file and compiles.
 - Python compilation checks passed.
 - `git diff --check` passed.

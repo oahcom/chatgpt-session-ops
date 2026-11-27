@@ -13,7 +13,7 @@ These patches were generated from the live deployed Python source trees on 2026-
   - `mcp-sender-event-client.patch`: add `SenderGatewayClient.claim_events()` / `ack_event()` using the existing mTLS + service-token + HMAC identity assertion path.
   - `mcp-server-events.patch`: register MCP Events request handlers and advertise `capabilities.events`.
   - `mcp-runtime-events.patch`: add key-file loading, opt-in store creation, and ASGI-lifespan-managed collector/delivery workers.
-  - `mcp-event-modules.patch`: add `mcp_events.py`, `mcp_event_collector.py`, and `mcp_event_workers.py` with subscribe-time job ownership checks, per-delivery authorization rechecks, bounded retry, and retention cleanup.
+  - `mcp-event-modules.patch`: add `mcp_events.py`, `mcp_event_collector.py`, and `mcp_event_workers.py` with subscribe-time job ownership checks, per-delivery authorization and subscription-expiry rechecks immediately before callback I/O, bounded retry, and retention cleanup.
 
 `deployed-source.sha256` records the original deployed base before any Sender Gateway changes. `deployed-source-post-combined.sha256` records the production state after the combined cleanup + success-outbox patch and is the base for `sender-gateway-failed-terminal-event.patch`. `deployed-source-post-failure-event.sha256` records the current files after that incremental patch was applied to disk. `sender-original-base.sha256` records the original Sender Gateway files preserved under `/var/backups`. The sender-gateway and MCP client patches are not guaranteed to apply to the older `/srv/so-mcp-trusted` client file; the MCP client patch is based on the current deployed `/opt/so-mcp` version.
 

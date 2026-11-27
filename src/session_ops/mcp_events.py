@@ -573,39 +573,47 @@ class MCPEventsStore:
             if len(body) > MAX_EVENT_BYTES:
                 status = 413
             else:
-                with self._db() as db:
-                    active_row = db.execute(
-                        "SELECT active FROM event_subscriptions WHERE id=?",
-                        (row["subscription_id"],),
-                    ).fetchone()
-                if active_row is None or active_row["active"] != 1:
-                    status = 410
-                else:
-                    try:
-                        if authorize is not None:
-                            allowed = authorize(
-                                tenant_id=row["tenant_id"],
-                                principal_id=row["principal_id"],
-                                job_id=event["data"].get("job_id"),
-                            )
-                            if allowed is not True:
-                                status = 403
-                                raise PermissionError("event resource is no longer accessible")
+                try:
+                    if authorize is not None:
+                        allowed = authorize(
+                            tenant_id=row["tenant_id"],
+                            principal_id=row["principal_id"],
+                            job_id=event["data"].get("job_id"),
+                        )
+                        if allowed is not True:
+                            raise PermissionError("event resource is no longer accessible")
+                    # Recheck subscription state after the potentially slow
+                    # authorization round-trip and immediately before network I/O.
+                    # This prevents a lease claimed before expiry/unsubscribe from
+                    # sending a callback after that state transition.
+                    with self._db() as db:
+                        active_row = db.execute(
+                            "SELECT active, expires_at FROM event_subscriptions WHERE id=?",
+                            (row["subscription_id"],),
+                        ).fetchone()
+                    current_time = int(self.clock())
+                    if (
+                        active_row is None
+                        or active_row["active"] != 1
+                        or (active_row["expires_at"] is not None and active_row["expires_at"] <= current_time)
+                    ):
+                        status = 410
+                    else:
                         secret = self._decrypt_secret(row["subscription_id"], row["secret_enc"])
                         previous_secret = None
-                        if row["secret_prev_enc"] is not None and row["secret_prev_until"] is not None and row["secret_prev_until"] > now:
+                        if row["secret_prev_enc"] is not None and row["secret_prev_until"] is not None and row["secret_prev_until"] > current_time:
                             previous_secret = self._decrypt_secret(row["subscription_id"], row["secret_prev_enc"])
                         headers = _signed_headers(
                             row["subscription_id"], secret, row["event_id"], body,
                             previous_secret=previous_secret,
                         )
                         status, _ = self.post_json(row["callback_url"], body, headers)
-                    except PermissionError:
-                        # A definitive authorization denial is terminal and must
-                        # never be sent to the callback or retried.
-                        status = 403
-                    except Exception:
-                        status = 599
+                except PermissionError:
+                    # A definitive authorization denial is terminal and must
+                    # never be sent to the callback or retried.
+                    status = 403
+                except Exception:
+                    status = 599
             retryable = status not in (403, 410, 413) and (
                 status == 599 or status in (408, 429) or status >= 500
             )

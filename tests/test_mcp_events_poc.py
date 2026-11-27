@@ -157,6 +157,33 @@ class MCPEventsStoreTests(unittest.TestCase):
         self.assertEqual(row["status"], "failed")
         self.assertEqual(row["last_status"], 403)
 
+    def test_subscription_expiry_during_authorization_prevents_callback(self):
+        now = [1_800_000_000]
+        self.store.clock = lambda: now[0]
+        with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
+            subscription = self.store.subscribe(self.auth, {
+                "name": "chatgpt.job.completed",
+                "arguments": {"job_id": "job-expires-during-auth"},
+                "delivery": self.delivery,
+                "ttlMs": 60_000,
+            })
+        event_id = self.store.publish_job_completed(
+            "tenant-a", "issuer:user-a", "job-expires-during-auth", "Finished",
+            event_id="evt_expiry_during_auth",
+        )
+        def authorize(**_kwargs):
+            now[0] += 61
+            return True
+        self.assertEqual(self.store.deliver_pending(authorize=authorize), 0)
+        self.assertEqual(len(self.callback.requests), 1)  # challenge only; no event POST
+        with self.store._db() as db:
+            row = db.execute(
+                "SELECT status, last_status FROM event_deliveries WHERE event_id=? AND subscription_id=?",
+                (event_id, subscription["id"]),
+            ).fetchone()
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["last_status"], 410)
+
     def test_transient_authorization_check_failure_retries_without_delivery(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.subscribe(job_id="job-auth-transient")
