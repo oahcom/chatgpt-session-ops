@@ -4539,7 +4539,36 @@ def device_summary():
 _THINKING_MODEL_CACHE = {}
 # 默认思考模型优先级：清单里存在该 slug 时优先选它（用户裁定 2026-11-26）。
 # 只影响“自动选择”的排序；CHATGPT_MODEL 显式指定仍然最高优先。
-_PREFERRED_THINKING_SLUG = "gpt-6-t-mini"
+# 环境变量 CHATGPT_PREFERRED_THINKING 可覆盖它；未设置时用下面的默认值。
+_DEFAULT_PREFERRED_THINKING_SLUG = "gpt-6-t-mini"
+_PREFERRED_THINKING_SLUG = _DEFAULT_PREFERRED_THINKING_SLUG
+_PREFERRED_THINKING_ENV = "CHATGPT_PREFERRED_THINKING"
+_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _preferred_thinking_slug():
+    """优先思考模型 slug：CHATGPT_PREFERRED_THINKING > 默认 gpt-6-t-mini。
+
+    返回 (slug, source)，source 取 "env" 或 "default"。
+
+    非法配置直接抛 ValueError，不悄悄退回默认值：配置写错却照常选出默认模型，
+    等于让操作者以为“我设的优先模型生效了”——A27 要堵的正是这种静默回退。
+    """
+    raw = os.environ.get(_PREFERRED_THINKING_ENV)
+    if raw is None:
+        return _DEFAULT_PREFERRED_THINKING_SLUG, "default"
+    slug = raw.strip()
+    if not slug:
+        raise ValueError(
+            "%s 为空：删掉该变量走默认 %s，或给一个含 -t- 的 slug"
+            % (_PREFERRED_THINKING_ENV, _DEFAULT_PREFERRED_THINKING_SLUG)
+        )
+    if not _SLUG_RE.match(slug) or "-t-" not in slug:
+        raise ValueError(
+            "%s=%r 不是思考模型 slug（必须含 -t-，只允许字母数字 . _ -）"
+            % (_PREFERRED_THINKING_ENV, raw)
+        )
+    return slug, "env"
 
 class ThinkingModelUnavailable(RuntimeError):
     """当前账号无法满足强制思考模式要求。
@@ -5198,9 +5227,12 @@ class ChatGPTAPI:
         account = getattr(api, "account", "unknown")
         explicit = os.environ.get("CHATGPT_MODEL") or ""
 
-        # 显式模型配置也参与 cache key，避免切换 CHATGPT_MODEL 后
-        # 错误复用之前账号的模型。
-        key = (account, explicit)
+        # 优先 slug 先解析：非法配置必须在任何请求之前就炸，不能等拿到清单才发现。
+        preferred, preferred_source = _preferred_thinking_slug()
+
+        # 显式模型配置与优先 slug 都参与 cache key，避免切换 CHATGPT_MODEL 或
+        # 改 CHATGPT_PREFERRED_THINKING 后错误复用之前选定的模型。
+        key = (account, explicit, preferred)
 
         if key in cache:
             return cache[key]
@@ -5287,9 +5319,23 @@ class ChatGPTAPI:
 
         chosen = ""
 
-        # 优先级 0：清单里存在 gpt-6-t-mini 时默认选它。
-        if _PREFERRED_THINKING_SLUG in by_slug:
-            chosen = _PREFERRED_THINKING_SLUG
+        # 优先级 0：清单里存在优先 slug 时默认选它。
+        # 优先 slug 来自 CHATGPT_PREFERRED_THINKING，未设置时是默认值。
+        if preferred in by_slug:
+            chosen = preferred
+            print(
+                "thinking model: 优先命中 %s（source=%s）"
+                % (preferred, preferred_source),
+                flush=True,
+            )
+        else:
+            # 不能静默：优先候选缺失必须留下可 grep 的诊断，否则日志看起来
+            # 和“优先模型生效”一模一样。
+            print(
+                "thinking model: 优先候选 %s 不在清单里（source=%s），按后备顺序解析"
+                % (preferred, preferred_source),
+                flush=True,
+            )
 
         # 优先级 1：默认模型本身就是思考模型。
         if not chosen and "-t-" in default:
