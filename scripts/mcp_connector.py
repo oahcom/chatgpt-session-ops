@@ -71,6 +71,36 @@ class CheckError(Exception):
 
 # ---------------------------------------------------------------- url guard
 
+def _embedded_ipv4(ip):
+    """The IPv4 address an IPv6 transition form carries, or None.
+
+    6to4 (2002::/16) and IPv4-mapped (::ffff:0:0/96) store the address at a
+    fixed offset; Teredo (2001::/32) keeps the client address XOR-obfuscated in
+    the last 32 bits. ipaddress already decodes all three, so the guard only
+    has to ask rather than re-derive the bit layout.
+    """
+    if ip.version != 6:
+        return None
+    if ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    if ip.sixtofour is not None:
+        return ip.sixtofour
+    teredo = ip.teredo
+    return None if teredo is None else teredo[1]
+
+
+def _is_public_destination(ip) -> bool:
+    """True only for a globally routable address, embedded IPv4 included."""
+    if (ip in CGNAT_NETWORK or not ip.is_global or ip.is_private
+            or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+        return False
+    embedded = _embedded_ipv4(ip)
+    # One level only: an embedded address is IPv4, so the recursion ends there.
+    # ponytail: NAT64 64:ff9b::/96 is not unwrapped; add it when one shows up.
+    return embedded is None or _is_public_destination(embedded)
+
+
 def assert_safe_url(url: str) -> None:
     """Reject anything that could turn this CLI into an SSRF primitive."""
     p = urlparse(url)
@@ -92,9 +122,7 @@ def assert_safe_url(url: str) -> None:
         raise CheckError('UNSAFE_ENDPOINT', f'dns resolution failed: {e}') from e
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
-        if (ip in CGNAT_NETWORK or not ip.is_global or ip.is_private
-                or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified):
+        if not _is_public_destination(ip):
             raise CheckError('UNSAFE_ENDPOINT', f'{p.hostname} resolves to {ip}')
 
 
@@ -478,7 +506,9 @@ assert _parse_mcp_body('data: {"result":{"ok":1}}')['result']['ok'] == 1
 assert _parse_mcp_body('{"result":{"ok":2}}')['result']['ok'] == 2
 assert _parse_mcp_body('') is None
 for bad in ('http://x/mcp', 'https://user:pw@x/mcp', 'https://x/mcp#frag',
-            'https://100.100.100.200/mcp'):
+            'https://100.100.100.200/mcp',
+            'https://[2002::1]/', 'https://[2002:c0a8:101::1]/',
+            'https://[::ffff:127.0.0.1]/'):
     try:
         assert_safe_url(bad)
         raise SystemExit('guard failed to reject ' + bad)

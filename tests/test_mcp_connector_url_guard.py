@@ -217,5 +217,64 @@ class TestMalformedPort(GuardTestCase):
         )
 
 
+class TestTransitionFormRejections(GuardTestCase):
+    """IPv6 addresses that tunnel IPv4 (the ``2002::1`` defect).
+
+    ``2002::1`` is 6to4 carrying ``0.0.0.0`` and ``is_global`` is True, so a
+    guard that judges only the envelope accepted it. Teredo (``2001::/32``)
+    and IPv4-mapped (``::ffff:0:0/96``) hide an IPv4 address the same way.
+    Rejection follows the embedded address; a public embedded address must
+    still be allowed, or unwrapping becomes a blanket IPv6 ban.
+    """
+
+    EMBEDDED_NON_PUBLIC = (
+        ("2002::1", "0.0.0.0"),                      # 6to4, unspecified
+        ("2002:c0a8:101::1", "192.168.1.1"),         # 6to4, private
+        ("2002:7f00:1::", "127.0.0.1"),              # 6to4, loopback
+        ("2001:0:4136:e378:8000:63bf:f5ff:fffe", "10.0.0.1"),  # Teredo client
+        ("::ffff:127.0.0.1", "127.0.0.1"),           # IPv4-mapped, loopback
+        ("::ffff:10.0.0.1", "10.0.0.1"),             # IPv4-mapped, private
+    )
+
+    def test_embedded_address_is_decoded(self):
+        for ip, embedded in self.EMBEDDED_NON_PUBLIC:
+            with self.subTest(ip=ip):
+                self.assertEqual(
+                    str(mcp_connector._embedded_ipv4(ipaddress.ip_address(ip))),
+                    embedded,
+                )
+
+    def test_plain_addresses_embed_nothing(self):
+        for ip in ("1.1.1.1", "2001:4860:4860::8888"):
+            with self.subTest(ip=ip):
+                self.assertIsNone(
+                    mcp_connector._embedded_ipv4(ipaddress.ip_address(ip))
+                )
+
+    def test_embedded_non_public_rejected(self):
+        # Resolve through the fake resolver so the decision under test is the
+        # guard's, not the host's: a runner without IPv6 makes the real
+        # getaddrinfo fail, which would reject for the wrong reason.
+        for ip, _embedded in self.EMBEDDED_NON_PUBLIC:
+            with self.subTest(ip=ip):
+                with mock.patch.object(socket, "getaddrinfo", _resolver({ip: (ip,)})):
+                    # The message keeps the URL literal, then the parsed
+                    # address, which compresses IPv4-mapped forms
+                    # (::ffff:10.0.0.1 -> ::ffff:a00:1).
+                    shown = str(ipaddress.ip_address(ip))
+                    self.assert_rejected(
+                        f"https://[{ip}]/mcp",
+                        "UNSAFE_ENDPOINT",
+                        f"{ip} resolves to {shown}",
+                    )
+
+    def test_public_embedded_address_allowed(self):
+        # 2002:0808:0808:: carries 8.8.8.8; 2001:4860:4860::8888 tunnels nothing.
+        for ip in ("2002:808:808::1", "2001:4860:4860::8888"):
+            with self.subTest(ip=ip):
+                with mock.patch.object(socket, "getaddrinfo", _resolver({ip: (ip,)})):
+                    self.assert_allowed(f"https://[{ip}]/mcp")
+
+
 if __name__ == "__main__":
     unittest.main()
