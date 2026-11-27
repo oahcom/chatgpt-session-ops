@@ -194,6 +194,94 @@ class TestCdpResolution(unittest.TestCase):
         self.assertNotIn("CDP_UNAVAILABLE", msg)
 
 
+class TestCdpImportFailureBranches(unittest.TestCase):
+    """#156：两份副本的「内部依赖缺失」「初始化失败」分支各补断言。
+
+    这四条分支都在模块级 `from cdp import CDPClient` 期间触发，stub 的 `cdp`
+    若留在 sys.modules，会污染同进程后续用例（`_load` 还会把模块塞进 _CACHE），
+    所以每个用例都在 addCleanup 里还原 sys.path、sys.modules 与 _CACHE。
+    """
+
+    _MODNAMES = ("cdp", "p2a_under_test_extract_auth",
+                 "p2a_under_test_continue_full")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="p2a-cdp-boom-")
+        self._old_path = list(sys.path)
+        self._old_env = os.environ.get("CHATGPT_CDP_DIR")
+        self._old_mods = {n: sys.modules.get(n) for n in self._MODNAMES}
+        self._old_cache = dict(_CACHE)
+        sys.path.insert(0, self.tmp)
+        os.environ["CHATGPT_CDP_DIR"] = self.tmp
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        for name in self._MODNAMES:
+            sys.modules.pop(name, None)
+            if self._old_mods[name] is not None:
+                sys.modules[name] = self._old_mods[name]
+        _CACHE.clear()
+        _CACHE.update(self._old_cache)
+        sys.path[:] = self._old_path
+        if self._old_env is None:
+            os.environ.pop("CHATGPT_CDP_DIR", None)
+        else:
+            os.environ["CHATGPT_CDP_DIR"] = self._old_env
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_cdp(self, body):
+        with open(os.path.join(self.tmp, "cdp.py"), "w", encoding="utf-8") as f:
+            f.write(body)
+
+    def _branch_error(self, name):
+        """加载模块并触发 `_cdp_client()`，返回它抛出的异常。
+
+        宽口径 assertRaises 是刻意的：把对应 `raise CdpUnavailable(...)` 变异成
+        `pass` 后 `_client` 未绑定，`return _client` 抛 UnboundLocalError。窄口径
+        assertRaises(CdpUnavailable) 会把它原样抛穿，失败点落在 `return _client`
+        上，看起来像产品 bug；宽口径才能让失败停在下面的断言行。
+        """
+        mod = _load(name, force=True)
+        with self.assertRaises(Exception) as ctx:
+            mod._cdp_client()
+        return mod, ctx.exception
+
+    def test_extract_auth_init_failure_reports_exception_type(self):
+        """extract_auth.py L53：消息必须带 `{type(e).__name__}`，不能只说失败。"""
+        self._write_cdp('raise RuntimeError("boom-at-import")\n')
+        mod, exc = self._branch_error("extract_auth")
+        self.assertIs(type(exc), mod.CdpUnavailable)
+        self.assertEqual(
+            str(exc), "CDP 模块初始化失败：RuntimeError: boom-at-import")
+
+    def test_continue_full_init_failure_reports_exception_type(self):
+        """continue_full.py L60：与 extract_auth 同一分支的另一份副本。"""
+        self._write_cdp('raise RuntimeError("boom-at-import")\n')
+        mod, exc = self._branch_error("continue_full")
+        self.assertIs(type(exc), mod.CdpUnavailable)
+        self.assertEqual(
+            str(exc), "CDP 模块初始化失败：RuntimeError: boom-at-import")
+
+    def test_init_failure_distinguishes_import_error_from_runtime_error(self):
+        """cdp 能被解析但没有 CDPClient：裸 ImportError 也落进同一分支且如实署名。
+
+        证明这条守卫的价值在 `{type(e).__name__}`：同样是「初始化失败」，
+        异常种类必须能区分开。
+        """
+        self._write_cdp("X = 1\n")
+        for name in MODULES:
+            mod, exc = self._branch_error(name)
+            self.assertIs(type(exc), mod.CdpUnavailable, name)
+            self.assertIn("CDP 模块初始化失败：ImportError: ", str(exc), name)
+
+    def test_continue_full_missing_transitive_dependency_is_distinguished(self):
+        """continue_full.py L58：镜像 extract_auth 的同名用例，别让该副本裸奔。"""
+        self._write_cdp('raise ModuleNotFoundError(name="some_inner_pkg")\n')
+        mod, exc = self._branch_error("continue_full")
+        self.assertIs(type(exc), mod.CdpUnavailable)
+        self.assertEqual(str(exc), "CDP 模块内部依赖缺失：some_inner_pkg")
+
+
 class TestCliSurface(unittest.TestCase):
     """CLI 入口契约：--help 不依赖浏览器，用法错误与依赖缺失退出码分离。"""
 
