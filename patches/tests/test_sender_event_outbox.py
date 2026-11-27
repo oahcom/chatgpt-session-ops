@@ -14,6 +14,7 @@ from http.server import ThreadingHTTPServer
 
 from sender_gateway.app import make_handler
 from sender_gateway.job_store import JobStore
+from sender_gateway.models import add_seconds
 from session_ops.sender_gateway_client import SenderGatewayClient, EVENT_DISPATCHER_IDENTITY
 
 FIXED = "2026-11-27T12:00:00.000000Z"
@@ -22,7 +23,8 @@ FIXED = "2026-11-27T12:00:00.000000Z"
 class SenderOutboxTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(dir="/dev/shm")
-        self.store = JobStore(Path(self.tmp.name) / "sender.sqlite3", now=lambda: FIXED)
+        self.db_path = Path(self.tmp.name) / "sender.sqlite3"
+        self.store = JobStore(self.db_path, now=lambda: FIXED)
         job = self.store.enqueue(
             principal_id="user-a",
             tenant_id="tenant-a",
@@ -39,6 +41,19 @@ class SenderOutboxTests(unittest.TestCase):
 
     def complete(self):
         self.store.complete(self.job_id, {"summary": "Finished"}, now=FIXED)
+
+    def create_job(self, *, now):
+        store = JobStore(self.db_path, now=lambda: now)
+        job = store.enqueue(
+            principal_id="user-a",
+            tenant_id="tenant-a",
+            operation="session.send",
+            idempotency_key=str(uuid.uuid4()),
+            payload={"conversation_id": str(uuid.uuid4()), "prompt": "do work", "account": "acct1"},
+        )
+        store.claim_next("worker-retention", now=now)
+        store.close()
+        return job["job_id"]
 
     def event_rows(self):
         return self.store._connection().execute(
@@ -92,6 +107,40 @@ class SenderOutboxTests(unittest.TestCase):
         self.assertTrue(payload["outcome_unknown"])
         self.assertEqual(rows[0]["tenant_id"], "tenant-a")
         self.assertEqual(rows[0]["principal_id"], "user-a")
+
+    def test_event_outbox_retention_prunes_only_terminal_rows_and_keeps_pending_or_active_lease(self):
+        old = add_seconds(FIXED, -31 * 24 * 60 * 60)
+        with self.store._connection() as conn:
+            for event_id, job_id, status, created_at, delivered_at, lease_until, lease_token in (
+                ("evt_old_pending", "job_old_pending", "pending", old, None, None, None),
+                ("evt_old_sending", "job_old_sending", "sending", old, None, add_seconds(FIXED, 60), "lease"),
+                ("evt_old_delivered", "job_old_delivered", "delivered", old, old, None, None),
+                ("evt_current_pending", "job_current_pending", "pending", FIXED, None, None, None),
+            ):
+                conn.execute(
+                    """INSERT INTO job_event_outbox
+                       (event_id, job_id, tenant_id, principal_id, event_name, payload_json,
+                        created_at, status, attempts, next_attempt_at, delivered_at,
+                        lease_until, lease_token, worker_id)
+                       VALUES (?, ?, 'tenant-a', 'user-a', 'chatgpt.job.completed',
+                               '{"job_id":"x"}', ?, ?, 0, ?, ?, ?, ?, NULL)""",
+                    (event_id, job_id, created_at, status, created_at, delivered_at, lease_until, lease_token),
+                )
+        with self.store.transaction() as txn:
+            deleted = self.store._cleanup_event_outbox_txn(txn, FIXED)
+        self.assertEqual(deleted, 1)  # only terminal history is pruned
+        with self.store._connection() as conn:
+            rows = conn.execute(
+                "SELECT job_id, status FROM job_event_outbox ORDER BY job_id"
+            ).fetchall()
+        self.assertEqual(
+            {row["job_id"]: row["status"] for row in rows},
+            {
+                "job_old_pending": "pending",
+                "job_old_sending": "sending",
+                "job_current_pending": "pending",
+            },
+        )
 
     def test_claim_lease_expiry_stale_ack_and_idempotent_ack(self):
         self.complete()
