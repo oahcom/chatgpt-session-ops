@@ -100,9 +100,18 @@ Transport uses UTF-8 JSON Lines.
 For v0.1:
 
 - One request per process invocation.
-- One JSON request line on stdin.
+- The first complete JSON request line is the only request
+  processed by that invocation.
+- A newline terminates a request line. EOF also terminates
+  a final non-empty request line without a trailing newline.
+- The process MUST NOT execute a second request from the same
+  stdin stream.
+- The process MUST NOT wait for stdin EOF after receiving a
+  complete request line.
+- Input following the first request line is never processed.
+- The client is not required to close stdin before receiving
+  the response.
 - One JSON response line on stdout.
-- EOF terminates the request.
 - stdout contains protocol data only.
 - stderr contains diagnostic information only.
 - No interactive prompts.
@@ -246,6 +255,7 @@ Optional:
 - session_id
 - limit, default 10
 - threshold, default 0.34
+- max_chars, no default (unbounded)
 
 Constraints:
 - work_item_id must pass identifier validation.
@@ -257,6 +267,15 @@ Constraints:
   remain restricted to the explicit work_item_id.
 - Implementations MUST NOT interpret an absent session_id as an
   unrestricted or global search.
+
+v0.1 clarification: `session_id` is optional in `retrieve`. Omitting it means
+cross-Session retrieval inside the same `work_item_id`; it is never a global
+search. This restates the constraints above and is not a breaking change.
+
+v0.1 clarification: `max_chars` is optional and bounds the returned entries by
+the Unicode scalar count of each entry's `content` only. An entry that would
+exceed the remaining budget is omitted whole; `content` is never truncated. An
+absent `max_chars` means no budget.
 
 The retrieval scope is always the explicit WorkItem.
 
@@ -333,6 +352,8 @@ several Sessions inside that WorkItem:
     "entries_omitted": 0
   }
 }
+
+`entries_omitted` counts only entries excluded because they do not fit the aggregate `max_chars` character budget. It does not include entries omitted by the `limit` result-count cap. In other words, entries not returned because the result set was truncated by `limit` are not counted in `entries_omitted`.
 
 An empty entries array is a successful result.
 
