@@ -29,6 +29,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -38,6 +39,8 @@ import chatgpt_send as cs  # noqa: E402
 
 CB = "https://chatgpt.com/connector_platform_oauth_redirect"
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ALLOWED_HOSTS = {"chatgpt.com", "mcp.oachom0831.xyz"}
+KEYCLOAK_HOST = "mcp.oachom0831.xyz"
 TARGETS = {
     "--rmc": ("RMC", "https://mcp.oachom0831.xyz/mcp"),
     "--so-mcp": ("SO MCP", "https://mcp.oachom0831.xyz/so-mcp"),
@@ -79,6 +82,42 @@ def hidden_fields(frag):
     return out
 
 
+def checked_url(url, expected_host=None):
+    """Accept HTTPS URLs only on an exact, explicitly allowed hostname."""
+    if not isinstance(url, str) or not url:
+        raise ValueError("OAuth URL is empty or not a string")
+    parsed = urllib.parse.urlparse(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    if parsed.scheme != "https" or host not in ALLOWED_HOSTS:
+        raise ValueError("OAuth URL host/scheme rejected: %s://%s" % (parsed.scheme, host or "<empty>"))
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("OAuth URL has an invalid port") from exc
+    if port not in (None, 443):
+        raise ValueError("OAuth URL port is not allowed: %s" % port)
+    if expected_host and host != expected_host:
+        raise ValueError("OAuth URL must use host %s, got %s" % (expected_host, host))
+    if parsed.username or parsed.password:
+        raise ValueError("OAuth URL userinfo is forbidden")
+    return url
+
+
+def auth_error(text):
+    value = (text or "").casefold()
+    for needle, label in (
+        ("invalid_scope", "invalid_scope"),
+        ("invalid_client", "invalid_client"),
+        ("unauthorized_client", "unauthorized_client"),
+        ("account is not fully set up", "Account is not fully set up"),
+        ("callback error", "callback error"),
+        ("error=access_denied", "access_denied"),
+    ):
+        if needle in value:
+            return label
+    return ""
+
+
 def main():
     if len(sys.argv) < 2 or not sys.argv[1].startswith("acct"):
         die("usage: python install_mcp.py <acctN> [--rmc] [--so-mcp]")
@@ -86,12 +125,6 @@ def main():
     flags = [a for a in sys.argv[2:] if a in TARGETS]
     if not flags:
         flags = list(TARGETS)
-    kc_pass = os.environ.get("RMC_KC_PASS") or _side_file(".kc-pass")
-    if not kc_pass:
-        die("Keycloak 口令未找到。设置 RMC_KC_PASS 环境变量，或在脚本目录放 .kc-pass 文件。")
-    kc_user_name = kc_user()
-    print("Keycloak 用户: %s" % kc_user_name, flush=True)
-
     api = cs.ChatGPTAPI(account=acct)
     api.warm_cookies()
     tok, proof = api.requirements()
@@ -112,174 +145,282 @@ def main():
     healthy = {}
     for l in links:
         cid = l.get("connector_id")
-        st2, out2 = api.req("GET", cs.API_BASE + "/backend-api/aip/connectors/" + cid, None, hdr)
+        if not isinstance(cid, str) or not cid:
+            continue
+        try:
+            st2, out2 = api.req("GET", cs.API_BASE + "/backend-api/aip/connectors/" + urllib.parse.quote(cid, safe=""), None, hdr)
+        except Exception:
+            continue
         if st2 != 200:
             continue
         d = json.loads(out2)
-        healthy[d.get("base_url") or ""] = (cid, d.get("name"), l.get("auth_status"), len(l.get("actions") or []))
+        base_url = d.get("base_url") or ""
+        candidate = (cid, d.get("name"), l.get("auth_status"), len(l.get("actions") or []))
+        previous = healthy.get(base_url)
+        if previous is None or (candidate[2] == "ACTIVE" and candidate[3] > 0):
+            healthy[base_url] = candidate
 
     results = []
     for flag in flags:
-        label, url = TARGETS[flag]
-        name = "%s %s" % (label, acct)
-        print("\n=== [%s] %s -> %s ===" % (acct, name, url), flush=True)
-        hit = healthy.get(url)
-        if hit and hit[2] == "ACTIVE" and hit[3] > 0:
-            print("SKIP 已装且健康: cid=%s name=%s actions=%d" % (hit[0], hit[1], hit[3]), flush=True)
-            results.append((name, "SKIP", hit[0]))
-            continue
-
-        # ---- 1. oauth_config 发现 ----
-        st, out = post("/backend-api/aip/connectors/mcp/oauth_config", {"mcp_url": url})
-        if st != 200:
-            print("oauth_config -> %s %s" % (st, out[:300]), flush=True)
-            results.append((name, "FAIL@oauth_config", ""))
-            continue
-        cfg = json.loads(out)["oauth_config"]
-
-        # ---- 2. 创建（UI 同款 payload）----
-        body = {"name": name, "description": "", "mcp_url": url, "logo_url": None,
-                "auth_request": {"supported_auth": [cfg]}}
-        st, out = post("/backend-api/aip/connectors/mcp", body)
-        if st == 409:
-            cid = (json.loads(out).get("detail") or {}).get("existing_connector_id")
-            print("同名连接器已存在，认领继续: cid=%s" % cid, flush=True)
-        elif st != 200:
-            print("create -> %s %s" % (st, out[:300]), flush=True)
-            results.append((name, "FAIL@create", ""))
-            continue
-        else:
-            c = json.loads(out).get("connector") or json.loads(out)
-            cid = c.get("id")
-            auths = [a.get("type") for a in (c.get("supported_auth") or [])]
-            print("created cid=%s supported_auth=%s" % (cid, auths), flush=True)
-            if not auths or auths[0] != "OAUTH":
-                print("校验失败: supported_auth[0].type != OAUTH，删除半成品", flush=True)
-                api.req("DELETE", cs.API_BASE + "/backend-api/aip/connectors/" + cid, None, hdr)
-                results.append((name, "FAIL@auth_type", cid))
+        try:
+            label, url = TARGETS[flag]
+            name = "%s %s" % (label, acct)
+            print("\n=== [%s] %s -> %s ===" % (acct, name, url), flush=True)
+            hit = healthy.get(url)
+            if hit and hit[2] == "ACTIVE" and hit[3] > 0:
+                print("SKIP 已装且健康: cid=%s name=%s actions=%d" % (hit[0], hit[1], hit[3]), flush=True)
+                results.append((name, "SKIP", hit[0]))
                 continue
 
-        # ---- 3. OAuth 链接（同进程连做：code 有时效）----
-        st, out = post("/backend-api/aip/connectors/links/oauth",
-                       {"connector_id": cid, "name": "Primary", "callback_url": CB})
-        if st != 200:
-            print("links/oauth -> %s %s" % (st, out[:300]), flush=True)
-            results.append((name, "FAIL@links_oauth", cid))
-            continue
-        redirect_url = json.loads(out)["redirect_url"]
-        print("redirect_url: %s" % redirect_url[:160], flush=True)
+            # Credentials are needed only when an OAuth login is actually required.
+            # Healthy existing links must be skippable without Keycloak secrets.
+            kc_pass = os.environ.get("RMC_KC_PASS") or _side_file(".kc-pass")
+            if not kc_pass:
+                print("Keycloak 口令未找到；该目标需要新授权，跳过安装", flush=True)
+                results.append((name, "FAIL@credentials", ""))
+                continue
+            kc_user_name = kc_user()
+            print("Keycloak 用户: %s" % kc_user_name, flush=True)
 
-        cj = http.cookiejar.CookieJar()
-        # Keycloak 在自有服务器上走直连（实测 2026-11-27 本地代理隧道到 mcp.oachom0831.xyz TLS 会断）；
-        # chatgpt.com 的任何请求一律走代理（fail-closed 纪律），按 URL 域名分流。
+            # ---- 1. oauth_config 发现 ----
+            st, out = post("/backend-api/aip/connectors/mcp/oauth_config", {"mcp_url": url})
+            if st != 200:
+                print("oauth_config -> %s %s" % (st, out[:300]), flush=True)
+                results.append((name, "FAIL@oauth_config", ""))
+                continue
+            cfg = json.loads(out)["oauth_config"]
 
-        class _NoRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, req, fp, code, msg, headers, newurl):
-                return None  # 3xx 以 HTTPError 冒出，交给 fetch 手动逐跳处理
-
-        op_direct = urllib.request.build_opener(
-            _NoRedirect, urllib.request.HTTPCookieProcessor(cj))
-        op_proxy = urllib.request.build_opener(
-            _NoRedirect,
-            urllib.request.ProxyHandler({"http": proxy_url(), "https": proxy_url()}),
-            urllib.request.HTTPCookieProcessor(cj),
-        )
-        UA = getattr(cs, "UA", "Mozilla/5.0")
-
-        def fetch(u, method="GET", data=None):
-            # 手动逐跳跟随重定向：每一跳按域名选通道（chatgpt.com→代理，其余→直连），
-            # 避免 urllib 自动跳转时沿用同一 opener 导致跨域分流失效。
-            cur_url, cur_method, cur_data = u, method, data
-            for _ in range(10):
-                op = op_proxy if "chatgpt.com" in urllib.parse.urlparse(cur_url).netloc else op_direct
-                rq = urllib.request.Request(
-                    cur_url, data=cur_data, method=cur_method, headers={"User-Agent": UA})
-                try:
-                    with op.open(rq, timeout=90) as r:
-                        st_, page_, loc = r.status, r.read().decode("utf-8", "replace"), r.url
-                        redirs = [v for k, v in r.getheaders() if k.lower() == "location"]
-                except urllib.error.HTTPError as e:
-                    st_, page_, loc = e.code, e.read().decode("utf-8", "replace"), e.url
-                    redirs = [v for k, v in e.headers.items() if k.lower() == "location"]
-                except urllib.error.URLError as e:
-                    # Cloudflare 偶发 TLS 掐断（实测 2026-11-27），同 URL 重试 2 次再认输
-                    last_err = e
-                    for retry in range(2):
-                        try:
-                            with op.open(rq, timeout=90) as r:
-                                st_, page_, loc = (r.status,
-                                                   r.read().decode("utf-8", "replace"), r.url)
-                                redirs = [v for k, v in r.getheaders()
-                                          if k.lower() == "location"]
-                            break
-                        except urllib.error.HTTPError as e2:
-                            st_, page_, loc = (e2.code,
-                                               e2.read().decode("utf-8", "replace"), e2.url)
-                            redirs = [v for k, v in e2.headers.items()
-                                      if k.lower() == "location"]
-                            break
-                        except urllib.error.URLError as e2:
-                            last_err = e2
-                    else:
-                        return 0, "URLError: %s" % last_err.reason, cur_url
-                if st_ in (301, 302, 303, 307, 308) and redirs:
-                    cur_url = urllib.parse.urljoin(cur_url, redirs[0])
-                    if st_ in (301, 302, 303):
-                        cur_method, cur_data = "GET", None
+            # ---- 2. 创建（UI 同款 payload）----
+            body = {"name": name, "description": "", "mcp_url": url, "logo_url": None,
+                    "auth_request": {"supported_auth": [cfg]}}
+            st, out = post("/backend-api/aip/connectors/mcp", body)
+            if st == 409:
+                cid = (json.loads(out).get("detail") or {}).get("existing_connector_id")
+                if not cid:
+                    print("create -> 409 but existing_connector_id missing: %s" % out[:300], flush=True)
+                    results.append((name, "FAIL@create_conflict", ""))
                     continue
-                return st_, page_, loc
-            return 0, "redirect loop", cur_url
+                st_existing, out_existing = api.req(
+                    "GET", cs.API_BASE + "/backend-api/aip/connectors/" + urllib.parse.quote(cid, safe=""), None, hdr)
+                if st_existing != 200:
+                    print("409 existing connector read-back failed -> %s %s" % (st_existing, out_existing[:300]), flush=True)
+                    results.append((name, "FAIL@conflict_readback", cid))
+                    continue
+                try:
+                    existing = json.loads(out_existing)
+                    existing_auths = [a.get("type") for a in (existing.get("supported_auth") or [])]
+                except (TypeError, ValueError, AttributeError):
+                    existing, existing_auths = {}, []
+                if existing.get("base_url") != url or not existing_auths or existing_auths[0] != "OAUTH":
+                    print("409 existing connector mismatch: base_url=%r supported_auth=%s; refusing to claim" %
+                          (existing.get("base_url"), existing_auths), flush=True)
+                    results.append((name, "FAIL@conflict_mismatch", cid))
+                    continue
+                print("409 existing connector verified: cid=%s base_url exact, OAUTH" % cid, flush=True)
+            elif st != 200:
+                print("create -> %s %s" % (st, out[:300]), flush=True)
+                results.append((name, "FAIL@create", ""))
+                continue
+            else:
+                c = json.loads(out).get("connector") or json.loads(out)
+                cid = c.get("id")
+                if not isinstance(cid, str) or not cid:
+                    print("create response missing connector id", flush=True)
+                    results.append((name, "FAIL@create_id", ""))
+                    continue
+                # The create response is not authoritative: GET the persisted connector
+                # and validate both its exact target URL and effective auth type.
+                st_read, out_read = api.req(
+                    "GET", cs.API_BASE + "/backend-api/aip/connectors/" + urllib.parse.quote(cid, safe=""), None, hdr)
+                if st_read != 200:
+                    print("created connector read-back failed -> %s %s" % (st_read, out_read[:300]), flush=True)
+                    results.append((name, "FAIL@create_readback", cid))
+                    continue
+                try:
+                    created = json.loads(out_read)
+                    auths = [a.get("type") for a in (created.get("supported_auth") or [])]
+                except (TypeError, ValueError, AttributeError):
+                    created, auths = {}, []
+                print("created cid=%s readback_base_url=%s supported_auth=%s" %
+                      (cid, created.get("base_url"), auths), flush=True)
+                if created.get("base_url") != url or not auths or auths[0] != "OAUTH":
+                    print("回读校验失败: base_url 或 supported_auth[0].type 不匹配，删除半成品", flush=True)
+                    api.req("DELETE", cs.API_BASE + "/backend-api/aip/connectors/" + urllib.parse.quote(cid, safe=""), None, hdr)
+                    results.append((name, "FAIL@auth_type", cid))
+                    continue
 
-        st, page, cur = fetch(redirect_url)
-        m = re.search(r'<form[^>]*action=["\']([^"\']+)["\'][^>]*>(.*?)</form>', page, re.S | re.I)
-        if not m:
-            diag = re.sub(r'\s+', ' ', page)[:400]
-            print("Keycloak 表单未找到 (HTTP %s) final_url=%s 页面开头: %s" % (st, cur[:160], diag), flush=True)
-            results.append((name, "FAIL@kc_form", cid))
-            continue
-        f = hidden_fields(m.group(2))
-        f["username"] = kc_user_name
-        f["password"] = kc_pass
-        st, page, cur = fetch(html.unescape(m.group(1)), "POST",
-                              urllib.parse.urlencode(f).encode(),
-                              )
-        for _ in range(3):
-            m2 = re.search(r'<form[^>]*action=["\']([^"\']+)["\'][^>]*>(.*?)</form>', page, re.S | re.I)
-            if not m2 or "kc-form-login" in m2.group(0):
-                break
-            f2 = hidden_fields(m2.group(2))
-            for b in re.findall(r'<input[^>]*type=["\']submit["\'][^>]*>', m2.group(2), re.I):
-                n = re.search(r'name=["\']([^"\']+)', b)
-                if n:
-                    f2.setdefault(n.group(1), "yes")
-            st, page, cur = fetch(html.unescape(m2.group(1)), "POST",
-                                  urllib.parse.urlencode(f2).encode())
-        if "code=" not in cur:
-            print("OAuth 回跳未拿到 code，最终 URL: %s" % cur[:120], flush=True)
-            results.append((name, "FAIL@kc_login", cid))
-            continue
-        st, out = post("/backend-api/aip/connectors/links/oauth/callback",
-                       {"full_redirect_url": cur})
-        print("callback -> %s" % st, flush=True)
-        if st != 200:
-            print(out[:300], flush=True)
-            results.append((name, "FAIL@callback", cid))
-            continue
+            # ---- 3. OAuth 链接（同进程连做：code 有时效）----
+            st, out = post("/backend-api/aip/connectors/links/oauth",
+                           {"connector_id": cid, "name": "Primary", "callback_url": CB})
+            if st != 200:
+                print("links/oauth -> %s %s" % (st, out[:300]), flush=True)
+                results.append((name, "FAIL@links_oauth", cid))
+                continue
+            redirect_url = json.loads(out)["redirect_url"]
+            print("redirect_url: %s" % redirect_url[:160], flush=True)
 
-        # ---- 4. 三项校验 ----
-        st, out = post("/backend-api/aip/connectors/links/list_accessible", {"principals": []})
-        ok = None
-        if st == 200:
-            for l in json.loads(out).get("links", []):
-                if l.get("connector_id") == cid and l.get("auth_status") == "ACTIVE" and (l.get("actions") or []):
-                    ok = len(l.get("actions") or [])
+            cj = http.cookiejar.CookieJar()
+            # Keycloak 在自有服务器上走直连（实测 2026-11-27 本地代理隧道到 mcp.oachom0831.xyz TLS 会断）；
+            # chatgpt.com 的任何请求一律走代理（fail-closed 纪律），按 URL 域名分流。
+
+            class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    return None  # 3xx 以 HTTPError 冒出，交给 fetch 手动逐跳处理
+
+            op_direct = urllib.request.build_opener(
+                _NoRedirect, urllib.request.HTTPCookieProcessor(cj))
+            op_proxy = urllib.request.build_opener(
+                _NoRedirect,
+                urllib.request.ProxyHandler({"http": proxy_url(), "https": proxy_url()}),
+                urllib.request.HTTPCookieProcessor(cj),
+            )
+            UA = getattr(cs, "UA", "Mozilla/5.0")
+
+            def fetch(u, method="GET", data=None):
+                # 每一跳都校验精确 hostname，再按 host 选择代理；禁止子串误判和开放重定向。
+                cur_url, cur_method, cur_data = checked_url(u), method, data
+                for _ in range(10):
+                    host = urllib.parse.urlparse(cur_url).hostname.lower().rstrip(".")
+                    op = op_proxy if host == "chatgpt.com" else op_direct
+                    rq = urllib.request.Request(
+                        cur_url, data=cur_data, method=cur_method, headers={"User-Agent": UA})
+                    try:
+                        with op.open(rq, timeout=90) as r:
+                            st_, page_, loc = r.status, r.read().decode("utf-8", "replace"), r.url
+                            redirs = [v for k, v in r.getheaders() if k.lower() == "location"]
+                    except urllib.error.HTTPError as e:
+                        st_, page_, loc = e.code, e.read().decode("utf-8", "replace"), e.url
+                        redirs = [v for k, v in e.headers.items() if k.lower() == "location"]
+                    except urllib.error.URLError as e:
+                        last_err = e
+                        for delay in (0.5, 1.0):
+                            time.sleep(delay)
+                            try:
+                                with op.open(rq, timeout=90) as r:
+                                    st_, page_, loc = (r.status,
+                                                       r.read().decode("utf-8", "replace"), r.url)
+                                    redirs = [v for k, v in r.getheaders()
+                                              if k.lower() == "location"]
+                                break
+                            except urllib.error.HTTPError as e2:
+                                st_, page_, loc = (e2.code,
+                                                   e2.read().decode("utf-8", "replace"), e2.url)
+                                redirs = [v for k, v in e2.headers.items()
+                                          if k.lower() == "location"]
+                                break
+                            except urllib.error.URLError as e2:
+                                last_err = e2
+                        else:
+                            return 0, "URLError: %s" % last_err.reason, cur_url
+                    if st_ in (301, 302, 303, 307, 308) and redirs:
+                        next_url = urllib.parse.urljoin(cur_url, redirs[0])
+                        try:
+                            cur_url = checked_url(next_url)
+                        except ValueError as exc:
+                            return 0, "redirect rejected: %s" % exc, next_url
+                        if st_ in (301, 302, 303):
+                            cur_method, cur_data = "GET", None
+                        continue
+                    return st_, page_, loc
+                return 0, "redirect loop", cur_url
+
+            try:
+                checked_url(redirect_url)
+            except ValueError as exc:
+                print("OAuth redirect URL rejected: %s" % exc, flush=True)
+                results.append((name, "FAIL@redirect_host", cid))
+                continue
+            st, page, cur = fetch(redirect_url)
+            diagnosed = auth_error(page + "\n" + cur)
+            if diagnosed:
+                print("Keycloak/OAuth error: %s" % diagnosed, flush=True)
+                results.append((name, "FAIL@%s" % diagnosed, cid))
+                continue
+            if st == 0 and page.startswith("redirect rejected:"):
+                print("OAuth redirect rejected: %s" % page, flush=True)
+                results.append((name, "FAIL@redirect_host", cid))
+                continue
+            m = re.search(r'<form[^>]*action=["\']([^"\']+)["\'][^>]*>(.*?)</form>', page, re.S | re.I)
+            if not m:
+                diag = re.sub(r'\s+', ' ', page)[:400]
+                print("Keycloak 表单未找到 (HTTP %s) final_url=%s 页面开头: %s" % (st, cur[:160], diag), flush=True)
+                results.append((name, "FAIL@kc_form", cid))
+                continue
+            f = hidden_fields(m.group(2))
+            f["username"] = kc_user_name
+            f["password"] = kc_pass
+            try:
+                form_action = checked_url(urllib.parse.urljoin(cur, html.unescape(m.group(1))),
+                                          expected_host=KEYCLOAK_HOST)
+            except ValueError as exc:
+                print("Keycloak form action rejected: %s" % exc, flush=True)
+                results.append((name, "FAIL@form_action", cid))
+                continue
+            st, page, cur = fetch(form_action, "POST", urllib.parse.urlencode(f).encode())
+            diagnosed = auth_error(page + "\n" + cur)
+            if diagnosed:
+                print("Keycloak login error: %s" % diagnosed, flush=True)
+                results.append((name, "FAIL@%s" % diagnosed, cid))
+                continue
+            for _ in range(3):
+                m2 = re.search(r'<form[^>]*action=["\']([^"\']+)["\'][^>]*>(.*?)</form>', page, re.S | re.I)
+                if not m2 or "kc-form-login" in m2.group(0):
                     break
-        if ok:
-            print("OK 通了: cid=%s auth_status=ACTIVE actions=%d" % (cid, ok), flush=True)
-            results.append((name, "OK(%d tools)" % ok, cid))
-        else:
-            print("校验未过: link 非 ACTIVE 或 actions 为空", flush=True)
-            results.append((name, "FAIL@verify", cid))
+                f2 = hidden_fields(m2.group(2))
+                for b in re.findall(r'<input[^>]*type=["\']submit["\'][^>]*>', m2.group(2), re.I):
+                    n = re.search(r'name=["\']([^"\']+)', b)
+                    if n:
+                        f2.setdefault(n.group(1), "yes")
+                try:
+                    form_action = checked_url(urllib.parse.urljoin(cur, html.unescape(m2.group(1))),
+                                              expected_host=KEYCLOAK_HOST)
+                except ValueError as exc:
+                    print("Keycloak follow-up form action rejected: %s" % exc, flush=True)
+                    results.append((name, "FAIL@form_action", cid))
+                    break
+                st, page, cur = fetch(form_action, "POST", urllib.parse.urlencode(f2).encode())
+                diagnosed = auth_error(page + "\n" + cur)
+                if diagnosed:
+                    print("Keycloak follow-up error: %s" % diagnosed, flush=True)
+                    results.append((name, "FAIL@%s" % diagnosed, cid))
+                    break
+            if results and results[-1][0] == name and results[-1][1].startswith("FAIL@"):
+                continue
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(cur).query)
+            if not query.get("code"):
+                diagnosed = auth_error(page + "\n" + cur)
+                suffix = " (%s)" % diagnosed if diagnosed else ""
+                print("OAuth 回跳未拿到 code%s，最终 URL: %s" % (suffix, cur[:120]), flush=True)
+                results.append((name, "FAIL@kc_login", cid))
+                continue
+            st, out = post("/backend-api/aip/connectors/links/oauth/callback",
+                           {"full_redirect_url": cur})
+            print("callback -> %s" % st, flush=True)
+            if st != 200:
+                diagnosed = auth_error(out)
+                print("%s%s" % ("callback -> %s " % st,
+                                  "(%s) " % diagnosed if diagnosed else "") + out[:300], flush=True)
+                results.append((name, "FAIL@callback" + ("_" + diagnosed if diagnosed else ""), cid))
+                continue
+
+            # ---- 4. 三项校验 ----
+            st, out = post("/backend-api/aip/connectors/links/list_accessible", {"principals": []})
+            ok = None
+            if st == 200:
+                for l in json.loads(out).get("links", []):
+                    if l.get("connector_id") == cid and l.get("auth_status") == "ACTIVE" and (l.get("actions") or []):
+                        ok = len(l.get("actions") or [])
+                        break
+            if ok:
+                print("OK 通了: cid=%s auth_status=ACTIVE actions=%d" % (cid, ok), flush=True)
+                results.append((name, "OK(%d tools)" % ok, cid))
+            else:
+                print("校验未过: link 非 ACTIVE 或 actions 为空", flush=True)
+                results.append((name, "FAIL@verify", cid))
+
+        except Exception as exc:
+            print("目标处理发生未预期异常: %s" % exc, flush=True)
+            results.append((name, "FAIL@unexpected", ""))
 
     print("\n==== %s 汇总 ====" % acct)
     for n, r, cid in results:

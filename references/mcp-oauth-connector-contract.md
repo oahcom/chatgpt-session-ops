@@ -354,3 +354,28 @@ journalctl -u <hub> --since "-10min" | grep 'tool="exec_command"'
 | 提交回调 | `POST …/links/oauth/callback` | 200 |
 | 校验 | `POST …/links/list_accessible` | 该 `connector_id` 出现 **且** `auth_status == "ACTIVE"` |
 | 实跑 | ChatGPT 会话内调用工具 | 网关日志有 `POST /mcp` 200 + 服务端 `outcome=ok` + 回报内容与服务器原文一致 |
+
+---
+
+## 9. 双 realm 安装与授权补充（2026-11-27）
+
+### 9.1 RMC 与 SO MCP 使用独立 Keycloak realm
+
+- RMC 的 issuer / 登录 realm 为 `rmc`；SO MCP 的 issuer / 登录 realm 为 `so-mcp`。两边即使创建同名用户 `mcp-link`，也会得到不同的 Keycloak `sub`，不可交叉使用。
+- 已核实 subject：`rmc` realm 的 `mcp-link` 为 `92fbe145-083a-4779-ac72-38e61533588f`；`so-mcp` realm 的 `mcp-link` 为 `42d7b1b4-f41b-4388-a1cc-a320991b734a`。
+- Keycloak 用户创建后必须补齐 `firstName` 与 `lastName`。仅有 username/password 的用户在登录时会被拒为 `Account is not fully set up`。
+
+### 9.2 动态客户端的 default client scopes
+
+动态客户端的默认 scope 来源是对应 realm 的 default client scopes 模板，不是仅凭 `oauth_config` 响应就能推断客户端已拥有全部 scope。`so-mcp` realm 已补齐 8 个 `session_ops` default scopes，包含 `session.read` 与 `session.write`。若授权端点返回 `invalid_scope`，应核对该 realm 的 default-client-scopes 关联；通过 Keycloak Admin API 的客户端子资源 `default-client-scopes/{scopeId}` 逐项关联并回读验证。不要依赖 `kcadm update -s defaultClientScopes=...` 的静默写法作为成功证据。
+
+### 9.3 创建冲突（HTTP 409）不是可直接认领
+
+`POST /backend-api/aip/connectors/mcp` 返回 409 时，响应中的 `detail.existing_connector_id` 只提供候选 ID，不证明它就是本次目标连接器。必须 GET 回读该 connector，并同时确认 `base_url` 与目标 MCP URL 精确相等、`supported_auth[0].type == "OAUTH"`；缺 ID、读回失败或任一字段不匹配都必须 fail-closed，不得继续 `links/oauth`。
+
+### 9.4 OAuth 网络分流与跳转安全
+
+- `chatgpt.com` 请求经配置代理；`mcp.oachom0831.xyz` 的 Keycloak 请求直连。分流必须按解析后的 `hostname` 精确相等判断，禁止用 `"chatgpt.com" in netloc` 一类子串判断。
+- OAuth 初始 `redirect_url`、每个 HTTP redirect 的目标、以及每个 HTML form action 都必须校验 HTTPS 与 hostname 白名单。form action 可能是相对路径，必须先以当前页面 URL `urljoin` 后再校验；Keycloak 登录表单 action 只允许 `mcp.oachom0831.xyz`。
+- 对 `URLError` 的同 URL 重试最多两次，退避间隔依次为 0.5 秒、1 秒；HTTP 状态码错误不得伪装成网络重试。
+- 诊断至少区分 `invalid_scope`、`invalid_client`、`unauthorized_client`、`Account is not fully set up` 与 callback error。授权失败必须停止当前目标的剩余步骤；RMC 与 SO MCP 两目标分别处理，但任一目标 FAIL 都使最终退出码非零。

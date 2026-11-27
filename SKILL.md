@@ -525,6 +525,21 @@ python scripts/mcp_connector.py eligibility --account acct1 --capability CUSTOM_
 
 退出码：`0` 全部检查完成、`1` 部分检查操作失败、`2` 参数或凭据缺失、`4` 资格无法确定。
 
+### 双 MCP 连接器一键安装（RMC + SO MCP）
+
+先按 JWT `sub` 核对导出身份，再安装连接器；不要按导出文件名猜账号归属。凭据不得通过聊天粘贴，也不得提交到 Git。
+
+```bash
+python scripts/install_export.py <export.json> <acctN>
+python scripts/install_mcp.py acctN                 # RMC + SO MCP
+python scripts/install_mcp.py acctN --rmc           # 仅 RMC
+python scripts/install_mcp.py acctN --so-mcp        # 仅 SO MCP
+```
+
+Keycloak 凭据优先从环境变量 `RMC_KC_PASS` / `RMC_KC_USER` 读取，否则从 `scripts/.kc-pass` / `scripts/.kc-user` 读取；用户名默认 `owner`。两个目标分别使用 realm `rmc` 与 `so-mcp`。`install_mcp.py` 必须逐目标验收：`oauth_config` → 创建且回读 `supported_auth[0].type=OAUTH` → OAuth 登录回调 → `list_accessible` 中 `auth_status=ACTIVE` 且 actions 非空。已有连接器只有在 `base_url` 精确匹配且 ACTIVE、actions 非空时才允许 SKIP；HTTP 200 或 409 本身都不是成功判据。任一目标失败即停止该目标的后续步骤，另一个目标仍独立处理；只要汇总存在 FAIL，最终退出码必须非零。
+
+2026-11-27 acct5 运行快照：RMC ACTIVE / 11 actions；SO MCP ACTIVE / 15 actions。该数量是当日运行快照，不是普遍承诺。SO MCP 运维文档的 10 个领域工具与 connector 暴露的 15 个 actions 是不同口径，不得混为一谈。
+
 ## 可信 WorkItem 投递（D10）
 
 `chatgpt_send.py` 有第四条投递入口，与普通投递的区别是**先验权限再发送**：它要求一个存在的 WorkItem 与一份写入授权，发送成功后写一条 landing event 和一条 session link。普通 `--new` / `<conv_id>` 路径不碰这套东西。
