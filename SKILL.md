@@ -20,9 +20,27 @@ ChatGPT 会话操控与生命周期管理。把"手和眼"（I/O、投递、收�
 - **会话管理层级（用户裁定 2026-11-18，SESSION-HIERARCHY v1.0）**：**Owner ≠ 会话**——A–I 是身份定义，会话=身份实例（N:1），同身份可并发多实例；每需求一个总理人（A 实例）负责分解分配、构建子工作提示词、统筹总审，同一工作项同时仅一个 A 实例持派工写租约。层级 L0–L4：L0 管理器（路由/投递，无专业决策权）→ L1 总理人 → L2 领域工作会话 → L3 独立审查 → L4 验收裁决；**专业提示词只出自 L1/L2 自产**。管理器判断必须以「管理器观点」显式提交 ChatGPT 挑战收敛，不得当影子作者强加结论。
 - **主理人膨胀收敛职责（用户明示 2026-11-19，强制）**：**每个需求的主理人对该需求范围 PR/Issue 膨胀直接负责**——开工前预检、增量先查归并、发现趋势立即收敛、WIP 超线先收敛再开新工单；不等巡检窗口。配额纪律：open PR 超线即冻结新建 PR/Issue，只做既有载体补提交/合并/归并，解除按协调器宣布。
 
+## 投递与编排契约（2026-11-26 实测，优先于本文件其它建议）
+
+`references/CONTRACT-BASELINE.md`（**v1.0 / 2026-11-26**）是投递参数、送达验证、提示词纪律、编号分配、PR 合并的**契约基线**：17 条规则，每条带「规则 / 依据（当日实测数字）/ 违反后果」。**本契约优先于本文件与 `references/baselines.md` 中任何与它冲突的建议**——冲突时按契约执行，并把旧建议改成指向契约，不保留第二套（冲突清单见契约 §6）。契约里的数字来自当日实测，**复测后必须整份更新并升版本**（契约 §7）。
+
+最常踩的九条（全文与判定口径见契约）：
+
+| 编号 | 一句话 |
+|---|---|
+| **CB-A1** | **默认不开 `--thinking`**：同输出量 411.5s vs 209s（约 2×），方差约 10 倍，13% 的 thinking 投递在服务端 1700s 断流墙上白跑 |
+| **CB-A2** | **新任务一律 `--new`**：`--new` 只省一次 tail GET（1–2s），但 413 全部发生在续接（13/13 vs 0），且被截断会话会毒化（后续 413 率 21.4% vs 1.9%，11×） |
+| **CB-A3** | **`--timeout` 默认 600s**（命令行 > `CHATGPT_SEND_TIMEOUT` > 600）；超时产出 `TIMEOUT_PARTIAL` 并落盘 `<auth>/timeouts/`；长等待显式 `--timeout 1800` |
+| **CB-A4** | **不拆长提示词**：耗时跟回复长度走（r=0.690），不跟提示词长度走（r=0.197）；每多一轮白付 40–105s |
+| **CB-A5** | **同账号可并行 2–3 路 POST**（`SLOT_CAP` 未启用、POST 不持锁），**必须逐条送达验证**；GET 仍单进程 |
+| **CB-B6/B8** | **`SEND <prompt> -> 200` 是唯一送达凭证**；`NOT_SENT` 三条件合取（无 `SEND` + <200 字节 + mtime>5 分钟），**在飞不判死** |
+| **CB-B9** | 投递必须在**同一个未结束回合**内前台等完（长 timeout）；**0 字节日志＝进程被掐**，不是"没写日志" |
+| **CB-C12** | **一轮一条指令，一次给全**；不发"若 A 则 B"条件指令（条件会在错误时点被满足并执行） |
+| **CB-D14/E16** | 编号按**账号固定号段**（禁抢 `max+1`）；合并走**原子窗口**（刷新 → 16 项全绿 → 立刻合并，中间不插任何 API 调用） |
+
 ## 基线（A/B 类，可判定）
 
-**详细条款、判定口径、违例后果、现成配方见 `references/baselines.md`。** 这里是索引，不是全文——条款冲突时以该文件为准，用户明示的管理基线又高于该文件。
+**详细条款、判定口径、违例后果、现成配方见 `references/baselines.md`。** 这里是索引，不是全文——条款冲突时以该文件为准，用户明示的管理基线又高于该文件；**但投递/编排细则（thinking 默认值、`--new`、timeout、并发、送达验证、编号、合并）以 `references/CONTRACT-BASELINE.md` 为准，高于本节与该文件中的冲突条款**。
 
 | 类 | 主题 | 编号 | 一句话 |
 |---|---|---|---|
@@ -31,10 +49,10 @@ ChatGPT 会话操控与生命周期管理。把"手和眼"（I/O、投递、收�
 | **A1–A4** | 内容主权 | A1–A4 | 逻辑规划/实现/提示词全部由 ChatGPT 主导自产、逐字节搬运、裁决必投全新会话 |
 | **A5–A9** | 通道与身份 | A5–A9 | 登录态优先、401/403 不兜底、匿名只认设备身份、可写窗口=原标签页 |
 | **A10–A14** | 投递与收割 | A10–A14 | 必带 `conversation_id`、200 即停轮转、大交付对 raw mapping、全文落盘、先落设备 |
-| **A15–A18** | 限速与失败 | A15–A18 | 单 GET 进程、会话间 ≥60s、**`Retry-After` 是下限（不得向下截 180s）**、401/403/429 分级 |
+| **A15–A18** | 限速与失败 | A15–A18 | 单 GET 进程、**发送并发与间隔按契约 CB-A5（固定 60s 间距已取代）**、**`Retry-After` 是下限（不得向下截 180s）**、401/403/429 分级 |
 | **A19–A22** | 存储与安全 | A19–A22 | id 白名单、原子写、损坏隔离、锁按线程判重入 + **回收前校验 PID 启动时间** |
 | **A23–A26** | 出口 | A23–A26 | 单一出口、fail-closed(exit 3)、探活真握手、探活要验目标站、**WebRTC 不许漏真实 IP** |
-| **A27–A28** | 思考模式 / 流截断 | A27–A28 | 要思考就必须真开（解析不出 `-t-` 抛 `ThinkingModelUnavailable`：默认轮转换账号、全废才 `exit 1`，显式 `--account` 直接失败；无降级口子）；**`IncompleteRead` ≠ 失败**，保留半截 + GET 补全文 |
+| **A27–A28** | 思考模式 / 流截断 | A27–A28 | **默认不开（CB-A1：2× 耗时、13% 撞断流墙）**；要用就必须真开（解析不出 `-t-` 抛 `ThinkingModelUnavailable`：默认轮转换账号、全废才 `exit 1`，显式 `--account` 直接失败；无降级口子）；**`IncompleteRead` ≠ 失败**，保留半截 + GET 补全文 |
 | **A29** | Cookie 落盘边界 | A29 | `cookies.json` 里每条 cookie 的 `domain` 必须**精确等于或后缀匹配** `chatgpt.com`/`openai.com`（禁止字符串包含）；`warm_cookies()` 回写前对内存与磁盘同步过滤；`extract_auth.py` 导入同语义。请求头过滤只管「发不发得出去」，管不住「存不存得下来」 |
 | **B1–B5** | 排程 | B1–B5 | 1 小时维度、条件巡检、validFrom/Until 收窗、看门狗 ≤1h、过期即 PAUSED |
 | **B6–B9** | 执行可靠性 | B6–B9 | prompt 自包含（含路径**类型**校验）、task/step 状态机幂等续跑、**RUNNING ≤3 且原子领槽**、删前先 PAUSED |
@@ -168,7 +186,7 @@ python scripts/chatgpt_send.py --account acct2 <conv_id> <prompt_file>
 
 每个会话只属于创建它或明确授权访问它的账号。未显式指定 `--account` 时，脚本必须根据 `conv-accounts.json` 中经过验证的登记归属自动路由；登记缺失、记录无效或归属矛盾时必须 fail closed，禁止隐式回落到 `acct1`、自动探测其他账号或继续访问，并要求用户明确提供或确认归属。显式指定 `--account` 时，必须验证其与已登记归属一致；不一致时以退出码 `2` 拒绝执行，不得仅打印 WARN 后继续。`default` 与 `acct1` 按既有配置定义作为同一 credential root 的别名处理。匿名态只用于明确公开、且服务端允许匿名访问的内容；不用于访问或探测私有会话。
 
-各账号限速彼此独立。429 时对原身份退避至少 90 秒，GET 可用该身份缓存；不要并发运行同一账号请求。
+各账号限速彼此独立。429 时先定性，再按返回体的真实时限退避（见「协调纪律」#3）；GET 可用该身份缓存。**并发口径以契约 CB-A5 为准**：同账号可并行 2–3 路 POST（POST 不持账号锁，`SLOT_CAP` 未启用），但每条都必须拿到 `SEND <prompt> -> 200` 送达凭证；GET 仍单进程。旧说法「不要并发运行同一账号请求」已被契约取代。
 
 查询会话清单：`python scripts/chatgpt_send.py --account acct1 --list` 查询单一账号；`python scripts/chatgpt_send.py --list-all` 顺序查询本机已配置的**六个登录态**（`acct1`–`acct6`，即 `ROTATION_PRIMARY`），并为每条结果标注身份。**默认不含匿名态**——匿名态只在显式加 `--include-nologin` 时才纳入枚举。`--list-all` 输出 `by_account`（按账号分组，便于归档）、`summary`（各账号计数）、`quota`（各账号最近响应的限速观测头，只读）与 `errors`。不可用的账号和接口错误会进入 errors；遇到 429 即停止剩余扫描。聚合结果只覆盖各身份自身有权看到的会话，不代表匿名态能读取私有会话。
 
@@ -292,8 +310,8 @@ Consequence for the registry: an account stuck at `failed` keeps its last-known 
 ### 2. 开全新会话（Owner 裁决模式，登录态优先）
 
 ```bash
-python scripts/chatgpt_send.py --thinking --new <prompt_file>       # 思考模式（评审/裁决必开）
-python scripts/chatgpt_send.py --new <prompt_file>                  # 默认：acct1/acct2/acct3/acct4/acct5/acct6 均分
+python scripts/chatgpt_send.py --new <prompt_file>                  # 默认路径：不开 thinking，acct1/acct2/acct3/acct4/acct5/acct6 均分（CB-A1）
+python scripts/chatgpt_send.py --thinking --timeout 1800 --new <prompt_file>  # 例外：显式要求深度推理时才开（约 2× 耗时，长等待要给足预算）
 python scripts/chatgpt_send.py --account acct2 --new <prompt_file>  # 指定身份
 python scripts/chatgpt_send.py --account auto --new <prompt_file>   # 自动挑（仅 --new 分支支持）
 python scripts/chatgpt_send.py --rotation                           # 游标/计数/兜底次数
@@ -365,7 +383,7 @@ s.pop("last", None)
 | L1 读路径 | `--account <acct> --list` | token 被服务端接受，会话列表可拉 | 401 → 认证失效；403/429 → 风控；超时 → 网络 |
 | L2 写路径 | `--account <acct> --new <probe.txt>` | **完整链路可用**：PoW、发送、流式响应、落盘 | 才叫「不可用」 |
 
-L2 的探针文件内容写成 `Reply with exactly: PROBE_OK`，回复正文（`replies/reply-*.md` 去掉首行注释）应恰好是 `PROBE_OK`——**收到非空且符合预期的正文**才算通过，`status:200` 本身不算。单账号 L2 约 5–8 秒，六账号串行约 45 秒；L1 单账号 30–45 秒，六账号约 90 秒（都要后台跑，前台 120s 会截断）。
+L2 的探针文件内容写成 `Reply with exactly: PROBE_OK`，回复正文（`replies/reply-*.md` 去掉首行注释）应恰好是 `PROBE_OK`——**收到非空且符合预期的正文**才算通过，`status:200` 本身不算。单账号 L2 约 5–8 秒，六账号串行约 45 秒；L1 单账号 30–45 秒，六账号约 90 秒。**探针要设足前台 timeout 一次跑完（契约 CB-B9）**：不要短超时后台发射再结束回合——回合结束会把后台进程掐死，日志 0 字节即"从未投递"。
 
 故意不带 conversation_id。用于：各工作会话自产"Owner 裁决提示词"（自包含：背景、精确基线、待裁决项、可选裁决、记录格式）→ **原样**收集（回复中最长代码块，一字不改）→ 投递给全新 ChatGPT 会话扮演 Owner → 收割裁决记录（ACCEPT / ACCEPT WITH AMENDMENTS / NEEDS REVISION / REJECT + 理由 + 执行边界）→ 原文引用回灌工作会话。
 
@@ -387,7 +405,7 @@ python scripts/chatgpt_send.py --tail <conv_id>
 
 1. **防撞车**：开工前查目标仓库 open PR/Issue；撞车即停，走"证据归并到主 PR + 关重复件"。
 2. **事实仲裁**：跨会话冲突一律以 GitHub API / git log 的 exact head 为准，不以任何会话转述为准；中间提交的 CI 失败不代表当前 head。
-3. **限速纪律（先定性，再退避；用户裁定 2026-11-19，取代固定 90 秒口径）**：同一账号同时只允许一个 GET 进程；发送器与补采器错峰；会话间发送 ≥60s。任何失败**先定性**（`ChatGPTAPI.classify_failure`）：
+3. **限速纪律（先定性，再退避；用户裁定 2026-11-19，取代固定 90 秒口径）**：同一账号同时只允许一个 GET 进程。**发送并发按契约 CB-A5**：同账号可并行 2–3 路 POST，固定「会话间发送 ≥60s」间距已被契约取代（`references/baselines.md` A16 已加取代注记），但每条并行投递都必须过 CB-B6/B8 送达验证；发送器与补采器仍错峰。任何失败**先定性**（`ChatGPTAPI.classify_failure`）：
    - **代理/网络问题**（`proxy`：status 0、SSL EOF、连接重置/超时、`EXC …`）→ **跟进修复代理**（`repair_proxy()` 重新探测出口/换端口重建连接，或 `--proxy-check` 诊断后修代理工具），修好即重试，**不做计时死等**；反复探测无出口要明确报"代理需人工跟进"，不得伪装成限速。
    - **上游限速**（`ratelimit`：429，或响应体带限速字段）→ 退避时长**按返回体/头里的真实时限**（取值顺序：响应体 `resets_in` / `retry_after` / `rate_limit.reset` 等 → `Retry-After` 头 → 都没有才用默认值并注明），禁止固定 90 秒；服务端声明值夹在 [5,3600] 秒。
    - **风控**（`risk`：403 Unusual activity、Cloudflare 质询页）→ 补 cookie（`warm_cookies()`）+ 重跑 PoW 流程，仍失败进冷却，不定时硬闯。
@@ -581,7 +599,9 @@ python scripts/chatgpt_send.py --work-item wi_<uuid> \
 | 复验方反复 HOLD/ACCEPT_WITH_AMENDMENTS 要求"独立核验" | 摘要包不含完整函数体/完整测试断言/完整 SHA256，文本复验方无法确认断言覆盖 | 给**完整代码段**（27KB 级：完整函数+完整测试方法体+完整 SHA256+原始测试输出）比 4-5KB 摘要更有效；实证 D 三轮才 PASS（摘要→补证→全文）、Storage 两轮。复验方要"独立核验"时给完整函数+完整测试体+完整 SHA256 即可推进 |
 | 上下文压缩/续接后发现仓库出现自己没写的提交 | **上下文压缩不杀后台进程**：丢失段启动的协调驱动仍存活，与新代理并行写同一 repo | 恢复后**先盘点**（`git log`、文件 mtime）再动手；发现并行写者改为协作（审其产物、补缺口），不重做不回滚 |
 | 构建脚本 git HEAD 报旧 SHA / 产物指向旧树 | 同工作区有双 repo：`workspace/repo`（可能滞留旧头）vs `workspace/state/repo`（真头） | 构建/取证脚本显式指对 repo 路径；每次开工先 `git log -1` 确认头与预期一致 |
-| 413 conversation_too_large | 会话满员 | continue_full.py 摘要续接 |
+| 413 conversation_too_large | 会话满员 | 新任务按契约 CB-A2 直接 `--new`，不要在满员会话硬发重试；确需续接的链走 `continue_full.py` 摘要续接 |
+| `TIMEOUT_PARTIAL after Ns, M bytes buffered, saved to <path>` | 投递超过 `--timeout` 预算（默认 600s），已收内容落到 `<auth>/timeouts/` | 按契约 CB-A3：该轮正文按不完整处理，用 A12 raw mapping 补采；确需长等待时显式 `--timeout 1800`，不要改默认值 |
+| 投递日志 0 字节，或只有一行 `timeout: 600s (source=default)` | 0 字节＝进程被掐（回合结束时后台进程被终止）；只有首行＝还在飞 | 0 字节：同一未结束回合内重投；只有首行且 mtime<5 分钟：等 `SEND` 行，**不得判 `NOT_SENT`**（契约 CB-B7/B8/B9） |
 | **投递的代码正文里 `#[derive]` / `#[test]` / `#[cfg]` / markdown 标题全部消失** | 投递器把 `#` 开头行当注释删（旧版 `[l for l in text.splitlines() if not l.strip().startswith("#")]`）；Rust 属性行恰好全部以 `#` 开头 | 该行已改为只做空正文判定、不删任何行（2026-11-21）。**症状识别**：会话反馈"正文里没有属性行"时先查投递器，别怀疑会话。回归自检：投递前后 `text.count("#[derive")` 必须相等 |
 | 流读取为空 | `with` 提前关连接 | 读到 EOF（chatgpt_send.py 已正确处理） |
 | 输入框填入失败 | 用了 innerHTML 或裸赋值 | 文本域用原生 setter + InputEvent，或 CDP `Input.insertText` |
@@ -611,7 +631,8 @@ python scripts/chatgpt_send.py --work-item wi_<uuid> \
 
 ### references/
 
-- `baselines.md` — **基线条款（全部唯一条款，含 A/B/C/E 类，共 51 条）**：每条带判定口径与违例后果，附 C 类现成配方（每小时巡检、落盘看门狗、到期处置、配额哨兵）、D 类事故→条款映射、E 类变更纪律、G 类证据矩阵说明。**开工前扫 A0/B0 清单，排程前读 B1–B15，改代码前读对应条款。**
+- `CONTRACT-BASELINE.md` — **投递与编排契约基线（v1.0，2026-11-26 实测，数字来自当日实测、复测后需更新）**：17 条规则，覆盖投递参数（thinking 默认关、一律 `--new`、`--timeout` 600/优先级/`TIMEOUT_PARTIAL`、不拆提示词、并行 2–3 路）、送达验证（`SEND … -> 200` 唯一凭证、在飞时序、`NOT_SENT` 三条件合取、0 字节＝进程被掐、日志 BOM 编码）、提示词纪律（数字取当期实测、一轮一条、否定句加"停下来指出"）、编号（账号固定号段、合并后不改号）、合并（原子窗口 1–2 分钟、不关 strict）。**§0 是机读 JSON 索引；§6 是它取代的旧建议清单；本契约优先于 `SKILL.md` 与 `baselines.md` 中的冲突建议。** 发布状态：B 侧权威；列入 `docs/RELEASE-AUTHORITY.md` §2 白名单需单独审查（未列入前 A 侧不会随发布更新）。
+- `baselines.md` — **基线条款（全部唯一条款，含 A/B/C/E 类，共 51 条）**：每条带判定口径与违例后果，附 C 类现成配方（每小时巡检、落盘看门狗、到期处置、配额哨兵）、D 类事故→条款映射、E 类变更纪律、G 类证据矩阵说明。**开工前扫 A0/B0 清单，排程前读 B1–B15，改代码前读对应条款。投递/编排细节与 `CONTRACT-BASELINE.md` 冲突时以契约为准（A16 已加取代注记）。**
 - `evidence-matrix.md` — **逐条对账「这条基线由什么证明」**：`test:` 用例名 / `code:` 符号 / `live:` 实测日期 / `human:` 人判理由，四类分开标注；34 条有离线用例、3 条只有代码、14 条纯人判，缺口按危害排序列在文末。改基线必须同步这张表——`TestEvidenceMatrix` 会校验引用是否真实存在。
 - `security-acceptance-matrix.md` — **安全验收矩阵（SO MCP 面，仅存在于仓库、不随发布拷贝到 A）**：逐场景写「攻击者/误操作会得到什么、实际发生什么」，是负面测试台账而非功能清单。行数以表格本身为准（本文不复述，复述必漂移），每行带 `test:`/`code:` 证据与状态（`PROVEN`、`PROVEN mutation-checked`、`partial` 等）；**`PROVEN` 不等于 `mutation-checked`**，只有带 `mutation-checked` 标记的行真的做过「删掉实现看它变红」。改这张表必须同步——`TestSecurityMatrix` 会校验引用与状态列。**A 侧没有本文件，也没有它引用的 `test_mcp_*` 用例**：这张表的每一行都以「哪个用例证明了它」为证，脱离那些用例就只剩结论没有依据，所以它留在 B，不跟着 `SKILL.md` 发布出去。
 - `mcp-oauth-connector-contract.md` — **ChatGPT 侧 MCP 连接器 / OAuth 契约（2026-11-23 实测，单一部署 rmc-hub + nginx、六账号）**：`/backend-api/aip/connectors/*` 从创建、`type` 判定、授权回调、校验到删除的全流程实测。三个反直觉点：`POST /aip/connectors/mcp` 只认 `mcp_url`（不是 `base_url`）；`auth_request` 必须是 `{"supported_auth": [<oauth_config>]}` 而不是平铺对象——平铺也回 200，但 `type` 会静默退化成 `NONE`；网关用 `proxy_hide_header` / location 级 `add_header` 改 `WWW-Authenticate` 会连带吞掉上游其它挑战头和 HSTS/X-Frame-Options。**§7 的「不要相信调用成功」是最该先读的一节**：连接器建成、`type=OAUTH` 都不等于授权链路真的通。
