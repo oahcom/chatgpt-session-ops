@@ -1,0 +1,3 @@
+# Local Keycloak credentials used by install_mcp.py; never commit secrets.
+.kc-pass
+.kc-user

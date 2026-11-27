@@ -14,6 +14,10 @@ scripts/accounts/nologin/devices/
 *.key
 .env
 .env.*
+.kc-pass
+.kc-user
+scripts/.kc-pass
+scripts/.kc-user
 
 # ==========================================================
 # 运行态与会话产物（本机生成，含私有对话内容）

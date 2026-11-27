@@ -597,3 +597,26 @@ X=2` 会被当成单个合法 VALUE 放行；改为 `([^;
 
 
 > **全套件验收快照**（as-of `2026-11-24`，commit `40c436c7930f75819eb287bfcac756db44424031`）：执行 `python -m pytest tests -q`，结果为 708 passed、6 skipped、968 subtests passed；收集结果为 714 tests。`python -m unittest discover -s tests` 交叉验证为 714 tests、6 skipped。**此处为该提交上的历史验收记录，不构成后续提交的数量承诺**——新增/删除任何测试都会改变这些数字，见 §E 的「动态统计维护纪律」。全套件统计只在本节维护一份，其他文档一律用指针，不复制数字。
+---
+
+## H. 双 MCP 连接器安装运行基线（2026-11-27）
+
+### H1 安装脚本链
+
+- `scripts/install_export.py <export.json> <acctN>`：读取浏览器导出的 JSON，校验 JWT `sub` 与 cookie 域，再备份并写入账号槽位；文件名不是身份依据，凭据按 JWT `sub` 判定。
+- `scripts/install_mcp.py <acctN>`：在同一账号下依次检查并安装 RMC 与 SO MCP；`--rmc`、`--so-mcp` 可分别限定目标。健康连接器以 `base_url` 精确匹配、`auth_status=ACTIVE`、`actions` 非空为 SKIP 条件。任何目标失败都必须让该目标停止后续步骤；两个目标独立处理，汇总中只要有 FAIL，进程最终必须非零。
+- 安装顺序为 `oauth_config` 发现 → 创建 OAUTH connector → `links/oauth` → Keycloak 登录 → callback → `list_accessible` 回读验证。HTTP 200 不是成功判据；必须验证 `supported_auth[0].type=OAUTH`，最终还必须验证 ACTIVE 与非空 actions。
+- `.kc-pass`、`.kc-user` 是本机凭据文件，必须被 `.gitignore` 排除；禁止写入源码、命令参数或提交历史。
+
+### H2 Keycloak 双 realm 拓扑与身份边界
+
+- RMC 使用 Keycloak realm `rmc`；SO MCP 使用独立 realm `so-mcp`。两个 realm 可有同名 `mcp-link` 用户，但它们是两个不同的 Keycloak subject，不得把一个 realm 的 `sub` 当作另一个 realm 的身份。
+- 已核实的 `mcp-link` subjects：`rmc` = `92fbe145-083a-4779-ac72-38e61533588f`；`so-mcp` = `42d7b1b4-f41b-4388-a1cc-a320991b734a`。
+- RMC hub 的 `hub.json` `principals` 已登记 RMC realm 对应的 subject，device 为 `vm-43-ubuntu`；这是 RMC hub 的主体授权配置。SO MCP 的 `SO_MCP_PRINCIPAL_DIRECTORY` 只用于 grant-target resolution，不是认证或鉴权机制，不得把它描述成授权来源。
+- Keycloak 动态客户端的 default client scopes 来自对应 realm 的默认 scope 模板。`so-mcp` realm 的 8 个 `session_ops` default scopes 已补齐，包含 `session.read` / `session.write`；不得只检查客户端创建成功而跳过授权 URL 实测。
+
+### H3 已验证运行快照（acct5）
+
+- RMC connector：`ACTIVE`，11 actions。
+- SO MCP connector：`ACTIVE`，15 actions。
+- 这是 2026-11-27 的账号运行快照，不是对所有账号、后端版本或未来时间的承诺。SO MCP 的 15 个 connector actions 与运维文档中 10 个领域工具不是同一计数口径；不得用十工具列表推断 connector actions 数量。
