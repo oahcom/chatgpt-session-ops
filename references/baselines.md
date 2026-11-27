@@ -159,7 +159,7 @@
 
 | 编号 | 基线 | 判定口径 | 违例后果 |
 |---|---|---|---|
-| **A27** | **新建会话必须开思考模式**（评审/裁决/审查类硬要求，用户明示 2026-11-19） | API：输出必须出现 `thinking model: *-t-*`；浏览器：`思考` 按钮 `aria-pressed="true"` | 回复更浅、更「防御性」，评审流于表态、抓不到真缺陷 |
+| **A27** | **新建会话必须开思考模式**（评审/裁决/审查类硬要求，用户明示 2026-11-19） | API：输出必须出现 `thinking model: *-t-*`；**优先 slug：清单里存在 `gpt-6-t-mini` 时优先选它（默认），可用 `CHATGPT_PREFERRED_THINKING` 覆盖；该 slug 不在清单、或配置非法时，必须留下可 grep 的诊断并按后备顺序解析，不得静默选中后备模型后当成「优先模型命中」**；浏览器：`思考` 按钮 `aria-pressed="true"` | 回复更浅、更「防御性」，评审流于表态、抓不到真缺陷 |
 | **A28** | **流被截断 ≠ 发送失败** | 收到 `IncompleteRead` 时保留 `e.partial` 字节并返回 200 语义（`last_truncated=True`），从中解析 `conversation_id`；随后 **GET 补全文**，不得据此换身份重投 | 同一 prompt 建出多个会话 + 白烧一轮配额 |
 | **A29** | **Cookie 落盘只允许 OpenAI 自有域** | `cookies.json` 里每条 cookie 的 `domain` 必须等于 `chatgpt.com`/`openai.com` 或其子域（**精确域名或后缀匹配，禁止字符串包含**）；`warm_cookies()` 回写前对内存与磁盘同步过滤；`extract_auth.py` 导入时同语义过滤 | 请求头过滤只管「发不发得出去」，管不住「存不存得下来」——实测 acct1 的 `cookies.json` 混进 50 条 Google 会话，每次补 CF cookie 都整包回写磁盘，等于把全站登录态反复备份 |
 
