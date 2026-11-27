@@ -1,0 +1,172 @@
+--- a/scripts/run_mcp_server.py
++++ b/scripts/run_mcp_server.py
+@@ -11,9 +11,11 @@
+ import os
+ import re
+ import shutil
++import stat
+ import sys
++import uuid
+ from pathlib import Path
+-from typing import Any, Optional
++from typing import Any, Optional, Sequence
+ from urllib.parse import urlsplit
+ 
+ import uvicorn
+@@ -26,6 +28,9 @@
+ )
+ from src.session_ops.mcp_auth import JWTVerifier
+ from src.session_ops.mcp_server import MCPToolService, build_mcp_server
++from src.session_ops.mcp_events import MCPEventsStore
++from src.session_ops.mcp_event_collector import MCPEventCollector
++from src.session_ops.mcp_event_workers import MCPEventDeliveryWorker, MCPEventWorkers
+ from src.session_ops.sender_gateway_client import SenderGatewayClient
+ 
+ 
+@@ -41,6 +46,8 @@
+ ]
+ 
+ MEMORY_STDIO_ENV = "SO_MCP_MEMORY_STDIO"
++EVENTS_KEY_FILE_ENV = "SO_MCP_EVENTS_KEY_FILE"
++EVENTS_DB_ENV = "SO_MCP_EVENTS_DB"
+ PRINCIPAL_DIRECTORY_ENV = "SO_MCP_PRINCIPAL_DIRECTORY"
+ 
+ #: The only keys a principal-directory entry may carry.
+@@ -494,6 +501,25 @@
+     return value[:match.start(1)] + replacement + value[match.end(1):]
+ 
+ 
++def _load_events_encryption_key(path_value: str) -> bytes:
++    """Read a raw 32-byte key owned by the MCP service and private to it."""
++    path = Path(path_value)
++    if not path.is_absolute():
++        raise RuntimeError(EVENTS_KEY_FILE_ENV + " must be an absolute path")
++    try:
++        metadata = path.stat()
++        if not stat.S_ISREG(metadata.st_mode):
++            raise RuntimeError(EVENTS_KEY_FILE_ENV + " must reference a regular file")
++        if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
++            raise RuntimeError(EVENTS_KEY_FILE_ENV + " must be owned by the MCP service user and mode 0400/0600")
++        key = path.read_bytes()
++    except OSError as exc:
++        raise RuntimeError(EVENTS_KEY_FILE_ENV + " is unavailable") from exc
++    if len(key) != 32:
++        raise RuntimeError(EVENTS_KEY_FILE_ENV + " must contain exactly 32 raw bytes")
++    return key
++
++
+ class DeploymentASGI:
+     """Add health and RFC 9728 metadata endpoints around the MCP ASGI app."""
+ 
+@@ -503,10 +529,12 @@
+         *,
+         issuer: str,
+         audience: str,
++        background_workers: Optional[Sequence[Any]] = None,
+     ) -> None:
+         self.inner = inner
+         self.issuer = issuer
+         self.audience = audience
++        self.background_workers = tuple(background_workers or ())
+ 
+         resource = urlsplit(audience)
+         self.endpoint_path = resource.path
+@@ -560,6 +588,30 @@
+         )
+ 
+     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
++        if scope.get("type") == "lifespan" and self.background_workers:
++            started_workers: list[Any] = []
++            stopped_workers: set[int] = set()
++
++            async def receive_with_worker_lifecycle() -> dict[str, Any]:
++                message = await receive()
++                if message.get("type") == "lifespan.startup":
++                    for worker in self.background_workers:
++                        worker.start()
++                        started_workers.append(worker)
++                elif message.get("type") == "lifespan.shutdown":
++                    for worker in reversed(started_workers):
++                        worker.stop()
++                        stopped_workers.add(id(worker))
++                return message
++
++            try:
++                await self.inner(scope, receive_with_worker_lifecycle, send)
++            finally:
++                for worker in reversed(started_workers):
++                    if id(worker) not in stopped_workers:
++                        worker.stop()
++            return
++
+         if scope.get("type") != "http":
+             await self.inner(scope, receive, send)
+             return
+@@ -649,12 +701,66 @@
+         memory_adapter=config.get("memory_adapter_command"),
+         sender_gateway=sender_gateway,
+     )
+-    mcp_app = build_mcp_server(service, verifier)
++
++    events_key_file = os.environ.get(EVENTS_KEY_FILE_ENV, "").strip()
++    events_db_path = os.environ.get(EVENTS_DB_ENV, "").strip()
++    if events_db_path and not events_key_file:
++        raise RuntimeError(EVENTS_DB_ENV + " requires " + EVENTS_KEY_FILE_ENV)
++
++    events_store = None
++    background_workers: list[Any] = []
++    if events_key_file:
++        encryption_key = _load_events_encryption_key(events_key_file)
++        if events_db_path and not Path(events_db_path).is_absolute():
++            raise RuntimeError(EVENTS_DB_ENV + " must be an absolute path")
++        if not events_db_path:
++            events_db_path = str(
++                Path(config["database_path"]).parent / "events" / "events.sqlite3"
++            )
++        if not callable(getattr(sender_gateway, "claim_events", None)) or not callable(
++            getattr(sender_gateway, "ack_event", None)
++        ) or not callable(getattr(sender_gateway, "get_job", None)):
++            raise RuntimeError("SenderGatewayClient lacks MCP Events claim/ack/authorization methods")
++        events_store = MCPEventsStore(
++            events_db_path,
++            encryption_key=encryption_key,
++        )
++        collector = MCPEventCollector(
++            sender_gateway,
++            events_store,
++            worker_id="mcp-events-" + uuid.uuid4().hex,
++        )
++        def authorize_event(*, tenant_id: str, principal_id: str, job_id: str) -> bool:
++            try:
++                sender_gateway.get_job(
++                    principal_id=principal_id,
++                    tenant_id=tenant_id,
++                    job_id=job_id,
++                )
++                return True
++            except Exception as exc:
++                if getattr(exc, "code", None) in ("NOT_FOUND", "PERMISSION_DENIED"):
++                    return False
++                raise
++
++        delivery_worker = MCPEventDeliveryWorker(
++            events_store,
++            authorize=authorize_event,
++        )
++        background_workers.append(MCPEventWorkers(collector, delivery_worker))
++
++    mcp_app = build_mcp_server(
++        service,
++        verifier,
++        events_store=events_store,
++        sender_gateway=sender_gateway,
++    )
+ 
+     return DeploymentASGI(
+         mcp_app,
+         issuer=config["issuer"],
+         audience=config["audience"],
++        background_workers=background_workers,
+     )
+ 
+ 

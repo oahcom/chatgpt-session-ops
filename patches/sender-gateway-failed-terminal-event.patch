@@ -1,0 +1,49 @@
+--- a/sender_gateway/job_store.py
++++ b/sender_gateway/job_store.py
+@@ -573,7 +573,8 @@
+ 
+         with self.transaction() as txn:
+             row = txn.fetchone(
+-                "SELECT status, error_code FROM jobs WHERE job_id = ?", (job_id,)
++                "SELECT status, error_code, tenant_id, principal_id FROM jobs WHERE job_id = ?",
++                (job_id,),
+             )
+             if row is None:
+                 raise JobStateError(f"unknown job {job_id}", code=ErrorCode.NOT_FOUND)
+@@ -612,6 +613,36 @@
+                     f"job {job_id} left the running state", code=ErrorCode.CONFLICT
+                 )
+ 
++            # A failed terminal transition is a completion event too. Keep the
++            # event insert in this transaction so no observer can see a failed
++            # job without its durable notification.
++            outcome_unknown = code is ErrorCode.OUTCOME_UNKNOWN
++            event_id = "evt_" + hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:32]
++            event_payload = {
++                "job_id": job_id,
++                "status": "failed",
++                "summary": f"Job failed with error code {code.value}.",
++                "completed_at": completed_at,
++                "error_code": code.value,
++                "outcome_unknown": outcome_unknown,
++            }
++            txn.execute(
++                """INSERT INTO job_event_outbox
++                   (event_id, job_id, tenant_id, principal_id, event_name,
++                    payload_json, created_at, status, attempts, next_attempt_at)
++                   VALUES (?, ?, ?, ?, 'chatgpt.job.completed', ?, ?, 'pending', 0, ?)
++                   ON CONFLICT(job_id) DO NOTHING""",
++                (
++                    event_id,
++                    job_id,
++                    row["tenant_id"],
++                    row["principal_id"],
++                    canonical_json(event_payload),
++                    completed_at,
++                    completed_at,
++                ),
++            )
++
+     # -- lease reconciliation ------------------------------------------
+ 
+     def expired_leases(self, *, now: str | None = None) -> list[dict]:

@@ -7,6 +7,7 @@ only when importing the top-level ``mcp`` package raises ImportError.
 
 import asyncio
 import unittest
+from unittest.mock import patch
 from urllib.parse import urlsplit
 
 try:
@@ -166,6 +167,250 @@ class MCPSDKIntegrationTests(unittest.TestCase):
         self.assertIsInstance(result, self.types.ListToolsResult)
         actual_names = {tool.name for tool in result.tools}
         self.assertEqual(actual_names, set(TOOL_SCHEMAS))
+
+    def test_events_handlers_register_and_advertise_capability(self):
+        import base64
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from src.session_ops.authority import Principal
+        from src.session_ops.mcp_auth import AuthContext
+        from src.session_ops.mcp_events import MCPEventsStore, build_event_request_models
+
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as tmp:
+            store = MCPEventsStore(
+                str(Path(tmp) / "events.sqlite3"),
+                post_json=lambda _url, body, _headers: (
+                    200,
+                    __import__("json").dumps({"challenge": __import__("json").loads(body)["challenge"]}).encode(),
+                ),
+                encryption_key=b"e" * 32,
+            )
+            app = build_mcp_server(self.service, self.verifier, events_store=store)
+            previous_app = type(self).app
+            try:
+                type(self).app = app
+                server = self._find_server()
+            finally:
+                type(self).app = previous_app
+
+            handlers = [server.get_request_handler(method) for method in (
+                "events/list", "events/subscribe", "events/unsubscribe"
+            )]
+            self.assertTrue(all(handler is not None for handler in handlers))
+
+            middleware = next(
+                item for item in server.middleware
+                if getattr(item, "__name__", "") == "advertise_events_capability"
+            )
+
+            async def next_initialize(_ctx):
+                return {"capabilities": {"tools": {}}, "protocolVersion": "2025-03-26"}
+
+            advertised = asyncio.run(middleware(self._request_context("initialize"), next_initialize))
+            self.assertEqual(advertised["capabilities"]["events"], {})
+
+            async def next_discover(_ctx):
+                return {"capabilities": {"tools": {}}, "supportedVersions": ["2026-07-28"], "resultType": "complete"}
+
+            discovered = asyncio.run(middleware(self._request_context("server/discover"), next_discover))
+            self.assertEqual(discovered["capabilities"]["events"], {})
+
+            auth = AuthContext(
+                Principal(tenant_id="tenant-a", principal_id="session_ops:user-a"),
+                ["session_ops.chatgpt.session.read", "session_ops.chatgpt.session.write"],
+                "https://issuer.example.test/realm",
+                "user-a",
+                "session_ops",
+            )
+            context = self._request_context("events/list")
+            context.request = SimpleNamespace(scope={"state": {"session_ops_auth": auth}})
+            EventsListParams, EventsSubscribeParams, EventsUnsubscribeParams = build_event_request_models()
+            listed = asyncio.run(handlers[0].handler(context, EventsListParams()))
+            self.assertEqual(listed["events"][0]["name"], "chatgpt.job.completed")
+
+            with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
+                subscribed = asyncio.run(handlers[1].handler(
+                    context,
+                    EventsSubscribeParams.model_validate({
+                        "name": "chatgpt.job.completed",
+                        "arguments": {},
+                        "delivery": {
+                            "mode": "webhook",
+                            "url": "https://events.example.test/callback",
+                            "secret": "whsec_" + base64.b64encode(b"s" * 32).decode(),
+                        },
+                    }),
+                ))
+            self.assertTrue(subscribed["id"].startswith("sub_"))
+
+            from mcp.shared.exceptions import MCPError
+            store.post_json = lambda _url, _body, _headers: (200, b'{"challenge":"wrong"}')
+            with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
+                with self.assertRaises(MCPError) as callback_error:
+                    asyncio.run(handlers[1].handler(
+                        context,
+                        EventsSubscribeParams.model_validate({
+                            "name": "chatgpt.job.completed",
+                            "arguments": {},
+                            "delivery": {
+                                "mode": "webhook",
+                                "url": "https://events.example.test/second-callback",
+                                "secret": "whsec_" + base64.b64encode(b"z" * 32).decode(),
+                            },
+                        }),
+                    ))
+            self.assertEqual(callback_error.exception.code, -32015)
+            self.assertEqual(callback_error.exception.data, {"reason": "challenge_failed"})
+
+    def test_streamable_http_events_handshake_and_lifecycle(self):
+        import base64
+        import json
+        import tempfile
+        from pathlib import Path
+        from src.session_ops.authority import Principal
+        from src.session_ops.mcp_auth import AuthContext
+        from src.session_ops.mcp_events import MCPEventsStore
+
+        class TokenProvider:
+            audience = "https://resource.example.test/mcp"
+
+            def verify(self, token):
+                self_token = token
+                if self_token != "probe-token":
+                    raise AssertionError("unexpected token")
+                return AuthContext(
+                    Principal("tenant-a", "session_ops:user-a"),
+                    ["session_ops.chatgpt.session.read", "session_ops.chatgpt.session.write"],
+                    "https://issuer.example.test/realm",
+                    "user-a",
+                    "session_ops",
+                )
+
+        async def run_protocol(app, store):
+            async def send_rpc(payload, session_id=None):
+                body = __import__("json").dumps(payload).encode()
+                headers = [
+                    (b"authorization", b"Bearer probe-token"),
+                    (b"accept", b"application/json, text/event-stream"),
+                    (b"content-type", b"application/json"),
+                    (b"host", b"resource.example.test"),
+                ]
+                if session_id:
+                    headers.append((b"mcp-session-id", session_id.encode()))
+                messages = []
+                first = True
+                disconnected = asyncio.Event()
+
+                async def receive():
+                    nonlocal first
+                    if first:
+                        first = False
+                        return {"type": "http.request", "body": body, "more_body": False}
+                    await disconnected.wait()
+                    return {"type": "http.disconnect"}
+
+                async def send(message):
+                    messages.append(message)
+
+                scope = {
+                    "type": "http",
+                    "asgi": {"version": "3.0"},
+                    "http_version": "1.1",
+                    "method": "POST",
+                    "scheme": "https",
+                    "path": "/mcp",
+                    "raw_path": b"/mcp",
+                    "query_string": b"",
+                    "root_path": "",
+                    "headers": headers,
+                    "client": ("127.0.0.1", 12345),
+                    "server": ("resource.example.test", 443),
+                }
+
+                async def disconnect_later():
+                    await asyncio.sleep(0.05)
+                    disconnected.set()
+
+                stopper = asyncio.create_task(disconnect_later())
+                await app(scope, receive, send)
+                await stopper
+                start = next(item for item in messages if item["type"] == "http.response.start")
+                response_headers = {key.decode().lower(): value.decode() for key, value in start["headers"]}
+                response_body = b"".join(
+                    item.get("body", b"") for item in messages if item["type"] == "http.response.body"
+                ).decode()
+                data_line = next(line[6:] for line in response_body.splitlines() if line.startswith("data: "))
+                return start["status"], response_headers, json.loads(data_line)
+
+            inner = app.inner
+            async with inner.router.lifespan_context(inner):
+                status, headers, initialized = await send_rpc({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "clientInfo": {"name": "events-poc", "version": "1"},
+                    },
+                })
+                self.assertEqual(status, 200)
+                self.assertEqual(initialized["result"]["capabilities"]["events"], {})
+                session_id = headers["mcp-session-id"]
+
+                status, _headers, listed = await send_rpc(
+                    {"jsonrpc": "2.0", "id": 2, "method": "events/list", "params": {}},
+                    session_id,
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(listed["result"]["events"][0]["name"], "chatgpt.job.completed")
+
+                secret = "whsec_" + base64.b64encode(b"w" * 32).decode()
+                with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
+                    status, _headers, subscribed = await send_rpc({
+                        "jsonrpc": "2.0", "id": 3, "method": "events/subscribe",
+                        "params": {
+                            "name": "chatgpt.job.completed",
+                            "arguments": {"job_id": "job-1"},
+                            "delivery": {"mode": "webhook", "url": "https://events.example.test/callback", "secret": secret},
+                            "ttlMs": None,
+                        },
+                    }, session_id)
+                self.assertEqual(status, 200)
+                self.assertTrue(subscribed["result"]["id"].startswith("sub_"))
+                self.assertIsNone(subscribed["result"]["refreshBefore"])
+
+                status, _headers, unsubscribed = await send_rpc({
+                    "jsonrpc": "2.0", "id": 4, "method": "events/unsubscribe",
+                    "params": {
+                        "name": "chatgpt.job.completed",
+                        "arguments": {"job_id": "job-1"},
+                        "delivery": {"mode": "webhook", "url": "https://events.example.test/callback"},
+                    },
+                }, session_id)
+                self.assertEqual(status, 200)
+                self.assertEqual(unsubscribed["result"], {})
+
+        with tempfile.TemporaryDirectory(dir="/dev/shm") as tmp:
+            store = MCPEventsStore(
+                str(Path(tmp) / "events.sqlite3"),
+                encryption_key=b"h" * 32,
+                post_json=lambda _url, body, _headers: (
+                    200,
+                    json.dumps({"challenge": json.loads(body)["challenge"]}).encode(),
+                ),
+            )
+            class Sender:
+                def get_job(self, **kwargs):
+                    return {"job_id": kwargs["job_id"]}
+
+            sender = Sender()
+            app = build_mcp_server(
+                self.service,
+                TokenProvider(),
+                events_store=store,
+                sender_gateway=sender,
+            )
+            asyncio.run(run_protocol(app, store))
 
     def test_real_tools_call_rejects_missing_request_authentication(self):
         server = self._find_server()

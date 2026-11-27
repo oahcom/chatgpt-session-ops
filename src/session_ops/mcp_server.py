@@ -476,10 +476,17 @@ class MCPToolService:
     It is configuration, not a shared MemoryAdapterClient instance.
     """
 
-    def __init__(self, store: Any, *, memory_adapter: Optional[Sequence[str]] = None):
+    def __init__(
+        self,
+        store: Any,
+        *,
+        memory_adapter: Optional[Sequence[str]] = None,
+        sender_gateway: Any = None,
+    ):
         if store is None:
             raise ValueError("SecureWorkItemStore is required")
         self.store = store
+        self.sender_gateway = sender_gateway
         if memory_adapter is None:
             self.memory_adapter_command = None
         else:
@@ -731,7 +738,13 @@ class MCPToolService:
 # Streamable HTTP authentication and SDK binding
 # ---------------------------------------------------------------------------
 
-def build_mcp_server(service: MCPToolService, token_provider: JWTVerifier) -> Any:
+def build_mcp_server(
+    service: MCPToolService,
+    token_provider: JWTVerifier,
+    *,
+    events_store: Any = None,
+    sender_gateway: Any = None,
+) -> Any:
     """Build and return the authenticated Streamable HTTP ASGI application.
 
     ``token_provider`` is one shared JWTVerifier instance. It is not called
@@ -745,6 +758,8 @@ def build_mcp_server(service: MCPToolService, token_provider: JWTVerifier) -> An
         raise TypeError("service must be MCPToolService")
     if not callable(getattr(token_provider, "verify", None)):
         raise TypeError("token_provider must be a JWTVerifier instance")
+    if sender_gateway is None:
+        sender_gateway = getattr(service, "sender_gateway", None)
 
     # The optional SDK is deliberately imported only here.
     from mcp import types
@@ -840,6 +855,101 @@ def build_mcp_server(service: MCPToolService, token_provider: JWTVerifier) -> An
         on_list_tools=on_list_tools,
         on_call_tool=on_call_tool,
     )
+
+    if events_store is not None:
+        # MCP SDK 2.3.0 supports custom request handlers and context middleware,
+        # but its ServerCapabilities model predates the ChatGPT MCP Events field.
+        # Advertise the field after SDK serialization, without monkey-patching
+        # the SDK's Pydantic models or changing non-event deployments.
+        from src.session_ops.mcp_events import CallbackEndpointError, build_event_request_models
+
+        EventsListParams, EventsSubscribeParams, EventsUnsubscribeParams = (
+            build_event_request_models()
+        )
+
+        def _event_auth(ctx: Any) -> Any:
+            request = getattr(ctx, "request", None)
+            if request is None:
+                return None
+            state = request.scope.get("state", {})
+            return state.get("session_ops_auth") if isinstance(state, dict) else None
+
+        async def on_events_list(ctx: Any, params: Any) -> Any:
+            auth = _event_auth(ctx)
+            if not isinstance(auth, AuthContext):
+                raise AuthenticationError("verified authentication context required")
+            events_store._identity(auth)
+            if not ({"session_ops.chatgpt.session.read", "session_ops.chatgpt.session.write"} & set(auth.scopes)):
+                raise ScopeError(("session_ops.chatgpt.session.read",))
+            return {"events": events_store.event_catalog()}
+
+        async def on_events_subscribe(ctx: Any, params: Any) -> Any:
+            auth = _event_auth(ctx)
+            if not isinstance(auth, AuthContext):
+                raise AuthenticationError("verified authentication context required")
+            if "session_ops.chatgpt.session.write" not in auth.scopes:
+                raise ScopeError(("session_ops.chatgpt.session.write",))
+            arguments = params.arguments or {}
+            job_id = arguments.get("job_id")
+            if job_id is not None:
+                if sender_gateway is None:
+                    from mcp.shared.exceptions import MCPError
+                    raise MCPError(code=-32003, message="Event authorization service unavailable")
+                try:
+                    sender_gateway.get_job(
+                        principal_id=auth.principal.principal_id,
+                        tenant_id=auth.principal.tenant_id,
+                        job_id=job_id,
+                    )
+                except Exception as exc:
+                    if getattr(exc, "code", None) in ("NOT_FOUND", "PERMISSION_DENIED"):
+                        from mcp.shared.exceptions import MCPError
+                        raise MCPError(
+                            code=-32602,
+                            message="Invalid event subscription",
+                            data={"reason": "job_not_accessible"},
+                        ) from exc
+                    raise
+            try:
+                return events_store.subscribe(
+                    auth,
+                    params.model_dump(by_alias=True, exclude_unset=True),
+                )
+            except CallbackEndpointError as exc:
+                from mcp.shared.exceptions import MCPError
+                raise MCPError(
+                    code=-32015,
+                    message="Callback endpoint verification failed",
+                    data={"reason": exc.reason},
+                ) from exc
+            except ValueError as exc:
+                from mcp.shared.exceptions import MCPError
+                raise MCPError(code=-32602, message="Invalid event subscription", data={"reason": "invalid_subscription"}) from exc
+
+        async def on_events_unsubscribe(ctx: Any, params: Any) -> Any:
+            auth = _event_auth(ctx)
+            if not isinstance(auth, AuthContext):
+                raise AuthenticationError("verified authentication context required")
+            if "session_ops.chatgpt.session.write" not in auth.scopes:
+                raise ScopeError(("session_ops.chatgpt.session.write",))
+            return events_store.unsubscribe(
+                auth,
+                params.model_dump(by_alias=True, exclude_unset=True),
+            )
+
+        server.add_request_handler("events/list", EventsListParams, on_events_list)
+        server.add_request_handler("events/subscribe", EventsSubscribeParams, on_events_subscribe)
+        server.add_request_handler("events/unsubscribe", EventsUnsubscribeParams, on_events_unsubscribe)
+
+        async def advertise_events_capability(ctx: Any, call_next: Any) -> Any:
+            result = await call_next(ctx)
+            if ctx.method in ("initialize", "server/discover") and isinstance(result, dict):
+                capabilities = result.get("capabilities")
+                if isinstance(capabilities, dict):
+                    result["capabilities"] = {**capabilities, "events": {}}
+            return result
+
+        server.middleware.append(advertise_events_capability)
 
     # The SDK enforces the request-body limit in its Streamable HTTP transport.
     # Host/origin checks remain enabled for the public resource and local tests.

@@ -1,0 +1,319 @@
+--- a/sender_gateway/job_store.py
++++ b/sender_gateway/job_store.py
+@@ -27,8 +27,11 @@
+ 
+ from __future__ import annotations
+ 
++import hashlib
++import json
+ import sqlite3
+ import threading
++import uuid
+ from contextlib import contextmanager
+ from pathlib import Path
+ from typing import Any, Iterator, Sequence
+@@ -100,6 +103,26 @@
+     """,
+     "CREATE INDEX IF NOT EXISTS ix_session_owners_owner"
+     " ON session_owners(tenant_id, principal_id)",
++    """
++    CREATE TABLE IF NOT EXISTS job_event_outbox (
++        event_id TEXT PRIMARY KEY,
++        job_id TEXT NOT NULL UNIQUE,
++        tenant_id TEXT NOT NULL,
++        principal_id TEXT NOT NULL,
++        event_name TEXT NOT NULL,
++        payload_json TEXT NOT NULL,
++        created_at TEXT NOT NULL,
++        status TEXT NOT NULL DEFAULT 'pending',
++        attempts INTEGER NOT NULL DEFAULT 0,
++        next_attempt_at TEXT NOT NULL,
++        lease_until TEXT,
++        lease_token TEXT,
++        worker_id TEXT,
++        delivered_at TEXT
++    )
++    """,
++    "CREATE INDEX IF NOT EXISTS ix_job_event_outbox_due"
++    " ON job_event_outbox(status, next_attempt_at, created_at)",
+ )
+ 
+ _INSERT_JOB = """
+@@ -207,7 +230,13 @@
+         self._local = threading.local()
+ 
+     def close_thread_connection(self) -> None:
+-        """Close and unregister this request thread's SQLite connection."""
++        """Close and unregister this request thread's SQLite connection.
++
++        ThreadingHTTPServer creates a fresh thread for each request. A
++        thread-local alone does not close SQLite handles when that thread
++        exits if the store also retains a global reference in `_connections`.
++        Call this from the HTTP handler's `finish()` hook.
++        """
+         conn = getattr(self._local, "conn", None)
+         if conn is None:
+             return
+@@ -464,7 +493,10 @@
+         completed_at = now or self._now()
+ 
+         with self.transaction() as txn:
+-            row = txn.fetchone("SELECT status FROM jobs WHERE job_id = ?", (job_id,))
++            row = txn.fetchone(
++                "SELECT status, tenant_id, principal_id FROM jobs WHERE job_id = ?",
++                (job_id,),
++            )
+             if row is None:
+                 raise JobStateError(f"unknown job {job_id}", code=ErrorCode.NOT_FOUND)
+             status = row["status"]
+@@ -492,6 +524,34 @@
+                     f"job {job_id} left the running state", code=ErrorCode.CONFLICT
+                 )
+ 
++            summary = result.get("summary")
++            if not isinstance(summary, str):
++                summary = "Job completed; fetch the result with chatgpt.job.get."
++            summary = summary[:4000]
++            event_id = "evt_" + hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:32]
++            event_payload = {
++                "job_id": job_id,
++                "status": "succeeded",
++                "summary": summary,
++                "completed_at": completed_at,
++            }
++            txn.execute(
++                """INSERT INTO job_event_outbox
++                   (event_id, job_id, tenant_id, principal_id, event_name,
++                    payload_json, created_at, status, attempts, next_attempt_at)
++                   VALUES (?, ?, ?, ?, 'chatgpt.job.completed', ?, ?, 'pending', 0, ?)
++                   ON CONFLICT(job_id) DO NOTHING""",
++                (
++                    event_id,
++                    job_id,
++                    row["tenant_id"],
++                    row["principal_id"],
++                    canonical_json(event_payload),
++                    completed_at,
++                    completed_at,
++                ),
++            )
++
+     def fail(
+         self,
+         job_id: str,
+@@ -513,7 +573,8 @@
+ 
+         with self.transaction() as txn:
+             row = txn.fetchone(
+-                "SELECT status, error_code FROM jobs WHERE job_id = ?", (job_id,)
++                "SELECT status, error_code, tenant_id, principal_id FROM jobs WHERE job_id = ?",
++                (job_id,),
+             )
+             if row is None:
+                 raise JobStateError(f"unknown job {job_id}", code=ErrorCode.NOT_FOUND)
+@@ -552,6 +613,36 @@
+                     f"job {job_id} left the running state", code=ErrorCode.CONFLICT
+                 )
+ 
++            # A failed terminal transition is a completion event too. Keep the
++            # event insert in this transaction so no observer can see a failed
++            # job without its durable notification.
++            outcome_unknown = code is ErrorCode.OUTCOME_UNKNOWN
++            event_id = "evt_" + hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:32]
++            event_payload = {
++                "job_id": job_id,
++                "status": "failed",
++                "summary": f"Job failed with error code {code.value}.",
++                "completed_at": completed_at,
++                "error_code": code.value,
++                "outcome_unknown": outcome_unknown,
++            }
++            txn.execute(
++                """INSERT INTO job_event_outbox
++                   (event_id, job_id, tenant_id, principal_id, event_name,
++                    payload_json, created_at, status, attempts, next_attempt_at)
++                   VALUES (?, ?, ?, ?, 'chatgpt.job.completed', ?, ?, 'pending', 0, ?)
++                   ON CONFLICT(job_id) DO NOTHING""",
++                (
++                    event_id,
++                    job_id,
++                    row["tenant_id"],
++                    row["principal_id"],
++                    canonical_json(event_payload),
++                    completed_at,
++                    completed_at,
++                ),
++            )
++
+     # -- lease reconciliation ------------------------------------------
+ 
+     def expired_leases(self, *, now: str | None = None) -> list[dict]:
+@@ -602,6 +693,84 @@
+ 
+     # -- reads ---------------------------------------------------------
+ 
++    def claim_events(
++        self,
++        worker_id: str,
++        *,
++        limit: int = 25,
++        lease_seconds: float = 30.0,
++        now: str | None = None,
++    ) -> list[dict]:
++        """Claim due completion events for the authenticated MCP dispatcher."""
++        if not isinstance(worker_id, str) or not worker_id.strip():
++            raise StoreError("worker_id is required", code=ErrorCode.INVALID_ARGUMENT)
++        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
++            raise StoreError("limit must be in 1..100", code=ErrorCode.INVALID_ARGUMENT)
++        if not 1 <= float(lease_seconds) <= 300:
++            raise StoreError("lease_seconds must be in 1..300", code=ErrorCode.INVALID_ARGUMENT)
++        claimed_at = now or self._now()
++        lease_until = add_seconds(claimed_at, float(lease_seconds))
++        claimed: list[dict] = []
++        with self.transaction() as txn:
++            txn.execute(
++                """UPDATE job_event_outbox
++                   SET status='pending', lease_until=NULL, lease_token=NULL, worker_id=NULL
++                   WHERE status='sending' AND lease_until<=?""",
++                (claimed_at,),
++            )
++            rows = txn.fetchall(
++                """SELECT * FROM job_event_outbox
++                   WHERE status='pending' AND next_attempt_at<=?
++                   ORDER BY created_at, event_id LIMIT ?""",
++                (claimed_at, limit),
++            )
++            for row in rows:
++                lease_token = uuid.uuid4().hex
++                cursor = txn.execute(
++                    """UPDATE job_event_outbox
++                       SET status='sending', attempts=attempts+1, worker_id=?,
++                           lease_until=?, lease_token=?
++                       WHERE event_id=? AND status='pending'""",
++                    (worker_id, lease_until, lease_token, row["event_id"]),
++                )
++                if cursor.rowcount == 1:
++                    claimed.append({
++                        "event_id": row["event_id"],
++                        "job_id": row["job_id"],
++                        "tenant_id": row["tenant_id"],
++                        "principal_id": row["principal_id"],
++                        "name": row["event_name"],
++                        "payload": json.loads(row["payload_json"]),
++                        "lease_token": lease_token,
++                        "attempt": int(row["attempts"]) + 1,
++                    })
++        return claimed
++
++    def ack_event(self, event_id: str, lease_token: str, *, now: str | None = None) -> bool:
++        """Acknowledge durable MCP ingestion; stale leases cannot ack a new claim."""
++        if not isinstance(event_id, str) or not event_id or not isinstance(lease_token, str) or not lease_token:
++            raise StoreError("event_id and lease_token are required", code=ErrorCode.INVALID_ARGUMENT)
++        acknowledged_at = now or self._now()
++        with self.transaction() as txn:
++            row = txn.fetchone(
++                "SELECT status, lease_token FROM job_event_outbox WHERE event_id=?",
++                (event_id,),
++            )
++            if row is None:
++                return False
++            if row["status"] == "delivered":
++                return True
++            if row["status"] != "sending" or row["lease_token"] != lease_token:
++                return False
++            txn.execute(
++                """UPDATE job_event_outbox
++                   SET status='delivered', delivered_at=?, lease_until=NULL,
++                       lease_token=NULL, worker_id=NULL
++                   WHERE event_id=? AND status='sending' AND lease_token=?""",
++                (acknowledged_at, event_id, lease_token),
++            )
++        return True
++
+     def get(self, principal_id: str, tenant_id: str, job_id: str) -> dict | None:
+         """Tenant- and principal-scoped read.  No cross-tenant leakage."""
+ 
+--- a/sender_gateway/app.py
++++ b/sender_gateway/app.py
+@@ -49,6 +49,9 @@
+     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+ )
+ JOB_RE = re.compile(r"cgj_[0-9a-f-]{36}")
++EVENT_ID_RE = re.compile(r"evt_[0-9a-f]{32}")
++EVENT_DISPATCHER_PRINCIPAL = "session_ops:event-dispatcher"
++EVENT_DISPATCHER_TENANT = "session_ops"
+ 
+ 
+ def _required(name: str) -> str:
+@@ -304,6 +307,13 @@
+                             """,
+                             (cutoff,),
+                         )
++                        txn.execute(
++                            """
++                            DELETE FROM job_event_outbox
++                             WHERE status = 'delivered' AND created_at < ?
++                            """,
++                            (cutoff,),
++                        )
+                     last_retention = now
+                 if not self.worker.run_once():
+                     self._stop.wait(self._poll_seconds)
+@@ -344,6 +354,10 @@
+             try:
+                 super().finish()
+             finally:
++                # One request per ThreadingHTTPServer worker thread. Release
++                # the JobStore's thread-local SQLite handle before the thread
++                # exits; otherwise its global connection registry keeps every
++                # request's DB/WAL descriptors alive until process shutdown.
+                 app.store.close_thread_connection()
+ 
+         def log_message(self, fmt, *args):
+@@ -397,6 +411,46 @@
+                 parsed = urlsplit(self.path)
+                 path = parsed.path
+ 
++                if self.command == "POST" and path in (
++                    "/internal/v1/events/claim",
++                ):
++                    if (principal_id, tenant_id) != (
++                        EVENT_DISPATCHER_PRINCIPAL,
++                        EVENT_DISPATCHER_TENANT,
++                    ):
++                        raise GatewayError(
++                            "event dispatcher identity required",
++                            code=ErrorCode.PERMISSION_DENIED,
++                        )
++                    body = self._body()
++                    worker_id = body.get("worker_id")
++                    limit = body.get("limit", 25)
++                    items = app.store.claim_events(worker_id, limit=limit)
++                    self._json(200, {"items": items})
++                    return
++
++                match = re.fullmatch(r"/internal/v1/events/(evt_[0-9a-f]{32})/ack", path)
++                if self.command == "POST" and match:
++                    if (principal_id, tenant_id) != (
++                        EVENT_DISPATCHER_PRINCIPAL,
++                        EVENT_DISPATCHER_TENANT,
++                    ):
++                        raise GatewayError(
++                            "event dispatcher identity required",
++                            code=ErrorCode.PERMISSION_DENIED,
++                        )
++                    body = self._body()
++                    acknowledged = app.store.ack_event(
++                        match.group(1), body.get("lease_token")
++                    )
++                    if not acknowledged:
++                        raise GatewayError(
++                            "event lease is stale or unknown",
++                            code=ErrorCode.CONFLICT,
++                        )
++                    self._json(200, {"acknowledged": True})
++                    return
++
+                 if self.command == "POST" and path == "/internal/v1/jobs":
+                     body = self._body()
+                     operation = body.get("operation")

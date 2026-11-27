@@ -1,0 +1,42 @@
+--- a/sender_gateway/job_store.py
++++ b/sender_gateway/job_store.py
+@@ -206,6 +206,24 @@
+                 pass
+         self._local = threading.local()
+ 
++    def close_thread_connection(self) -> None:
++        """Close and unregister this request thread's SQLite connection."""
++        conn = getattr(self._local, "conn", None)
++        if conn is None:
++            return
++        with self._connections_lock:
++            try:
++                if conn.in_transaction:
++                    conn.rollback()
++                conn.close()
++            except sqlite3.Error:
++                pass
++            self._connections = [item for item in self._connections if item is not conn]
++            try:
++                del self._local.conn
++            except AttributeError:
++                pass
++
+     def _ensure_schema(self) -> None:
+         with self._schema_lock:
+             conn = self._connection()
+--- a/sender_gateway/app.py
++++ b/sender_gateway/app.py
+@@ -340,6 +340,12 @@
+     class Handler(BaseHTTPRequestHandler):
+         server_version = "so-sender/1"
+ 
++        def finish(self):
++            try:
++                super().finish()
++            finally:
++                app.store.close_thread_connection()
++
+         def log_message(self, fmt, *args):
+             logging.info("%s - %s", self.address_string(), fmt % args)
+ 
