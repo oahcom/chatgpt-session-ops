@@ -288,12 +288,15 @@ entry's `content` only. If an entry would exceed the remaining aggregate
 budget, that whole entry is omitted; content is never truncated. An absent
 or null `max_chars` means unbounded.
 
-The current Session Ops client does not send `max_chars` in v0.1. It keeps
-its existing context entry-count and per-entry content checks. The optional
-Adapter budget remains available to other callers; it is not a hard resource
-or response-byte limit and does not bound request bytes, metadata, JSON
-envelope bytes, or Core allocations. Those hard bounds are tracked separately
-by Adapter #36 and Session Ops #165.
+v0.1 clarification: `max_chars`, when present and non-null, MUST be a
+positive integer. The budget is measured by Unicode scalar values in each
+entry's `content` only. If an entry would exceed the remaining aggregate
+budget, that whole entry is omitted; content is never truncated. An absent
+or null `max_chars` means unbounded.
+
+The `max_chars` budget is not a hard resource or response-byte limit. It does
+not bound request bytes, metadata, JSON envelope bytes, or Core allocations;
+those require separate hard limits.
 
 The retrieval scope is always the explicit WorkItem.
 
