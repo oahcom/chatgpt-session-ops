@@ -29,26 +29,87 @@ Reachable only after stubbing the upstream authorization check
            fall-through is a ``TypeError`` rather than ``NotAuthorized``.
 
 Unreachable: post-hoc invariants of a single transaction
-    L564 L578 L597 L622 L633 L651
-        ``initialize`` re-verifies its own landing-evidence migration inside
-        the same ``BEGIN IMMEDIATE``.  Each guard restates a query that ran
-        microseconds earlier on the same connection:
+    Six guards in ``SecureWorkItemStore.initialize``.  Line numbers below are
+    from ``ea7bdd3``; the quoted message is the stable identifier, so grep for
+    it rather than trusting the number.  All six are permanent mutation
+    survivors *by design* -- see "Why record instead of delete" below.
 
-        L564  ``changed`` (``.rowcount`` of the downgrade UPDATE) vs
-              ``legacy_pending_count`` (a COUNT with a byte-identical WHERE).
-        L578  a re-COUNT of that same WHERE immediately after the UPDATE.
-        L597  ``COUNT(*)`` of the table: the migration only runs ALTER TABLE
-              ADD COLUMN, one UPDATE, and CREATE INDEX -- never INSERT/DELETE.
-        L622  the distribution map, adjusted by ``legacy_pending_count`` --
-              the same number the UPDATE moved.
-        L633  ``consumed_at`` / ``linked_at`` correspondence: neither column
-              is written by the migration.
-        L651  ``invalid_legacy_rows`` counts a SUPERSET of the rows the UPDATE
-              just touched: every touched row satisfies all of its terms
-              (``rejected_at IS NULL`` implies ``rejection_reason IS NULL``
-              through the table's own CHECK), and it additionally matches
-              pre-existing ambiguous rows, so the COUNT can only be
-              ``< legacy_pending_count`` if the UPDATE failed to apply.
+        L564  "migration changed an unexpected row count"
+              ``changed`` is the ``.rowcount`` of the downgrade UPDATE; the
+              value it is compared with is a ``SELECT COUNT(*)`` whose WHERE
+              clause is byte-identical (``W1 == W2``, checked at runtime), on
+              the same connection, inside the same ``BEGIN IMMEDIATE``.
+              ``SET match = 'ambiguous'`` is disjoint from ``WHERE match =
+              'confirmed'``, so every matched row is physically rewritten and
+              ``rowcount`` always equals the matched count.
+
+        L578  "legacy pending confirmed landing evidence remains"
+              The re-check re-uses the very predicate P the UPDATE has just
+              falsified for every row: P requires ``match = 'confirmed'`` and
+              the UPDATE sets ``match = 'ambiguous'`` on exactly the rows
+              satisfying P.  Between the UPDATE and the re-check only the L564
+              comparison runs -- no INSERT/DELETE/REPLACE, and the
+              ``CREATE INDEX`` comes after the re-check -- so P stays empty.
+
+        L597  "migration changed total event count"
+              Between the two snapshots the block executes only four
+              ``ALTER TABLE ... ADD COLUMN``, one row-count-preserving UPDATE,
+              and ``CREATE INDEX IF NOT EXISTS``.  Nothing can add or remove a
+              row.
+
+        L622  "changed unexpected match/consumption distribution"
+              The distribution key is ``(match, consumed_at IS NOT NULL)``.
+              The only write statement pins ``consumed_at`` to NULL (its WHERE
+              requires ``consumed_at IS NULL``) and flips ``confirmed`` ->
+              ``ambiguous``; that is exactly the delta
+              ``expected_distributions`` derives from ``legacy_pending_count``.
+
+        L633  "changed historical session-link correspondence"
+              Both metrics read only ``session_id`` / ``consumed_at`` /
+              ``linked_at``.  The UPDATE writes only ``match,
+              evidence_complete``, and only where ``consumed_at IS NULL``,
+              while ``events_with_link`` requires ``consumed_at IS NOT NULL``;
+              ``session_links`` is not written in this block at all.
+
+        L651  "failed legacy-row verification"
+              After the UPDATE the verification predicate holds for all k
+              ``legacy_pending_count`` rows (same shape as the downgrade, and
+              the identity/consumption columns are already NULL by the
+              UPDATE's WHERE).  Its seventh conjunct, ``rejection_reason IS
+              NULL``, is guaranteed by the malformed-state guard at L537
+              ("landing evidence contains an inconsistent consumption state"):
+              that guard rejects a NULL ``rejected_at`` next to a non-NULL
+              ``rejection_reason``, so every row with ``rejected_at IS NULL``
+              has ``rejection_reason IS NULL``.  **This derivation is valid
+              only while L537 remains.**
+
+        Why record instead of delete.  Earlier rounds did delete genuinely
+        unreachable guards -- three in ``src/session_ops/mcp_server.py``, three
+        in ``scripts/chatgpt_send.py``, three in
+        ``src/session_ops/work_items.py`` -- but those were input-validation
+        branches on pure functions whose conditions were exhaustively false.
+        These six are of a different kind: they are *post-conditions of a data
+        migration*, and each is unreachable only because two expressions are
+        **textually coupled**.  Edit one side of a pair -- the COUNT's WHERE
+        without the UPDATE's, or the SET list without the distribution key --
+        and the guard becomes reachable.  It is then the only thing standing
+        between a silent half migration and a rolled-back database.  These are
+        sentinels: deleting one removes the only detector for exactly that
+        drift.  L651 is also a second line of defence behind L537, and its own
+        unreachability proof depends on L537, so it must not be "cleaned up"
+        either.
+
+        Expected mutation-sweep baseline: this file contributes exactly **six
+        known survivors** (the six above).  Every other guard in this file must
+        be KILLED.  Future sweeps should not re-report these six as findings.
+
+        Measurement caveat: ``-k "authority or migration"`` collects only 133
+        tests and **omits ``tests/test_landing_identity_contract.py``**, which
+        is where the positive controls for L523 and L537 are actually killed
+        (``test_t4_partial_identity_row_aborts_initialize_and_rolls_back`` /
+        ``test_t5_rejected_row_without_reason_aborts_initialize_and_rolls_back``).
+        A SURVIVOR reported by that subset run is not admissible for this file;
+        only a full-suite run counts.
 
         ``BEGIN IMMEDIATE`` plus a single connection means no concurrent
         writer can break any of these.  No test here claims to kill the guard.
@@ -232,7 +293,31 @@ class _Base(unittest.TestCase):
 
 
 class LandingMigrationInvariantTests(_Base):
-    """initialize: L564, L578, L597, L622, L633, L651 (all unreachable)."""
+    """Pins the post-migration state the six ``initialize`` guards protect.
+
+    Six by-design mutation survivors, all in ``initialize``; the full reasoning
+    is in the module docstring under "Unreachable: post-hoc invariants of a
+    single transaction".  In brief, so each one can be checked against the
+    source rather than taken on trust:
+
+    L564  "migration changed an unexpected row count" -- ``rowcount`` of the
+          downgrade UPDATE vs a ``COUNT(*)`` with a byte-identical WHERE, same
+          connection, same transaction; the SET is disjoint from the WHERE.
+    L578  "legacy pending confirmed landing evidence remains" -- the re-count
+          uses the predicate the UPDATE just falsified, with no INSERT/DELETE
+          in between.
+    L597  "migration changed total event count" -- only ADD COLUMN, one
+          row-count-preserving UPDATE, and CREATE INDEX between snapshots.
+    L622  "changed unexpected match/consumption distribution" -- the only
+          write flips confirmed -> ambiguous while leaving ``consumed_at``
+          NULL, which is the delta ``expected_distributions`` computes.
+    L633  "changed historical session-link correspondence" -- the UPDATE writes
+          only ``match, evidence_complete`` on rows with ``consumed_at IS
+          NULL``; the metrics read ``session_id`` / ``consumed_at`` /
+          ``linked_at``.
+    L651  "failed legacy-row verification" -- all seven conjuncts hold after
+          the UPDATE; the last one rests on L537 (see below).
+    """
 
     def setUp(self) -> None:
         super().setUp()
@@ -300,6 +385,17 @@ class LandingMigrationInvariantTests(_Base):
         The guard fires when the downgraded rows fail to match the
         verification query.  Mutating the UPDATE's SET clause (dropping
         ``evidence_complete = 0``) makes this count 0 and is caught here.
+
+        L651 is unreachable only while the malformed-state guard at L537
+        ("landing evidence contains an inconsistent consumption state") is in
+        place: L537 is what makes L651's final conjunct (``rejection_reason IS
+        NULL``) hold for every row whose ``rejected_at`` is NULL.  Remove L537
+        and L651 becomes reachable, so do not delete L537 as "redundant".  The
+        positive control for L537 lives in
+        ``tests/test_landing_identity_contract.py``
+        (``test_t5_rejected_row_without_reason_aborts_initialize_and_rolls_back``)
+        -- i.e. outside this file, which is why a subset sweep that omits that
+        module cannot be trusted.
         """
         self.store.initialize()
         self.assertEqual(
