@@ -155,6 +155,33 @@ class ChatGPTWorkItemExecutionTests(unittest.TestCase):
         self.assertEqual(context["status"], 0)
         self.assertIn("POST attempt", context["link_error"])
 
+
+    def test_direct_cli_http_503_is_outcome_unknown(self):
+        api = SimpleNamespace(account="acct2", last_send_started=True)
+        with (
+            mock.patch.object(runtime, "ChatGPTAPI", return_value=api),
+            mock.patch.object(runtime, "send_prompt", return_value=(503, None, None)),
+        ):
+            status, conv = runtime._attempt_create({}, "acct2", "/tmp/prompt", [])
+        self.assertEqual(status, "OUTCOME_UNKNOWN")
+        self.assertIsNone(conv)
+
+    def test_direct_cli_identity_mismatch_is_outcome_unknown(self):
+        api = SimpleNamespace(account="acct2", last_send_started=True)
+        mismatch = runtime.ConvRef(
+            "target-conv",
+            actual_conv_id="actual-conv",
+            mismatch=True,
+            reason="conversation id mismatch",
+        )
+        with (
+            mock.patch.object(runtime, "ChatGPTAPI", return_value=api),
+            mock.patch.object(runtime, "send_prompt", return_value=(200, None, mismatch)),
+        ):
+            status, conv = runtime._attempt_create({}, "acct2", "/tmp/prompt", [])
+        self.assertEqual(status, "OUTCOME_UNKNOWN")
+        self.assertIs(conv, mismatch)
+
     def test_work_item_send_rejects_anonymous_api_before_any_send(self):
         store = SecureWorkItemStore.__new__(SecureWorkItemStore)
         principal = Principal("tenant-a", "principal-a")

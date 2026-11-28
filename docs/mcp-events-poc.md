@@ -24,7 +24,7 @@ The event store key is separate from the database file. `SO_MCP_EVENTS_DB`, if c
 ## Reliability and security
 
 - Event creation and terminal WorkItem state commit or roll back together. A process crash cannot leave a completed WorkItem without its outbox event.
-- Tenant and principal identity come from verified MCP authentication, never from event payload arguments.
+- Tenant and principal identity come from verified MCP authentication, never from event payload arguments. Before each callback, current WorkItem read/write access for the event owner is rechecked; an authorization failure is terminal for that delivery and sends no callback.
 - Subscription secrets are AES-GCM encrypted. Callback challenge verification and per-delivery Standard Webhooks signatures are enforced.
 - Callback destinations require public HTTPS; DNS is validated and the selected public address is pinned for the request. Redirects and ambient proxies are not used.
 - Delivery uses leases, bounded retry/backoff, idempotent event IDs, and retention cleanup. A single dispatcher thread is supervised by the MCP ASGI lifespan.
@@ -32,6 +32,8 @@ The event store key is separate from the database file. `SO_MCP_EVENTS_DB`, if c
 
 ## Verification
 
-Focused integration tests cover the full local path: authenticated WorkItem -> terminal transition -> same-transaction outbox insert -> webhook delivery. They also verify one event is fanned out once when a WorkItem has multiple linked sessions, delegated completion is routed to the owner, and an outbox insertion failure rolls back the terminal transition and session unlink.
+Latest full repository test run: **1322 passed, 13 skipped, 1575 subtests passed**.
+
+Focused integration tests cover the full local path: authenticated WorkItem -> terminal transition -> same-transaction outbox insert -> webhook delivery. They also verify one event is fanned out once when a WorkItem has multiple linked sessions, delegated completion is routed to the owner, and an outbox insertion failure rolls back the terminal transition and session unlink. Additional regression tests cover bounded DNS resolution, dispatcher shutdown failure without duplicate stop waits, send-attempt idempotency, and ambiguous remote-send outcomes without account rotation/retry.
 
 A real ChatGPT Work callback/resumption acceptance test is still required. Local tests and mock callbacks do not prove product-level conversation resumption. No production service, database, key, or configuration has been changed by this work.

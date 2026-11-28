@@ -7653,6 +7653,31 @@ def _attempt_create(
                 })
                 return "OUTCOME_UNKNOWN", conv
 
+        if work_item_context is None:
+            if isinstance(conv, ConvRef) and conv.mismatch:
+                actual = getattr(conv, "actual_conv_id", "") or "unknown"
+                reason = getattr(conv, "reason", "") or "conversation identity mismatch"
+                attempts.append({
+                    "account": name,
+                    "status": "OUTCOME_UNKNOWN",
+                    "reason": reason,
+                    "actual_conv_id": actual,
+                })
+                return "OUTCOME_UNKNOWN", conv
+            ambiguous_transport = (
+                status in (408, 425)
+                or (isinstance(status, int) and status >= 500)
+                or (status in (None, 0) and bool(getattr(api, "last_send_started", False)))
+            )
+            if ambiguous_transport:
+                detail = "send outcome unknown after POST attempt (status=%s)" % status
+                attempts.append({
+                    "account": name,
+                    "status": "OUTCOME_UNKNOWN",
+                    "reason": detail,
+                })
+                return "OUTCOME_UNKNOWN", conv
+
     except ThinkingModelUnavailable as e:
         # 思考模型不可用是账号级失败，不是整个进程的退出信号。
         # 记录账号状态，让 create_chat_rotating 尝试下一个身份。

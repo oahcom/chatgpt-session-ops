@@ -760,6 +760,7 @@ class MCPToolService:
         resolved_account = None
         outcome_unknown = False
         attempt_error = None
+        context = None
         try:
             # All local authorization and account checks happen before the
             # remote side effect. A failed preflight consumes this attempt ID
@@ -919,15 +920,23 @@ class MCPToolService:
                 "replayed": False,
             }
         except BaseException as exc:
-            # The remote side may already have accepted the prompt. Persist an
-            # unknown result and never replay this attempt automatically.
+            # Only failures after a POST may have reached ChatGPT are unknown.
+            # Authorization/account/prompt preflight failures are definitely
+            # non-deliveries and must not poison the WorkItem send slot.
+            remote_send_started = bool(getattr(api, "last_send_started", False))
+            if context is not None:
+                context_api = context.get("api")
+                remote_send_started = remote_send_started or bool(
+                    getattr(context_api, "last_send_started", False)
+                ) or bool(context.get("outcome_unknown"))
+            attempt_status = "outcome_unknown" if remote_send_started else "failed"
             try:
                 self._run_db(
                     lambda: self.store.complete_send_attempt(
                         principal,
                         work_item_id,
                         attempt_id,
-                        status="outcome_unknown",
+                        status=attempt_status,
                         error=type(exc).__name__,
                     )
                 )

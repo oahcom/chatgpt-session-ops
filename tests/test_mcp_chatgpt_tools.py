@@ -383,6 +383,7 @@ class MCPChatGPTToolTests(unittest.TestCase):
             )
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"]["code"], "NOT_FOUND")
+        self.assertEqual(store.attempts[ATTEMPT_ID]["status"], "failed")
         api.assert_not_called()
         send.assert_not_called()
 

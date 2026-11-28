@@ -491,8 +491,8 @@ def _getaddrinfo_bounded(host: str, port: int) -> list[tuple[Any, ...]]:
         finally:
             _DNS_RESOLVER_SLOTS.release()
 
-    worker = threading.Thread(target=resolve, name="mcp-dns-resolver", daemon=True)
     try:
+        worker = threading.Thread(target=resolve, name="mcp-dns-resolver", daemon=True)
         worker.start()
     except BaseException:
         _DNS_RESOLVER_SLOTS.release()
