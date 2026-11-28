@@ -124,16 +124,26 @@ class ChatGPTDirectClient:
             raise SessionOpsError("DEPENDENCY_UNAVAILABLE", "runtime accounts directory must not be a symlink")
         accounts_runtime.mkdir(exist_ok=True, mode=0o700)
         try:
-            sources = sorted(
-                self.accounts_dir.iterdir(),
-                key=lambda p: (int(p.name[4:]) if re.fullmatch(r"acct[1-9][0-9]*", p.name) else 10**18, p.name),
-            )
+            entries = list(self.accounts_dir.iterdir())
+        except FileNotFoundError:
+            entries = []
         except OSError as exc:
             raise SessionOpsError("DEPENDENCY_UNAVAILABLE", "cannot enumerate the ChatGPT account vault") from exc
-        for source in sources:
-            if not re.fullmatch(r"acct[1-9][0-9]*", source.name) or source.is_symlink() or not source.is_dir():
+        sources = [
+            (entry.name, entry) for entry in entries
+            if re.fullmatch(r"acct[1-9][0-9]*", entry.name)
+        ]
+        # Backward compatibility: when no canonical accounts/acct1 directory
+        # exists, accept the legacy credential pair at the vault root.
+        if not (self.accounts_dir / "acct1").is_dir():
+            legacy_root = self.accounts_dir.parent
+            if (legacy_root / "cookies.json").is_file() and (legacy_root / "access_token.txt").is_file():
+                sources.append(("acct1", legacy_root))
+        sources.sort(key=lambda item: int(item[0][4:]))
+        for account_name, source in sources:
+            if source.is_symlink() or not source.is_dir():
                 continue
-            target = accounts_runtime / source.name
+            target = accounts_runtime / account_name
             if target.is_symlink():
                 raise SessionOpsError("DEPENDENCY_UNAVAILABLE", "runtime account directory must not be a symlink")
             target.mkdir(exist_ok=True, mode=0o700)
@@ -144,8 +154,16 @@ class ChatGPTDirectClient:
                 if not credential.is_file() or not os.access(credential, os.R_OK):
                     continue
                 if link.is_symlink():
-                    if link.resolve() != credential.resolve():
-                        raise SessionOpsError("DEPENDENCY_UNAVAILABLE", "runtime credential link target mismatch")
+                    try:
+                        current_target = link.resolve(strict=True)
+                    except FileNotFoundError:
+                        # The canonical acct1 directory may have been removed
+                        # when migrating back to the legacy root credential pair.
+                        link.unlink()
+                        link.symlink_to(credential)
+                    else:
+                        if current_target != credential.resolve(strict=True):
+                            raise SessionOpsError("DEPENDENCY_UNAVAILABLE", "runtime credential link target mismatch")
                 elif link.exists():
                     if not link.is_file():
                         raise SessionOpsError("DEPENDENCY_UNAVAILABLE", "runtime credential path is not a regular file")

@@ -283,7 +283,7 @@ def token_path(account: str) -> str:
         raise CheckError('INVALID_ARGUMENT', 'account must match acctN')
     if account == 'acct1':
         canonical = os.path.join(ACCOUNTS_DIR, 'acct1')
-        if os.path.isdir(canonical):
+        if os.path.isdir(canonical) and not os.path.islink(canonical):
             return os.path.join(canonical, 'access_token.txt')
         return os.path.join(SKILL_DIR, 'access_token.txt')
     return os.path.join(ACCOUNTS_DIR, account, 'access_token.txt')
@@ -294,7 +294,7 @@ def discover_accounts() -> list[str]:
     names = []
     acct1_dir = os.path.join(ACCOUNTS_DIR, 'acct1')
     legacy_acct1_token = os.path.join(SKILL_DIR, 'access_token.txt')
-    if os.path.isdir(acct1_dir) or os.path.isfile(legacy_acct1_token):
+    if (os.path.isdir(acct1_dir) and not os.path.islink(acct1_dir)) or os.path.isfile(legacy_acct1_token):
         names.append('acct1')
     try:
         with os.scandir(ACCOUNTS_DIR) as entries:

@@ -151,6 +151,16 @@ class TestLoadToken(GuardAssertions, TmpAccountDirs):
             os.path.join(canonical, "access_token.txt"),
         )
 
+    def test_acct1_symlink_directory_does_not_override_legacy_root(self):
+        external = os.path.join(self.root, "external")
+        os.makedirs(external)
+        os.symlink(external, os.path.join(self.accounts_dir, "acct1"))
+        legacy = os.path.join(self.skill_dir, "access_token.txt")
+        with open(legacy, "w", encoding="utf-8") as fh:
+            fh.write("legacy-token")
+        self.assertEqual(mcp_connector.token_path("acct1"), legacy)
+        self.assertEqual(mcp_connector.discover_accounts(), ["acct1"])
+
     def test_token_path_rejects_noncanonical_account_names(self):
         for account in ("acct0", "acct01", "acctx", "../acct1"):
             with self.subTest(account=account):

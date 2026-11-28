@@ -356,6 +356,23 @@ def test_read_only_vault_credentials_are_accepted_and_new_accounts_are_discovere
     assert runtime_cookie.resolve() == (new / "cookies.json").resolve()
 
 
+def test_legacy_root_acct1_credentials_are_mirrored_when_canonical_dir_is_absent(tmp_path):
+    client = make_client(tmp_path)
+    acct1 = client.accounts_dir / "acct1"
+    legacy_cookie = client.accounts_dir.parent / "cookies.json"
+    legacy_token = client.accounts_dir.parent / "access_token.txt"
+    (acct1 / "cookies.json").replace(legacy_cookie)
+    (acct1 / "access_token.txt").replace(legacy_token)
+    acct1.rmdir()
+
+    client._sync_runtime_accounts()
+    runtime_cookie = client.runtime_dir / "accounts" / "acct1" / "cookies.json"
+    runtime_token = client.runtime_dir / "accounts" / "acct1" / "access_token.txt"
+    assert runtime_cookie.is_symlink() and runtime_cookie.resolve() == legacy_cookie.resolve()
+    assert runtime_token.is_symlink() and runtime_token.resolve() == legacy_token.resolve()
+    assert "acct1" in client._active_accounts()
+
+
 def test_runtime_account_directory_symlink_is_rejected(tmp_path):
     client = make_client(tmp_path)
     external = tmp_path / "external-account"
