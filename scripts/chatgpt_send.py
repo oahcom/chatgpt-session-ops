@@ -3693,7 +3693,7 @@ def parse_cookie_header(cookie):
 #
 # 解析优先级：CHATGPT_PROXY > proxy.json > 系统 https_proxy/http_proxy/all_proxy > 本机端口探测
 # 兜底：一条都解析不到时拒绝联网（除非显式 CHATGPT_ALLOW_DIRECT=1）。
-PROXY_FILE = os.path.join(BASE, "proxy.json")
+PROXY_FILE = os.path.abspath(os.environ.get("CHATGPT_PROXY_FILE") or os.path.join(BASE, "proxy.json"))
 PROXY_AUTODETECT_PORTS = (7890, 7897, 10809, 1080, 8888)
 # 本机地址永不过代理：CDP / 本地闸口(CHATGPT_BASE) 一旦被塞进代理，代理挂了就全链路瘫痪
 PROXY_BYPASS_HOSTS = ("127.0.0.1", "localhost", "::1", "0.0.0.0")
