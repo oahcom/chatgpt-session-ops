@@ -1,4 +1,6 @@
 import json
+import os
+import threading
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -30,6 +32,93 @@ def make_client(tmp_path):
 def test_active_accounts_excludes_disabled_accounts(tmp_path):
     client = make_client(tmp_path)
     assert client._active_accounts() == ("acct1", "acct2")
+
+
+def test_read_only_credential_vault_remains_eligible_for_account_preflight(tmp_path):
+    client = make_client(tmp_path)
+    real_access = os.access
+
+    def read_only_access(path, mode):
+        if mode & os.W_OK:
+            return False
+        return real_access(path, mode)
+
+    with patch("src.session_ops.chatgpt_direct_client.os.access", side_effect=read_only_access):
+        assert client._active_accounts() == ("acct1", "acct2")
+    client.stop()
+
+
+def test_stop_cancels_waiting_futures_and_restart_recovers_durable_queue(tmp_path):
+    client = make_client(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_run(_row):
+        started.set()
+        assert release.wait(2)
+        return {"conversation_id": "created", "account": "acct1", "receipt_durable": True}
+
+    client._run_operation = slow_run
+    first = client.enqueue(
+        principal_id="p1", tenant_id="t1", operation="session.create",
+        arguments={"account": "auto"}, idempotency_key="stop-active",
+    )
+    assert started.wait(1)
+    second = client.enqueue(
+        principal_id="p1", tenant_id="t1", operation="session.create",
+        arguments={"account": "auto"}, idempotency_key="stop-queued",
+    )
+
+    stopper = threading.Thread(target=client.stop)
+    stopper.start()
+    time.sleep(0.05)
+    release.set()
+    stopper.join(2)
+    assert not stopper.is_alive()
+
+    with client._connect() as conn:
+        statuses = {
+            row["job_id"]: row["status"]
+            for row in conn.execute(
+                "SELECT job_id,status FROM chatgpt_jobs WHERE job_id IN (?,?)",
+                (first["job_id"], second["job_id"]),
+            )
+        }
+    assert statuses[first["job_id"]] == "succeeded"
+    assert statuses[second["job_id"]] == "queued"
+
+    try:
+        client.enqueue(
+            principal_id="p1", tenant_id="t1", operation="session.create",
+            arguments={"account": "auto"}, idempotency_key="after-stop",
+        )
+    except SessionOpsError as exc:
+        assert exc.code == "SERVICE_UNAVAILABLE"
+    else:
+        raise AssertionError("closed executor accepted a new ChatGPT job")
+
+    def recovered_run(_row):
+        return {"conversation_id": "recovered", "account": "acct1", "receipt_durable": True}
+
+    with patch.object(ChatGPTDirectClient, "_run_operation", recovered_run):
+        restarted = ChatGPTDirectClient(
+            client.database_path,
+            repository_root=client.repository_root,
+            accounts_dir=client.accounts_dir,
+            runtime_dir=client.runtime_dir,
+        )
+    try:
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            recovered = restarted.get_job(
+                principal_id="p1", tenant_id="t1", job_id=second["job_id"]
+            )
+            if recovered["status"] == "succeeded":
+                break
+            time.sleep(0.01)
+        assert recovered["status"] == "succeeded"
+    finally:
+        restarted.stop()
 
 
 def test_default_send_queue_is_one_active_plus_eight_waiting(tmp_path):
