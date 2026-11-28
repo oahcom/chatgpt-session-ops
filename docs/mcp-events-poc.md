@@ -7,7 +7,7 @@ The event path is owned by `chatgpt-session-ops`; it has no Sender Gateway, Send
 1. A trusted WorkItem send creates/links the ChatGPT conversation to its WorkItem.
 2. When the WorkItem transitions to `completed` or `cancelled`, `SecureWorkItemStore.set_status()` writes the terminal state, audit rows, session unlink records, and exactly one completion event into one SQLite transaction.
 3. `MCPEventsStore` stores the outbox, subscription, and delivery tables in that same database. The completion event identifies the WorkItem, terminal result, and completion time; it never copies conversation content. For backward compatibility it emits `conversation_id` when exactly one conversation is linked and `conversation_ids` when multiple conversations are linked.
-4. Event ownership follows the WorkItem owner, not a delegated principal who happens to perform the terminal status update. One event fans out once to each active subscription owned by that principal.
+4. Only the immutable WorkItem owner may perform a terminal status transition. Delegated writers may update non-terminal status, but cannot complete/cancel the WorkItem or trigger its completion event. One event fans out once to each active subscription owned by the WorkItem owner.
 5. One in-process dispatcher delivers pending callbacks with bounded retries and Standard Webhooks signatures. Failed delivery remains durable for retry; duplicate delivery is idempotently identified by the stable event ID.
 
 The event store key is separate from the database file. `SO_MCP_EVENTS_DB`, if configured, must resolve to the same file as the WorkItem database; a second database is rejected because it would break atomicity. `SO_MCP_EVENTS_KEY_FILE` must contain a raw 32-byte key with service-user-only read access.
@@ -32,8 +32,8 @@ The event store key is separate from the database file. `SO_MCP_EVENTS_DB`, if c
 
 ## Verification
 
-Latest canonical CI test command (`python -m unittest discover -s tests -v`): **1334 tests passed, 13 skipped**. Full-repository pytest run: **1380 passed, 13 skipped, 1575 subtests passed**.
+PR head `03da1406593c15f987ad24665ef6965dd401a6a7`: local full-repository pytest run excluding the optional `tools/proton-batch/tests` suite (which requires unavailable `cv2`) — **1385 passed, 13 skipped, 1577 subtests passed**. `git diff --check` and Python compile checks passed. GitHub Actions status for this head is not yet available.
 
-Focused integration tests cover the full local path: authenticated WorkItem -> terminal transition -> same-transaction outbox insert -> webhook delivery. They also verify one event is fanned out once when a WorkItem has multiple linked sessions, delegated completion is routed to the owner, and an outbox insertion failure rolls back the terminal transition and session unlink. Additional regression tests cover bounded DNS resolution, dispatcher shutdown failure without duplicate stop waits, send-attempt idempotency, and ambiguous remote-send outcomes without account rotation/retry.
+Focused integration tests cover the full local path: authenticated WorkItem -> owner-authorized terminal transition -> same-transaction outbox insert -> webhook delivery. They verify a delegated writer cannot complete/cancel a WorkItem, cannot create a filtered subscription for another owner's WorkItem, one event is fanned out once when a WorkItem has multiple linked sessions, and an outbox insertion failure rolls back the terminal transition and session unlink. Additional regression tests cover bounded DNS resolution, dispatcher shutdown failure without duplicate stop waits, send-attempt idempotency, and ambiguous remote-send outcomes without account rotation/retry.
 
 A real ChatGPT Work callback/resumption acceptance test is still required. Local tests and mock callbacks do not prove product-level conversation resumption. No production service, database, key, or configuration has been changed by this work.
