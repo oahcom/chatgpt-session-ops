@@ -46,20 +46,24 @@ class MCPEventsStoreTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def subscribe(self, **kwargs):
+        kwargs.setdefault("conversation_id", "test-conversation")
         return self.store.subscribe(self.auth, {
             "name": "chatgpt.job.completed",
             "arguments": kwargs,
             "delivery": self.delivery,
         })
 
-    def test_event_catalog_declares_optional_conversation_id(self):
+    def publish_job_completed(self, *args, **kwargs):
+        kwargs.setdefault("conversation_id", "test-conversation")
+        return self.store.publish_job_completed(*args, **kwargs)
+
+    def test_event_catalog_requires_conversation_scoped_payload(self):
         definition = self.store.event_catalog()[0]
         properties = definition["payloadSchema"]["properties"]
         required = definition["payloadSchema"]["required"]
         self.assertEqual(properties["conversation_id"], {"type": "string"})
-        self.assertEqual(properties["conversation_ids"], {"type": "array", "items": {"type": "string"}})
-        self.assertNotIn("conversation_id", required)
-        self.assertNotIn("conversation_ids", required)
+        self.assertIn("conversation_id", required)
+        self.assertNotIn("conversation_ids", properties)
 
     def test_subscribe_verifies_challenge_and_persists_subscription(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
@@ -105,13 +109,13 @@ class MCPEventsStoreTests(unittest.TestCase):
             with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
                 finite = store.subscribe(auth, {
                     "name": "chatgpt.job.completed",
-                    "arguments": {"job_id": "job-cleanup"},
+                    "arguments": {"job_id": "job-cleanup", "conversation_id": "test-conversation"},
                     "delivery": delivery,
                     "ttlMs": 60_000,
                 })
                 permanent = store.subscribe(auth, {
                     "name": "chatgpt.job.completed",
-                    "arguments": {},
+                    "arguments": {"conversation_id": "test-conversation"},
                     "delivery": {
                         **delivery,
                         "url": "https://events.example.test/permanent",
@@ -122,6 +126,7 @@ class MCPEventsStoreTests(unittest.TestCase):
                 "tenant-a", "issuer:user-a", "job-cleanup", "Finished",
                 event_id="evt_cleanup_old",
                 completed_at="2027-01-01T00:00:00Z",
+                conversation_id="test-conversation",
             )
             self.assertEqual(store.deliver_pending(), 2)
             now[0] += 31 * 24 * 60 * 60
@@ -144,7 +149,7 @@ class MCPEventsStoreTests(unittest.TestCase):
     def test_delivery_is_blocked_when_job_access_has_been_revoked(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.subscribe(job_id="job-revoked")
-        event_id = self.store.publish_job_completed(
+        event_id = self.publish_job_completed(
             "tenant-a", "issuer:user-a", "job-revoked", "Finished",
             event_id="evt_revoked_job",
         )
@@ -173,11 +178,11 @@ class MCPEventsStoreTests(unittest.TestCase):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             subscription = self.store.subscribe(self.auth, {
                 "name": "chatgpt.job.completed",
-                "arguments": {"job_id": "job-expires-during-auth"},
+                "arguments": {"job_id": "job-expires-during-auth", "conversation_id": "test-conversation"},
                 "delivery": self.delivery,
                 "ttlMs": 60_000,
             })
-        event_id = self.store.publish_job_completed(
+        event_id = self.publish_job_completed(
             "tenant-a", "issuer:user-a", "job-expires-during-auth", "Finished",
             event_id="evt_expiry_during_auth",
         )
@@ -197,7 +202,7 @@ class MCPEventsStoreTests(unittest.TestCase):
     def test_transient_authorization_check_failure_retries_without_delivery(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.subscribe(job_id="job-auth-transient")
-        event_id = self.store.publish_job_completed(
+        event_id = self.publish_job_completed(
             "tenant-a", "issuer:user-a", "job-auth-transient", "Finished",
             event_id="evt_auth_transient",
         )
@@ -218,7 +223,7 @@ class MCPEventsStoreTests(unittest.TestCase):
     def test_failed_terminal_event_is_delivered_with_error_metadata(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.subscribe(job_id="job-failed")
-        event_id = self.store.publish_job_completed(
+        event_id = self.publish_job_completed(
             "tenant-a", "issuer:user-a", "job-failed", "Job failed with error code OUTCOME_UNKNOWN.",
             event_id="evt_failed_terminal", completed_at="2026-11-27T12:00:00Z",
             status="failed", error_code="OUTCOME_UNKNOWN", outcome_unknown=True,
@@ -237,7 +242,7 @@ class MCPEventsStoreTests(unittest.TestCase):
         original_verify = self.store._verify_callback
         def complete_during_subscribe(*args):
             original_verify(*args)
-            event_ids.append(self.store.publish_job_completed(
+            event_ids.append(self.publish_job_completed(
                 "tenant-a", "issuer:user-a", "task-fast", "Finished",
                 event_id="evt_fast_job_before_subscribe",
             ))
@@ -258,16 +263,16 @@ class MCPEventsStoreTests(unittest.TestCase):
         original_verify = self.store._verify_callback
         def publish_racing_events(*args):
             original_verify(*args)
-            event_ids.append(self.store.publish_job_completed(
+            event_ids.append(self.publish_job_completed(
                 "tenant-a", "issuer:user-a", "task-match", "Finished", event_id="evt_own_match"
             ))
-            self.store.publish_job_completed(
+            self.publish_job_completed(
                 "tenant-a", "issuer:user-a", "task-other", "Finished", event_id="evt_own_other"
             )
-            self.store.publish_job_completed(
+            self.publish_job_completed(
                 "tenant-b", "issuer:user-a", "task-match", "Finished", event_id="evt_other_tenant"
             )
-            self.store.publish_job_completed(
+            self.publish_job_completed(
                 "tenant-a", "issuer:other-user", "task-match", "Finished", event_id="evt_other_principal"
             )
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
@@ -279,7 +284,7 @@ class MCPEventsStoreTests(unittest.TestCase):
 
     def test_subscribe_backfill_does_not_replay_events_completed_before_request(self):
         now = int(self.store.clock())
-        old_event = self.store.publish_job_completed(
+        old_event = self.publish_job_completed(
             "tenant-a", "issuer:user-a", "task-old", "Finished",
             event_id="evt_old_completion",
             completed_at="2026-11-25T00:00:00Z",
@@ -295,7 +300,7 @@ class MCPEventsStoreTests(unittest.TestCase):
     def test_event_is_persisted_then_delivered_with_standard_webhook_signature(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.subscribe(job_id="task-1")
-        event_id = self.store.publish_job_completed("tenant-a", "issuer:user-a", "task-1", "Finished")
+        event_id = self.publish_job_completed("tenant-a", "issuer:user-a", "task-1", "Finished")
         self.assertEqual(self.store.deliver_pending(), 1)
         _, body, headers = self.callback.requests[-1]
         event = json.loads(body)
@@ -313,7 +318,7 @@ class MCPEventsStoreTests(unittest.TestCase):
     def test_retry_preserves_event_id_and_terminal_statuses_are_not_retried(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.subscribe()
-        event_id = self.store.publish_job_completed("tenant-a", "issuer:user-a", "task-2", "Finished")
+        event_id = self.publish_job_completed("tenant-a", "issuer:user-a", "task-2", "Finished")
         self.callback.fail_statuses = [503, 204]
         self.assertEqual(self.store.deliver_pending(), 0)
         with self.store._db() as db:
@@ -329,7 +334,7 @@ class MCPEventsStoreTests(unittest.TestCase):
             new_secret = "whsec_" + base64.b64encode(b"n" * 32).decode()
             refreshed = self.store.subscribe(self.auth, {
                 "name": "chatgpt.job.completed",
-                "arguments": {"job_id": "rotation-task"},
+                "arguments": {"job_id": "rotation-task", "conversation_id": "test-conversation"},
                 "delivery": {**self.delivery, "secret": new_secret},
             })
         self.assertEqual(first["id"], refreshed["id"])
@@ -338,7 +343,7 @@ class MCPEventsStoreTests(unittest.TestCase):
         self.assertEqual(self.store._decrypt_secret(refreshed["id"], row["secret_enc"]), new_secret)
         self.assertEqual(self.store._decrypt_secret(refreshed["id"], row["secret_prev_enc"]), old_secret)
         self.assertGreater(row["secret_prev_until"], int(self.store.clock()))
-        self.store.publish_job_completed("tenant-a", "issuer:user-a", "rotation-task", "Finished")
+        self.publish_job_completed("tenant-a", "issuer:user-a", "rotation-task", "Finished")
         self.assertEqual(self.store.deliver_pending(), 1)
         signatures = self.callback.requests[-1][2]["webhook-signature"].split()
         self.assertEqual(len(signatures), 2)
@@ -354,20 +359,20 @@ class MCPEventsStoreTests(unittest.TestCase):
     def test_task_filter_only_delivers_matching_task(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.subscribe(job_id="only-this-task")
-        self.store.publish_job_completed("tenant-a", "issuer:user-a", "another-task", "Finished")
+        self.publish_job_completed("tenant-a", "issuer:user-a", "another-task", "Finished")
         self.assertEqual(self.store.deliver_pending(), 0)
-        self.store.publish_job_completed("tenant-a", "issuer:user-a", "only-this-task", "Finished")
+        self.publish_job_completed("tenant-a", "issuer:user-a", "only-this-task", "Finished")
         self.assertEqual(self.store.deliver_pending(), 1)
 
     def test_replayed_sender_event_is_idempotent_and_owner_bound(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.subscribe(job_id="job-replay")
         args = ("tenant-a", "issuer:user-a", "job-replay", "Finished")
-        event_id = self.store.publish_job_completed(
+        event_id = self.publish_job_completed(
             *args, event_id="evt_sender-stable-1", completed_at="2026-11-27T12:00:00Z"
         )
         self.assertEqual(
-            self.store.publish_job_completed(
+            self.publish_job_completed(
                 *args, event_id="evt_sender-stable-1", completed_at="2026-11-27T12:00:00Z"
             ),
             event_id,
@@ -376,7 +381,7 @@ class MCPEventsStoreTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT count(*) FROM event_outbox WHERE event_id=?", (event_id,)).fetchone()[0], 1)
             self.assertEqual(db.execute("SELECT count(*) FROM event_deliveries WHERE event_id=?", (event_id,)).fetchone()[0], 1)
         with self.assertRaisesRegex(ValueError, "different event"):
-            self.store.publish_job_completed(
+            self.publish_job_completed(
                 "tenant-b", "issuer:user-b", "job-replay", "Finished",
                 event_id=event_id, completed_at="2026-11-27T12:00:00Z",
             )
@@ -384,7 +389,7 @@ class MCPEventsStoreTests(unittest.TestCase):
     def test_concurrent_delivery_workers_claim_each_event_once(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.subscribe()
-        self.store.publish_job_completed("tenant-a", "issuer:user-a", "task-concurrent", "Finished")
+        self.publish_job_completed("tenant-a", "issuer:user-a", "task-concurrent", "Finished")
         entered = threading.Event()
         release = threading.Event()
         calls = []
@@ -413,7 +418,7 @@ class MCPEventsStoreTests(unittest.TestCase):
     def test_lease_reclaim_between_validation_and_renewal_prevents_callback(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.subscribe(job_id="job-lease-race")
-        self.store.publish_job_completed("tenant-a", "issuer:user-a", "job-lease-race", "Finished")
+        self.publish_job_completed("tenant-a", "issuer:user-a", "job-lease-race", "Finished")
         self.callback.requests.clear()
         original_db = self.store._db
 
@@ -450,7 +455,7 @@ class MCPEventsStoreTests(unittest.TestCase):
 
     def test_null_ttl_means_no_expiration(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
-            result = self.store.subscribe(self.auth, {"name": "chatgpt.job.completed", "arguments": {}, "delivery": self.delivery, "ttlMs": None})
+            result = self.store.subscribe(self.auth, {"name": "chatgpt.job.completed", "arguments": {"conversation_id": "test-conversation"}, "delivery": self.delivery, "ttlMs": None})
         self.assertIsNone(result["refreshBefore"])
 
     def test_new_database_parent_is_created_private(self):
@@ -480,12 +485,12 @@ class MCPEventsStoreTests(unittest.TestCase):
     def test_unsubscribe_marks_pending_deliveries_terminal(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.subscribe(job_id="job-unsubscribe-pending")
-        event_id = self.store.publish_job_completed(
+        event_id = self.publish_job_completed(
             "tenant-a", "issuer:user-a", "job-unsubscribe-pending", "Finished"
         )
         self.store.unsubscribe(self.auth, {
             "name": "chatgpt.job.completed",
-            "arguments": {"job_id": "job-unsubscribe-pending"},
+            "arguments": {"job_id": "job-unsubscribe-pending", "conversation_id": "test-conversation"},
             "delivery": {"url": self.delivery["url"]},
         })
         self.assertEqual(self.store.deliver_pending(), 0)
@@ -501,7 +506,7 @@ class MCPEventsStoreTests(unittest.TestCase):
     def test_gone_callback_deactivates_subscription(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.subscribe()
-        first_event = self.store.publish_job_completed("tenant-a", "issuer:user-a", "job-gone", "Finished")
+        first_event = self.publish_job_completed("tenant-a", "issuer:user-a", "job-gone", "Finished")
         self.callback.fail_statuses = [410]
         self.assertEqual(self.store.deliver_pending(), 0)
         with self.store._db() as db:
@@ -513,15 +518,15 @@ class MCPEventsStoreTests(unittest.TestCase):
         self.assertEqual(row["active"], 0)
         self.assertEqual(delivery["status"], "failed")
         self.assertEqual(delivery["last_status"], 410)
-        self.store.publish_job_completed("tenant-a", "issuer:user-a", "job-gone-2", "Finished")
+        self.publish_job_completed("tenant-a", "issuer:user-a", "job-gone-2", "Finished")
         with self.store._db() as db:
             self.assertEqual(db.execute("SELECT count(*) FROM event_deliveries").fetchone()[0], 1)
 
     def test_unsubscribe_is_owner_scoped_and_idempotent(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.subscribe()
-        self.store.unsubscribe(self.auth, {"name": "chatgpt.job.completed", "arguments": {}, "delivery": {"url": self.delivery["url"]}})
-        self.store.unsubscribe(self.auth, {"name": "chatgpt.job.completed", "arguments": {}, "delivery": {"url": self.delivery["url"]}})
+        self.store.unsubscribe(self.auth, {"name": "chatgpt.job.completed", "arguments": {"conversation_id": "test-conversation"}, "delivery": {"url": self.delivery["url"]}})
+        self.store.unsubscribe(self.auth, {"name": "chatgpt.job.completed", "arguments": {"conversation_id": "test-conversation"}, "delivery": {"url": self.delivery["url"]}})
         with self.store._db() as db:
             self.assertEqual(db.execute("SELECT count(*) FROM event_subscriptions WHERE active=1").fetchone()[0], 0)
 
@@ -529,19 +534,19 @@ class MCPEventsStoreTests(unittest.TestCase):
     def test_unsubscribe_then_resubscribe_does_not_revive_old_generation(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             first = self.subscribe(job_id="job-generation")
-        old_event = self.store.publish_job_completed(
+        old_event = self.publish_job_completed(
             "tenant-a", "issuer:user-a", "job-generation", "old",
             event_id="evt_old_generation",
         )
         self.store.unsubscribe(self.auth, {
             "name": "chatgpt.job.completed",
-            "arguments": {"job_id": "job-generation"},
+            "arguments": {"job_id": "job-generation", "conversation_id": "test-conversation"},
             "delivery": {"url": self.delivery["url"]},
         })
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             second = self.subscribe(job_id="job-generation")
         self.assertEqual(first["id"], second["id"])
-        new_event = self.store.publish_job_completed(
+        new_event = self.publish_job_completed(
             "tenant-a", "issuer:user-a", "job-generation", "new",
             event_id="evt_new_generation",
         )
@@ -560,8 +565,8 @@ class MCPEventsStoreTests(unittest.TestCase):
         self.store.clock = lambda: now[0]
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.subscribe()
-        first_event = self.store.publish_job_completed("tenant-a", "issuer:user-a", "job-stale-410-a", "A")
-        second_event = self.store.publish_job_completed("tenant-a", "issuer:user-a", "job-stale-410-b", "B")
+        first_event = self.publish_job_completed("tenant-a", "issuer:user-a", "job-stale-410-a", "A")
+        second_event = self.publish_job_completed("tenant-a", "issuer:user-a", "job-stale-410-b", "B")
         entered = threading.Event()
         release = threading.Event()
         calls = []
@@ -598,7 +603,7 @@ class MCPEventsStoreTests(unittest.TestCase):
         self.store.clock = lambda: now[0]
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.subscribe(job_id="job-backoff-time")
-        event_id = self.store.publish_job_completed("tenant-a", "issuer:user-a", "job-backoff-time", "Finished")
+        event_id = self.publish_job_completed("tenant-a", "issuer:user-a", "job-backoff-time", "Finished")
         def slow_failure(_url, _body, _headers):
             now[0] += 10
             return 503, b""
@@ -612,7 +617,7 @@ class MCPEventsStoreTests(unittest.TestCase):
     def test_expired_crash_lease_at_attempt_ceiling_is_terminal(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.subscribe(job_id="job-crash-ceiling")
-        event_id = self.store.publish_job_completed("tenant-a", "issuer:user-a", "job-crash-ceiling", "Finished")
+        event_id = self.publish_job_completed("tenant-a", "issuer:user-a", "job-crash-ceiling", "Finished")
         now = int(self.store.clock())
         with self.store._db() as db:
             db.execute(
@@ -628,7 +633,7 @@ class MCPEventsStoreTests(unittest.TestCase):
     def test_recent_event_completed_before_subscribe_request_is_not_backfilled(self):
         now = [1_800_000_000.5]
         self.store.clock = lambda: now[0]
-        old_event = self.store.publish_job_completed(
+        old_event = self.publish_job_completed(
             "tenant-a", "issuer:user-a", "job-before-request", "Finished",
             event_id="evt_before_request",
             completed_at="2027-01-15T07:59:30Z",

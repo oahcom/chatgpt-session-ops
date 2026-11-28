@@ -11,13 +11,13 @@ Type=simple
 User=ubuntu
 Group=ubuntu
 
-WorkingDirectory=/home/ubuntu/ai-projects/chatgpt-session-ops
+WorkingDirectory=/opt/so-mcp
 
 EnvironmentFile=/etc/so-mcp/so-mcp.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 
-ExecStart=/home/ubuntu/ai-projects/chatgpt-session-ops/.venv/bin/python -m scripts.run_mcp_server
+ExecStart=/opt/so-mcp/.venv/bin/python -m scripts.run_mcp_server
 
 Restart=on-failure
 RestartSec=5s
@@ -34,7 +34,7 @@ SyslogIdentifier=so-mcp
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=read-only
+ProtectHome=true
 
 ReadWritePaths=/var/lib/so-mcp
 

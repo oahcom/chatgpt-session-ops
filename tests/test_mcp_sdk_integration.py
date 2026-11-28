@@ -245,7 +245,7 @@ class MCPSDKIntegrationTests(unittest.TestCase):
                     context,
                     EventsSubscribeParams.model_validate({
                         "name": "chatgpt.job.completed",
-                        "arguments": {},
+                        "arguments": {"conversation_id": "12345678-1234-4234-8234-123456789abc"},
                         "delivery": {
                             "mode": "webhook",
                             "url": "https://events.example.test/callback",
@@ -290,7 +290,7 @@ class MCPSDKIntegrationTests(unittest.TestCase):
                         context,
                         EventsSubscribeParams.model_validate({
                             "name": "chatgpt.job.completed",
-                            "arguments": {},
+                            "arguments": {"conversation_id": "12345678-1234-4234-8234-123456789abc"},
                             "delivery": {
                                 "mode": "webhook",
                                 "url": "https://events.example.test/second-callback",
@@ -408,7 +408,7 @@ class MCPSDKIntegrationTests(unittest.TestCase):
                         "jsonrpc": "2.0", "id": 3, "method": "events/subscribe",
                         "params": {
                             "name": "chatgpt.job.completed",
-                            "arguments": {"job_id": "job-1"},
+                            "arguments": {"job_id": "job-1", "conversation_id": "12345678-1234-4234-8234-123456789abc"},
                             "delivery": {"mode": "webhook", "url": "https://events.example.test/callback", "secret": secret},
                             "ttlMs": None,
                         },
@@ -421,7 +421,7 @@ class MCPSDKIntegrationTests(unittest.TestCase):
                     "jsonrpc": "2.0", "id": 4, "method": "events/unsubscribe",
                     "params": {
                         "name": "chatgpt.job.completed",
-                        "arguments": {"job_id": "job-1"},
+                        "arguments": {"job_id": "job-1", "conversation_id": "12345678-1234-4234-8234-123456789abc"},
                         "delivery": {"mode": "webhook", "url": "https://events.example.test/callback"},
                     },
                 }, session_id)

@@ -107,6 +107,11 @@ were installed from that commit. Section 8 states what is.
 
 ## 1. Deployment authority
 
+`oahcom/chatgpt-session-ops` is the sole source repository for the MCP server
+and its ChatGPT runtime. `/opt/so-mcp` is only an immutable deployment artifact
+built from that repository; it is not a second source tree and must not be
+edited independently. The Gateway/sidecar path is not part of this deployment.
+
 The only deployment authority is a full Git commit SHA from
 `oahcom/chatgpt-session-ops`'s GitHub `main` history.
 
@@ -138,6 +143,8 @@ test ! -e "$TMP"
 install -d -o ubuntu -g ubuntu -m 0750 "$TMP"
 git archive --format=tar "$COMMIT" \
   scripts/run_mcp_server.py \
+  scripts/chatgpt_send.py \
+  scripts/pow_solver.py \
   src \
   requirements-mcp.txt \
   tools/verify_deploy.py \
@@ -163,11 +170,9 @@ test ! -e "$TMP/deploy"
 test ! -e "$TMP/docs"
 test ! -e "$TMP/references"
 test ! -e "$TMP/.github"
-test ! -e "$TMP/scripts/chatgpt_send.py"
 test ! -e "$TMP/scripts/continue_full.py"
 test ! -e "$TMP/scripts/extract_auth.py"
 test ! -e "$TMP/scripts/mcp_connector.py"
-test ! -e "$TMP/scripts/pow_solver.py"
 test ! -e "$TMP/scripts/accounts"
 ```
 

@@ -1,6 +1,7 @@
 # Runtime entry point
 scripts/run_mcp_server.py
 scripts/chatgpt_send.py
+scripts/pow_solver.py
 
 # Application package
 src/session_ops/__init__.py

@@ -1,8 +1,9 @@
 """SQLite-backed MCP Events subscription and webhook delivery implementation.
 
 The service launcher enables this module only when a private encryption key
-file is explicitly configured. Sender job events are ingested through the
-separate durable outbox collector.
+file is explicitly configured. WorkItem terminal transitions insert completion
+events into this same SQLite database and transaction; delivery is handled by
+the in-process dispatcher.
 """
 from __future__ import annotations
 
@@ -108,7 +109,7 @@ def _post_public_https(url: str, body: bytes, headers: Mapping[str, str], timeou
 
 
 class MCPEventsStore:
-    """SQLite-backed subscriptions and an event-delivery outbox for the PoC."""
+    """SQLite-backed subscriptions and transactional completion-event delivery."""
 
     def __init__(
         self,
@@ -191,6 +192,26 @@ class MCPEventsStore:
             delivery_columns = {row["name"] for row in db.execute("PRAGMA table_info(event_deliveries)")}
             if "generation" not in delivery_columns:
                 db.execute("ALTER TABLE event_deliveries ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+            # Legacy owner-wide subscriptions have no conversation boundary.
+            # Disable them and cancel only their pending deliveries; never
+            # reinterpret historical outbox rows or fan them out broadly.
+            legacy_rows = db.execute(
+                "SELECT id, arguments_json FROM event_subscriptions WHERE active=1"
+            ).fetchall()
+            for legacy in legacy_rows:
+                try:
+                    filters = json.loads(legacy["arguments_json"])
+                except (TypeError, ValueError):
+                    filters = {}
+                if not isinstance(filters, dict) or not isinstance(filters.get("conversation_id"), str) or not filters["conversation_id"]:
+                    db.execute(
+                        "UPDATE event_subscriptions SET active=0, generation=generation+1 WHERE id=?",
+                        (legacy["id"],),
+                    )
+                    db.execute(
+                        "UPDATE event_deliveries SET status='failed', last_status=410, next_attempt_at=0, lease_until=NULL, lease_token=NULL WHERE subscription_id=? AND status IN ('pending','sending')",
+                        (legacy["id"],),
+                    )
         if database != ":memory:":
             os.chmod(database, 0o600)
 
@@ -241,8 +262,10 @@ class MCPEventsStore:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string", "description": "Optional WorkItem ID to monitor."}
+                    "conversation_id": {"type": "string", "minLength": 1, "description": "The exact ChatGPT Work conversation to receive events for."},
+                    "job_id": {"type": "string", "description": "Optional WorkItem ID to monitor within this conversation."}
                 },
+                "required": ["conversation_id"],
                 "additionalProperties": False,
             },
             "payloadSchema": {
@@ -250,14 +273,13 @@ class MCPEventsStore:
                 "properties": {
                     "job_id": {"type": "string"},
                     "conversation_id": {"type": "string"},
-                    "conversation_ids": {"type": "array", "items": {"type": "string"}},
                     "status": {"type": "string", "enum": ["succeeded", "failed"]},
                     "summary": {"type": "string"},
                     "completed_at": {"type": "string", "format": "date-time"},
                     "error_code": {"type": "string"},
                     "outcome_unknown": {"type": "boolean"},
                 },
-                "required": ["job_id", "status", "summary", "completed_at"],
+                "required": ["job_id", "conversation_id", "status", "summary", "completed_at"],
                 "additionalProperties": False,
             },
         }]
@@ -304,8 +326,14 @@ class MCPEventsStore:
         delivery = params.get("delivery")
         if name != "chatgpt.job.completed" or not isinstance(arguments, dict):
             raise ValueError("unsupported event or invalid arguments")
-        if set(arguments) - {"job_id"} or ("job_id" in arguments and (not isinstance(arguments["job_id"], str) or not arguments["job_id"])):
-            raise ValueError("invalid chatgpt.job.completed subscription filter")
+        if (
+            set(arguments) - {"job_id", "conversation_id"}
+            or not isinstance(arguments.get("conversation_id"), str)
+            or not arguments["conversation_id"]
+            or ("job_id" in arguments and (not isinstance(arguments["job_id"], str) or not arguments["job_id"]))
+        ):
+            raise ValueError("a conversation_id-scoped chatgpt.job.completed subscription is required")
+        conversation_id = arguments["conversation_id"]
         job_id = arguments.get("job_id")
         if job_id is not None:
             # Completion events are owned and published by the WorkItem
@@ -403,7 +431,13 @@ class MCPEventsStore:
             ).fetchall()
             for event in recent_events:
                 event_data = json.loads(event["data_json"])
-                if arguments.get("job_id") not in (None, event_data.get("job_id")):
+                event_conversations = set(event_data.get("conversation_ids") or [])
+                if event_data.get("conversation_id"):
+                    event_conversations.add(event_data["conversation_id"])
+                if (
+                    conversation_id not in event_conversations
+                    or arguments.get("job_id") not in (None, event_data.get("job_id"))
+                ):
                     continue
                 db.execute(
                     """INSERT OR IGNORE INTO event_deliveries(event_id, subscription_id, status, generation)
@@ -554,13 +588,25 @@ class MCPEventsStore:
             "INSERT INTO event_outbox VALUES (?, ?, ?, ?, ?, ?)",
             (event_id, tenant_id, principal_id, "chatgpt.job.completed", canonical_data, event_created_at),
         )
+        event_conversations = set(conversation_ids or [])
+        if conversation_id is not None:
+            event_conversations.add(conversation_id)
+        # A completion with no linked conversation is not a deliverable
+        # ChatGPT Work event. In particular, never broadcast it owner-wide.
+        if not event_conversations:
+            return event_id
         subscriptions = db.execute(
             "SELECT id, arguments_json, generation FROM event_subscriptions WHERE tenant_id=? AND principal_id=? AND name='chatgpt.job.completed' AND active=1 AND (expires_at IS NULL OR expires_at>?)",
             (tenant_id, principal_id, now),
         ).fetchall()
         for sub in subscriptions:
             filters = json.loads(sub["arguments_json"])
-            if filters.get("job_id") not in (None, job_id):
+            scoped_conversation = filters.get("conversation_id")
+            if (
+                not isinstance(scoped_conversation, str)
+                or scoped_conversation not in event_conversations
+                or filters.get("job_id") not in (None, job_id)
+            ):
                 continue
             db.execute(
                 "INSERT INTO event_deliveries(event_id, subscription_id, status, generation) VALUES (?, ?, 'pending', ?)",
@@ -651,7 +697,7 @@ class MCPEventsStore:
             rows = db.execute(
                 """SELECT d.event_id, d.subscription_id, d.attempts, d.generation,
                           s.callback_url, s.secret_enc, s.secret_prev_enc, s.secret_prev_until,
-                          e.name, e.data_json, e.created_at, e.tenant_id, e.principal_id
+                          s.arguments_json, e.name, e.data_json, e.created_at, e.tenant_id, e.principal_id
                    FROM event_deliveries d JOIN event_subscriptions s ON s.id=d.subscription_id
                    JOIN event_outbox e ON e.event_id=d.event_id
                    WHERE d.status='pending' AND d.next_attempt_at<=? AND s.active=1
@@ -677,13 +723,29 @@ class MCPEventsStore:
         delivered = 0
         for row in claimed:
             status = 599
-            event = {
-                "eventId": row["event_id"], "name": row["name"],
-                "timestamp": datetime.fromtimestamp(row["created_at"], timezone.utc).isoformat().replace("+00:00", "Z"),
-                "data": json.loads(row["data_json"]), "cursor": None,
-            }
-            body = _canonical_json(event).encode("utf-8")
-            if len(body) > MAX_EVENT_BYTES:
+            event_data = json.loads(row["data_json"])
+            filters = json.loads(row["arguments_json"])
+            scoped_conversation = filters.get("conversation_id")
+            event_conversations = set(event_data.get("conversation_ids") or [])
+            if event_data.get("conversation_id"):
+                event_conversations.add(event_data["conversation_id"])
+            if not isinstance(scoped_conversation, str) or scoped_conversation not in event_conversations:
+                # Old or corrupt deliveries must never cross a conversation boundary.
+                status = 403
+                event = None
+                body = b""
+            else:
+                event_data.pop("conversation_ids", None)
+                event_data["conversation_id"] = scoped_conversation
+                event = {
+                    "eventId": row["event_id"], "name": row["name"],
+                    "timestamp": datetime.fromtimestamp(row["created_at"], timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "data": event_data, "cursor": None,
+                }
+                body = _canonical_json(event).encode("utf-8")
+            if status == 403:
+                pass
+            elif len(body) > MAX_EVENT_BYTES:
                 status = 413
             else:
                 try:

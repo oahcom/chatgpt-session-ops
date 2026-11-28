@@ -50,6 +50,8 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         self,
         callback_url: str = "https://events.example.test/work-item-completed",
         principal: Principal | None = None,
+        conversation_id: str = "12345678-1234-4234-8234-123456789abc",
+        job_id: str | None = None,
     ) -> None:
         principal = principal or self.principal
         auth = SimpleNamespace(principal=SimpleNamespace(
@@ -64,7 +66,7 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.events.subscribe(auth, {
                 "name": "chatgpt.job.completed",
-                "arguments": {},
+                "arguments": {"conversation_id": conversation_id, **({"job_id": job_id} if job_id else {})},
                 "delivery": delivery,
             })
 
@@ -116,8 +118,10 @@ class WorkItemCompletionEventTests(unittest.TestCase):
 
 
     def test_multiple_linked_sessions_fan_out_one_event_per_subscription(self):
-        self._subscribe("https://events.example.test/conversation-one")
-        self._subscribe("https://events.example.test/conversation-two")
+        first_session = "12345678-1234-4234-8234-123456789abc"
+        second_session = "22345678-1234-4234-8234-123456789abc"
+        self._subscribe("https://events.example.test/conversation-one", conversation_id=first_session)
+        self._subscribe("https://events.example.test/conversation-two", conversation_id=second_session)
         item, _first_session = self._create_linked_item()
         second_session = "22345678-1234-4234-8234-123456789abc"
         second_attempt = "att_22345678-1234-4234-8234-123456789abc"
@@ -140,11 +144,81 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         self.assertEqual(delivery_count, 2)
         with self.events._db() as db:
             payload = json.loads(db.execute("SELECT data_json FROM event_outbox").fetchone()[0])
-        self.assertEqual(payload["conversation_ids"], [
-            "12345678-1234-4234-8234-123456789abc",
-            second_session,
-        ])
+        self.assertEqual(set(payload["conversation_ids"]), {first_session, second_session})
+        self.assertEqual(self.events.deliver_pending(), 2)
+        delivered_payloads = [json.loads(body)["data"] for _url, body, _headers in self.callback.requests if json.loads(body).get("type") != "verification"]
+        self.assertEqual({payload["conversation_id"] for payload in delivered_payloads}, {first_session, second_session})
+        self.assertTrue(all("conversation_ids" not in payload for payload in delivered_payloads))
 
+
+    def test_same_owner_conversations_do_not_cross_deliver(self):
+        first_session = "12345678-1234-4234-8234-123456789abc"
+        other_session = "32345678-1234-4234-8234-123456789abc"
+        self._subscribe("https://events.example.test/first", conversation_id=first_session)
+        self._subscribe("https://events.example.test/other", conversation_id=other_session)
+        item, _ = self._create_linked_item()
+        self.store.set_status(self.principal, item.work_item_id, "completed")
+        self.assertEqual(self.events.deliver_pending(), 1)
+        payloads = [json.loads(body) for _url, body, _headers in self.callback.requests if json.loads(body).get("type") != "verification"]
+        self.assertEqual(len(payloads), 1)
+        self.assertEqual(payloads[0]["data"]["conversation_id"], first_session)
+        self.assertNotIn("conversation_ids", payloads[0]["data"])
+
+    def test_replay_backfill_matches_exact_conversation(self):
+        first_session = "12345678-1234-4234-8234-123456789abc"
+        other_session = "32345678-1234-4234-8234-123456789abc"
+        self.events.clock = lambda: 1000.0
+        self.events.publish_job_completed(
+            self.principal.tenant_id,
+            self.principal.principal_id,
+            "wi_replay",
+            "replay event",
+            event_id="evt_replay_scoped",
+            completed_at="1970-01-01T00:16:41Z",
+            conversation_ids=[first_session],
+        )
+        self._subscribe("https://events.example.test/replay-first", conversation_id=first_session)
+        self._subscribe("https://events.example.test/replay-other", conversation_id=other_session)
+        with self.events._db() as db:
+            rows = db.execute(
+                "SELECT s.callback_url FROM event_deliveries d JOIN event_subscriptions s ON s.id=d.subscription_id WHERE d.event_id='evt_replay_scoped'"
+            ).fetchall()
+        self.assertEqual([row["callback_url"] for row in rows], ["https://events.example.test/replay-first"])
+
+    def test_unscoped_subscription_is_rejected(self):
+        auth = SimpleNamespace(principal=SimpleNamespace(
+            tenant_id=self.principal.tenant_id, principal_id=self.principal.principal_id
+        ))
+        delivery = {
+            "mode": "webhook",
+            "url": "https://events.example.test/unscoped",
+            "secret": "whsec_" + base64.b64encode(b"u" * 32).decode(),
+        }
+        with self.assertRaisesRegex(ValueError, "conversation_id-scoped"):
+            self.events.subscribe(auth, {
+                "name": "chatgpt.job.completed", "arguments": {}, "delivery": delivery
+            })
+
+    def test_completion_without_linked_conversation_is_not_broadcast(self):
+        self._subscribe()
+        item = self.store.create_work_item(self.principal)
+        self.store.set_status(self.principal, item.work_item_id, "completed")
+        with self.events._db() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM event_outbox").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT count(*) FROM event_deliveries").fetchone()[0], 0)
+        self.assertEqual(self.events.deliver_pending(), 0)
+
+    def test_unscoped_legacy_subscription_is_disabled_on_startup(self):
+        # Create an old-format subscription row directly to model an upgrade.
+        self._subscribe()
+        with self.events._db() as db:
+            db.execute("UPDATE event_subscriptions SET arguments_json='{}', active=1")
+        reopened = MCPEventsStore(
+            str(self.database), encryption_key=b"k" * 32, post_json=self.callback.post
+        )
+        with reopened._db() as db:
+            row = db.execute("SELECT active FROM event_subscriptions").fetchone()
+        self.assertEqual(row["active"], 0)
 
     def test_delegated_completion_notifies_work_item_owner(self):
         self._subscribe(principal=self.principal)
@@ -237,7 +311,7 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         ):
             self.events.subscribe(owner_auth, {
                 "name": "chatgpt.job.completed",
-                "arguments": {"job_id": item.work_item_id},
+                "arguments": {"job_id": item.work_item_id, "conversation_id": "12345678-1234-4234-8234-123456789abc"},
                 "delivery": owner_delivery,
             })
         owner_verify.assert_called_once()
@@ -255,7 +329,7 @@ class WorkItemCompletionEventTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "owned by the subscriber"):
                 self.events.subscribe(delegate_auth, {
                     "name": "chatgpt.job.completed",
-                    "arguments": {"job_id": item.work_item_id},
+                    "arguments": {"job_id": item.work_item_id, "conversation_id": "12345678-1234-4234-8234-123456789abc"},
                     "delivery": delivery,
                 })
         verify.assert_not_called()
@@ -311,7 +385,7 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.events.subscribe(writer_auth, {
                 "name": "chatgpt.job.completed",
-                "arguments": {},
+                "arguments": {"conversation_id": session_id},
                 "delivery": writer_delivery,
             })
 

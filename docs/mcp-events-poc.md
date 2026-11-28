@@ -6,9 +6,11 @@ The event path is owned by `chatgpt-session-ops`; it has no Sender Gateway, Send
 
 1. A trusted WorkItem send creates/links the ChatGPT conversation to its WorkItem.
 2. When the WorkItem transitions to `completed` or `cancelled`, `SecureWorkItemStore.set_status()` writes the terminal state, audit rows, session unlink records, and exactly one completion event into one SQLite transaction.
-3. `MCPEventsStore` stores the outbox, subscription, and delivery tables in that same database. The completion event identifies the WorkItem, terminal result, and completion time; it never copies conversation content. For backward compatibility it emits `conversation_id` when exactly one conversation is linked and `conversation_ids` when multiple conversations are linked.
-4. Only the immutable WorkItem owner may perform a terminal status transition. Delegated writers may update non-terminal status, but cannot complete/cancel the WorkItem or trigger its completion event. One event fans out once to each active subscription owned by the WorkItem owner.
-5. One in-process dispatcher delivers pending callbacks with bounded retries and Standard Webhooks signatures. Failed delivery remains durable for retry; duplicate delivery is idempotently identified by the stable event ID.
+3. `MCPEventsStore` stores the outbox, subscription, and delivery tables in that same database. The durable event identifies the WorkItem, terminal result, completion time, and linked conversation IDs; it never copies conversation content.
+4. Only the immutable WorkItem owner may perform a terminal status transition. Delegated writers may update non-terminal status, but cannot complete/cancel the WorkItem or trigger its completion event. Event ownership and subscriptions are scoped to that owner.
+5. Every subscription must specify one exact `conversation_id` (with optional `job_id`). Publish and replay/backfill create a delivery only when that conversation is linked to the event. Each callback receives a sanitized payload containing only its own `conversation_id`; a multi-conversation WorkItem still creates one outbox event and one delivery per matching subscription. WorkItems without linked conversations are not broadcast.
+6. Legacy unscoped subscriptions are disabled during store initialization and their pending deliveries are failed closed; historical outbox rows are retained.
+7. One in-process dispatcher delivers pending callbacks with bounded retries and Standard Webhooks signatures. Failed delivery remains durable for retry; duplicate delivery is idempotently identified by the stable event ID.
 
 The event store key is separate from the database file. `SO_MCP_EVENTS_DB`, if configured, must resolve to the same file as the WorkItem database; a second database is rejected because it would break atomicity. `SO_MCP_EVENTS_KEY_FILE` must contain a raw 32-byte key with service-user-only read access.
 
@@ -24,7 +26,7 @@ The event store key is separate from the database file. `SO_MCP_EVENTS_DB`, if c
 ## Reliability and security
 
 - Event creation and terminal WorkItem state commit or roll back together. A process crash cannot leave a completed WorkItem without its outbox event.
-- Tenant and principal identity come from verified MCP authentication, never from event payload arguments. Before each callback, current WorkItem read/write access for the event owner is rechecked; an authorization failure is terminal for that delivery and sends no callback.
+- Tenant and principal identity come from verified MCP authentication, never from event payload arguments. Subscription identity includes the conversation filter. Before each callback, current WorkItem read/write access for the event owner is rechecked; an authorization failure is terminal for that delivery and sends no callback.
 - Subscription secrets are AES-GCM encrypted. Callback challenge verification and per-delivery Standard Webhooks signatures are enforced. Subscribe challenge I/O and unsubscribe database mutations run off the ASGI event loop.
 - Callback destinations require public HTTPS; DNS is validated and the selected public address is pinned for the request. Redirects and ambient proxies are not used.
 - Delivery uses leases, bounded retry/backoff, idempotent event IDs, and retention cleanup. A single dispatcher thread is supervised by the MCP ASGI lifespan.
@@ -32,8 +34,8 @@ The event store key is separate from the database file. `SO_MCP_EVENTS_DB`, if c
 
 ## Verification
 
-PR head `03da1406593c15f987ad24665ef6965dd401a6a7`: local full-repository pytest run excluding the optional `tools/proton-batch/tests` suite (which requires unavailable `cv2`) — **1385 passed, 13 skipped, 1577 subtests passed**. `git diff --check` and Python compile checks passed. GitHub Actions status for this head is not yet available.
+Rebased branch verification: `python -m unittest discover -s tests -q` — **1,344 passed, 13 skipped**; full repository `python -m pytest -q` — **1,391 passed, 13 skipped, 1,577 subtests passed**. Python compilation and `git diff --check` passed.
 
-Focused integration tests cover the full local path: authenticated WorkItem -> owner-authorized terminal transition -> same-transaction outbox insert -> webhook delivery. They verify a delegated writer cannot complete/cancel a WorkItem, cannot create a filtered subscription for another owner's WorkItem, one event is fanned out once when a WorkItem has multiple linked sessions, and an outbox insertion failure rolls back the terminal transition and session unlink. Additional regression tests cover bounded DNS resolution, dispatcher shutdown failure without duplicate stop waits, send-attempt idempotency, and ambiguous remote-send outcomes without account rotation/retry.
+Focused integration tests cover the full local path: authenticated WorkItem -> owner-authorized terminal transition -> same-transaction outbox insert -> webhook delivery. They verify delegated writers cannot complete/cancel a WorkItem, cannot create a filtered subscription for another owner's WorkItem, conversation-isolated fan-out and payload sanitization across multiple linked sessions, exact-conversation replay/backfill, rejection and migration shutdown of unscoped subscriptions, no fan-out without a linked conversation, and outbox rollback on terminal-transition failure. Additional regression tests cover bounded DNS resolution, dispatcher shutdown failure without duplicate stop waits, send-attempt idempotency, and ambiguous remote-send outcomes without account rotation/retry.
 
 A real ChatGPT Work callback/resumption acceptance test is still required. Local tests and mock callbacks do not prove product-level conversation resumption. No production service, database, key, or configuration has been changed by this work.
