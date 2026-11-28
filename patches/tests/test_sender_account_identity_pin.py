@@ -65,6 +65,24 @@ class SenderAccountIdentityPinTests(unittest.TestCase):
         if applied.returncode != 0:
             raise AssertionError(f"patch apply failed: {applied.stdout}\n{applied.stderr}")
 
+        account_only_patch = ROOT / "patches/sender-account-only-adapter.patch"
+        dry_run = subprocess.run(
+            ["patch", "--dry-run", "-p1", "-i", str(account_only_patch)],
+            cwd=cls.root, text=True, capture_output=True, check=False,
+        )
+        if dry_run.returncode != 0:
+            raise AssertionError(
+                f"account-only patch --dry-run failed: {dry_run.stdout}\n{dry_run.stderr}"
+            )
+        applied = subprocess.run(
+            ["patch", "-p1", "-i", str(account_only_patch)],
+            cwd=cls.root, text=True, capture_output=True, check=False,
+        )
+        if applied.returncode != 0:
+            raise AssertionError(
+                f"account-only patch apply failed: {applied.stdout}\n{applied.stderr}"
+            )
+
         os.environ["SO_SENDER_ACCOUNTS_DIR"] = str(cls.accounts)
         sys.path.insert(0, str(cls.cli_dir.parent))
         spec = importlib.util.spec_from_file_location(
@@ -93,7 +111,7 @@ class SenderAccountIdentityPinTests(unittest.TestCase):
         self.old_cli_globals = {
             name: getattr(self.cli, name, None)
             for name in (
-                "ChatGPTAPI", "send_prompt", "record_conv", "create_chat_rotating",
+                "ChatGPTAPI", "send_prompt", "record_conv", "create_chat_rotating", "_cli_open_api",
                 "load_rotation", "purge_expired", "is_unavailable", "rotation_plan",
                 "_effective_rotation_primary", "_attempt_create", "_mark_success",
             )
@@ -166,6 +184,115 @@ class SenderAccountIdentityPinTests(unittest.TestCase):
         self.assertEqual(result, 0, output.getvalue())
         self.assertEqual(api_calls, ["acct10"])
         self.assertEqual(requests, ["acct10"])
+
+    def test_account_only_acct5_rejected_before_open_api(self):
+        os.environ["CHATGPT_ALLOWED_ACCOUNTS"] = "acct1,acct2"
+        open_api = Mock()
+        self.cli._cli_open_api = open_api
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = self.cli._cli_account_only_create("acct5", "prompt.txt")
+        self.assertEqual(result, 2)
+        open_api.assert_not_called()
+        self.assertIn('"reason": "invalid_account"', output.getvalue())
+
+    def test_account_only_acct10_allowed_and_constructs_api(self):
+        os.environ["CHATGPT_ALLOWED_ACCOUNTS"] = "acct10"
+        api_calls = []
+        api = SimpleNamespace(last_headers={"x-adapter-account": "acct10"})
+
+        def fake_api(*, account):
+            api_calls.append(account)
+            return api
+
+        self.cli.ChatGPTAPI = fake_api
+        self.cli.send_prompt = Mock(return_value=(200, None, str(uuid.uuid4())))
+        self.cli.record_conv = Mock()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = self.cli._cli_account_only_create("acct10", "prompt.txt")
+        self.assertEqual(result, 0, output.getvalue())
+        self.assertEqual(api_calls, ["acct10"])
+        self.cli.send_prompt.assert_called_once()
+        self.cli.record_conv.assert_called_once()
+        payload = __import__("json").loads(output.getvalue().strip().splitlines()[-1])
+        self.assertEqual(payload["event"], "create_result")
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["account"], "acct10")
+        self.assertRegex(payload["conversation_id"], r"^[0-9a-f-]{36}$")
+
+    def test_account_only_echo_mismatch_preserves_created_conversation_identity(self):
+        os.environ["CHATGPT_ALLOWED_ACCOUNTS"] = "acct1,acct2"
+        conv_id = str(uuid.uuid4())
+        api = SimpleNamespace(last_headers={"x-adapter-account": "acct2"})
+        self.cli.ChatGPTAPI = Mock(return_value=api)
+        self.cli.send_prompt = Mock(return_value=(200, None, conv_id))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = self.cli._cli_account_only_create("acct1", "prompt.txt")
+        self.assertEqual(result, 1)
+        payload = __import__("json").loads(output.getvalue().strip().splitlines()[-1])
+        self.assertEqual(payload["reason"], "account_echo_mismatch")
+        self.assertEqual(payload["conversation_id"], conv_id)
+        self.assertEqual(payload["actual_account"], "acct2")
+
+    def test_account_only_acct1_429_never_rotates_to_acct2(self):
+        os.environ["CHATGPT_ALLOWED_ACCOUNTS"] = "acct1,acct2"
+        api = SimpleNamespace(last_headers={})
+        self.cli.ChatGPTAPI = Mock(return_value=api)
+        self.cli.send_prompt = Mock(return_value=(429, None, None))
+        rotate = Mock(return_value=0)
+        self.cli.create_chat_rotating = rotate
+        self.cli._cli_retry_after_seconds = Mock(return_value=19)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = self.cli._cli_account_only_create("acct1", "prompt.txt")
+        self.assertEqual(result, 1)
+        self.cli.ChatGPTAPI.assert_called_once_with(account="acct1")
+        self.cli.send_prompt.assert_called_once()
+        rotate.assert_not_called()
+        payload = __import__("json").loads(output.getvalue().strip().splitlines()[-1])
+        self.assertEqual(payload["http_status"], 429)
+        self.assertEqual(payload["retry_after_seconds"], 19)
+        self.assertNotIn("acct2", output.getvalue())
+
+    def test_adapter_uses_account_only_argv_and_parses_create_result(self):
+        adapter = object.__new__(self.adapter_type)
+        prompt_root = self.root / "adapter-prompts"
+        prompt_root.mkdir(exist_ok=True)
+        prompt = prompt_root / "prompt.txt"
+        prompt.write_text("ping")
+        adapter._prompt_root = str(prompt_root)
+        argv = adapter._build_argv("create", account="acct10", prompt_path=str(prompt))
+        self.assertEqual(argv, ("--new", "--account-only", "acct10", str(prompt)))
+
+        conv_id = str(uuid.uuid4())
+        result = SimpleNamespace(
+            stdout=__import__("json").dumps({
+                "event": "create_result", "ok": True, "account": "acct10",
+                "conversation_id": conv_id, "http_status": 200, "reason": None,
+            }) + "\n",
+            exit_code=0, stderr="",
+        )
+        self.assertEqual(
+            adapter._parse_create(result, expected_account="acct10"),
+            (conv_id, "acct10", None),
+        )
+
+    def test_adapter_preserves_account_only_429_retry_after(self):
+        adapter = object.__new__(self.adapter_type)
+        result = SimpleNamespace(
+            stdout=__import__("json").dumps({
+                "event": "create_result", "ok": False, "reason": "rate_limited",
+                "account": "acct1", "http_status": 429, "retry_after_seconds": 23,
+            }) + "\n",
+            exit_code=1, stderr="",
+        )
+        with self.assertRaises(self.sender_error_type) as caught:
+            adapter._parse_create(result, expected_account="acct1")
+        self.assertEqual(caught.exception.code, "RESOURCE_EXHAUSTED")
+        self.assertEqual(caught.exception.upstream_status, 429)
+        self.assertEqual(caught.exception.retry_after_seconds, 23)
 
     def test_explicit_acct1_403_fails_without_acct2_attempt(self):
         result, api_calls, requests, rotate, output = self.run_cli_new("acct1", 403)

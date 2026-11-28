@@ -67,6 +67,8 @@ class SenderChildAccountRootsTests(unittest.TestCase):
         os.environ["CHATGPT_AUTH_DIR"] = str(self.auth_root)
         os.environ["CHATGPT_PROXY"] = "http://must-not-be-inherited.invalid"
 
+        sys.modules.pop("sender_gateway.sender_adapter", None)
+        sys.modules.pop("sender_gateway", None)
         sys.path.insert(0, str(self.root / "so-sender"))
         try:
             from sender_gateway.sender_adapter import ChatGPTSenderAdapter, _discover_logged_in_accounts
@@ -129,6 +131,8 @@ print(json.dumps({
     def test_unset_roots_are_not_added_to_child_environment(self):
         os.environ.pop("SO_SENDER_ACCOUNTS_DIR", None)
         os.environ.pop("CHATGPT_AUTH_DIR", None)
+        sys.modules.pop("sender_gateway.sender_adapter", None)
+        sys.modules.pop("sender_gateway", None)
         sys.path.insert(0, str(self.root / "so-sender"))
         try:
             from sender_gateway.sender_adapter import ChatGPTSenderAdapter
