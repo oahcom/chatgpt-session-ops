@@ -504,6 +504,9 @@ class TestLoadConfig(unittest.TestCase):
                 "log_level": "info",
                 "discovery_url": None,
                 "memory_adapter_command": None,
+                "chatgpt_cli_path": str(
+                    Path(__file__).resolve().parents[1] / "scripts" / "chatgpt_send.py"
+                ),
             },
         )
 
