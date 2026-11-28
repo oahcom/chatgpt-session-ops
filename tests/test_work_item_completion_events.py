@@ -222,6 +222,28 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         self.store.set_status(other, foreign.work_item_id, "completed")
         self.assertEqual(self.events.deliver_pending(), 0)
 
+    def test_multiple_owners_can_route_their_workitems_to_one_destination_conversation(self):
+        destination = "92345678-1234-4234-8234-123456789abc"
+        other = Principal("tenant-a", "another-owner")
+        self._subscribe("https://events.example.test/shared-destination", principal=self.principal, conversation_id=destination)
+        self._subscribe("https://events.example.test/shared-destination", principal=other, conversation_id=destination)
+
+        first = self.store.create_work_item(self.principal)
+        second = self.store.create_work_item(other)
+        self.store.set_status(self.principal, first.work_item_id, "completed")
+        self.store.set_status(other, second.work_item_id, "completed")
+
+        # Each owner's authenticated subscription is isolated, but both
+        # callbacks target the same ChatGPT Work destination conversation.
+        self.assertEqual(self.events.deliver_pending(), 2)
+        payloads = [
+            json.loads(body)["data"]
+            for _url, body, _headers in self.callback.requests
+            if json.loads(body).get("type") != "verification"
+        ]
+        self.assertEqual({payload["job_id"] for payload in payloads}, {first.work_item_id, second.work_item_id})
+        self.assertEqual({payload["conversation_id"] for payload in payloads}, {destination})
+
     def test_owner_destination_receives_completion_even_without_workitem_session_link(self):
         self._subscribe()
         item = self.store.create_work_item(self.principal)
