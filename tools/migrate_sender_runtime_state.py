@@ -174,7 +174,7 @@ def merge_legacy_account_health(
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as output:
                 json.dump(rotation, output, ensure_ascii=False, indent=2)
-                output.write("\\n")
+                output.write("\n")
                 output.flush()
                 os.fsync(output.fileno())
             os.chmod(temp_path, 0o660)
