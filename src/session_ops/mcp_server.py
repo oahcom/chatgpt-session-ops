@@ -306,7 +306,7 @@ TOOL_SCHEMAS = {
         },
         ("session_id", "idempotency_key"),
     ),
-    "session.list":    "session.list": _object_schema(
+    "session.list": _object_schema(
         {
             "work_item_id": _WORK_ITEM_ID,
             "include_unlinked": {"type": "boolean", "default": False},
