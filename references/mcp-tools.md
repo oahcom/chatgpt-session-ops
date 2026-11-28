@@ -16,7 +16,7 @@ Replace the host and `$SO_MCP_TOKEN` with deployment values.
 
 ## 1. Common protocol
 
-All ten tools use MCP JSON-RPC `tools/call`.
+All fourteen tools use MCP JSON-RPC `tools/call`.
 
 Request format:
 
@@ -751,3 +751,139 @@ known, recorded gap rather than covered ground.
 
 `SO_MCP_MEMORY_STDIO` in `scripts/run_mcp_server.py` is unrelated: it configures
 the Memory Adapter client's stdio command, not an MCP transport.
+
+
+## 15. chatgpt.session.create
+
+**Purpose:** Create a logged-in ChatGPT conversation by invoking the repository's local CLI directly.
+
+**Required scopes:** `session_ops.chatgpt.session.write`.
+
+**Optional parameters:**
+- `account`: `auto`, `default`, or a discovered `acctN`; default `auto`. With `auto`, the CLI's dynamic account rotation chooses the actual account.
+- `idempotency_key`: optional UUIDv4. Reusing the same key and arguments returns the stored result; a different payload or an unresolved prior attempt returns `CONFLICT`.
+
+**Success data:**
+
+```json
+{
+  "conversation_id": "12345678-1234-4234-8234-123456789abc",
+  "account": "acct2"
+}
+```
+
+The returned `account` is the actual account selected by the CLI. Anonymous `nologin` fallback is rejected. This call is synchronous; it does not create a job.
+
+**Failures:** `INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`, `UNAUTHENTICATED`, `CONFLICT`, `DEPENDENCY_UNAVAILABLE`, `TIMEOUT`, and common errors from §1.
+
+## 16. chatgpt.session.list
+
+**Purpose:** List only ChatGPT conversations registered to the authenticated tenant and principal.
+
+**Required scopes:** `session_ops.chatgpt.session.read`.
+
+**Optional parameters:**
+- `page_size`: integer 1–50, default 25.
+- `cursor`: decimal offset string, maximum 10 digits.
+
+**Success data:**
+
+```json
+{
+  "items": [
+    {
+      "conversation_id": "12345678-1234-4234-8234-123456789abc",
+      "account": "acct2",
+      "title": "Example",
+      "last_message_at": "2026-01-01T00:00:00Z",
+      "message_count": null
+    }
+  ],
+  "next_cursor": null,
+  "partial": false,
+  "errors": []
+}
+```
+
+The CLI performs account discovery and multi-account listing; the MCP layer filters by SQLite ownership before pagination. `partial=true` means one or more account listings were unavailable; `errors` contains bounded, redacted diagnostics.
+
+**Failures:** `INVALID_ARGUMENT`, `DEPENDENCY_UNAVAILABLE`, `TIMEOUT`, `RESOURCE_EXHAUSTED`, and common errors from §1.
+
+## 17. chatgpt.session.send
+
+**Purpose:** Send a prompt to an existing ChatGPT conversation through the local CLI and wait for its completed send receipt.
+
+**Required scopes:** `session_ops.chatgpt.session.write`.
+
+**Required parameters:**
+- `conversation_id`: canonical lowercase UUID string.
+- `prompt`: non-empty string, maximum 32,768 characters.
+
+**Optional parameters:**
+- `account`: `auto`, `default`, or a discovered `acctN`; default `auto`. The SQLite owner record is authoritative; a caller cannot move a conversation to another account.
+- `idempotency_key`: optional UUIDv4. The database stores a payload digest and result, not the prompt body. An unresolved prior attempt fails closed with `CONFLICT` rather than being sent again.
+
+**Success data:**
+
+```json
+{
+  "conversation_id": "12345678-1234-4234-8234-123456789abc",
+  "account": "acct2",
+  "status": 200,
+  "sent": true
+}
+```
+
+This operation is synchronous. No `job_id`, background Worker, or `chatgpt.job.get` tool exists in this contract.
+
+**Failures:** `INVALID_ARGUMENT`, `NOT_FOUND` (including cross-principal ownership), `CONFLICT`, `RESOURCE_EXHAUSTED`, `UNAUTHENTICATED`, `TIMEOUT`, `DEPENDENCY_UNAVAILABLE`, and common errors from §1.
+
+## 18. chatgpt.session.read
+
+**Purpose:** Read a bounded message window from a ChatGPT conversation owned by the authenticated tenant and principal.
+
+**Required scopes:** `session_ops.chatgpt.session.read`.
+
+**Required parameters:**
+- `conversation_id`: canonical lowercase UUID string.
+
+**Optional parameters:**
+- `after_message_id`: message ID cursor.
+- `limit`: integer 1–50, default 20.
+
+**Success data:**
+
+```json
+{
+  "conversation_id": "12345678-1234-4234-8234-123456789abc",
+  "account": "acct2",
+  "messages": [
+    {
+      "message_id": "message-id",
+      "role": "assistant",
+      "content": "Reply text",
+      "created_at": null
+    }
+  ],
+  "complete": true,
+  "has_more": false,
+  "next_after_message_id": null
+}
+```
+
+`created_at` and `message_count` are not inferred when the CLI does not provide them. Cross-tenant or cross-principal reads fail closed as `NOT_FOUND`.
+
+**Failures:** `INVALID_ARGUMENT`, `NOT_FOUND`, `UNAUTHENTICATED`, `RESOURCE_EXHAUSTED`, `TIMEOUT`, `DEPENDENCY_UNAVAILABLE`, and common errors from §1.
+
+## 19. Direct execution and legacy migration
+
+The four `chatgpt.session.*` tools call `scripts/chatgpt_send.py` directly from
+inside the MCP process. Create and send calls block until the CLI returns. The
+separate Sender Gateway HTTP service, sender JobStore, sender Worker, and
+`chatgpt.job.get` surface are not part of this implementation.
+
+`chatgpt_session_owners` and `chatgpt_mcp_idempotency` live in the existing
+`SO_MCP_DB`. On the first configured startup, `SO_MCP_LEGACY_SENDER_DB` may be
+used to import the legacy `session_owners` table exactly once. Legacy `jobs`
+and `job_event_outbox` rows are not imported; retain that database as an
+archive until the old service has been drained and retired.
