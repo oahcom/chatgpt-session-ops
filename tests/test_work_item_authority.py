@@ -417,11 +417,11 @@ class OperationReceiptTests(Base):
         item = self.store.create_work_item(self.alice)
         grant = self.store.grant(
             self.alice, item.work_item_id, "bob", "read",
-            request_id="grant-receipt-1",
+            request_id="grant-rpc-1", idempotency_key="stable-grant-1",
         )
         replay = self.store.grant(
             self.alice, item.work_item_id, "bob", "read",
-            request_id="grant-receipt-1",
+            request_id="grant-rpc-2", idempotency_key="stable-grant-1",
         )
         self.assertEqual(replay, grant)
 
@@ -433,31 +433,31 @@ class OperationReceiptTests(Base):
         self.assertEqual(
             self.store.grant(
                 self.alice, item.work_item_id, "bob", "read",
-                request_id="grant-receipt-1",
+                request_id="grant-rpc-3", idempotency_key="stable-grant-1",
             ),
             grant,
         )
         with self.assertRaises(AuthorityError):
             self.store.grant(
                 self.alice, item.work_item_id, "carol", "read",
-                request_id="grant-receipt-1",
+                request_id="grant-rpc-4", idempotency_key="stable-grant-1",
             )
 
         revoke = self.store.revoke(
             self.alice, item.work_item_id, "bob", "read",
-            request_id="revoke-receipt-1",
+            request_id="revoke-rpc-1", idempotency_key="stable-revoke-1",
         )
         self.assertEqual(
             self.store.revoke(
                 self.alice, item.work_item_id, "bob", "read",
-                request_id="revoke-receipt-1",
+                request_id="revoke-rpc-2", idempotency_key="stable-revoke-1",
             ),
             revoke,
         )
         with self.assertRaises(AuthorityError):
             self.store.revoke(
                 self.alice, item.work_item_id, "bob", "write",
-                request_id="revoke-receipt-1",
+                request_id="revoke-rpc-3", idempotency_key="stable-revoke-1",
             )
         actions = [
             event["action"] for event in self.store.list_audit_events(item.work_item_id)
@@ -471,19 +471,19 @@ class OperationReceiptTests(Base):
         attempt_id = self.record_landing(sid, item.work_item_id)
         link = self.store.link_session(
             self.alice, sid, item.work_item_id, attempt_id,
-            request_id="link-receipt-1",
+            request_id="link-rpc-1", idempotency_key="stable-link-1",
         )
         self.assertEqual(
             self.store.link_session(
                 self.alice, sid, item.work_item_id, attempt_id,
-                request_id="link-receipt-1",
+                request_id="link-rpc-2", idempotency_key="stable-link-1",
             ),
             link,
         )
         with self.assertRaises(AuthorityError):
             self.store.link_session(
                 self.alice, conversation_id(), item.work_item_id, attempt_id,
-                request_id="link-receipt-1",
+                request_id="link-rpc-3", idempotency_key="stable-link-1",
             )
 
         reopened = SecureWorkItemStore(
@@ -499,7 +499,7 @@ class OperationReceiptTests(Base):
         )
         unlinked = reopened.unlink_session(
             self.alice, sid, expected_link_id=link.link_id,
-            request_id="unlink-receipt-1",
+            request_id="unlink-rpc-1", idempotency_key="stable-unlink-1",
         )
         restarted = SecureWorkItemStore(
             self.db, principal_directory=self.directory
@@ -508,14 +508,14 @@ class OperationReceiptTests(Base):
         self.assertEqual(
             restarted.unlink_session(
                 self.alice, sid, expected_link_id=link.link_id,
-                request_id="unlink-receipt-1",
+                request_id="unlink-rpc-2", idempotency_key="stable-unlink-1",
             ),
             unlinked,
         )
         with self.assertRaises(AuthorityError):
             restarted.unlink_session(
                 self.alice, sid, expected_link_id="sl_" + str(uuid.uuid4()),
-                request_id="unlink-receipt-1",
+                request_id="unlink-rpc-3", idempotency_key="stable-unlink-1",
             )
 
 
@@ -527,7 +527,7 @@ class OperationReceiptTests(Base):
         ):
             with self.assertRaises(RuntimeError):
                 self.store.create_work_item(
-                    self.alice, request_id="atomic-create-receipt"
+                    self.alice, request_id="atomic-rpc-1", idempotency_key="atomic-create-key"
                 )
 
         reopened = SecureWorkItemStore(
@@ -542,7 +542,7 @@ class OperationReceiptTests(Base):
             receipt_count = conn.execute(
                 "SELECT count(*) FROM authority_operation_receipts "
                 "WHERE request_id = ?",
-                ("atomic-create-receipt",),
+                ("atomic-create-key",),
             ).fetchone()[0]
         finally:
             conn.close()
@@ -550,7 +550,7 @@ class OperationReceiptTests(Base):
         self.assertEqual(receipt_count, 0)
 
         created = reopened.create_work_item(
-            self.alice, request_id="atomic-create-receipt"
+            self.alice, request_id="atomic-rpc-2", idempotency_key="atomic-create-key"
         )
         self.assertTrue(created.work_item_id.startswith("wi_"))
         conn = reopened._connect()

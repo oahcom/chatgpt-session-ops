@@ -798,14 +798,18 @@ class SecureWorkItemStore:
         conn: sqlite3.Connection,
         principal: Principal,
         tool_name: str,
-        request_id: Optional[str],
+        idempotency_key: Optional[str],
         arguments: Dict[str, Any],
     ) -> Any:
         """Reserve or replay a receipt inside the domain mutation transaction."""
-        if request_id is None:
+        if idempotency_key is None:
             return _NO_OPERATION_RECEIPT
-        if not isinstance(request_id, str) or not request_id or len(request_id) > 256:
-            raise AuthorityError("operation request_id must be 1..256 characters")
+        if (
+            not isinstance(idempotency_key, str)
+            or not idempotency_key
+            or len(idempotency_key) > 256
+        ):
+            raise AuthorityError("operation idempotency_key must be 1..256 characters")
         canonical = json.dumps(
             arguments, sort_keys=True, separators=(",", ":"), ensure_ascii=False
         )
@@ -814,12 +818,12 @@ class SecureWorkItemStore:
             "SELECT argument_digest, state, result_json "
             "FROM authority_operation_receipts "
             "WHERE tenant_id = ? AND principal_id = ? AND tool_name = ? AND request_id = ?",
-            (principal.tenant_id, principal.principal_id, tool_name, request_id),
+            (principal.tenant_id, principal.principal_id, tool_name, idempotency_key),
         ).fetchone()
         if row is not None:
             if row["argument_digest"] != digest:
                 raise AuthorityError(
-                    "operation request_id conflicts with a different argument payload"
+                    "operation idempotency_key conflicts with a different argument payload"
                 )
             if row["state"] != "completed" or row["result_json"] is None:
                 raise AuthorityError(
@@ -831,8 +835,10 @@ class SecureWorkItemStore:
             "(tenant_id, principal_id, tool_name, request_id, argument_digest, "
             "state, result_json, created_at, completed_at) "
             "VALUES (?, ?, ?, ?, ?, 'in_progress', NULL, ?, NULL)",
-            (principal.tenant_id, principal.principal_id, tool_name, request_id,
-             digest, _utc_now()),
+            (
+                principal.tenant_id, principal.principal_id, tool_name,
+                idempotency_key, digest, _utc_now(),
+            ),
         )
         return _NO_OPERATION_RECEIPT
 
@@ -841,10 +847,10 @@ class SecureWorkItemStore:
         conn: sqlite3.Connection,
         principal: Principal,
         tool_name: str,
-        request_id: Optional[str],
+        idempotency_key: Optional[str],
         result: Any,
     ) -> None:
-        if request_id is None:
+        if idempotency_key is None:
             return
         encoded = json.dumps(
             result, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -854,8 +860,10 @@ class SecureWorkItemStore:
             "SET state = 'completed', result_json = ?, completed_at = ? "
             "WHERE tenant_id = ? AND principal_id = ? AND tool_name = ? "
             "AND request_id = ? AND state = 'in_progress'",
-            (encoded, _utc_now(), principal.tenant_id, principal.principal_id,
-             tool_name, request_id),
+            (
+                encoded, _utc_now(), principal.tenant_id, principal.principal_id,
+                tool_name, idempotency_key,
+            ),
         ).rowcount
         if changed != 1:
             raise AuthorityError("operation receipt could not be completed atomically")
@@ -944,16 +952,20 @@ class SecureWorkItemStore:
     # -- WorkItem operations -------------------------------------------------
 
     def create_work_item(
-        self, principal: Principal, request_id: Optional[str] = None
+        self,
+        principal: Principal,
+        request_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> WorkItem:
         """Create WorkItem and owner row atomically; no intermediate orphan."""
+        operation_id = idempotency_key if idempotency_key is not None else request_id
         now = _utc_now()
         work_item_id = "wi_" + str(uuid.uuid4())
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             replay = self._operation_begin(
-                conn, principal, "work_item.create", request_id, {}
+                conn, principal, "work_item.create", operation_id, {}
             )
             if replay is not _NO_OPERATION_RECEIPT:
                 conn.execute("COMMIT")
@@ -974,7 +986,7 @@ class SecureWorkItemStore:
                 request_id=request_id,
             )
             self._operation_complete(
-                conn, principal, "work_item.create", request_id,
+                conn, principal, "work_item.create", operation_id,
                 {"work_item_id": work_item_id, "status": "active",
                  "created_at": now, "updated_at": now},
             )
@@ -1070,6 +1082,7 @@ class SecureWorkItemStore:
         status: WorkItemStatus,
         expected_updated_at: Optional[str] = None,
         request_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> WorkItem:
         validate_work_item_id(work_item_id)
         if status not in STATUSES:
@@ -1078,12 +1091,13 @@ class SecureWorkItemStore:
             raise InvalidTransition(
                 "terminal status requires an Owner Acceptance or cancellation operation"
             )
+        operation_id = idempotency_key if idempotency_key is not None else request_id
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             self._require(conn, principal, work_item_id, "write")
             replay = self._operation_begin(
-                conn, principal, "work_item.update", request_id,
+                conn, principal, "work_item.update", operation_id,
                 {"work_item_id": work_item_id, "status": status,
                  "expected_updated_at": expected_updated_at},
             )
@@ -1148,6 +1162,7 @@ class SecureWorkItemStore:
         work_item_id: str,
         status: str,
         request_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> WorkItem:
         """Complete or cancel a WorkItem as its immutable owner.
 
@@ -1159,12 +1174,13 @@ class SecureWorkItemStore:
         if status not in TERMINAL_STATUSES:
             raise InvalidTransition("terminal status must be completed or cancelled")
         tool_name = "work_item.finish"
+        operation_id = idempotency_key if idempotency_key is not None else request_id
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             self._require_owner(conn, principal, work_item_id)
             replay = self._operation_begin(
-                conn, principal, tool_name, request_id,
+                conn, principal, tool_name, operation_id,
                 {"work_item_id": work_item_id, "status": status},
             )
             if replay is not _NO_OPERATION_RECEIPT:
@@ -1261,6 +1277,7 @@ class SecureWorkItemStore:
         target_principal_id: str,
         scope: Scope,
         request_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         validate_work_item_id(work_item_id)
         _validate_scope(scope)
@@ -1269,18 +1286,19 @@ class SecureWorkItemStore:
             "target_principal_id": target_principal_id,
             "scope": scope,
         }
+        operation_id = idempotency_key if idempotency_key is not None else request_id
         try:
             self._resolve_grant_target(principal, target_principal_id)
         except (InvalidPrincipal, PrincipalDirectoryUnavailable):
             # Replay a committed grant even if the principal directory is now
             # unavailable or the target was subsequently disabled.
-            if request_id is not None:
+            if operation_id is not None:
                 replay_conn = self._connect()
                 try:
                     replay_conn.execute("BEGIN IMMEDIATE")
                     self._require_owner(replay_conn, principal, work_item_id)
                     replay = self._operation_begin(
-                        replay_conn, principal, "work_item.grant", request_id, arguments
+                        replay_conn, principal, "work_item.grant", operation_id, arguments
                     )
                     if replay is not _NO_OPERATION_RECEIPT:
                         replay_conn.execute("COMMIT")
@@ -1298,7 +1316,7 @@ class SecureWorkItemStore:
             conn.execute("BEGIN IMMEDIATE")
             self._require_owner(conn, principal, work_item_id)
             replay = self._operation_begin(
-                conn, principal, "work_item.grant", request_id, arguments
+                conn, principal, "work_item.grant", operation_id, arguments
             )
             if replay is not _NO_OPERATION_RECEIPT:
                 conn.execute("COMMIT")
@@ -1322,7 +1340,7 @@ class SecureWorkItemStore:
                 "granted": True,
             }
             self._operation_complete(
-                conn, principal, "work_item.grant", request_id, result
+                conn, principal, "work_item.grant", operation_id, result
             )
             conn.execute("COMMIT")
             return result
@@ -1340,6 +1358,7 @@ class SecureWorkItemStore:
         target_principal_id: str,
         scope: Scope,
         request_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         validate_work_item_id(work_item_id)
         _validate_scope(scope)
@@ -1349,12 +1368,13 @@ class SecureWorkItemStore:
             "target_principal_id": target_principal_id,
             "scope": scope,
         }
+        operation_id = idempotency_key if idempotency_key is not None else request_id
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             self._require_owner(conn, principal, work_item_id)
             replay = self._operation_begin(
-                conn, principal, "work_item.revoke", request_id, arguments
+                conn, principal, "work_item.revoke", operation_id, arguments
             )
             if replay is not _NO_OPERATION_RECEIPT:
                 conn.execute("COMMIT")
@@ -1376,7 +1396,7 @@ class SecureWorkItemStore:
                 "revoked": True,
             }
             self._operation_complete(
-                conn, principal, "work_item.revoke", request_id, result
+                conn, principal, "work_item.revoke", operation_id, result
             )
             conn.execute("COMMIT")
             return result
@@ -1480,6 +1500,7 @@ class SecureWorkItemStore:
         attempt_id: str,
         evidence: Any = None,
         request_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> SessionLink:
         """Consume only evidence bound to this exact WorkItem attempt.
 
@@ -1514,6 +1535,8 @@ class SecureWorkItemStore:
             raise QuarantineNotCleared(
                 "caller-supplied landing evidence is not accepted"
             )
+
+        operation_id = idempotency_key if idempotency_key is not None else request_id
 
         def reject_after_rollback(event_id: str, reason: str) -> None:
             """Persist a deterministic rejection in its own transaction.
@@ -1589,7 +1612,7 @@ class SecureWorkItemStore:
             # only the WorkItem Owner may consume trusted landing evidence.
             self._require_owner(conn, principal, work_item_id)
             replay = self._operation_begin(
-                conn, principal, "session.link", request_id,
+                conn, principal, "session.link", operation_id,
                 {
                     "session_id": session_id,
                     "work_item_id": work_item_id,
@@ -1760,6 +1783,7 @@ class SecureWorkItemStore:
         session_id: str,
         expected_link_id: Optional[str] = None,
         request_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Optional[SessionLink]:
         """Unlink atomically; absent and unauthorized links both return None."""
         validate_conversation_id(session_id)
@@ -1769,11 +1793,12 @@ class SecureWorkItemStore:
             "session_id": session_id,
             "expected_link_id": expected_link_id,
         }
+        operation_id = idempotency_key if idempotency_key is not None else request_id
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             replay = self._operation_begin(
-                conn, principal, "session.unlink", request_id, arguments
+                conn, principal, "session.unlink", operation_id, arguments
             )
             if replay is not _NO_OPERATION_RECEIPT:
                 conn.execute("COMMIT")

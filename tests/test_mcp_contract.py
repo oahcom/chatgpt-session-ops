@@ -85,7 +85,7 @@ class FakeStore:
         self.calls = []
         self.created = []
 
-    def create_work_item(self, principal, request_id=None):
+    def create_work_item(self, principal, request_id=None, idempotency_key=None):
         self.calls.append(("create", principal))
         item = {
             "work_item_id": WORK_ITEM_ID,
@@ -116,7 +116,7 @@ class FakeStore:
 
     def set_status(
         self, principal, work_item_id, status,
-        expected_updated_at=None, request_id=None,
+        expected_updated_at=None, request_id=None, idempotency_key=None,
     ):
         self.calls.append(
             ("update", principal, work_item_id, status)
@@ -126,13 +126,13 @@ class FakeStore:
             "status": status,
         }
 
-    def finish_work_item(self, principal, work_item_id, status, request_id=None):
+    def finish_work_item(self, principal, work_item_id, status, request_id=None, idempotency_key=None):
         self.calls.append(("finish", principal, work_item_id, status))
         return {"work_item_id": work_item_id, "status": status}
 
     def grant(
         self, principal, work_item_id, target_principal_id,
-        scope, request_id=None,
+        scope, request_id=None, idempotency_key=None,
     ):
         self.calls.append(("grant", principal, target_principal_id, scope))
         return {
@@ -162,6 +162,7 @@ class FakeStore:
         attempt_id,
         evidence=None,
         request_id=None,
+        idempotency_key=None,
     ):
         self.calls.append(
             ("link", principal, session_id, work_item_id, attempt_id)
@@ -174,7 +175,7 @@ class FakeStore:
 
     def unlink_session(
         self, principal, session_id,
-        expected_link_id=None, request_id=None,
+        expected_link_id=None, request_id=None, idempotency_key=None,
     ):
         self.calls.append(("unlink", principal, session_id))
         return SimpleNamespace(
@@ -723,12 +724,17 @@ class MCPContractTests(unittest.TestCase):
             store.initialize()
             original_create = store.create_work_item
 
-            def delayed_create(principal, request_id=None):
+            operation_key = str(uuid.uuid4())
+            mutation_args = {"idempotency_key": operation_key}
+
+            def delayed_create(principal, request_id=None, idempotency_key=None):
                 started.set()
                 if not release.wait(2):
                     raise AssertionError("test did not release delayed mutation")
                 try:
-                    return original_create(principal, request_id=request_id)
+                    return original_create(
+                        principal, request_id=request_id, idempotency_key=idempotency_key
+                    )
                 finally:
                     finished.set()
 
@@ -737,7 +743,8 @@ class MCPContractTests(unittest.TestCase):
             try:
                 with patch.object(mcp_server, "DB_DEADLINE_SECONDS", 0.05):
                     result = service.dispatch(
-                        "work_item.create", {}, self.auth, request_id="late-commit"
+                        "work_item.create", mutation_args, self.auth,
+                        request_id="late-commit", request_session_id="session-before-timeout"
                     )
                 self.assertTrue(started.wait(1), "DB mutation never started")
                 self.assert_error(result, "INDETERMINATE")
@@ -758,7 +765,8 @@ class MCPContractTests(unittest.TestCase):
             )
             restarted_store.initialize()
             replay = MCPToolService(restarted_store).dispatch(
-                "work_item.create", {}, self.auth, request_id="late-commit"
+                "work_item.create", mutation_args, self.auth,
+                request_id="new-jsonrpc-id", request_session_id="new-mcp-session"
             )
             self.assertTrue(replay["ok"], replay)
             page = restarted_store.list_work_items(Principal(TENANT, OWNER))
@@ -773,7 +781,8 @@ class MCPContractTests(unittest.TestCase):
             store.initialize()
             service = MCPToolService(store)
             first = service.dispatch(
-                "work_item.create", {}, self.auth, request_id=0
+                "work_item.create", {}, self.auth, request_id=0,
+                request_session_id="zero-id-session"
             )
             replay = service.dispatch(
                 "work_item.create", {}, self.auth, request_id=0
@@ -782,6 +791,77 @@ class MCPContractTests(unittest.TestCase):
             self.assertEqual(replay["data"], first["data"])
             self.assertEqual(
                 len(store.list_work_items(Principal(TENANT, OWNER))), 1
+            )
+
+    def test_explicit_idempotency_key_replays_across_mcp_sessions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SecureWorkItemStore(Path(directory) / "authority.sqlite3")
+            store.initialize()
+            service = MCPToolService(store)
+            key = str(uuid.uuid4())
+            first = service.dispatch(
+                "work_item.create", {"idempotency_key": key}, self.auth,
+                request_id="rpc-first", request_session_id="mcp-session-first",
+            )
+            replay = service.dispatch(
+                "work_item.create", {"idempotency_key": key}, self.auth,
+                request_id="rpc-after-reconnect",
+                request_session_id="mcp-session-after-reconnect",
+            )
+            self.assertTrue(first["ok"], first)
+            self.assertEqual(replay["data"], first["data"])
+            self.assertEqual(
+                len(store.list_work_items(Principal(TENANT, OWNER))), 1
+            )
+
+    def test_legacy_fallback_idempotency_is_scoped_to_mcp_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SecureWorkItemStore(Path(directory) / "authority.sqlite3")
+            store.initialize()
+            service = MCPToolService(store)
+            first = service.dispatch(
+                "work_item.create", {}, self.auth,
+                request_id="reused-jsonrpc-id", request_session_id="mcp-session-one",
+            )
+            second = service.dispatch(
+                "work_item.create", {}, self.auth,
+                request_id="reused-jsonrpc-id", request_session_id="mcp-session-two",
+            )
+            self.assertTrue(first["ok"], first)
+            self.assertTrue(second["ok"], second)
+            self.assertNotEqual(
+                first["data"]["work_item_id"], second["data"]["work_item_id"]
+            )
+            self.assertEqual(
+                len(store.list_work_items(Principal(TENANT, OWNER))), 2
+            )
+
+    def test_explicit_idempotency_key_rejects_changed_arguments_across_sessions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SecureWorkItemStore(Path(directory) / "authority.sqlite3")
+            store.initialize()
+            service = MCPToolService(store)
+            created = service.dispatch(
+                "work_item.create", {"idempotency_key": str(uuid.uuid4())},
+                self.auth, request_id="create-rpc", request_session_id="session-a",
+            )
+            work_item_id = created["data"]["work_item_id"]
+            key = str(uuid.uuid4())
+            first = service.dispatch(
+                "work_item.update",
+                {"work_item_id": work_item_id, "status": "paused", "idempotency_key": key},
+                self.auth, request_id="update-rpc-a", request_session_id="session-a",
+            )
+            self.assertTrue(first["ok"], first)
+            changed = service.dispatch(
+                "work_item.update",
+                {"work_item_id": work_item_id, "status": "active", "idempotency_key": key},
+                self.auth, request_id="update-rpc-b", request_session_id="session-b",
+            )
+            self.assert_error(changed, "CONFLICT")
+            self.assertEqual(
+                store.get_work_item(Principal(TENANT, OWNER), work_item_id).status,
+                "paused",
             )
 
     def test_queued_mutation_timeout_is_cancelled_before_execution(self):

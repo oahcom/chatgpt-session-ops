@@ -241,7 +241,7 @@ _IDEMPOTENCY_KEY = {
 
 
 TOOL_SCHEMAS = {
-    "work_item.create": _object_schema({}),
+    "work_item.create": "Create a WorkItem. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
     "work_item.get": _object_schema(
         {"work_item_id": _WORK_ITEM_ID},
         ("work_item_id",),
@@ -251,49 +251,55 @@ TOOL_SCHEMAS = {
         "page_size": _PAGE_SIZE,
         "cursor": _CURSOR,
     }),
-    "work_item.update": _object_schema(
+    "work_item.update": "Update a WorkItem. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
         {
             "work_item_id": _WORK_ITEM_ID,
             "status": _MUTABLE_WORK_ITEM_STATUS,
             "expected_updated_at": _ID,
+            "idempotency_key": _IDEMPOTENCY_KEY,
         },
         ("work_item_id", "status"),
     ),
-    "work_item.finish": _object_schema(
+    "work_item.finish": "Complete or cancel a WorkItem. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
         {
             "work_item_id": _WORK_ITEM_ID,
             "status": {"type": "string", "enum": ["completed", "cancelled"]},
+            "idempotency_key": _IDEMPOTENCY_KEY,
         },
         ("work_item_id", "status"),
     ),
-    "work_item.grant": _object_schema(
+    "work_item.grant": "Grant WorkItem access. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
         {
             "work_item_id": _WORK_ITEM_ID,
             "target_principal_id": _ID,
             "scope": _GRANT_SCOPE,
+            "idempotency_key": _IDEMPOTENCY_KEY,
         },
         ("work_item_id", "target_principal_id", "scope"),
     ),
-    "work_item.revoke": _object_schema(
+    "work_item.revoke": "Revoke WorkItem access. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
         {
             "work_item_id": _WORK_ITEM_ID,
             "target_principal_id": _ID,
             "scope": _GRANT_SCOPE,
+            "idempotency_key": _IDEMPOTENCY_KEY,
         },
         ("work_item_id", "target_principal_id", "scope"),
     ),
-    "session.link": _object_schema(
+    "session.link": "Link a trusted Session. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
         {
             "session_id": _SESSION_ID,
             "work_item_id": _WORK_ITEM_ID,
             "attempt_id": _ATTEMPT_ID,
+            "idempotency_key": _IDEMPOTENCY_KEY,
         },
         ("session_id", "work_item_id"),
     ),
-    "session.unlink": _object_schema(
+    "session.unlink": "Unlink a Session. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
         {
             "session_id": _SESSION_ID,
             "expected_link_id": _LINK_ID,
+            "idempotency_key": _IDEMPOTENCY_KEY,
         },
         ("session_id",),
     ),
@@ -358,6 +364,11 @@ TOOL_SCHEMAS = {
     ),
 }
 
+
+_DB_MUTATION_TOOLS = frozenset({
+    "work_item.create", "work_item.update", "work_item.finish",
+    "work_item.grant", "work_item.revoke", "session.link", "session.unlink",
+})
 
 TOOL_DESCRIPTIONS = {
     "work_item.create": "Create a WorkItem owned by the authenticated principal.",
@@ -1301,22 +1312,31 @@ class MCPToolService:
             auth.require(*required_scopes_for_tool(name))
             principal = auth.principal
             normalized_arguments = arguments
-            if name in ("chatgpt.session.create", "chatgpt.session.send"):
+            if name in _DB_MUTATION_TOOLS or name in (
+                "chatgpt.session.create", "chatgpt.session.send"
+            ):
                 if arguments is None:
                     normalized_arguments = {}
                 if isinstance(normalized_arguments, Mapping):
                     normalized_arguments = dict(normalized_arguments)
-                    normalized_arguments.setdefault(
-                        "idempotency_key",
-                        _request_scoped_idempotency_key(
+                    if name in _DB_MUTATION_TOOLS and not request_session_id:
+                        # Stateless legacy calls have no stable session scope.
+                        # Avoid collisions; cross-session retries must provide
+                        # a caller-stable idempotency_key.
+                        fallback_key = str(uuid.uuid4())
+                    else:
+                        fallback_key = _request_scoped_idempotency_key(
                             name, principal, request_id, request_session_id
-                        ),
-                    )
+                        )
+                    normalized_arguments.setdefault("idempotency_key", fallback_key)
             args = _validate_arguments(name, normalized_arguments)
 
             if name == "work_item.create":
                 result = self._run_db(
-                    lambda: self.store.create_work_item(principal, request_id=request_id),
+                    lambda: self.store.create_work_item(
+                        principal, request_id=request_id,
+                        idempotency_key=args["idempotency_key"],
+                    ),
                     mutation=True,
                 )
                 data = _record_dict(result)
@@ -1349,6 +1369,7 @@ class MCPToolService:
                         args["status"],
                         expected_updated_at=args.get("expected_updated_at"),
                         request_id=request_id,
+                        idempotency_key=args["idempotency_key"],
                     ),
                     mutation=True,
                 )
@@ -1361,6 +1382,7 @@ class MCPToolService:
                         args["work_item_id"],
                         args["status"],
                         request_id=request_id,
+                        idempotency_key=args["idempotency_key"],
                     ),
                     mutation=True,
                 )
@@ -1374,6 +1396,7 @@ class MCPToolService:
                         args["target_principal_id"],
                         args["scope"],
                         request_id=request_id,
+                        idempotency_key=args["idempotency_key"],
                     ),
                     mutation=True,
                 )
@@ -1386,6 +1409,7 @@ class MCPToolService:
                         args["target_principal_id"],
                         args["scope"],
                         request_id=request_id,
+                        idempotency_key=args["idempotency_key"],
                     ),
                     mutation=True,
                 )
@@ -1399,6 +1423,7 @@ class MCPToolService:
                         args.get("attempt_id"),
                         evidence=None,
                         request_id=request_id,
+                        idempotency_key=args["idempotency_key"],
                     ),
                     mutation=True,
                 )
@@ -1411,6 +1436,7 @@ class MCPToolService:
                         args["session_id"],
                         expected_link_id=args.get("expected_link_id"),
                         request_id=request_id,
+                        idempotency_key=args["idempotency_key"],
                     ),
                     mutation=True,
                 )

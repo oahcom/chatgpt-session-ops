@@ -1,38 +1,32 @@
-# MCP database mutation receipts
+# MCP database mutation idempotency
 
-The MCP database mutations now use the existing `authority_operation_receipts`
-table. A receipt stores a digest of canonical arguments and the original result
-inside the same SQLite `BEGIN IMMEDIATE` transaction as the domain mutation.
-A repeated key with changed arguments is rejected as `CONFLICT`.
+All database mutation tools accept an `idempotency_key` (UUIDv4). New clients
+should generate it before the operation and reuse the exact value across
+retries, new JSON-RPC request IDs, and new MCP sessions. It is scoped by the
+authenticated tenant/principal and tool name. The receipt stores a digest of
+canonical business arguments and the original result. Reusing the key with
+changed arguments returns `CONFLICT`.
 
-The current key is authenticated tenant + principal + tool name + JSON-RPC
-request ID. This is a **transport-request replay receipt**, not yet a
-caller-stable idempotency key:
+For legacy clients that omit the field, the server derives a fallback from the
+authenticated principal, tool, MCP session ID, and JSON-RPC request ID. That
+fallback is intentionally session-scoped. If no MCP session ID exists, the
+server uses a per-call random key rather than risking collisions between
+unrelated stateless clients. Legacy stateless calls do not get retry
+deduplication; callers requiring it must send an explicit key.
 
-- A retry only replays the original result if the caller reuses the exact same
-  JSON-RPC request ID.
-- JSON-RPC IDs are response-correlation IDs and clients may generate a new ID
-  after reconnecting or retrying; a new ID does not deduplicate the original
-  operation.
-- The receipt key does not include the MCP session ID, so two sessions for the
-  same principal that reuse the same request ID and tool can collide. This
-  scope must be resolved before claiming cross-session idempotency.
+The receipt reservation, domain mutation, and terminal result commit in the
+same SQLite `BEGIN IMMEDIATE` transaction. If the process exits before commit,
+SQLite rolls back both. If the transaction commits but the caller times out
+before receiving the response, retry with the same explicit `idempotency_key`
+to replay the original result. The JSON-RPC `request_id` remains a separate
+audit correlation value; the legacy receipt-table column named `request_id`
+stores the idempotency key.
 
-If the process exits before commit, SQLite rolls back both receipt and
-mutation. If the transaction commits but the MCP caller times out before
-receiving the response, an exact same-request-ID retry can replay the stored
-result. A running mutation that outlives the request deadline returns
-`INDETERMINATE`; do not retry it with a new request ID until the outcome is
-reconciled.
+A running mutation that outlives the request deadline returns
+non-automatically-retryable `INDETERMINATE`; the caller can manually replay
+with the same idempotency key. A persisted receipt marked in-progress is
+reported as indeterminate and requires reconciliation.
 
-Receipts currently cover WorkItem create/update/finish, grant/revoke, and
-Session link/unlink. External ChatGPT sends use their separate durable
-attempt-state machine because remote side effects cannot share the SQLite
-transaction.
-
-**Remaining #205 work:** introduce an explicit caller-stable mutation
-`idempotency_key` (or an equivalent documented contract), define MCP-session
-scoping and reconnect behavior, and test same-key/same-arguments replay,
-same-key/changed-arguments conflict, cross-session request-ID collisions,
-late commit after caller timeout, and restart reconciliation. Do not describe
-the current JSON-RPC request-ID receipts as full durable idempotency.
+This applies to WorkItem create/update/finish, grant/revoke, and Session
+link/unlink. External ChatGPT sends use their separate durable attempt state
+machine because remote side effects cannot share the SQLite transaction.
