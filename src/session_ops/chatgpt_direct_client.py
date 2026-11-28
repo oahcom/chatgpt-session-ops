@@ -60,6 +60,8 @@ class ChatGPTDirectClient:
         self.max_queue_size = max_queue_size
         self._db_lock = threading.RLock()
         self._rotation_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._closed = False
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="chatgpt-session")
         self._prepare_runtime()
         self._initialize_database(legacy_database_path)
@@ -78,6 +80,23 @@ class ChatGPTDirectClient:
             # command; the running MCP service never reads the old database.
             legacy_database_path=None,
         )
+
+    def start(self) -> None:
+        """ASGI lifespan hook; the durable executor is initialized in __init__."""
+        with self._lifecycle_lock:
+            if self._closed:
+                raise SessionOpsError("SERVICE_UNAVAILABLE", "ChatGPT executor is shutting down")
+
+    def stop(self) -> None:
+        """Drain the active send and cancel queued futures for restart recovery."""
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+        # Queued jobs remain status='queued' in SQLite and are recovered on
+        # the next process start. Only the single active remote operation is
+        # allowed to finish before the service exits.
+        self._executor.shutdown(wait=True, cancel_futures=True)
 
     def _connect(self):
         conn = sqlite3.connect(str(self.database_path), timeout=10)
@@ -231,8 +250,8 @@ class ChatGPTDirectClient:
                 continue
             cookies, token = entry / "cookies.json", entry / "access_token.txt"
             if (cookies.is_symlink() or token.is_symlink() or not cookies.is_file()
-                    or not token.is_file() or not os.access(cookies, os.R_OK | os.W_OK)
-                    or not os.access(token, os.R_OK | os.W_OK)):
+                    or not token.is_file() or not os.access(cookies, os.R_OK)
+                    or not os.access(token, os.R_OK)):
                 continue
             accounts.append(entry.name)
         with self._connect() as conn:
@@ -291,6 +310,8 @@ class ChatGPTDirectClient:
             self._executor.submit(self._execute_job, row["job_id"])
 
     def enqueue(self, *, principal_id, tenant_id, operation, arguments, idempotency_key):
+        if getattr(self, "_closed", False):
+            raise SessionOpsError("SERVICE_UNAVAILABLE", "ChatGPT executor is shutting down")
         if operation not in ("session.create", "session.send"):
             raise SessionOpsError("INVALID_ARGUMENT", "unsupported ChatGPT operation")
         args = dict(arguments or {})
@@ -349,7 +370,12 @@ class ChatGPTDirectClient:
                 )
             conn.execute("""INSERT INTO chatgpt_jobs(job_id,tenant_id,principal_id,operation,idempotency_key,status,conversation_id,requested_account,prompt_path,created_at,payload_hash)
                 VALUES(?,?,?,?,?,'queued',?,?,?,?,?)""", (job_id, tenant_id, principal_id, operation, idempotency_key, args.get("conversation_id"), requested_account, prompt_path, created, payload_hash))
-        self._executor.submit(self._execute_job, job_id)
+        try:
+            self._executor.submit(self._execute_job, job_id)
+        except RuntimeError:
+            # Shutdown raced with admission after the durable insert. Leave the
+            # job queued for restart recovery rather than dropping or replaying it.
+            pass
         return {"job_id": job_id, "operation": operation, "status": "queued", "created_at": created, "conversation_id": args.get("conversation_id")}
 
     def _execute_job(self, job_id):
