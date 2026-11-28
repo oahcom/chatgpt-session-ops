@@ -181,9 +181,11 @@ def _rotation_order():
 
 ROTATION_FALLBACK = ("nologin",)
 
-ROTATION_FILE = os.path.join(BASE, "account-rotation.json")
-CONV_MAP_FILE = os.path.join(BASE, "conv-accounts.json")
-ANON_SESSIONS_FILE = os.path.join(BASE, "anon-sessions.json")
+STATE_DIR = os.path.abspath(os.environ.get("CHATGPT_STATE_DIR") or BASE)
+os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+ROTATION_FILE = os.path.join(STATE_DIR, "account-rotation.json")
+CONV_MAP_FILE = os.path.join(STATE_DIR, "conv-accounts.json")
+ANON_SESSIONS_FILE = os.path.join(STATE_DIR, "anon-sessions.json")
 UNAVAILABLE_TTL = 6 * 3600  # 不可用标记有效期：过期后容许再试一次（凭据可能已刷新）
 COOLDOWN_429 = 180          # 429 只是临时限速，短冷却后重新纳入轮转
 COOLDOWN_403 = 900          # 403 多为 PoW/风控或隐性限速，15 分钟后允许重试
