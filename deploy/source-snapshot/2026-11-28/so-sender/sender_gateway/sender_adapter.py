@@ -268,15 +268,32 @@ class ChatGPTSenderAdapter:
         # 没有注入查询器时一律按「无归属」处理，绝不回退到 JSON。
         self._owner_lookup = owner_lookup
 
+        # The caller owns prompt_dir (production passes the shared state_dir/prompts
+        # directory). Give every adapter a private child so one instance can never
+        # remove another instance's files or the caller-owned parent.
         if prompt_dir is None:
-            prompt_dir = tempfile.mkdtemp(prefix="chatgpt-sender-prompts-")
-        self._prompt_root = os.path.abspath(prompt_dir)
-        os.makedirs(self._prompt_root, mode=0o700, exist_ok=True)
+            parent = None
+        else:
+            parent = os.path.abspath(prompt_dir)
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+        self._prompt_root = tempfile.mkdtemp(
+            prefix="chatgpt-sender-prompts-", dir=parent
+        )
+        self._prompt_root = os.path.abspath(self._prompt_root)
+        self._prompt_root_owned = True
+        self._lifecycle_lock = threading.RLock()
+        self._closed = False
 
     # -- 生命周期 -----------------------------------------------------------
 
     def close(self):
-        shutil.rmtree(self._prompt_root, ignore_errors=True)
+        # Idempotent; only remove the private directory created by this instance.
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self._prompt_root_owned:
+                shutil.rmtree(self._prompt_root, ignore_errors=True)
 
     def __enter__(self):
         return self
@@ -681,17 +698,31 @@ class ChatGPTSenderAdapter:
             )
         name = uuid.uuid4().hex + ".txt"
         path = os.path.join(self._prompt_root, name)
-        # O_EXCL：绝不覆盖既有文件；0600：提示词只对本进程可读。
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
-                fh.write(text)
-        except BaseException:
+        # Serialize with close(): never return a path from an already-closed
+        # adapter, and never let close remove the directory during a write.
+        with self._lifecycle_lock:
+            if self._closed:
+                raise SenderError(
+                    CODE_DEPENDENCY_UNAVAILABLE,
+                    "prompt storage is closed",
+                )
             try:
-                os.unlink(path)
-            except OSError:
-                pass
-            raise
+                # O_EXCL: never overwrite; 0600: prompt is private to the service.
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+                        fh.write(text)
+                except BaseException:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        pass
+                    raise
+            except OSError as exc:
+                raise SenderError(
+                    CODE_DEPENDENCY_UNAVAILABLE,
+                    "prompt storage unavailable: %s" % exc,
+                ) from exc
         return os.path.abspath(path)
 
     # -- 子进程执行 ---------------------------------------------------------
