@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS authority_landing_events (
     session_id TEXT NOT NULL,
     work_item_id TEXT,
     attempt_id TEXT,
+    link_id TEXT,
     match TEXT NOT NULL
         CHECK (match IN ('confirmed', 'mismatch', 'ambiguous')),
     evidence_complete INTEGER NOT NULL
@@ -547,6 +548,56 @@ class SecureWorkItemStore:
                         "ADD COLUMN rejection_reason TEXT"
                     )
 
+                if "link_id" not in landing_columns:
+                    conn.execute(
+                        "ALTER TABLE authority_landing_events "
+                        "ADD COLUMN link_id TEXT"
+                    )
+
+                # Backfill the resulting link for historical consumed events
+                # only when the old session/work-item/timestamp relationship
+                # identifies exactly one SessionLink. Ambiguous history is
+                # preserved and startup fails closed rather than guessing.
+                ambiguous_consumed_links = conn.execute(
+                    "SELECT COUNT(*) FROM authority_landing_events AS e "
+                    "WHERE e.consumed_at IS NOT NULL AND ("
+                    "SELECT COUNT(*) FROM session_links AS s "
+                    "WHERE s.session_id = e.session_id "
+                    "AND s.work_item_id = e.work_item_id "
+                    "AND s.linked_at = e.consumed_at) > 1"
+                ).fetchone()[0]
+                if ambiguous_consumed_links:
+                    raise AuthorityError(
+                        "consumed landing evidence maps to multiple SessionLinks"
+                    )
+
+                conn.execute(
+                    "UPDATE authority_landing_events AS e "
+                    "SET link_id = (SELECT s.link_id FROM session_links AS s "
+                    "WHERE s.session_id = e.session_id "
+                    "AND s.work_item_id = e.work_item_id "
+                    "AND s.linked_at = e.consumed_at LIMIT 1) "
+                    "WHERE e.consumed_at IS NOT NULL AND e.link_id IS NULL "
+                    "AND EXISTS (SELECT 1 FROM session_links AS s "
+                    "WHERE s.session_id = e.session_id "
+                    "AND s.work_item_id = e.work_item_id "
+                    "AND s.linked_at = e.consumed_at)"
+                )
+
+                invalid_link_references = conn.execute(
+                    "SELECT COUNT(*) FROM authority_landing_events AS e "
+                    "WHERE e.link_id IS NOT NULL AND NOT EXISTS ("
+                    "SELECT 1 FROM session_links AS s "
+                    "WHERE s.link_id = e.link_id "
+                    "AND s.session_id = e.session_id "
+                    "AND s.work_item_id = e.work_item_id "
+                    "AND s.linked_at = e.consumed_at)"
+                ).fetchone()[0]
+                if invalid_link_references:
+                    raise AuthorityError(
+                        "landing receipt contains a mismatched SessionLink ID"
+                    )
+
                 # Reject malformed partial identities rather than guessing
                 # which side of an identity pair is authoritative.
                 malformed_identity = conn.execute(
@@ -570,7 +621,9 @@ class SecureWorkItemStore:
                     "OR (rejected_at IS NULL AND rejection_reason IS NOT NULL) "
                     "OR (rejected_at IS NOT NULL "
                     "AND (rejection_reason IS NULL "
-                    "OR length(trim(rejection_reason)) = 0))"
+                    "OR length(trim(rejection_reason)) = 0)) "
+                    "OR (link_id IS NOT NULL AND consumed_at IS NULL) "
+                    "OR (link_id IS NOT NULL AND rejected_at IS NOT NULL)"
                 ).fetchone()[0]
 
                 if malformed_state:
@@ -622,6 +675,25 @@ class SecureWorkItemStore:
                 # Use a new index name: an existing database may already
                 # have ix_authority_landing_pending with the old definition.
                 # Do not DROP or rebuild the existing index.
+                duplicate_attempts = conn.execute(
+                    "SELECT COUNT(*) FROM ("
+                    "SELECT work_item_id, attempt_id "
+                    "FROM authority_landing_events "
+                    "WHERE work_item_id IS NOT NULL AND attempt_id IS NOT NULL "
+                    "GROUP BY work_item_id, attempt_id HAVING COUNT(*) > 1)"
+                ).fetchone()[0]
+                if duplicate_attempts:
+                    raise AuthorityError(
+                        "duplicate landing rows exist for one WorkItem Attempt; "
+                        "manual reconciliation is required before enabling Attempt uniqueness"
+                    )
+
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "ux_authority_landing_attempt_identity "
+                    "ON authority_landing_events(work_item_id, attempt_id) "
+                    "WHERE work_item_id IS NOT NULL AND attempt_id IS NOT NULL"
+                )
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS "
                     "ix_authority_landing_pending_identity "
@@ -1448,7 +1520,7 @@ class SecureWorkItemStore:
                 "attempt_id must be att_ followed by a canonical lowercase UUIDv4"
             )
 
-        event_id = "le_" + str(uuid.uuid4())
+        proposed_event_id = "le_" + str(uuid.uuid4())
         created_at = _utc_now()
 
         conn = self._connect()
@@ -1465,13 +1537,15 @@ class SecureWorkItemStore:
                     consumed_at,
                     work_item_id,
                     attempt_id,
+                    link_id,
                     rejected_at,
                     rejection_reason
                 )
-                VALUES (?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL)
+                VALUES (?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL, NULL)
+                ON CONFLICT DO NOTHING
                 """,
                 (
-                    event_id,
+                    proposed_event_id,
                     session_id,
                     match,
                     int(evidence_complete),
@@ -1480,6 +1554,25 @@ class SecureWorkItemStore:
                     attempt_id,
                 ),
             )
+            receipt = conn.execute(
+                "SELECT event_id, session_id, work_item_id, attempt_id, "
+                "match, evidence_complete FROM authority_landing_events "
+                "WHERE work_item_id = ? AND attempt_id = ?",
+                (work_item_id, attempt_id),
+            ).fetchone()
+            if receipt is None:
+                raise AuthorityError(
+                    "landing receipt insert conflicted without an Attempt receipt"
+                )
+            if (
+                receipt["session_id"] != session_id
+                or receipt["match"] != match
+                or bool(receipt["evidence_complete"]) != evidence_complete
+            ):
+                raise QuarantineNotCleared(
+                    "this WorkItem Attempt already has a different immutable landing receipt"
+                )
+            event_id = receipt["event_id"]
             conn.execute("COMMIT")
         except BaseException:
             if conn.in_transaction:
@@ -1673,10 +1766,20 @@ class SecureWorkItemStore:
                     "session already has an active WorkItem link"
                 )
 
+            conn.execute(
+                """
+                INSERT INTO session_links (
+                    link_id, session_id, work_item_id, linked_at, unlinked_at
+                )
+                VALUES (?, ?, ?, ?, NULL)
+                """,
+                (link_id, session_id, work_item_id, now),
+            )
+
             consumed = conn.execute(
                 """
                 UPDATE authority_landing_events
-                SET consumed_at = ?
+                SET consumed_at = ?, link_id = ?
                 WHERE event_id = ?
                   AND session_id = ?
                   AND work_item_id = ?
@@ -1685,9 +1788,11 @@ class SecureWorkItemStore:
                   AND evidence_complete = 1
                   AND consumed_at IS NULL
                   AND rejected_at IS NULL
+                  AND link_id IS NULL
                 """,
                 (
                     now,
+                    link_id,
                     selected_event_id,
                     session_id,
                     work_item_id,
@@ -1698,16 +1803,6 @@ class SecureWorkItemStore:
                 raise QuarantineNotCleared(
                     "landing evidence was consumed or changed concurrently"
                 )
-
-            conn.execute(
-                """
-                INSERT INTO session_links (
-                    link_id, session_id, work_item_id, linked_at, unlinked_at
-                )
-                VALUES (?, ?, ?, ?, NULL)
-                """,
-                (link_id, session_id, work_item_id, now),
-            )
 
             self._audit(
                 conn,
