@@ -23,8 +23,8 @@ The feature stays disabled unless `SO_MCP_EVENTS_KEY_FILE` points to a raw 32-by
 
 ## Verification
 
-- Current reconstructed Sender + MCP integration suite: **25 passed**.
-- Full repository suite: **1302 passed, 7 skipped, 1573 subtests passed**.
+- Current reconstructed Sender + MCP integration suite: **26 passed**.
+- Full repository suite: **1304 passed, 7 skipped, 1573 subtests passed**.
 - Python compilation passed for the reconstructed MCP and Sender modules.
 - Sender and MCP-client patches passed `git apply --check` against the current live source files; MCP server/runtime patches passed the same check against their current live source files; the additive module patch passed its clean-tree check.
 - `git diff --check` clean.

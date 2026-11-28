@@ -40,8 +40,8 @@ fix from PR #215; that one file is not yet present in the live `/opt` tree.
 
 ## Validation
 
-- Full repository tests: **1302 passed, 7 skipped, 1573 subtests passed**.
-- Current reconstructed production integration tests: **25 passed**.
+- Full repository tests: **1304 passed, 7 skipped, 1573 subtests passed**.
+- Current reconstructed production integration tests: **26 passed**.
 - Sender and MCP patch series both apply cleanly to the current live source files
   in isolated temporary copies and pass Python compilation.
 - The legacy-outbox migration test seeds 75 pending rows, verifies that migration
@@ -58,4 +58,4 @@ fix from PR #215; that one file is not yet present in the live `/opt` tree.
 
 This snapshot was refreshed from the deployed source after the Sender runtime convergence work. The refreshed files cover persistent account-health gating (acct4 unavailable, acct5 operator-disabled by default), structured upstream 401/429 handling, bounded Retry-After cooldown with jitter, Worker deferral through `next_eligible_at`, stable account-identity rotation cursors, read/list 429 fail-fast behavior, and permission-safe JSON state loading. The rotation counter file is group-readable (`0640`, group `chatgpt-sender`); credential-bearing state remains `0600`.
 
-Verification against the refreshed source and current event changes: **1302 passed, 7 skipped, 1573 subtests passed**; Python compilation and `git diff --check` clean. No credentials, tokens, certificates, private keys, databases, environment files, or virtual environments are included in this source snapshot.
+Verification against the refreshed source and current event changes: **1304 passed, 7 skipped, 1573 subtests passed**; Python compilation and `git diff --check` clean. No credentials, tokens, certificates, private keys, databases, environment files, or virtual environments are included in this source snapshot.

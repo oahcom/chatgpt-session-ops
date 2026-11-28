@@ -247,6 +247,7 @@ class MCPEventsStore:
                 "type": "object",
                 "properties": {
                     "job_id": {"type": "string"},
+                    "conversation_id": {"type": "string"},
                     "status": {"type": "string", "enum": ["succeeded", "failed"]},
                     "summary": {"type": "string"},
                     "completed_at": {"type": "string", "format": "date-time"},

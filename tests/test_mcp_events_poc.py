@@ -52,6 +52,13 @@ class MCPEventsStoreTests(unittest.TestCase):
             "delivery": self.delivery,
         })
 
+    def test_event_catalog_declares_optional_conversation_id(self):
+        definition = self.store.event_catalog()[0]
+        properties = definition["payloadSchema"]["properties"]
+        required = definition["payloadSchema"]["required"]
+        self.assertEqual(properties["conversation_id"], {"type": "string"})
+        self.assertNotIn("conversation_id", required)
+
     def test_subscribe_verifies_challenge_and_persists_subscription(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             result = self.subscribe(job_id="task-1")

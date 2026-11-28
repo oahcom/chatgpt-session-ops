@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/src/session_ops/mcp_events.py
-@@ -0,0 +1,728 @@
+@@ -0,0 +1,729 @@
 +"""SQLite-backed MCP Events subscription and webhook delivery implementation.
 +
 +The service launcher enables this module only when a private encryption key
@@ -250,6 +250,7 @@
 +                "type": "object",
 +                "properties": {
 +                    "job_id": {"type": "string"},
++                    "conversation_id": {"type": "string"},
 +                    "status": {"type": "string", "enum": ["succeeded", "failed"]},
 +                    "summary": {"type": "string"},
 +                    "completed_at": {"type": "string", "format": "date-time"},

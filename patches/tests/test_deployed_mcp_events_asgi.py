@@ -426,6 +426,9 @@ class DeployedMCPEventsTests(unittest.TestCase):
                 }, session_id)
                 self.assertEqual(status, 200)
                 self.assertEqual(listed["result"]["events"][0]["name"], "chatgpt.job.completed")
+                payload_schema = listed["result"]["events"][0]["payloadSchema"]
+                self.assertEqual(payload_schema["properties"]["conversation_id"], {"type": "string"})
+                self.assertNotIn("conversation_id", payload_schema["required"])
 
                 secret = "whsec_" + base64.b64encode(b"w" * 32).decode()
                 with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
