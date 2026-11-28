@@ -4,8 +4,8 @@
 对应方案（reply-6b083c56-220811.md）§2.3、§2.6、§3 PR-2。
 
 本模块只做一件事：把固定子进程接口包成 ``ChatGPTCLIAdapter`` 的四个方法。
-调用方（worker / app）无法传入任意命令、路径或环境变量；CLI 参数协议全部来自
-``docs/CHATGPT-MCP.md`` 的「CLI 契约实测」一节，依据是 b74d9ff 的
+调用方（MCP service）无法传入任意命令、路径或环境变量；CLI 参数协议全部来自
+``docs/DEPLOY-so-mcp.md`` 的「CLI 契约实测」一节，依据是 b74d9ff 的
 ``scripts/chatgpt_send.py`` 源码与 ``tests/test_aid_2026_011_stage3_cli.py``。
 
 硬约束（方案 §2.3 第 1–8 条）：
@@ -63,7 +63,7 @@ CODE_TIMEOUT = "TIMEOUT"
 CODE_INTERNAL = "INTERNAL"
 
 # ---------------------------------------------------------------------------
-# CLI 契约常量（证据见 docs/CHATGPT-MCP.md「CLI 契约实测」）
+# CLI 契约常量（证据见 docs/DEPLOY-so-mcp.md「CLI 契约实测」）
 # ---------------------------------------------------------------------------
 
 # scripts/chatgpt_send.py:5939-5940：conv_id 必须是带连字符的小写 UUID。
@@ -166,8 +166,7 @@ _ENV_ALLOWLIST = (
     "CHATGPT_ALLOW_DIRECT",
     "CHATGPT_SEND_TIMEOUT",
     "CHATGPT_ANON_CDP_PORT",
-    "CHATGPT_STATE_DIR",
-    "SO_SENDER_ACCOUNT_LOCK_DIR",
+
 )
 
 # 显式写死的子进程 env（不是从调用方继承）。
@@ -180,7 +179,7 @@ _ENV_FORCED = {
 }
 
 # 建会话没有 CLI 侧 prompt 语义（--new 必带 prompt_file），这里固定引导语；
-# 真正的会话内容由后续 send 提供。TODO 见 docs/CHATGPT-MCP.md「缺口」。
+# 真正的会话内容由后续 send 提供。TODO 见 docs/DEPLOY-so-mcp.md「缺口」。
 _DEFAULT_CREATE_PROMPT = "ping"
 
 _PROMPT_MAX_CHARS = 32768
@@ -661,7 +660,7 @@ class ChatGPTCLIAdapter:
             )
         if self._allowed_accounts is not None:
             # Defense in depth: a direct adapter call must not bypass the
-            # Gateway's persisted health filter for a pinned account.
+            # the local CLI's current credential and rotation state for a pinned account.
             if normalized not in set(self._allowed_accounts()):
                 raise SenderError(
                     CODE_RESOURCE_EXHAUSTED,
