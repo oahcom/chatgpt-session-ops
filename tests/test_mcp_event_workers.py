@@ -40,13 +40,13 @@ class MCPEventDeliveryWorkerTests(unittest.TestCase):
             store,
             authorize=authorize,
             poll_seconds=0.05,
-            batch_size=17,
+            batch_size=2,
             cleanup_interval_seconds=60,
         )
         stop = StopAfterWait()
         worker.run_forever(stop)
         self.assertEqual(store.cleanup_calls, 1)
-        self.assertEqual(store.delivery_calls, [(17, authorize)])
+        self.assertEqual(store.delivery_calls, [(2, authorize)])
         self.assertEqual(stop.waits, 1)
 
 

@@ -14,13 +14,13 @@ class MCPEventDeliveryWorker:
         *,
         authorize: Any = None,
         poll_seconds: float = 0.5,
-        batch_size: int = 100,
+        batch_size: int = 2,
         cleanup_interval_seconds: float = 3600,
     ) -> None:
         if not 0.05 <= float(poll_seconds) <= 60:
             raise ValueError("poll_seconds must be in 0.05..60")
-        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 500:
-            raise ValueError("batch_size must be in 1..500")
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 2:
+            raise ValueError("batch_size must be in 1..2")
         if not 60 <= float(cleanup_interval_seconds) <= 86400:
             raise ValueError("cleanup_interval_seconds must be in 60..86400")
         self.events_store = events_store
