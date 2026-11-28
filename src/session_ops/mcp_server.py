@@ -529,7 +529,7 @@ class MCPToolService:
     It is configuration, not a shared MemoryAdapterClient instance.
     """
 
-    def __init__(self, store: Any, *, memory_adapter: Optional[Sequence[str]] = None, chatgpt_cli_path: Optional[str] = None):
+    def __init__(self, store: Any, *, memory_adapter: Optional[Sequence[str]] = None, chatgpt_cli_path: Optional[str] = None, legacy_sender_db_path: Optional[str] = None):
         if store is None:
             raise ValueError("SecureWorkItemStore is required")
         self.store = store
@@ -549,6 +549,11 @@ class MCPToolService:
                 raise ValueError("chatgpt_cli_path is invalid")
             self.chatgpt_registry = ChatGPTSessionRegistry(store.database_path)
             self.chatgpt_registry.initialize()
+            self.chatgpt_legacy_owner_imported = 0
+            if legacy_sender_db_path is not None:
+                self.chatgpt_legacy_owner_imported = self.chatgpt_registry.migrate_legacy_owners(
+                    legacy_sender_db_path
+                )
             cli_root = __import__("os").path.dirname(__import__("os").path.dirname(chatgpt_cli_path))
             self.chatgpt_cli = ChatGPTCLIAdapter(
                 chatgpt_cli_path,
