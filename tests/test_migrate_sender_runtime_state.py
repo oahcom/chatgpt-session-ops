@@ -1,9 +1,15 @@
+import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
-from tools.migrate_sender_runtime_state import STATE_FILES, migrate_state
+from tools.migrate_sender_runtime_state import (
+    STATE_FILES,
+    merge_legacy_account_health,
+    migrate_state,
+)
 
 
 class MigrateSenderRuntimeStateTests(unittest.TestCase):
@@ -50,6 +56,55 @@ class MigrateSenderRuntimeStateTests(unittest.TestCase):
         nested.mkdir()
         with self.assertRaisesRegex(RuntimeError, "separate"):
             migrate_state(self.source, nested)
+
+    def test_imports_legacy_disabled_accounts_without_overwriting_cli_state(self):
+        state_file = self.target / "account-rotation.json"
+        state_file.write_text(json.dumps({
+            "cursor": 0,
+            "unavailable": {
+                "acct4": {
+                    "reason": "manually disabled by CLI",
+                    "at": "2026-11-28 00:00:00",
+                    "epoch": 1,
+                    "ttl": 999999999,
+                }
+            },
+        }), encoding="utf-8")
+        legacy_db = self.root / "sender.sqlite3"
+        conn = sqlite3.connect(legacy_db)
+        conn.execute(
+            "CREATE TABLE account_health (account TEXT PRIMARY KEY, "
+            "state TEXT NOT NULL, reason TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        conn.executemany(
+            "INSERT INTO account_health VALUES (?, ?, ?, ?)",
+            [
+                ("acct4", "auth_unavailable", "stale token", "2026-11-28T00:00:00Z"),
+                ("acct5", "operator_disabled", "operator disabled", "2026-11-28T00:00:00Z"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        imported = merge_legacy_account_health(self.target, legacy_db)
+        self.assertEqual(imported, [("acct5", "operator_disabled")])
+        rotation = json.loads(state_file.read_text(encoding="utf-8"))
+        self.assertEqual(
+            rotation["unavailable"]["acct4"]["reason"],
+            "manually disabled by CLI",
+        )
+        self.assertIn(
+            "legacy Gateway operator_disabled",
+            rotation["unavailable"]["acct5"]["reason"],
+        )
+        self.assertGreater(
+            rotation["unavailable"]["acct5"]["ttl"],
+            365 * 24 * 60 * 60,
+        )
+
+        check = sqlite3.connect("file:" + str(legacy_db) + "?mode=ro", uri=True)
+        self.assertEqual(check.execute("SELECT count(*) FROM account_health").fetchone()[0], 2)
+        check.close()
 
 
 if __name__ == "__main__":
