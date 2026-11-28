@@ -770,6 +770,52 @@ class TestDeploymentASGIReadiness(unittest.TestCase):
         body = next(message for message in sent if message["type"] == "http.response.body")
         return start["status"], json.loads(body["body"])
 
+    def test_lifespan_stops_dispatcher_before_draining_chatgpt_executor(self):
+        calls = []
+
+        class Task:
+            def __init__(self, name):
+                self.name = name
+
+            def start(self):
+                calls.append("start:" + self.name)
+
+            def stop(self):
+                calls.append("stop:" + self.name)
+
+        class Inner:
+            async def __call__(self, scope, receive, send):
+                while True:
+                    message = await receive()
+                    if message["type"] == "lifespan.startup":
+                        await send({"type": "lifespan.startup.complete"})
+                    elif message["type"] == "lifespan.shutdown":
+                        await send({"type": "lifespan.shutdown.complete"})
+                        return
+
+        app = DeploymentASGI(
+            Inner(),
+            issuer="https://issuer.example.test/realm",
+            audience="https://resource.example.test/mcp",
+            background_tasks=[Task("chatgpt"), Task("dispatcher")],
+        )
+        messages = iter([
+            {"type": "lifespan.startup"},
+            {"type": "lifespan.shutdown"},
+        ])
+
+        async def receive():
+            return next(messages)
+
+        async def send(_message):
+            return None
+
+        asyncio.run(app({"type": "lifespan"}, receive, send))
+        self.assertEqual(
+            calls,
+            ["start:chatgpt", "start:dispatcher", "stop:dispatcher", "stop:chatgpt"],
+        )
+
     def test_readyz_distinguishes_disabled_live_and_stalled_dispatcher(self):
         class Inner:
             async def __call__(self, scope, receive, send):
@@ -825,6 +871,11 @@ class TestMCPEventsRuntimeWiring(unittest.TestCase):
         }
         events_store = mock.Mock()
         dispatcher = mock.Mock()
+        direct_client = scripts.run_mcp_server.ChatGPTDirectClient.__new__(
+            scripts.run_mcp_server.ChatGPTDirectClient
+        )
+        direct_client.start = mock.Mock()
+        direct_client.stop = mock.Mock()
         mcp_app = object()
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -841,7 +892,7 @@ class TestMCPEventsRuntimeWiring(unittest.TestCase):
                 mock.patch("scripts.run_mcp_server.SecureWorkItemStore") as store_type,
                 mock.patch("scripts.run_mcp_server.JWTVerifier"),
                 mock.patch("scripts.run_mcp_server.MCPEventsStore", return_value=events_store) as events_type,
-                mock.patch("scripts.run_mcp_server.ChatGPTDirectClient.from_env", return_value=mock.Mock()),
+                mock.patch("scripts.run_mcp_server.ChatGPTDirectClient.from_env", return_value=direct_client),
                 mock.patch("scripts.run_mcp_server.MCPEventDispatcher", return_value=dispatcher) as dispatcher_type,
                 mock.patch("scripts.run_mcp_server.build_mcp_server", return_value=mcp_app) as build_server,
             ):
@@ -860,7 +911,7 @@ class TestMCPEventsRuntimeWiring(unittest.TestCase):
         build_server.assert_called_once()
         self.assertIs(build_server.call_args.kwargs["events_store"], events_store)
         self.assertIs(app.inner, mcp_app)
-        self.assertEqual(app.background_tasks, [dispatcher])
+        self.assertEqual(app.background_tasks, [direct_client, dispatcher])
         self.assertIsNotNone(app.readiness_snapshot)
 
     def test_events_reject_memory_database_and_relative_events_path(self):
