@@ -9513,6 +9513,9 @@ def _main_impl():
             )
             return 2
         if explicit_account and account != "auto":
+            if account in ROTATION_PRIMARY and is_unavailable(load_rotation(), account):
+                print("ACCOUNT_DISABLED account=%s" % account, flush=True)
+                return 1
             api = build(account)
             if api is None:
                 return 2
@@ -9722,8 +9725,11 @@ def _main_impl():
             print("FAIL: 未取到会话内容（限速或会话不可访问）", flush=True)
             return 1
         return 0
+    if account in ROTATION_PRIMARY and is_unavailable(load_rotation(), account):
+        print("ACCOUNT_DISABLED account=%s" % account, flush=True)
+        return 1
     if len(args) != 2:
-        print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin] <conv_id> <prompt_file>", flush=True)
+        print("usage: [--account acctN|nologin] <conv_id> <prompt_file>", flush=True)
         return 2
     if work_item_id is not None:
         if account == "nologin":
