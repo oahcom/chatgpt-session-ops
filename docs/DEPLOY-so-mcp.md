@@ -107,6 +107,11 @@ were installed from that commit. Section 8 states what is.
 
 ## 1. Deployment authority
 
+`oahcom/chatgpt-session-ops` is the sole source repository for the MCP server
+and its ChatGPT runtime. `/opt/so-mcp` is only an immutable deployment artifact
+built from that repository; it is not a second source tree and must not be
+edited independently. The Gateway/sidecar path is not part of this deployment.
+
 The only deployment authority is a full Git commit SHA from
 `oahcom/chatgpt-session-ops`'s GitHub `main` history.
 
@@ -138,6 +143,8 @@ test ! -e "$TMP"
 install -d -o ubuntu -g ubuntu -m 0750 "$TMP"
 git archive --format=tar "$COMMIT" \
   scripts/run_mcp_server.py \
+  scripts/chatgpt_send.py \
+  scripts/pow_solver.py \
   src \
   requirements-mcp.txt \
   tools/verify_deploy.py \
@@ -152,6 +159,9 @@ test -f "$TMP/scripts/run_mcp_server.py"
 test -f "$TMP/src/session_ops/authority.py"
 test -f "$TMP/src/session_ops/mcp_auth.py"
 test -f "$TMP/src/session_ops/mcp_server.py"
+test -f "$TMP/src/session_ops/chatgpt_direct_client.py"
+test -f "$TMP/src/session_ops/mcp_events.py"
+test -f "$TMP/src/session_ops/mcp_event_dispatcher.py"
 test -f "$TMP/src/session_ops/memory_adapter_client.py"
 test -f "$TMP/src/session_ops/work_items.py"
 test -f "$TMP/src/session_ops/__init__.py"
@@ -163,11 +173,9 @@ test ! -e "$TMP/deploy"
 test ! -e "$TMP/docs"
 test ! -e "$TMP/references"
 test ! -e "$TMP/.github"
-test ! -e "$TMP/scripts/chatgpt_send.py"
 test ! -e "$TMP/scripts/continue_full.py"
 test ! -e "$TMP/scripts/extract_auth.py"
 test ! -e "$TMP/scripts/mcp_connector.py"
-test ! -e "$TMP/scripts/pow_solver.py"
 test ! -e "$TMP/scripts/accounts"
 ```
 
@@ -184,6 +192,40 @@ archive makes the application tree one immutable Git snapshot.
 ## 2. Production directory layout
 
 The active tree is `/opt/so-mcp`.
+
+The application tree is immutable at runtime. The service unit sets:
+
+- `CHATGPT_SESSION_OPS_ACCOUNTS_DIR=/var/lib/chatgpt-session-ops/accounts` for the credential vault. Credentials remain in the existing account directories and are not copied into the application tree.
+- `CHATGPT_SESSION_OPS_RUNTIME_DIR=/var/lib/so-mcp/chatgpt-session-ops` for mutable CLI state, prompt files, logs, and per-account runtime state.
+
+At startup and before each account preflight, `ChatGPTDirectClient` discovers
+all valid `acctN` directories in the vault (natural numeric order) and mirrors
+new account credentials into the runtime tree. Credential files begin as
+symlinks to the read-only vault; atomic cookie warm-up replaces only the
+runtime symlink with a writable runtime overlay, never the vault file. If an
+operator replaces vault credentials after a runtime overlay exists, remove that
+account's runtime overlay files before restarting so the new vault credentials
+are mirrored.
+
+The service runs as `User=ubuntu`, `Group=chatgpt-sender`. Keep the existing
+credential vault owned by `chatgpt-sender:chatgpt-sender` with directories
+mode `0750` and credential files mode `0660`; the service needs read/traverse
+access, not write access. The runtime directory is owned by `ubuntu:ubuntu`
+with mode `0700`. Do not recursively chown the existing vault to `ubuntu`.
+
+```bash
+sudo install -d -o ubuntu -g ubuntu -m 0700 \
+  /var/lib/so-mcp/chatgpt-session-ops
+# Credentials and account directories are provisioned by the existing
+# account-management workflow. Do not recreate, chown, or chmod the vault here.
+sudo -u ubuntu -g chatgpt-sender test -r /var/lib/chatgpt-session-ops/accounts
+```
+
+Do not put mutable rotation/ownership/proxy files or live credentials under
+`/opt/so-mcp`. `ChatGPTDirectClient` redirects the CLI's mutable state into
+`/var/lib/so-mcp/chatgpt-session-ops`; account credentials remain in the
+separate `/var/lib/chatgpt-session-ops/accounts` vault. File-based proxy
+configuration, when used, is stored as `proxy.json` under the runtime path.
 
 The immediately previous tree is retained as:
 
@@ -413,16 +455,137 @@ only the message and the traceback frame differ.
 
 `SO_MCP_DB` is only checked against the literal `:memory:`, not for being
 absolute; a relative path resolves against `WorkingDirectory=/opt/so-mcp`. The
-unit is `ProtectSystem=strict` with `ReadWritePaths=/var/lib/so-mcp`, so the
-database must live under `/var/lib/so-mcp` or SQLite fails to create its WAL
-files at runtime. Use the path shown above. The same file is also what
-`scripts/chatgpt_send.py` opens for trusted WorkItem delivery (`--db`, or the
-`SO_MCP_DB` environment variable in that process), so both must name one path.
+unit is `ProtectSystem=strict` with `ReadWritePaths=/var/lib/so-mcp` and `ReadOnlyPaths=/var/lib/chatgpt-session-ops/accounts`. The database must live under `/var/lib/so-mcp` or SQLite fails to create its WAL files at runtime. The service's `chatgpt-sender` primary group grants read-only access to the existing credential vault; do not grant the MCP process write access to credentials. Account preflight requires only read access to `cookies.json` and `access_token.txt`; cookie warm-up writes are best-effort and may be skipped on the read-only vault. Writable CLI state and prompt files stay under the runtime directory. The WorkItem database is also the Events outbox database; a separate Events database is rejected to preserve atomic terminal-state publication.
+
+`CHATGPT_SESSION_OPS_ACCOUNTS_DIR` and `CHATGPT_SESSION_OPS_RUNTIME_DIR` are the only runtime path settings for the in-process direct client. Do not override them to point into `/opt/so-mcp`: the application tree is intentionally read-only.
 
 `scripts/run_mcp_server.py` also reads `LOG_LEVEL` for the Python logger
 (`logging.basicConfig`). It is not validated, has no failure mode, and is not
 required; it is not part of the set above because `load_config()` does not
 read it.
+
+## 2c. Enabling MCP Events (explicit opt-in)
+
+MCP Events are disabled when `SO_MCP_EVENTS_KEY_FILE` is unset. Do not set
+`SO_MCP_EVENTS_DB` on its own: startup rejects that combination. The default
+is intentional — once the key is configured, the event outbox is created in
+the same SQLite file named by `SO_MCP_DB`, so a terminal WorkItem transition
+and its completion event remain one transaction.
+
+Provision the key once, as the service account, without overwriting an
+existing key:
+
+```bash
+sudo -u ubuntu sh -c '
+  set -eu
+  test ! -e /var/lib/so-mcp/events.key
+  umask 077
+  openssl rand -out /var/lib/so-mcp/events.key 32
+  chmod 0600 /var/lib/so-mcp/events.key
+'
+sudo stat -c '%U:%G %a %s %n' /var/lib/so-mcp/events.key
+```
+
+The required result is `ubuntu:ubuntu 600 32 /var/lib/so-mcp/events.key`.
+Never print or copy the key into a ticket, shell transcript, deployment
+manifest, or chat. Add this line to `/etc/so-mcp/so-mcp.env`:
+
+```ini
+SO_MCP_EVENTS_KEY_FILE=/var/lib/so-mcp/events.key
+```
+
+Leave `SO_MCP_EVENTS_DB` unset unless there is a specific operational reason
+to set it; if set, it must resolve to exactly the `SO_MCP_DB` file. The
+service accepts only a regular, non-symlink key file owned by the service
+user, with exact mode `0400` or `0600` and exactly 32 raw bytes. It opens the
+file without following a final-component symlink and reads no more than 33
+bytes. The systemd unit already grants the service read/write access to
+`/var/lib/so-mcp`.
+
+Treat this key as immutable for the lifetime of the WorkItem/Events database;
+do not replace it during routine deployment. Back up the SQLite database with
+SQLite's online backup API (the database uses WAL mode; copying only the main
+file can omit committed WAL contents) and back up the matching key separately
+in an encrypted secret manager. Restore both as a pair. If the key is lost,
+restore its matching backup or follow the explicit subscription-reset recovery
+procedure in `docs/mcp-events-poc.md`; never start with a new key while leaving
+old encrypted subscriptions active.
+
+### Event readiness and bounded health snapshot
+
+`/healthz` reports HTTP process liveness only. When Events are enabled,
+`/readyz` separately reports whether the in-process dispatcher thread is
+running and returns bounded aggregate data: pending/sending/delivered/failed
+counts, oldest pending age, retry exhaustion, attempt totals, active/expired
+subscriptions, last delivery status classes, callback latency/status counters
+for the current process, SQLite busy errors, secret-decryption failures, and
+database/WAL byte sizes. It never returns event IDs, WorkItem IDs, principal
+IDs, callback URLs, signing secrets, or payload contents. When Events are
+disabled, `/readyz` returns `events.enabled=false` and HTTP 200.
+
+Check readiness from the host:
+
+```bash
+curl --fail --silent --show-error http://127.0.0.1:8791/readyz
+systemctl is-active so-mcp.service
+journalctl -u so-mcp.service --since -15min --no-pager
+```
+
+Investigate when `dispatcher.running=false` while pending deliveries exist,
+`oldest_pending_age_seconds` remains above 120, `retry_exhausted` is nonzero,
+or callback 4xx/5xx, 410, 413, SQLite-busy, or secret-decryption counters
+increase. Check callback reachability and subscription expiry first. Do not
+replay the historical legacy Sender Outbox. Do not manually edit delivery
+leases or encrypted subscription rows. For a dispatcher crash, preserve the
+database/key pair, inspect the secret-free `/readyz` snapshot and journal,
+then restart the single MCP service in the approved window; leases recover
+automatically after expiry. If the key/database pair is suspect, follow the
+immutable-key recovery procedure above rather than generating a replacement
+key in place.
+
+`TimeoutStopSec=1900` covers the full in-process shutdown, not just the
+event dispatcher. The dispatcher waits at most 30 seconds for an in-flight
+callback/SQLite operation and 3 seconds for its thread to exit. The ChatGPT CLI
+socket timeout can be 420 seconds in normal mode or 1800 seconds in thinking
+mode. On ASGI shutdown, `ChatGPTDirectClient.stop()` cancels queued executor
+futures (their durable DB rows remain `queued` for restart recovery) and waits
+for the single active remote operation to finish. The additional budget covers
+the 5-second Uvicorn graceful-shutdown window and margin. Do not lower this
+below 1900 seconds unless the CLI maximum is reduced and the shutdown path is
+retested.
+
+`/healthz` remains a liveness check; a 200 there does not imply event
+delivery readiness. Keep the dispatcher in-process; this endpoint adds no
+worker, scheduler, queue, or external metrics dependency.
+
+### OAuth scope issuance is a separate gate
+
+The MCP resource metadata advertises the existing scopes
+`session_ops.chatgpt.session.read` and `session_ops.chatgpt.session.write`.
+Events do not introduce a separate OAuth scope: `events/list` requires the
+read scope, while `events/subscribe` and `events/unsubscribe` require the
+write scope. `work_item.finish` requires `session_ops.work_item.write` and
+is additionally restricted to the immutable WorkItem owner. This is only the
+resource-server contract; it does not prove that
+the configured authorization server/client actually issues those scopes.
+
+Before enabling Events, obtain a token through the real ChatGPT OAuth flow
+and verify (without logging the token) that its verified `scope` claim
+contains both scopes. Also verify that the authorization server's client
+configuration permits them. A metadata `scopes_supported` response or a
+successful OAuth discovery response alone is not evidence of scope issuance.
+If either scope is absent, fix the authorization-server/client grant first;
+do not weaken the MCP checks or infer a grant from this repository's code.
+
+After provisioning, restart only in the approved deployment window and
+verify startup, the configured database identity, and callback HTTPS egress.
+Do not provision the key or enable production delivery until the real ChatGPT Work acceptance test has passed in a controlled deployment window.
+That test must subscribe one destination conversation without `job_id`,
+complete multiple owner WorkItems (including one without a source session
+link), verify callbacks arrive in that same conversation, verify a different
+principal receives none, and verify unsubscribe. The service has no
+`SO_MCP_CHATGPT_MAINTENANCE` environment switch; production enablement is
+controlled solely by whether `SO_MCP_EVENTS_KEY_FILE` is configured.
 
 ### Deriving the realm namespace
 

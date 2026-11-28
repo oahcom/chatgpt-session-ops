@@ -23,7 +23,7 @@ SPEC.loader.exec_module(MODULE)
 
 
 # 跟随生产常量，避免每次扩账号都要改测试（DECISION-147）。
-ACCOUNTS = tuple(MODULE.ROTATION_PRIMARY)
+ACCOUNTS = ("acct1", "acct2", "acct3", "acct4", "acct5", "acct6")
 
 
 class FakeAPI:
@@ -85,6 +85,11 @@ class AID2026011ReconcileTestCase(unittest.TestCase):
         self.registry_patch.start()
 
         self.addCleanup(self.registry_patch.stop)
+        self.discovery_patch = mock.patch.object(
+            MODULE, "_rotation_primary", return_value=list(ACCOUNTS)
+        )
+        self.discovery_patch.start()
+        self.addCleanup(self.discovery_patch.stop)
         self.addCleanup(self.tempdir.cleanup)
 
     def registry_bytes(self):

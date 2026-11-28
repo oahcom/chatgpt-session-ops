@@ -1,0 +1,66 @@
+# MCP Events: `chatgpt.job.completed`
+
+## Design
+
+The event path is owned by `chatgpt-session-ops`; it has no Sender Gateway, Sender client, polling bridge, or second job system.
+
+1. The authenticated principal creates a WorkItem and may link one or more confirmed ChatGPT conversations to it with `session.link`. These are source sessions only; the ChatGPT-supplied webhook callback URL is the notification destination.
+2. The immutable WorkItem owner calls `work_item.finish` with `completed` or `cancelled`. `SecureWorkItemStore.finish_work_item()` writes the terminal state, audit rows, session unlink records, and exactly one completion event into one SQLite transaction.
+3. `MCPEventsStore` stores the outbox, subscription, and delivery tables in that same database. The event `job_id` is the WorkItem ID (not the internal `cgj_...` ChatGPT execution-queue job ID). The durable event identifies the WorkItem, terminal result, completion time, and linked conversation IDs; it never copies conversation content.
+4. Only the immutable WorkItem owner may call `work_item.finish`. Delegated writers may update non-terminal status, but cannot complete/cancel the WorkItem or trigger its completion event. Event ownership and subscriptions are scoped to that owner.
+5. The ChatGPT-provided webhook callback URL is the destination: ChatGPT binds it to the Work chat that created the subscription and delivers events back into that subscribed chat. The MCP server must not accept a caller-supplied `conversation_id` as a routing instruction. The only optional event filter is `job_id`; omitting it subscribes that Work chat to all completion events owned by the authenticated tenant/principal, while supplying it narrows the subscription to one owned WorkItem. The event payload may include `source_conversation_ids` for context; these identify source sessions linked to the WorkItem and are never routing targets.
+6. On the v2 schema upgrade, legacy subscriptions using the former destination-conversation filter are disabled and their pending deliveries are failed closed; historical outbox rows are retained. ChatGPT must establish new subscriptions with the callback URL as the destination.
+7. One in-process dispatcher delivers pending callbacks with bounded retries and Standard Webhooks signatures. Delivery is at-least-once, not end-to-end exactly-once: a crash after remote 2xx but before the local delivered commit can cause a retry. The stable `eventId` lets receivers deduplicate; failed delivery remains durable for retry.
+
+The event store key is separate from the database file. `SO_MCP_EVENTS_DB`, if configured, must resolve to the same file as the WorkItem database; a second database is rejected because it would break atomicity. `SO_MCP_EVENTS_KEY_FILE` must contain a raw 32-byte key in a regular, non-symlink file owned by the service user with exact mode `0400` or `0600`.
+
+### Encryption-key lifecycle and recovery
+
+The Events encryption key is **immutable for the lifetime of this database**. In-place key rotation is deliberately unsupported: replacing the key without re-encrypting every current and previous subscription secret makes those rows undecryptable. Startup stores a keyed SHA-256 check value in `event_key_metadata`; a later startup with a different key fails before the dispatcher starts. When upgrading a database created before this check existed, startup first verifies that the supplied key decrypts every stored subscription secret before recording the check value. The check value is not the encryption key and cannot be used to decrypt subscription secrets.
+
+Back up the WorkItem/Events SQLite database with SQLite's online backup API (or another SQLite-consistent backup method). Do not copy only the main `.sqlite3` file while WAL mode is active: committed rows may still be in `-wal`. Back up the exact 32-byte key separately in an encrypted secret manager or equivalent access-controlled secret backup. The database backup and its matching key form one recovery set; never place the raw key in the database backup, repository, logs, or ticket.
+
+Restore the SQLite database to the new host using the SQLite backup API, restore the matching key file with owner-only mode `0400` or `0600`, then start MCP. Startup verifies the key/database pairing before enabling delivery. A database restored without its matching key must remain stopped; do not generate a replacement key and leave old subscriptions active. If the matching key is irrecoverably lost, stop MCP and take a fresh consistent database backup first. Then run this transaction against the WorkItem database:
+
+```sql
+BEGIN IMMEDIATE;
+DELETE FROM event_deliveries;
+DELETE FROM event_subscriptions;
+DELETE FROM callback_verifications;
+DELETE FROM event_key_metadata WHERE singleton=1;
+COMMIT;
+```
+
+Keep `event_outbox` and all WorkItem data. Provision a new key and restart; all former subscriptions are gone and their ChatGPT Work conversations must explicitly subscribe again. Historical outbox rows are retained but are not automatically replayed as part of this recovery procedure.
+
+There is no re-encryption migration, so interrupted rotation and rotation rollback are not supported operations. A wrong-key startup is fail-closed and does not modify the existing key metadata or subscription rows. Recovery is either restore the matching database/key pair or deliberately discard all subscriptions and re-establish them with a new key.
+
+## Lifecycle boundary
+
+`work_item.finish` is a narrow v0.1 Owner-only terminal operation. It prevents generic `work_item.update` from setting terminal statuses and atomically commits the terminal projection, audit, SessionLink unlink, stable idempotency receipt, and optional completion Outbox event. It is not the full Owner Acceptance/cancellation model: there is no immutable Acceptance record bound to WorkItemSpec, Assignment, head SHA, and required Evidence, and cancellation has no separate immutable cancellation record or required reason. A delivered `chatgpt.job.completed` event is a terminal-state notification, not Acceptance evidence. Keep #196/#166 open until those lifecycle semantics are implemented; the event publisher must ultimately be called by the authoritative Acceptance/cancellation transaction.
+
+## Direct ChatGPT execution
+
+- `chatgpt.session.create` and `chatgpt.session.send` use `ChatGPTDirectClient`, an in-process adapter over the repository's existing `scripts/chatgpt_send.py` implementation. There is no Sender Gateway, HTTP sidecar, mTLS client, or separate worker service.
+- The adapter persists requests in `chatgpt_jobs` in the canonical WorkItem SQLite database and runs them through one bounded executor thread. Capacity is nine outstanding jobs total (one active plus eight queued); admission fails fast when full. This queue is deliberately retained to prevent bursts of MCP calls from overwhelming account/session operations.
+- Every request supplies a stable UUIDv4 `idempotency_key`. The key is bound to the operation and canonical request hash; an exact retry returns the original job, while reuse with changed or unverifiable arguments is rejected. `chatgpt.job.get` reads the durable job state.
+- On restart, queued jobs are resubmitted. A job that was `running` at process death is marked `OUTCOME_UNKNOWN` and is never replayed automatically because the remote side effect may already have happened.
+- New-session account availability is checked before enqueue and again before execution. Existing-session sends require the conversation to belong to the authenticated tenant/principal and remain pinned to its recorded account. Anonymous fallback is disabled for the direct MCP runtime.
+- A send that is not positively confirmed is reported as `OUTCOME_UNKNOWN`; the queue does not rotate to another account or automatically repeat the remote POST. `chatgpt.session.read` reads only sessions owned by the authenticated tenant/principal.
+- ChatGPT execution jobs and WorkItem lifecycle are distinct. The `chatgpt.job.completed` MCP Event currently reports immutable-owner WorkItem terminal transitions; its `job_id` is a WorkItem ID. It is not emitted when a `chatgpt_jobs` queue entry completes.
+
+## Reliability and security
+
+- Event creation and terminal WorkItem state commit or roll back together. A process crash cannot leave a completed WorkItem without its outbox event.
+- Tenant and principal identity come from verified MCP authentication, never from event payload arguments. Subscription identity is the authenticated tenant/principal, event name, callback URL, and optional WorkItem filter; there is no caller-supplied destination conversation ID. Owner-level aggregation is strictly scoped by the authenticated tenant/principal in the outbox query; another owner’s events cannot enter the subscription. Before each callback, current WorkItem read/write access for the event owner is rechecked; an authorization failure is terminal for that delivery and sends no callback.
+- Subscription secrets are AES-GCM encrypted. Callback challenge verification and per-delivery Standard Webhooks signatures are enforced. Subscribe challenge I/O and unsubscribe database mutations run off the ASGI event loop.
+- Callback destinations require public HTTPS; DNS is validated and the selected public address is pinned for the request. Redirects and ambient proxies are not used.
+- Delivery uses leases, bounded retry/backoff, idempotent event IDs, and retention cleanup. A single dispatcher thread is supervised by the MCP ASGI lifespan.
+- Dispatcher shutdown waits at most 30 seconds for an in-flight operation and 3 seconds for thread exit. Uvicorn has a 5-second graceful request-shutdown budget. The 1900-second systemd stop budget covers in-flight ChatGPT sends (up to 1800 seconds), request drain, and bounded event drain.
+
+## Verification
+
+- Local full-suite run on the current source tree: **1,419 passed, 13 skipped, 1,612 subtests passed**. The unittest discovery pass ran **1,409 tests** with 13 expected skips; the direct-client pytest suite ran **20 passed**; tools/tests guards ran **58 passed**.
+- Python compilation and `git diff --check` passed. The SO-MCP unit has no unit-specific `systemd-analyze verify` errors; the host may emit unrelated warnings for other installed system units.
+- GitHub Actions run **#908** on ancestor head `091ca8a` passed all four jobs, including direct-client pytest, real MCP SDK integration, and real memory-stdio E2E. Run **#910** is validating parent head `90b9dc3`; the new exact PR head must receive its own green CI run before merge.
+- These checks do not replace real ChatGPT Work callback/resumption acceptance, actual OAuth scope verification, production deployment preflight, or the staged `TimeoutStopSec=1900` migration. PR #163 remains Draft until those external gates are closed.

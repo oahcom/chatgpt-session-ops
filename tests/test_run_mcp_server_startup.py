@@ -46,10 +46,12 @@ Run with:
     python -m unittest tests.test_run_mcp_server_startup
 """
 
+import asyncio
 import json
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -61,15 +63,85 @@ except ModuleNotFoundError:  # pragma: no cover
     sys.modules["uvicorn"] = types.ModuleType("uvicorn")
 
 from scripts.run_mcp_server import (  # noqa: E402
+    ChatGPTDirectClient,
+    DeploymentASGI,
     MEMORY_STDIO_ENV,
+    _load_events_encryption_key,
     _realm_namespace_from_issuer,
     _resolve_memory_executable,
     _validate_https_url,
+    create_application,
     load_config,
     load_memory_adapter_command,
     main,
     required_env,
 )
+
+
+class TestEventsEncryptionKey(unittest.TestCase):
+    """The Events key must be a private, regular, owner-controlled file."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.key = b"k" * 32
+        self.path = self.tmp / "events.key"
+
+    def write_key(self, mode=0o400, content=None):
+        if self.path.exists():
+            self.path.chmod(0o600)
+        self.path.write_bytes(self.key if content is None else content)
+        self.path.chmod(mode)
+        return self.path
+
+    def test_accepts_only_the_two_documented_owner_modes(self):
+        for mode in (0o400, 0o600):
+            with self.subTest(mode=oct(mode)):
+                self.write_key(mode)
+                self.assertEqual(_load_events_encryption_key(str(self.path)), self.key)
+
+    def test_rejects_other_owner_only_modes(self):
+        for mode in (0o500, 0o700):
+            with self.subTest(mode=oct(mode)):
+                self.write_key(mode)
+                with self.assertRaisesRegex(RuntimeError, "mode 0400/0600"):
+                    _load_events_encryption_key(str(self.path))
+
+    def test_rejects_group_or_world_permissions(self):
+        for mode in (0o440, 0o640, 0o644):
+            with self.subTest(mode=oct(mode)):
+                self.write_key(mode)
+                with self.assertRaisesRegex(RuntimeError, "mode 0400/0600"):
+                    _load_events_encryption_key(str(self.path))
+
+    def test_rejects_symlink_even_when_target_is_valid(self):
+        self.write_key(0o400)
+        link = self.tmp / "events-link.key"
+        link.symlink_to(self.path)
+        with self.assertRaisesRegex(RuntimeError, "regular non-symlink"):
+            _load_events_encryption_key(str(link))
+
+    def test_rejects_directory(self):
+        with self.assertRaisesRegex(RuntimeError, "regular non-symlink"):
+            _load_events_encryption_key(str(self.tmp))
+
+    def test_rejects_wrong_owner(self):
+        self.write_key(0o400)
+        with mock.patch("scripts.run_mcp_server.os.geteuid", return_value=os.geteuid() + 1):
+            with self.assertRaisesRegex(RuntimeError, "owned by the MCP service user"):
+                _load_events_encryption_key(str(self.path))
+
+    def test_rejects_short_and_oversized_keys(self):
+        for content in (b"k" * 31, b"k" * 33):
+            with self.subTest(length=len(content)):
+                self.write_key(0o400, content)
+                with self.assertRaisesRegex(RuntimeError, "exactly 32 raw bytes"):
+                    _load_events_encryption_key(str(self.path))
+
+    def test_rejects_relative_path(self):
+        with self.assertRaisesRegex(RuntimeError, "must be an absolute path"):
+            _load_events_encryption_key("events.key")
 
 
 class TestRequiredEnv(unittest.TestCase):
@@ -593,8 +665,317 @@ class TestLoadConfig(unittest.TestCase):
         self.assertEqual(str(ctx.exception), "UVICORN_LOG_LEVEL is invalid")
 
 
+class TestDeploymentASGILifespan(unittest.TestCase):
+    def test_background_dispatcher_starts_and_stops_with_asgi_lifespan(self):
+        calls = []
+
+        class Task:
+            def start(self):
+                calls.append("start")
+
+            def stop(self):
+                calls.append("stop")
+
+        class Inner:
+            async def __call__(self, scope, receive, send):
+                while True:
+                    message = await receive()
+                    if message["type"] == "lifespan.startup":
+                        await send({"type": "lifespan.startup.complete"})
+                    elif message["type"] == "lifespan.shutdown":
+                        await send({"type": "lifespan.shutdown.complete"})
+                        return
+
+        messages = iter((
+            {"type": "lifespan.startup"},
+            {"type": "lifespan.shutdown"},
+        ))
+        sent = []
+
+        async def receive():
+            return next(messages)
+
+        async def send(message):
+            sent.append(message)
+
+        app = DeploymentASGI(
+            Inner(),
+            issuer="https://issuer.example.test/realm",
+            audience="https://resource.example.test/mcp",
+            background_tasks=[Task()],
+        )
+        asyncio.run(app({"type": "lifespan"}, receive, send))
+
+        self.assertEqual(calls, ["start", "stop"])
+        self.assertEqual(
+            [message["type"] for message in sent],
+            ["lifespan.startup.complete", "lifespan.shutdown.complete"],
+        )
+
+    def test_failed_stop_is_not_retried_from_finally(self):
+        calls = []
+
+        class Task:
+            def start(self):
+                calls.append("start")
+
+            def stop(self):
+                calls.append("stop")
+                raise TimeoutError("dispatcher did not drain")
+
+        class Inner:
+            async def __call__(self, scope, receive, send):
+                await receive()
+                await send({"type": "lifespan.startup.complete"})
+                await receive()
+
+        messages = iter((
+            {"type": "lifespan.startup"},
+            {"type": "lifespan.shutdown"},
+        ))
+
+        async def receive():
+            return next(messages)
+
+        async def send(_message):
+            return None
+
+        app = DeploymentASGI(
+            Inner(),
+            issuer="https://issuer.example.test/realm",
+            audience="https://resource.example.test/mcp",
+            background_tasks=[Task()],
+        )
+        with self.assertRaisesRegex(TimeoutError, "did not drain"):
+            asyncio.run(app({"type": "lifespan"}, receive, send))
+
+        self.assertEqual(calls, ["start", "stop"])
+
+
+class TestDeploymentASGIReadiness(unittest.TestCase):
+    def _get_readyz(self, app):
+        sent = []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        asyncio.run(app(
+            {"type": "http", "method": "GET", "path": "/readyz", "headers": []},
+            receive,
+            send,
+        ))
+        start = next(message for message in sent if message["type"] == "http.response.start")
+        body = next(message for message in sent if message["type"] == "http.response.body")
+        return start["status"], json.loads(body["body"])
+
+    def test_lifespan_stops_dispatcher_before_draining_chatgpt_executor(self):
+        calls = []
+
+        class Task:
+            def __init__(self, name):
+                self.name = name
+
+            def start(self):
+                calls.append("start:" + self.name)
+
+            def stop(self):
+                calls.append("stop:" + self.name)
+
+        class Inner:
+            async def __call__(self, scope, receive, send):
+                while True:
+                    message = await receive()
+                    if message["type"] == "lifespan.startup":
+                        await send({"type": "lifespan.startup.complete"})
+                    elif message["type"] == "lifespan.shutdown":
+                        await send({"type": "lifespan.shutdown.complete"})
+                        return
+
+        app = DeploymentASGI(
+            Inner(),
+            issuer="https://issuer.example.test/realm",
+            audience="https://resource.example.test/mcp",
+            background_tasks=[Task("chatgpt"), Task("dispatcher")],
+        )
+        messages = iter([
+            {"type": "lifespan.startup"},
+            {"type": "lifespan.shutdown"},
+        ])
+
+        async def receive():
+            return next(messages)
+
+        async def send(_message):
+            return None
+
+        asyncio.run(app({"type": "lifespan"}, receive, send))
+        self.assertEqual(
+            calls,
+            ["start:chatgpt", "start:dispatcher", "stop:dispatcher", "stop:chatgpt"],
+        )
+
+    def test_readyz_distinguishes_disabled_live_and_stalled_dispatcher(self):
+        class Inner:
+            async def __call__(self, scope, receive, send):
+                raise AssertionError("readiness endpoint must not reach MCP transport")
+
+        base = {
+            "issuer": "https://issuer.example.test/realm",
+            "audience": "https://resource.example.test/mcp",
+        }
+        disabled = DeploymentASGI(Inner(), **base)
+        status, payload = self._get_readyz(disabled)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"status": "ready", "events": {"enabled": False}})
+
+        snapshot = {
+            "store": {"outbox": {
+                "pending": 3, "oldest_pending_age_seconds": 0, "retry_exhausted": 0
+            }},
+            "dispatcher": {
+                "running": False, "consecutive_errors": 0,
+                "last_loop_at": time.time(), "loop_count": 1,
+            },
+        }
+        stalled = DeploymentASGI(Inner(), readiness_snapshot=lambda: snapshot, **base)
+        status, payload = self._get_readyz(stalled)
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["status"], "degraded")
+        self.assertEqual(payload["events"]["store"]["outbox"]["pending"], 3)
+
+        snapshot["dispatcher"]["running"] = True
+        live = DeploymentASGI(Inner(), readiness_snapshot=lambda: snapshot, **base)
+        status, payload = self._get_readyz(live)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "ready")
+
+        snapshot["dispatcher"]["last_loop_at"] = time.time() - 90
+        stale = DeploymentASGI(Inner(), readiness_snapshot=lambda: snapshot, **base)
+        status, payload = self._get_readyz(stale)
+        self.assertEqual(status, 503)
+        self.assertIn("dispatcher_stale", payload["reasons"])
+
+
+class TestMCPEventsRuntimeWiring(unittest.TestCase):
+    def test_create_application_wires_local_event_store_and_dispatcher(self):
+        config = {
+            "database_path": "/tmp/session-ops-runtime-test.sqlite3",
+            "issuer": "https://issuer.example.test/realm",
+            "audience": "https://resource.example.test/mcp",
+            "realm_namespace": "realm",
+            "tenant_claim": "tenant_id",
+            "discovery_url": None,
+            "memory_adapter_command": None,
+        }
+        events_store = mock.Mock()
+        dispatcher = mock.Mock()
+        direct_client = ChatGPTDirectClient.__new__(ChatGPTDirectClient)
+        direct_client.start = mock.Mock()
+        direct_client.stop = mock.Mock()
+        mcp_app = object()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            key_path = Path(tmp) / "events.key"
+            key_path.write_bytes(b"e" * 32)
+            key_path.chmod(0o400)
+            events_db = config["database_path"]
+
+            with (
+                mock.patch.dict(os.environ, {
+                    "SO_MCP_EVENTS_KEY_FILE": str(key_path),
+                    "SO_MCP_EVENTS_DB": events_db,
+                }),
+                mock.patch("scripts.run_mcp_server.SecureWorkItemStore") as store_type,
+                mock.patch("scripts.run_mcp_server.JWTVerifier"),
+                mock.patch("scripts.run_mcp_server.MCPEventsStore", return_value=events_store) as events_type,
+                mock.patch("scripts.run_mcp_server.ChatGPTDirectClient.from_env", return_value=direct_client),
+                mock.patch("scripts.run_mcp_server.MCPEventDispatcher", return_value=dispatcher) as dispatcher_type,
+                mock.patch("scripts.run_mcp_server.build_mcp_server", return_value=mcp_app) as build_server,
+            ):
+                app = create_application(config)
+
+        store_type.return_value.initialize.assert_called_once_with()
+        events_type.assert_called_once_with(str(Path(events_db).resolve()), encryption_key=b"e" * 32)
+        store_type.assert_called_once_with(
+            Path(events_db).resolve(),
+            principal_directory=None,
+            completion_event_publisher=events_store.publish_job_completed_in_transaction,
+        )
+        dispatcher_type.assert_called_once()
+        self.assertIs(dispatcher_type.call_args.args[0], events_store)
+        self.assertTrue(callable(dispatcher_type.call_args.kwargs["authorize"]))
+        build_server.assert_called_once()
+        self.assertIs(build_server.call_args.kwargs["events_store"], events_store)
+        self.assertIs(app.inner, mcp_app)
+        self.assertEqual(app.background_tasks, [direct_client, dispatcher])
+        self.assertIsNotNone(app.readiness_snapshot)
+
+    def test_events_reject_memory_database_and_relative_events_path(self):
+        base_config = {
+            "database_path": ":memory:",
+            "issuer": "https://issuer.example.test/realm",
+            "audience": "https://resource.example.test/mcp",
+            "realm_namespace": "realm",
+            "tenant_claim": "tenant_id",
+            "discovery_url": None,
+            "memory_adapter_command": None,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            key_path = Path(tmp) / "events.key"
+            key_path.write_bytes(b"e" * 32)
+            key_path.chmod(0o400)
+            with (
+                mock.patch.dict(os.environ, {"SO_MCP_EVENTS_KEY_FILE": str(key_path)}, clear=True),
+                mock.patch("scripts.run_mcp_server.SecureWorkItemStore") as store_type,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "file-backed WorkItem database"):
+                    create_application(base_config)
+            store_type.assert_not_called()
+
+            file_config = dict(base_config, database_path=str(Path(tmp) / "work-items.sqlite3"))
+            with (
+                mock.patch.dict(os.environ, {
+                    "SO_MCP_EVENTS_KEY_FILE": str(key_path),
+                    "SO_MCP_EVENTS_DB": "relative-events.sqlite3",
+                }, clear=True),
+                mock.patch("scripts.run_mcp_server.SecureWorkItemStore") as store_type,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "must be an absolute path"):
+                    create_application(file_config)
+            store_type.assert_not_called()
+
+
 class TestMain(unittest.TestCase):
     """L537: startup failure is logged then re-raised unchanged."""
+
+    def test_uvicorn_graceful_shutdown_budget_is_explicit(self):
+        config = {
+            "issuer": "https://issuer.example.test/realm",
+            "audience": "https://resource.example.test/mcp",
+            "host": "127.0.0.1",
+            "port": 8791,
+            "log_level": "info",
+            "discovery_url": None,
+            "memory_adapter_command": None,
+        }
+        app = object()
+        with (
+            mock.patch("scripts.run_mcp_server.load_config", return_value=config),
+            mock.patch("scripts.run_mcp_server.create_application", return_value=app),
+            mock.patch("scripts.run_mcp_server.uvicorn.run", create=True) as run,
+        ):
+            main()
+        run.assert_called_once_with(
+            app,
+            host="127.0.0.1",
+            port=8791,
+            log_level="info",
+            access_log=True,
+            timeout_graceful_shutdown=5,
+        )
 
     def test_load_config_failure_propagates(self):
         boom = RuntimeError("SO_MCP_PORT must be an integer")

@@ -10,6 +10,8 @@ or real Memory Adapter subprocess is used.
 
 import importlib
 import tempfile
+import threading
+import time
 import uuid
 import unittest
 from pathlib import Path
@@ -36,6 +38,7 @@ from src.session_ops.mcp_server import (
     _error,
     _exception_code,
     _validate_arguments,
+    TOOL_SCHEMAS,
 )
 from src.session_ops.chatgpt_direct_client import SessionOpsError
 
@@ -46,6 +49,7 @@ OTHER = "realm-b:other"
 
 WORK_ITEM_ID = "wi_12345678-1234-4234-8234-123456789abc"
 SESSION_ID = "12345678-1234-4234-8234-123456789abc"
+IDEMPOTENCY_KEY = "123e4567-e89b-42d3-a456-426614174000"
 LINK_ID = "sl_12345678-1234-4234-8234-123456789abc"
 
 ALL_SCOPES = (
@@ -83,7 +87,7 @@ class FakeStore:
         self.calls = []
         self.created = []
 
-    def create_work_item(self, principal):
+    def create_work_item(self, principal, request_id=None, idempotency_key=None):
         self.calls.append(("create", principal))
         item = {
             "work_item_id": WORK_ITEM_ID,
@@ -114,7 +118,7 @@ class FakeStore:
 
     def set_status(
         self, principal, work_item_id, status,
-        expected_updated_at=None, request_id=None,
+        expected_updated_at=None, request_id=None, idempotency_key=None,
     ):
         self.calls.append(
             ("update", principal, work_item_id, status)
@@ -124,17 +128,33 @@ class FakeStore:
             "status": status,
         }
 
+    def finish_work_item(self, principal, work_item_id, status, request_id=None, idempotency_key=None):
+        self.calls.append(("finish", principal, work_item_id, status))
+        return {"work_item_id": work_item_id, "status": status}
+
     def grant(
         self, principal, work_item_id, target_principal_id,
-        scope, request_id=None,
+        scope, request_id=None, idempotency_key=None,
     ):
         self.calls.append(("grant", principal, target_principal_id, scope))
+        return {
+            "work_item_id": work_item_id,
+            "target_principal_id": target_principal_id,
+            "scope": scope,
+            "granted": True,
+        }
 
     def revoke(
         self, principal, work_item_id, target_principal_id,
-        scope, request_id=None,
+        scope, request_id=None, idempotency_key=None,
     ):
         self.calls.append(("revoke", principal, target_principal_id, scope))
+        return {
+            "work_item_id": work_item_id,
+            "target_principal_id": target_principal_id,
+            "scope": scope,
+            "revoked": True,
+        }
 
     def link_session(
         self,
@@ -144,6 +164,7 @@ class FakeStore:
         attempt_id,
         evidence=None,
         request_id=None,
+        idempotency_key=None,
     ):
         self.calls.append(
             ("link", principal, session_id, work_item_id, attempt_id)
@@ -156,7 +177,7 @@ class FakeStore:
 
     def unlink_session(
         self, principal, session_id,
-        expected_link_id=None, request_id=None,
+        expected_link_id=None, request_id=None, idempotency_key=None,
     ):
         self.calls.append(("unlink", principal, session_id))
         return SimpleNamespace(
@@ -226,9 +247,15 @@ class MCPContractTests(unittest.TestCase):
         self.auth = make_auth()
 
     def dispatch(self, name, arguments=None, service=None):
+        payload = dict(arguments or {})
+        if name in {
+            "work_item.create", "work_item.update", "work_item.finish",
+            "work_item.grant", "work_item.revoke", "session.link", "session.unlink",
+        }:
+            payload.setdefault("idempotency_key", str(uuid.uuid4()))
         return (service or self.service).dispatch(
             name,
-            arguments or {},
+            payload,
             self.auth,
             request_id="test-request",
         )
@@ -247,7 +274,7 @@ class MCPContractTests(unittest.TestCase):
         self.assertIn("details", result["error"])
 
     # --------------------------------------------------------------
-    # Ten tools: one successful dispatch each
+    # WorkItem, Session, and ChatGPT tools: one successful dispatch each
     # --------------------------------------------------------------
 
     def test_work_item_create(self):
@@ -274,6 +301,22 @@ class MCPContractTests(unittest.TestCase):
         )
         self.assert_success(result)
         self.assertEqual(result["data"]["status"], "paused")
+
+    def test_work_item_finish_uses_explicit_terminal_owner_operation(self):
+        store = FakeStore()
+        service = MCPToolService(store)
+        result = service.dispatch(
+            "work_item.finish",
+            {
+                "work_item_id": WORK_ITEM_ID,
+                "status": "completed",
+                "idempotency_key": IDEMPOTENCY_KEY,
+            },
+            make_auth(),
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["status"], "completed")
+        self.assertEqual(store.calls[-1][0], "finish")
 
     def test_work_item_update_rejects_terminal_status(self):
         result = self.dispatch(
@@ -367,6 +410,7 @@ class MCPContractTests(unittest.TestCase):
             {
                 "session_id": SESSION_ID,
                 "work_item_id": WORK_ITEM_ID,
+                "attempt_id": "att_11111111-1111-4111-8111-111111111111",
             },
         )
         self.assert_success(result)
@@ -600,6 +644,14 @@ class MCPContractTests(unittest.TestCase):
             _validate_arguments(tool, arguments)
         self.assertIn(fragment, str(caught.exception))
 
+    def test_all_database_mutations_advertise_required_idempotency_key(self):
+        for name in (
+            "work_item.create", "work_item.update", "work_item.finish",
+            "work_item.grant", "work_item.revoke", "session.link", "session.unlink",
+        ):
+            with self.subTest(tool=name):
+                self.assertIn("idempotency_key", TOOL_SCHEMAS[name]["required"])
+
     def test_required_argument_missing_is_rejected(self):
         self.assert_argument_rejected(
             "work_item.get", {}, "required argument missing"
@@ -619,6 +671,7 @@ class MCPContractTests(unittest.TestCase):
                 "work_item_id": WORK_ITEM_ID,
                 "target_principal_id": "",
                 "scope": "read",
+                "idempotency_key": "123e4567-e89b-42d3-a456-426614174000",
             },
             "string argument too short",
         )
@@ -646,6 +699,7 @@ class MCPContractTests(unittest.TestCase):
                 "session_id": SESSION_ID,
                 "work_item_id": WORK_ITEM_ID,
                 "attempt_id": "att_not-a-uuid",
+                "idempotency_key": "123e4567-e89b-42d3-a456-426614174000",
             },
             "string argument has invalid format",
         )
@@ -677,6 +731,158 @@ class MCPContractTests(unittest.TestCase):
                     },
                     "boolean argument required",
                 )
+
+    # --------------------------------------------------------------
+    # DB timeout certainty and bounded admission (#205)
+    # --------------------------------------------------------------
+
+    def test_running_mutation_timeout_is_indeterminate_and_can_commit_later(self):
+        from src.session_ops import mcp_server
+
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        with tempfile.TemporaryDirectory() as directory:
+            store = SecureWorkItemStore(Path(directory) / "authority.sqlite3")
+            store.initialize()
+            original_create = store.create_work_item
+
+            operation_key = str(uuid.uuid4())
+            mutation_args = {"idempotency_key": operation_key}
+
+            def delayed_create(principal, request_id=None, idempotency_key=None):
+                started.set()
+                if not release.wait(2):
+                    raise AssertionError("test did not release delayed mutation")
+                try:
+                    return original_create(
+                        principal, request_id=request_id, idempotency_key=idempotency_key
+                    )
+                finally:
+                    finished.set()
+
+            store.create_work_item = delayed_create
+            service = MCPToolService(store)
+            try:
+                with patch.object(mcp_server, "DB_DEADLINE_SECONDS", 0.05):
+                    result = service.dispatch(
+                        "work_item.create", mutation_args, self.auth,
+                        request_id="late-commit", request_session_id="session-before-timeout"
+                    )
+                self.assertTrue(started.wait(1), "DB mutation never started")
+                self.assert_error(result, "INDETERMINATE")
+                self.assertFalse(result["error"]["retryable"])
+                self.assertEqual(
+                    result["error"]["details"],
+                    {
+                        "outcome": "indeterminate",
+                        "retry_with_same_idempotency_key": True,
+                    },
+                )
+            finally:
+                release.set()
+
+            self.assertTrue(finished.wait(2), "late DB mutation did not finish")
+            restarted_store = SecureWorkItemStore(
+                Path(directory) / "authority.sqlite3"
+            )
+            restarted_store.initialize()
+            replay = MCPToolService(restarted_store).dispatch(
+                "work_item.create", mutation_args, self.auth,
+                request_id="new-jsonrpc-id", request_session_id="new-mcp-session"
+            )
+            self.assertTrue(replay["ok"], replay)
+            page = restarted_store.list_work_items(Principal(TENANT, OWNER))
+            self.assertEqual(len(page), 1)
+            self.assertEqual(
+                replay["data"]["work_item_id"], page[0].work_item_id
+            )
+
+    def test_db_mutation_rejects_missing_caller_idempotency_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SecureWorkItemStore(Path(directory) / "authority.sqlite3")
+            store.initialize()
+            service = MCPToolService(store)
+            result = service.dispatch(
+                "work_item.create", {}, self.auth, request_id="reusable-jsonrpc-id"
+            )
+            self.assert_error(result, "INVALID_ARGUMENT")
+            self.assertEqual(
+                len(store.list_work_items(Principal(TENANT, OWNER))), 0
+            )
+
+    def test_explicit_idempotency_key_replays_across_mcp_sessions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SecureWorkItemStore(Path(directory) / "authority.sqlite3")
+            store.initialize()
+            service = MCPToolService(store)
+            key = str(uuid.uuid4())
+            first = service.dispatch(
+                "work_item.create", {"idempotency_key": key}, self.auth,
+                request_id="rpc-first", request_session_id="mcp-session-first",
+            )
+            replay = service.dispatch(
+                "work_item.create", {"idempotency_key": key}, self.auth,
+                request_id="rpc-after-reconnect",
+                request_session_id="mcp-session-after-reconnect",
+            )
+            self.assertTrue(first["ok"], first)
+            self.assertEqual(replay["data"], first["data"])
+            self.assertEqual(
+                len(store.list_work_items(Principal(TENANT, OWNER))), 1
+            )
+
+    def test_explicit_idempotency_key_rejects_changed_arguments_across_sessions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SecureWorkItemStore(Path(directory) / "authority.sqlite3")
+            store.initialize()
+            service = MCPToolService(store)
+            created = service.dispatch(
+                "work_item.create", {"idempotency_key": str(uuid.uuid4())},
+                self.auth, request_id="create-rpc", request_session_id="session-a",
+            )
+            work_item_id = created["data"]["work_item_id"]
+            key = str(uuid.uuid4())
+            first = service.dispatch(
+                "work_item.update",
+                {"work_item_id": work_item_id, "status": "paused", "idempotency_key": key},
+                self.auth, request_id="update-rpc-a", request_session_id="session-a",
+            )
+            self.assertTrue(first["ok"], first)
+            changed = service.dispatch(
+                "work_item.update",
+                {"work_item_id": work_item_id, "status": "active", "idempotency_key": key},
+                self.auth, request_id="update-rpc-b", request_session_id="session-b",
+            )
+            self.assert_error(changed, "CONFLICT")
+            self.assertEqual(
+                store.get_work_item(Principal(TENANT, OWNER), work_item_id).status,
+                "paused",
+            )
+
+    def test_queued_mutation_timeout_is_cancelled_before_execution(self):
+        from concurrent.futures import Future
+        from src.session_ops import mcp_server
+
+        pending = Future()
+
+        class PendingExecutor:
+            def submit(self, function):
+                return pending
+
+        with patch.object(mcp_server, "_DB_EXECUTOR", PendingExecutor()):
+            with patch.object(mcp_server, "DB_DEADLINE_SECONDS", 0.01):
+                with self.assertRaises(mcp_server._DeadlineExceeded):
+                    MCPToolService._run_db(lambda: None, mutation=True)
+        self.assertTrue(pending.cancelled())
+
+    def test_db_executor_rejects_work_when_all_admission_slots_are_occupied(self):
+        from src.session_ops import mcp_server
+
+        with patch.object(mcp_server, "_DB_SLOTS", threading.BoundedSemaphore(0)):
+            result = self.dispatch("work_item.create")
+        self.assert_error(result, "RESOURCE_EXHAUSTED")
+        self.assertEqual(self.store.created, [])
 
     # --------------------------------------------------------------
     # Non-disclosure and trusted evidence
@@ -736,6 +942,7 @@ class MCPContractTests(unittest.TestCase):
                     "session_id": SESSION_ID,
                     "work_item_id": item.work_item_id,
                     "attempt_id": "att_" + str(uuid.uuid4()),
+                    "idempotency_key": str(uuid.uuid4()),
                 },
                 self.auth,
                 request_id="test-request",
@@ -851,13 +1058,13 @@ class MCPContractTests(unittest.TestCase):
 
     def test_oversized_response_becomes_resource_exhausted(self):
         class OversizedStore(FakeStore):
-            def create_work_item(self, principal):
+            def create_work_item(self, principal, request_id=None, idempotency_key=None):
                 return {"content": "x" * MAX_STRUCTURED_CONTENT_BYTES}
 
         service = MCPToolService(OversizedStore())
         result = service.dispatch(
             "work_item.create",
-            {},
+            {"idempotency_key": IDEMPOTENCY_KEY},
             self.auth,
             request_id="test-request",
         )
@@ -1052,6 +1259,30 @@ class ChatGPTSessionArgumentContractTests(unittest.TestCase):
                     "idempotency_key": str(uuid.uuid4()),
                 },
             )
+
+    def test_chatgpt_account_schema_accepts_dynamic_account_ids(self):
+        for account in ("acct7", "acct10", "acct123"):
+            with self.subTest(account=account):
+                args = _validate_arguments(
+                    "chatgpt.session.create",
+                    {"account": account, "idempotency_key": str(uuid.uuid4())},
+                )
+                self.assertEqual(args["account"], account)
+                send_args = _validate_arguments(
+                    "chatgpt.session.send",
+                    {"conversation_id": SESSION_ID, "prompt": "probe", "account": account,
+                     "idempotency_key": str(uuid.uuid4())},
+                )
+                self.assertEqual(send_args["account"], account)
+
+    def test_chatgpt_account_schema_rejects_noncanonical_ids(self):
+        for account in ("acct0", "acct01", "acctx", "nologin", "auto1"):
+            with self.subTest(account=account):
+                with self.assertRaisesRegex(ValueError, "invalid format"):
+                    _validate_arguments(
+                        "chatgpt.session.create",
+                        {"account": account, "idempotency_key": str(uuid.uuid4())},
+                    )
 
     def test_session_send_accepts_valid_conversation_id(self):
         args = _validate_arguments(

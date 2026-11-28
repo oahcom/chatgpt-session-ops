@@ -1,21 +1,23 @@
-# 凭据目录结构（acct2–acct6 / nologin）
+# 凭据目录结构（动态 acctN / nologin）
 
 **这些目录不入库**（`.gitignore` 已排除 `cookies.json` / `access_token.txt` /
 `devices/` / `device-cookie.txt`）。这里只说明**该放什么、放成什么样**，
 不要提交任何真实凭据。
 
-## 登录态（acct2 / acct3 / acct4 / acct5 / acct6）
+## 登录态（acctN）
 
 每个目录两份文件：
 
 ```
-accounts/<acct>/
+accounts/acctN/
 ├── cookies.json       # cookie 数组，见下
 └── access_token.txt   # 纯文本，单行，无尾随换行
 ```
 
-`acct1` 是例外：它复用默认凭据根（`CHATGPT_AUTH_DIR` 或 `scripts/` 本身），
-不在 `accounts/` 下。
+`acct1` 优先使用 `accounts/acct1/`。为兼容旧版本地 CLI，如果该目录
+不存在，才回退到默认凭据根（`CHATGPT_AUTH_DIR` 或 `scripts/` 本身）。
+统一 MCP 部署时，凭据根固定为 `/var/lib/chatgpt-session-ops`，因此所有登录账号统一放在
+`/var/lib/chatgpt-session-ops/accounts/acctN/`；不要把凭据放进只读的 `/opt/so-mcp` 应用树。
 
 ### cookies.json
 
@@ -55,9 +57,19 @@ accounts/nologin/
 ## 提取方式
 
 - **acct1**：`python scripts/extract_auth.py`（走 CDP，默认端口 9222）
-- **acct2–acct6**：已登录的 InPrivate 窗口里同源 `fetch('/api/auth/session')` 取
+- **acctN**：已登录的 InPrivate 窗口里同源 `fetch('/api/auth/session')` 取
   token、`document.cookie` 取可读 cookie，导出 JSON 再落到对应目录。
   浏览器 CSP/PNA 会拦发往 `127.0.0.1` 的 fetch，**兜底走「下载 JSON 再读文件」**。
+
+
+## 自动发现与轮转
+
+- MCP 部署以 CHATGPT_SESSION_OPS_ACCOUNTS_DIR=/var/lib/chatgpt-session-ops/accounts 作为只读凭据库；ChatGPTDirectClient 在 CHATGPT_SESSION_OPS_RUNTIME_DIR 下建立每个账号的运行时目录，并将凭据文件只读 symlink 到 vault。
+- CLI 的 BASE 指向运行时目录，因此账号发现读取运行时镜像；每次预检都会同步新出现的 vault 账号，按数字自然序发现，不需要改代码或白名单。
+- 凭据库只需要目录可遍历、文件可读；不要要求账号凭据文件可写。首次运行时运行时凭据路径是 vault symlink；若 warm_cookies 需要原子回写，symlink 会被安全替换为运行时本地 overlay，vault 原文件不变。若之后由操作员更新 vault 凭据，先删除对应账号运行时目录中的 overlay 凭据文件，再重启以重新链接。回复、conv-api、timeouts 等可变数据只写运行时目录。
+- 只有 cookies.json 是数组、access_token.txt 非空，且 Cookie 数组至少包含一条非空 OpenAI 域 Cookie 的账号才进入轮转。该检查是文件结构检查，不代表服务端认证仍有效；401 会由运行时标记为不可用。
+- --rotation-disable acctN 是持久人工禁用；只有 --rotation-enable acctN 才会解除。429/403 等临时冷却仍使用独立 TTL。
+- 显式指定 --account acctN 是身份固定，不会在 429 时自动换号；不指定账号时才执行自动轮转。
 
 ## 三条纪律
 

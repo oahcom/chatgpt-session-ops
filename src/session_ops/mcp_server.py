@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import threading
@@ -63,6 +64,7 @@ ADAPTER_DEADLINE_SECONDS = 8.0
 REQUEST_DEADLINE_SECONDS = 10.0
 CHATGPT_READ_REQUEST_DEADLINE_SECONDS = 20.0
 AUTH_VERIFY_DEADLINE_SECONDS = 3.5
+logger = logging.getLogger(__name__)
 
 MCP_SERVER_NAME = "chatgpt-session-ops"
 MCP_SERVER_VERSION = "0.1.0"
@@ -71,6 +73,7 @@ _DB_EXECUTOR = ThreadPoolExecutor(
     max_workers=8,
     thread_name_prefix="session-ops-db",
 )
+_DB_SLOTS = threading.BoundedSemaphore(16)
 
 _AUTH_VERIFY_WORKERS = 4
 _AUTH_VERIFY_MAX_INFLIGHT = 8
@@ -92,34 +95,87 @@ _CHATGPT_READ_EXECUTOR = ThreadPoolExecutor(
     thread_name_prefix="session-ops-chatgpt-read",
 )
 _CHATGPT_READ_SLOTS = threading.BoundedSemaphore(_CHATGPT_READ_WORKERS)
+_CHATGPT_READ_INFLIGHT_LOCK = threading.Lock()
+_CHATGPT_READ_INFLIGHT_KEYS = set()
 
 
 class _DeadlineExceeded(Exception):
     pass
 
 
+class _IndeterminateOperation(Exception):
+    """A DB mutation is still running after its caller deadline."""
+
+
 class _ResourceExhausted(Exception):
-    pass
+    """Bounded execution capacity is full."""
 
 
-def _submit_chatgpt_read(function: Any):
-    """Submit one bounded read; admission is immediate and fail-fast."""
-    if not _CHATGPT_READ_SLOTS.acquire(blocking=False):
-        raise _ResourceExhausted("ChatGPT read capacity is occupied")
+def _submit_chatgpt_read(function: Any, *, key: Any):
+    """Submit one bounded single-flight read; admission is immediate."""
+    with _CHATGPT_READ_INFLIGHT_LOCK:
+        if key in _CHATGPT_READ_INFLIGHT_KEYS:
+            raise _ResourceExhausted("the same ChatGPT read is already in flight")
+        if not _CHATGPT_READ_SLOTS.acquire(blocking=False):
+            raise _ResourceExhausted("ChatGPT read capacity is occupied")
+        _CHATGPT_READ_INFLIGHT_KEYS.add(key)
     try:
         future = _CHATGPT_READ_EXECUTOR.submit(function)
     except BaseException:
+        with _CHATGPT_READ_INFLIGHT_LOCK:
+            _CHATGPT_READ_INFLIGHT_KEYS.discard(key)
         _CHATGPT_READ_SLOTS.release()
         raise
-    # This callback belongs to the concurrent Future, so timeout/cancellation
-    # of the asyncio waiter cannot release capacity while the thread is alive.
-    future.add_done_callback(lambda _future: _CHATGPT_READ_SLOTS.release())
+
+    # The real concurrent Future owns both releases. A timed-out/cancelled MCP
+    # waiter cannot free the key or capacity while the upstream request lives.
+    def release(_future):
+        with _CHATGPT_READ_INFLIGHT_LOCK:
+            _CHATGPT_READ_INFLIGHT_KEYS.discard(key)
+        _CHATGPT_READ_SLOTS.release()
+
+    future.add_done_callback(release)
     return future
 
 
-async def _run_chatgpt_read(function: Any, *, timeout: float):
-    """Await a read without cancelling its underlying bounded worker thread."""
-    concurrent_future = _submit_chatgpt_read(function)
+def _chatgpt_read_key(
+    tool_name: str, auth: AuthContext, arguments: Any, request_id: str
+):
+    principal = auth.principal
+    identity = (
+        auth.issuer,
+        auth.realm_namespace,
+        auth.subject,
+        principal.tenant_id,
+        principal.principal_id,
+    )
+    if tool_name == "chatgpt.session.read":
+        conversation_id = (
+            arguments.get("conversation_id")
+            if isinstance(arguments, Mapping)
+            else None
+        )
+        if not isinstance(conversation_id, str) or not conversation_id:
+            return (tool_name, *identity, "invalid", request_id)
+        return (tool_name, *identity, conversation_id)
+    raise ValueError("tool is not a ChatGPT read")
+
+
+def _chatgpt_read_log_hashes(auth: AuthContext, request_id: str, read_key: Any):
+    identity_hash = hashlib.sha256(
+        "|".join((
+            auth.issuer, auth.realm_namespace, auth.subject,
+            auth.principal.tenant_id, auth.principal.principal_id,
+        )).encode("utf-8")
+    ).hexdigest()[:16]
+    request_hash = hashlib.sha256(str(request_id).encode("utf-8")).hexdigest()[:16]
+    resource_hash = hashlib.sha256(repr(read_key).encode("utf-8")).hexdigest()[:16]
+    return identity_hash, request_hash, resource_hash
+
+
+async def _run_chatgpt_read(function: Any, *, timeout: float, key: Any):
+    """Await a read without cancelling its tracked worker thread."""
+    concurrent_future = _submit_chatgpt_read(function, key=key)
     async_future = asyncio.wrap_future(concurrent_future)
     return await asyncio.wait_for(asyncio.shield(async_future), timeout=timeout)
 
@@ -183,19 +239,9 @@ _MUTABLE_WORK_ITEM_STATUS = {
 
 _GRANT_SCOPE = {"type": "string", "enum": ["read", "write"]}
 
-CHATGPT_ACCOUNTS = (
-    "auto",
-    "acct1",
-    "acct2",
-    "acct3",
-    "acct4",
-    "acct5",
-    "acct6",
-)
-
 _ACCOUNT = {
     "type": "string",
-    "enum": list(CHATGPT_ACCOUNTS),
+    "pattern": r"^(?:auto|acct[1-9][0-9]*)$",
     "default": "auto",
 }
 
@@ -236,7 +282,10 @@ _IDEMPOTENCY_KEY = {
 
 
 TOOL_SCHEMAS = {
-    "work_item.create": _object_schema({}),
+    "work_item.create": _object_schema(
+        {"idempotency_key": _IDEMPOTENCY_KEY},
+        ("idempotency_key",),
+    ),
     "work_item.get": _object_schema(
         {"work_item_id": _WORK_ITEM_ID},
         ("work_item_id",),
@@ -251,39 +300,52 @@ TOOL_SCHEMAS = {
             "work_item_id": _WORK_ITEM_ID,
             "status": _MUTABLE_WORK_ITEM_STATUS,
             "expected_updated_at": _ID,
+            "idempotency_key": _IDEMPOTENCY_KEY,
         },
-        ("work_item_id", "status"),
+        ("work_item_id", "status", "idempotency_key"),
+    ),
+    "work_item.finish": _object_schema(
+        {
+            "work_item_id": _WORK_ITEM_ID,
+            "status": {"type": "string", "enum": ["completed", "cancelled"]},
+            "idempotency_key": _IDEMPOTENCY_KEY,
+        },
+        ("work_item_id", "status", "idempotency_key"),
     ),
     "work_item.grant": _object_schema(
         {
             "work_item_id": _WORK_ITEM_ID,
             "target_principal_id": _ID,
             "scope": _GRANT_SCOPE,
+            "idempotency_key": _IDEMPOTENCY_KEY,
         },
-        ("work_item_id", "target_principal_id", "scope"),
+        ("work_item_id", "target_principal_id", "scope", "idempotency_key"),
     ),
     "work_item.revoke": _object_schema(
         {
             "work_item_id": _WORK_ITEM_ID,
             "target_principal_id": _ID,
             "scope": _GRANT_SCOPE,
+            "idempotency_key": _IDEMPOTENCY_KEY,
         },
-        ("work_item_id", "target_principal_id", "scope"),
+        ("work_item_id", "target_principal_id", "scope", "idempotency_key"),
     ),
     "session.link": _object_schema(
         {
             "session_id": _SESSION_ID,
             "work_item_id": _WORK_ITEM_ID,
             "attempt_id": _ATTEMPT_ID,
+            "idempotency_key": _IDEMPOTENCY_KEY,
         },
-        ("session_id", "work_item_id"),
+        ("session_id", "work_item_id", "attempt_id", "idempotency_key"),
     ),
     "session.unlink": _object_schema(
         {
             "session_id": _SESSION_ID,
             "expected_link_id": _LINK_ID,
+            "idempotency_key": _IDEMPOTENCY_KEY,
         },
-        ("session_id",),
+        ("session_id", "idempotency_key"),
     ),
     "session.list": _object_schema(
         {
@@ -347,15 +409,21 @@ TOOL_SCHEMAS = {
 }
 
 
+_DB_MUTATION_TOOLS = frozenset({
+    "work_item.create", "work_item.update", "work_item.finish",
+    "work_item.grant", "work_item.revoke", "session.link", "session.unlink",
+})
+
 TOOL_DESCRIPTIONS = {
-    "work_item.create": "Create a WorkItem owned by the authenticated principal.",
+    "work_item.create": "Create a WorkItem owned by the authenticated principal. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
     "work_item.get": "Get a WorkItem visible to the authenticated principal.",
     "work_item.list": "List visible WorkItems using keyset pagination.",
-    "work_item.update": "Update a WorkItem status with optional optimistic concurrency.",
-    "work_item.grant": "Grant a same-tenant principal read or write access.",
-    "work_item.revoke": "Revoke a same-tenant principal read or write access.",
-    "session.link": "Link a confirmed session to a visible WorkItem.",
-    "session.unlink": "Unlink the active session link if it is visible.",
+    "work_item.update": "Update a non-terminal WorkItem status with optional optimistic concurrency. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
+    "work_item.finish": "Complete or cancel a WorkItem as its immutable owner; terminal state, session unlink, and completion event are atomic. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
+    "work_item.grant": "Grant a same-tenant principal read or write access. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
+    "work_item.revoke": "Revoke a same-tenant principal read or write access. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
+    "session.link": "Link a confirmed session to a visible WorkItem using its verified attempt_id. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
+    "session.unlink": "Unlink the active session link if it is visible. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
     "session.list": "List sessions linked to a visible WorkItem.",
     "session.context": "Retrieve memory only through the authorized active session link.",
     "chatgpt.session.create": (
@@ -383,6 +451,7 @@ _ERROR_MESSAGES = {
     "NOT_FOUND": "resource is not available",
     "CONFLICT": "operation conflicts with the current state",
     "OUTCOME_UNKNOWN": "remote side effect may have occurred; reconcile before retrying",
+    "INDETERMINATE": "database mutation may still commit; inspect the same operation before retrying",
     "QUARANTINED_SESSION": "session is not confirmed or is quarantined",
     "RESOURCE_EXHAUSTED": "resource limit exceeded",
     "DEPENDENCY_UNAVAILABLE": "required dependency is unavailable",
@@ -398,6 +467,7 @@ _RETRYABLE = {
     "NOT_FOUND": False,
     "CONFLICT": False,
     "OUTCOME_UNKNOWN": False,
+    "INDETERMINATE": False,
     "QUARANTINED_SESSION": False,
     "RESOURCE_EXHAUSTED": True,
     "DEPENDENCY_UNAVAILABLE": True,
@@ -1125,11 +1195,15 @@ def _exception_code(exc: BaseException) -> Tuple[str, Dict[str, Any]]:
     ):
         return "INVALID_ARGUMENT", {}
 
-    if isinstance(exc, _DeadlineExceeded):
-        return "TIMEOUT", {}
-
+    if isinstance(exc, _IndeterminateOperation):
+        return "INDETERMINATE", {
+            "outcome": "indeterminate",
+            "retry_with_same_idempotency_key": True,
+        }
     if isinstance(exc, _ResourceExhausted):
         return "RESOURCE_EXHAUSTED", {}
+    if isinstance(exc, _DeadlineExceeded):
+        return "TIMEOUT", {}
 
     if isinstance(exc, sqlite3.OperationalError):
         message = str(exc).lower()
@@ -1156,8 +1230,15 @@ def _exception_code(exc: BaseException) -> Tuple[str, Dict[str, Any]]:
     if isinstance(exc, AuthorityError):
         message = str(exc).lower()
 
+        if "indeterminate" in message:
+            return "INDETERMINATE", {
+                "outcome": "indeterminate",
+                "reconciliation_required": True,
+            }
         if "changed" in message or "conflict" in message:
             return "CONFLICT", {}
+        if "operation receipt" in message:
+            return "INTERNAL", {}
 
         return "INVALID_ARGUMENT", {}
 
@@ -1228,16 +1309,29 @@ class MCPToolService:
             )
 
     @staticmethod
-    def _run_db(function: Any) -> Any:
-        future = _DB_EXECUTOR.submit(function)
-
+    def _run_db(function: Any, *, mutation: bool = False) -> Any:
+        if not _DB_SLOTS.acquire(blocking=False):
+            raise _ResourceExhausted("database operation capacity is full")
+        try:
+            future = _DB_EXECUTOR.submit(function)
+        except BaseException:
+            _DB_SLOTS.release()
+            raise
+        # Keep capacity occupied until the actual callable exits, even if the
+        # request times out. A running mutation may still commit.
+        future.add_done_callback(lambda _future: _DB_SLOTS.release())
         try:
             return future.result(timeout=DB_DEADLINE_SECONDS)
         except FutureTimeout:
-            future.cancel()
-            raise _DeadlineExceeded(
-                "database operation exceeded deadline"
-            )
+            if future.cancel():
+                raise _DeadlineExceeded("database operation cancelled before start")
+            if future.done():
+                return future.result()
+            if mutation:
+                raise _IndeterminateOperation(
+                    "database mutation is still running after caller deadline"
+                )
+            raise _DeadlineExceeded("database read exceeded deadline")
 
     def dispatch(
         self,
@@ -1249,7 +1343,7 @@ class MCPToolService:
         request_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Execute one tool and always return the v0.1 envelope."""
-        request_id = request_id or str(uuid.uuid4())
+        request_id = str(request_id) if request_id is not None else str(uuid.uuid4())
         started = time.monotonic()
 
         try:
@@ -1275,11 +1369,18 @@ class MCPToolService:
                             name, principal, request_id, request_session_id
                         ),
                     )
+            # WorkItem and SessionLink mutations never synthesize a durable key
+            # from JSON-RPC request_id. JSON-RPC ids are response-correlation
+            # values and may be reused; callers must provide a stable UUIDv4.
             args = _validate_arguments(name, normalized_arguments)
 
             if name == "work_item.create":
                 result = self._run_db(
-                    lambda: self.store.create_work_item(principal)
+                    lambda: self.store.create_work_item(
+                        principal, request_id=request_id,
+                        idempotency_key=args["idempotency_key"],
+                    ),
+                    mutation=True,
                 )
                 data = _record_dict(result)
 
@@ -1311,45 +1412,50 @@ class MCPToolService:
                         args["status"],
                         expected_updated_at=args.get("expected_updated_at"),
                         request_id=request_id,
-                    )
+                        idempotency_key=args["idempotency_key"],
+                    ),
+                    mutation=True,
+                )
+                data = _record_dict(result)
+
+            elif name == "work_item.finish":
+                result = self._run_db(
+                    lambda: self.store.finish_work_item(
+                        principal,
+                        args["work_item_id"],
+                        args["status"],
+                        request_id=request_id,
+                        idempotency_key=args["idempotency_key"],
+                    ),
+                    mutation=True,
                 )
                 data = _record_dict(result)
 
             elif name == "work_item.grant":
-                self._run_db(
+                data = self._run_db(
                     lambda: self.store.grant(
                         principal,
                         args["work_item_id"],
                         args["target_principal_id"],
                         args["scope"],
                         request_id=request_id,
-                    )
+                        idempotency_key=args["idempotency_key"],
+                    ),
+                    mutation=True,
                 )
 
-                data = {
-                    "work_item_id": args["work_item_id"],
-                    "target_principal_id": args["target_principal_id"],
-                    "scope": args["scope"],
-                    "granted": True,
-                }
-
             elif name == "work_item.revoke":
-                self._run_db(
+                data = self._run_db(
                     lambda: self.store.revoke(
                         principal,
                         args["work_item_id"],
                         args["target_principal_id"],
                         args["scope"],
                         request_id=request_id,
-                    )
+                        idempotency_key=args["idempotency_key"],
+                    ),
+                    mutation=True,
                 )
-
-                data = {
-                    "work_item_id": args["work_item_id"],
-                    "target_principal_id": args["target_principal_id"],
-                    "scope": args["scope"],
-                    "revoked": True,
-                }
 
             elif name == "session.link":
                 result = self._run_db(
@@ -1360,7 +1466,9 @@ class MCPToolService:
                         args.get("attempt_id"),
                         evidence=None,
                         request_id=request_id,
-                    )
+                        idempotency_key=args["idempotency_key"],
+                    ),
+                    mutation=True,
                 )
                 data = _record_dict(result)
 
@@ -1371,7 +1479,9 @@ class MCPToolService:
                         args["session_id"],
                         expected_link_id=args.get("expected_link_id"),
                         request_id=request_id,
-                    )
+                        idempotency_key=args["idempotency_key"],
+                    ),
+                    mutation=True,
                 )
 
                 data = {
@@ -1572,6 +1682,8 @@ class MCPToolService:
 def build_mcp_server(
     service: MCPToolService,
     token_provider: JWTVerifier,
+    *,
+    events_store: Any = None,
 ) -> Any:
     """Build and return the authenticated Streamable HTTP ASGI application."""
     if not isinstance(service, MCPToolService):
@@ -1632,7 +1744,9 @@ def build_mcp_server(
         return types.ListToolsResult(tools=tools)
 
     async def on_call_tool(ctx: Any, params: Any) -> Any:
-        request_id = str(ctx.request_id or uuid.uuid4())
+        request_id = str(
+            ctx.request_id if ctx.request_id is not None else uuid.uuid4()
+        )
         request = getattr(ctx, "request", None)
         auth = None
 
@@ -1665,9 +1779,14 @@ def build_mcp_server(
             )
 
             try:
-                if params.name in ("chatgpt.session.read", "chatgpt.session.list"):
+                if params.name == "chatgpt.session.read":
+                    read_key = _chatgpt_read_key(
+                        params.name, auth, arguments, request_id
+                    )
                     envelope = await _run_chatgpt_read(
-                        dispatch, timeout=CHATGPT_READ_REQUEST_DEADLINE_SECONDS
+                        dispatch,
+                        timeout=CHATGPT_READ_REQUEST_DEADLINE_SECONDS,
+                        key=read_key,
                     )
                 else:
                     future = loop.run_in_executor(None, dispatch)
@@ -1675,9 +1794,35 @@ def build_mcp_server(
                         future, timeout=REQUEST_DEADLINE_SECONDS
                     )
 
-            except _ResourceExhausted:
+            except asyncio.CancelledError:
+                if params.name == "chatgpt.session.read":
+                    identity_hash, request_hash, resource_hash = _chatgpt_read_log_hashes(
+                        auth, request_id, read_key
+                    )
+                    logger.warning(
+                        "chatgpt_read_waiter_cancelled tool=%s request_hash=%s principal_hash=%s resource_hash=%s worker_remains_tracked=true",
+                        params.name, request_hash, identity_hash, resource_hash,
+                    )
+                raise
+            except _ResourceExhausted as exc:
+                if params.name == "chatgpt.session.read":
+                    _identity_hash, request_hash, resource_hash = _chatgpt_read_log_hashes(
+                        auth, request_id, read_key
+                    )
+                    logger.warning(
+                        "chatgpt_read_admission_rejected tool=%s request_hash=%s resource_hash=%s reason=%s",
+                        params.name, request_hash, resource_hash, str(exc),
+                    )
                 envelope = _error("RESOURCE_EXHAUSTED", request_id)
             except asyncio.TimeoutError:
+                if params.name == "chatgpt.session.read":
+                    identity_hash, request_hash, resource_hash = _chatgpt_read_log_hashes(
+                        auth, request_id, read_key
+                    )
+                    logger.warning(
+                        "chatgpt_read_waiter_timeout tool=%s request_hash=%s principal_hash=%s resource_hash=%s worker_remains_tracked=true",
+                        params.name, request_hash, identity_hash, resource_hash,
+                    )
                 envelope = _error("TIMEOUT", request_id)
 
         return types.CallToolResult(
@@ -1701,6 +1846,89 @@ def build_mcp_server(
         on_list_tools=on_list_tools,
         on_call_tool=on_call_tool,
     )
+
+    if events_store is not None:
+        from src.session_ops.mcp_events import CallbackEndpointError, build_event_request_models
+
+        EventsListParams, EventsSubscribeParams, EventsUnsubscribeParams = build_event_request_models()
+
+        def _event_auth(ctx: Any) -> Any:
+            request = getattr(ctx, "request", None)
+            if request is None:
+                return None
+            state = request.scope.get("state", {})
+            return state.get("session_ops_auth") if isinstance(state, dict) else None
+
+        async def on_events_list(ctx: Any, params: Any) -> Any:
+            auth = _event_auth(ctx)
+            if not isinstance(auth, AuthContext):
+                raise AuthenticationError("verified authentication context required")
+            auth.require("session_ops.chatgpt.session.read")
+            events_store._identity(auth)
+            return {"events": events_store.event_catalog()}
+
+        async def on_events_subscribe(ctx: Any, params: Any) -> Any:
+            auth = _event_auth(ctx)
+            if not isinstance(auth, AuthContext):
+                raise AuthenticationError("verified authentication context required")
+            auth.require("session_ops.chatgpt.session.write")
+
+            def create_subscription() -> Any:
+                payload = params.model_dump(by_alias=True, exclude_unset=True)
+                arguments = payload.get("arguments") or {}
+                job_id = arguments.get("job_id")
+                if job_id is not None:
+                    service.store.require_owner(auth.principal, job_id)
+                return events_store.subscribe(auth, payload)
+
+            try:
+                return await asyncio.to_thread(create_subscription)
+            except CallbackEndpointError as exc:
+                from mcp.shared.exceptions import MCPError
+                raise MCPError(
+                    code=-32015,
+                    message="Callback endpoint verification failed",
+                    data={"reason": exc.reason},
+                ) from exc
+            except (NotAuthorized, InvalidIdentifier) as exc:
+                from mcp.shared.exceptions import MCPError
+                raise MCPError(
+                    code=-32602,
+                    message="Invalid event subscription",
+                    data={"reason": "job_not_owned"},
+                ) from exc
+            except ValueError as exc:
+                from mcp.shared.exceptions import MCPError
+                raise MCPError(
+                    code=-32602,
+                    message="Invalid event subscription",
+                    data={"reason": "invalid_subscription"},
+                ) from exc
+
+        async def on_events_unsubscribe(ctx: Any, params: Any) -> Any:
+            auth = _event_auth(ctx)
+            if not isinstance(auth, AuthContext):
+                raise AuthenticationError("verified authentication context required")
+            auth.require("session_ops.chatgpt.session.write")
+            return await asyncio.to_thread(
+                events_store.unsubscribe,
+                auth,
+                params.model_dump(by_alias=True, exclude_unset=True),
+            )
+
+        server.add_request_handler("events/list", EventsListParams, on_events_list)
+        server.add_request_handler("events/subscribe", EventsSubscribeParams, on_events_subscribe)
+        server.add_request_handler("events/unsubscribe", EventsUnsubscribeParams, on_events_unsubscribe)
+
+        async def advertise_events_capability(ctx: Any, call_next: Any) -> Any:
+            result = await call_next(ctx)
+            if ctx.method in ("initialize", "server/discover") and isinstance(result, dict):
+                capabilities = result.get("capabilities")
+                if isinstance(capabilities, dict):
+                    result["capabilities"] = {**capabilities, "events": {}}
+            return result
+
+        server.middleware.append(advertise_events_capability)
 
     allowed_hosts = [
         resource.netloc,

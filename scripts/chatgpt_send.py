@@ -64,7 +64,7 @@
           对不上就依次试其他留存设备并自动修正归属（--anon-devices 可查）。
 
 建会话身份优先级（--new 默认行为）：
-    第一优先：acct1 / acct2 / acct3 / acct4 / acct5 / acct6 均分轮转（游标只在六个登录态之间推进）。
+    第一优先：动态发现有效 acctN 并均分轮转（游标按当前账号集合推进）。
     兜底：仅当全部登录态都 429（本次命中或处于 429 冷却）时，才启用 nologin 匿名通道。
     不兜底的情形：401（认证失效，应重新提取凭据）、403（PoW/风控，短冷却后自愈）。
     为什么匿名只做兜底：匿名会话不入任何会话列表（list 恒为空），与设备身份(oai-did)绑定，
@@ -81,10 +81,10 @@
     quota          各账号最近一次响应的限速观测头（只读）
     errors         不可用账号 / 接口错误
 
-账号凭据放在 accounts/<acct1|acct2|acct3|acct4|acct5|acct6>/{cookies.json,access_token.txt}。
+账号凭据放在 CHATGPT_AUTH_DIR（未设置时使用 BASE）下：统一布局优先使用 accounts/acctN/{cookies.json,access_token.txt}；仅当 accounts/acct1 不存在时，acct1 兼容根目录旧布局。
 --list-all 只聚合各身份获准查看的会话；429 时停止扫描。
 
-前置：acct1/default 认证文件在本脚本目录；acct2/acct3/acct4/acct5/acct6 分别在 accounts/acct2/、accounts/acct3/、accounts/acct4/、accounts/acct5/、accounts/acct6/ 下：
+前置：统一布局下 acct1/default 与其他账号一样位于 accounts/acctN/；仅旧版无 accounts/acct1 目录时回退 CHATGPT_AUTH_DIR 根目录。其余 acctN 按自然数编号自动发现：
     cookies.json      由 extract_auth.py 从 Edge CDP 提取
     access_token.txt  同上（accessToken）
     pow_solver.py     PoW 解算器
@@ -429,12 +429,14 @@ def _send_exit_code(status, conv=None):
     return 0 if status == 200 else 1
 
 # ---------- 建会话身份轮转 ----------
-# 优先登录态：acct1 / acct2 / acct3 / acct4 / acct5 / acct6 均分轮转；nologin（匿名）只作兜底——
+# 优先登录态：从凭证根目录动态发现有效 acctN 并均分轮转；nologin（匿名）只作兜底——
 # 实测匿名会话不进任何会话历史（list 返回 0 条），随时可能被服务端回收，
 # 仅按 conv_id 在短期内可读，因此只在全部登录态都 429 时启用。
-ROTATION_ORDER = ("acct1", "acct2", "acct3", "acct4", "acct5", "acct6", "nologin")
-ROTATION_PRIMARY = ("acct1", "acct2", "acct3", "acct4", "acct5", "acct6")
+# Legacy constants retained for state migration and older callers/tests only.
+# Live account selection always comes from discover_configured_accounts().
 ROTATION_FALLBACK = ("nologin",)
+ROTATION_PRIMARY = None  # Optional runtime allowlist supplied by ChatGPTDirectClient
+AUTH_BASE = None  # Adapter-owned credential root; keeps legacy env overrides out of MCP runtime
 ROTATION_FILE = os.path.join(BASE, "account-rotation.json")
 CONV_MAP_FILE = os.path.join(BASE, "conv-accounts.json")
 ANON_SESSIONS_FILE = os.path.join(BASE, "anon-sessions.json")
@@ -2783,14 +2785,14 @@ def _normalize_rotation(st):
     """
     if not isinstance(st, dict):
         st = {}
-    order = [a for a in _as_seq(st.get("order")) if a in ROTATION_ORDER]
-    for a in ROTATION_ORDER:  # 保证全部身份齐全且顺序稳定
-        if a not in order:
-            order.append(a)
+    primary = _rotation_primary()
+    stored_order = [
+        a for a in _as_seq(st.get("order"))
+        if a == "nologin" or _is_account_identity(a)
+    ]
+    order = list(dict.fromkeys(stored_order + primary + ["nologin"]))
     st["order"] = order
-    # 游标只在登录态身份之间推进（匿名是兜底，不参与均分）；
-    # _as_int 不折叠 bool/float，垃圾游标归零而不是猜一个下标
-    st["cursor"] = _as_int(st.get("cursor"), 0) % len(ROTATION_PRIMARY)
+    st["cursor"] = _as_int(st.get("cursor"), 0) % max(len(primary), 1)
     created, failures = _as_dict(st.get("created")), _as_dict(st.get("failures"))
     for a in order:
         created[a] = _as_int(created.get(a), 0)
@@ -2800,6 +2802,8 @@ def _normalize_rotation(st):
     # purge_expired/mark_unavailable 都按这个形状读写）
     clean = {}
     for k, v in _as_dict(st.get("unavailable")).items():
+        if k != "nologin" and not _is_account_identity(k):
+            continue
         info = _as_dict(v)
         clean[k] = {
             "reason": _as_text(info.get("reason")),
@@ -2807,6 +2811,15 @@ def _normalize_rotation(st):
             "epoch": _as_float(info.get("epoch"), 0.0),
             "ttl": _as_float(info.get("ttl"), UNAVAILABLE_TTL),
         }
+    disabled = {
+        a for a in _as_seq(st.get("operator_disabled"))
+        if a == "nologin" or _is_account_identity(a)
+    }
+    for account, info in list(clean.items()):
+        if "manually disabled" in _as_text(info.get("reason")):
+            disabled.add(account)
+            clean.pop(account, None)
+    st["operator_disabled"] = sorted(disabled, key=_account_sort_key)
     st["unavailable"] = clean
     st["fallback_uses"] = _as_int(st.get("fallback_uses"), 0)
     return st
@@ -2874,24 +2887,19 @@ def purge_expired(st):
     return changed
 
 
-def _effective_rotation_primary():
-    """Return the explicitly allowed logged-in accounts, or the legacy pool."""
-    raw = os.environ.get("CHATGPT_ALLOWED_ACCOUNTS")
-    if raw is None:
-        return ROTATION_PRIMARY
-    allowed = {item.strip() for item in raw.split(",") if item.strip()}
-    return tuple(account for account in ROTATION_PRIMARY if account in allowed)
-
-
 def rotation_plan(st):
-    """Rotate only through allowed logged-in accounts; anonymous stays separate."""
+    """轮转当前凭证根目录中有效的 acctN；冷却账号排到末尾。"""
     st = _as_dict(st)
-    pool = _effective_rotation_primary()
-    if not pool:
+    primary = _rotation_primary()
+    if not primary:
         return []
-    cur = _as_int(st.get("cursor"), 0) % len(pool)
-    seq = [pool[(cur + i) % len(pool)] for i in range(len(pool))]
-    return [a for a in seq if not is_unavailable(st, a)] + [a for a in seq if is_unavailable(st, a)]
+    cur = _as_int(st.get("cursor"), 0) % len(primary)
+    seq = [primary[(cur + i) % len(primary)] for i in range(len(primary))]
+    disabled = set(_as_seq(st.get("operator_disabled")))
+    seq = [a for a in seq if a not in disabled]
+    return [a for a in seq if not is_unavailable(st, a)] + [
+        a for a in seq if is_unavailable(st, a)
+    ]
 
 
 def anon_fallback_block_reason(st, outcomes):
@@ -2907,7 +2915,7 @@ def anon_fallback_block_reason(st, outcomes):
     if not all("429" in str(v) for v in outcomes.values()):
         return "登录态并非全部 429（401=凭据失效、403=风控，都不该用匿名顶）"
     info = _as_dict(_as_dict(st.get("unavailable")).get("nologin"))
-    if "manually disabled" in _as_text(info.get("reason")):
+    if "nologin" in set(_as_seq(st.get("operator_disabled"))) or "manually disabled" in _as_text(info.get("reason")):
         return "nologin 已被手动禁用（--rotation-enable nologin 解封）"
     if is_unavailable(st, "nologin"):
         ttl = _as_float(info.get("ttl"), UNAVAILABLE_TTL)      # F-30
@@ -3582,16 +3590,104 @@ def restore_conv_map_minimal(candidate):
     }
 
 
-_VALID_ACCOUNT_IDENTITIES = frozenset((
-    "default",
-    "acct1",
-    "acct2",
-    "acct3",
-    "acct4",
-    "acct5",
-    "acct6",
-    "nologin",
-))
+_ACCOUNT_ID_RE = re.compile(r"^acct[1-9][0-9]*$")
+
+
+def _is_account_identity(account):
+    return isinstance(account, str) and bool(_ACCOUNT_ID_RE.fullmatch(account))
+
+
+def _account_sort_key(account):
+    if isinstance(account, str):
+        match = _ACCOUNT_ID_RE.fullmatch(account)
+        if match:
+            return (0, int(account[4:]))
+        if account == "nologin":
+            return (1, 0)
+    return (2, repr(account))
+
+
+def _auth_base():
+    """Credential root for CLI calls; runtime state remains under BASE."""
+    return AUTH_BASE or os.environ.get("CHATGPT_AUTH_DIR") or BASE
+
+
+def _auth_root(base_dir=None):
+    return os.path.abspath(base_dir or _auth_base())
+
+
+def _account_credentials_dir(account, root=None):
+    root = _auth_root(root)
+    acct1_dir = os.path.join(root, "accounts", "acct1")
+    if account in ("default", "acct1"):
+        # The unified vault stores acct1 with the other accounts. Keep the
+        # historical root-level layout only as a local compatibility fallback.
+        return acct1_dir if os.path.isdir(acct1_dir) else root
+    return os.path.join(root, "accounts", account)
+
+
+def _account_credentials_valid(account, root=None):
+    if not _is_account_identity(account):
+        return False
+    directory = _account_credentials_dir(account, root)
+    try:
+        with open(os.path.join(directory, "cookies.json"), encoding="utf-8") as handle:
+            cookies = json.load(handle)
+        with open(os.path.join(directory, "access_token.txt"), encoding="utf-8") as handle:
+            token = handle.read().strip()
+    except FileNotFoundError:
+        return False
+    except PermissionError as exc:
+        raise PermissionError(
+            "cannot read account credentials for %s" % account
+        ) from exc
+    except (OSError, ValueError, TypeError):
+        return False
+    if not isinstance(cookies, list) or not token:
+        return False
+    return any(
+        isinstance(cookie, dict)
+        and isinstance(cookie.get("name"), str) and bool(cookie.get("name"))
+        and isinstance(cookie.get("value"), str) and bool(cookie.get("value"))
+        and _cookie_domain_allowed(cookie.get("domain"))
+        for cookie in cookies
+    )
+
+
+def discover_configured_accounts(root=None):
+    """发现凭证有效的 acctN；不依赖固定名单，也不做网络认证探测。"""
+    root = _auth_root(root)
+    found = ["acct1"] if _account_credentials_valid("acct1", root) else []
+    accounts_dir = os.path.join(root, "accounts")
+    try:
+        with os.scandir(accounts_dir) as entries:
+            candidates = sorted(
+                (entry.name for entry in entries
+                 if entry.is_dir(follow_symlinks=False)
+                 and entry.name != "acct1" and _is_account_identity(entry.name)),
+                key=_account_sort_key,
+            )
+    except FileNotFoundError:
+        candidates = []
+    except PermissionError as exc:
+        raise PermissionError(
+            "cannot enumerate account credential directory: %s" % accounts_dir
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            "cannot enumerate account credential directory: %s" % accounts_dir
+        ) from exc
+    found.extend(a for a in candidates if _account_credentials_valid(a, root))
+    return found
+
+
+def _rotation_primary():
+    discovered = discover_configured_accounts()
+    configured = ROTATION_PRIMARY
+    if configured is None:
+        return discovered
+    allowed = {a for a in configured if _is_account_identity(a)}
+    return [a for a in discovered if a in allowed]
 
 
 def normalize_account_identity(account):
@@ -3601,7 +3697,7 @@ def normalize_account_identity(account):
     "default" and "acct1" share the same credential root and therefore
     compare as the same identity. Other account identities remain distinct.
     """
-    if not isinstance(account, str) or account not in _VALID_ACCOUNT_IDENTITIES:
+    if account not in ("default", "nologin") and not _is_account_identity(account):
         raise ValueError("invalid account identity")
     if account == "default":
         return "acct1"
@@ -4639,24 +4735,10 @@ def _filter_openai_cookies(cookies):
 class ChatGPTAPI:
     def __init__(self, base_dir=None, account="default"):
         # CHATGPT_AUTH_DIR selects credential/cache root; account data stays isolated.
-        root = base_dir or os.environ.get("CHATGPT_AUTH_DIR") or BASE
-        if account not in _VALID_ACCOUNT_IDENTITIES:
-            raise ValueError(
-                "account must be one of %s"
-                % ", ".join(sorted(_VALID_ACCOUNT_IDENTITIES))
-            )
-        if account in ("default", "acct1"):
-            # Support both the standalone layout (acct1 at root) and the
-            # shared production layout (/var/lib/chatgpt-session-ops/accounts/acctN).
-            acct1_root = os.path.join(root, "accounts", "acct1")
-            b = (
-                acct1_root
-                if not os.path.isfile(os.path.join(root, "cookies.json"))
-                and os.path.isfile(os.path.join(acct1_root, "cookies.json"))
-                else root
-            )
-        else:
-            b = os.path.join(root, "accounts", account)
+        root = os.path.abspath(base_dir or _auth_base())
+        if account not in ("default", "nologin") and not _is_account_identity(account):
+            raise ValueError("account must be default, nologin, or acctN")
+        b = _account_credentials_dir(account, root)
         self.account = account
         self.base_dir = b
         self.is_anon = account == "nologin"  # 匿名态：走 /backend-anon/，POST 需浏览器过 Turnstile
@@ -4909,7 +4991,10 @@ class ChatGPTAPI:
             pass
         return data
 
-    def req(self, method, url, body=None, extra_headers=None, timeout=120):
+    def req(
+        self, method, url, body=None, extra_headers=None, timeout=120,
+        total_timeout=None,
+    ):
         if self.is_anon:
             if not self.cookie:
                 self.ensure_device_cookie()
@@ -4935,6 +5020,16 @@ class ChatGPTAPI:
         for k, v in (extra_headers or {}).items():
             rq.add_header(k, v)
         t0 = time.time()
+        total_deadline = (
+            time.monotonic() + max(0.0, float(total_timeout))
+            if total_timeout is not None
+            else None
+        )
+        timeout_budget = (
+            min(float(timeout), float(total_timeout))
+            if total_timeout is not None
+            else timeout
+        )
         # 已收到的原始字节：超时/断流时这是唯一副本，必须边读边留（旧版 resp.read() 一次读完，
         # 中途超时异常里没有已读字节 → 已收内容全丢，19 次卡死全部零留存）。
         sink = []
@@ -4942,7 +5037,7 @@ class ChatGPTAPI:
         self.last_partial_bytes = 0
         try:
             with self._opener.open(rq, timeout=timeout) as resp:
-                self._read_stream(resp, sink)   # 读到 EOF，勿提前 close
+                self._read_stream(resp, sink, deadline=total_deadline)   # 读到 EOF，勿提前 close
                 data = self._decompress(b"".join(sink), resp.headers.get("Content-Encoding"))
                 self.last_headers = {k.lower(): v for k, v in resp.headers.items()}
                 self.quota = self._quota_from_headers(self.last_headers)
@@ -4951,7 +5046,13 @@ class ChatGPTAPI:
                 self.last_status = resp.status
                 return resp.status, text
         except urllib.error.HTTPError as e:
-            rraw = e.read()
+            if total_deadline is not None:
+                # Read-only callers need the status, not an unbounded error body.
+                # Closing the response also releases the socket immediately.
+                e.close()
+                rraw = b""
+            else:
+                rraw = e.read()
             rraw = self._decompress(rraw, (e.headers or {}).get("Content-Encoding"))
             self.last_headers = {k.lower(): v for k, v in (e.headers or {}).items()}
             self.quota = self._quota_from_headers(self.last_headers)
@@ -4969,11 +5070,11 @@ class ChatGPTAPI:
             return self._partial_result(
                 b"".join(sink), t0, "IncompleteRead: %s" % (e,), marker="PARTIAL")
         except (socket.timeout, TimeoutError) as e:
-            return self._timeout_result(sink, t0, timeout, str(e) or type(e).__name__)
+            return self._timeout_result(sink, t0, timeout_budget, str(e) or type(e).__name__)
         except urllib.error.URLError as e:
             reason = getattr(e, "reason", None)
             if isinstance(reason, (socket.timeout, TimeoutError)) or "timed out" in str(reason):
-                return self._timeout_result(sink, t0, timeout, "urlopen: %s" % (reason,))
+                return self._timeout_result(sink, t0, timeout_budget, "urlopen: %s" % (reason,))
             self.last_headers = {}
             self.quota = {}
             self.last_body = ""
@@ -4987,7 +5088,7 @@ class ChatGPTAPI:
             return 0, "EXC " + str(e)
 
     @staticmethod
-    def _read_stream(resp, sink):
+    def _read_stream(resp, sink, deadline=None):
         """分块读到 EOF，边读边把字节追加进 sink。
 
         为什么不用 `resp.read()`：一次性读到底，中途 socket 超时抛出时异常对象里没有
@@ -5003,14 +5104,27 @@ class ChatGPTAPI:
         都在 `read()` 内抛出，因此该分支现实不可达，无需额外处理。
         """
         while True:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout("total response deadline exceeded")
+                fp = getattr(resp, "fp", None)
+                raw = getattr(fp, "raw", None)
+                sock = getattr(raw, "_sock", None)
+                if sock is not None:
+                    sock.settimeout(remaining)
             try:
-                chunk = resp.read(16384)
+                reader = getattr(resp, "read1", None) if deadline is not None else None
+                chunk = (reader or resp.read)(16384)
             except http.client.IncompleteRead as e:
                 part = getattr(e, "partial", b"") or b""
                 if part:
                     sink.append(part)
                 raise
             if not chunk:
+                remaining_length = getattr(resp, "length", None)
+                if deadline is not None and remaining_length:
+                    raise http.client.IncompleteRead(b"", remaining_length)
                 return
             sink.append(chunk)
 
@@ -5125,6 +5239,19 @@ class ChatGPTAPI:
                 return self.tail_from_mapping(f.read())
         except Exception:
             return None
+
+    def live_tail_once(self, conv_id, timeout=90):
+        """Fetch one conversation snapshot without retry or backoff."""
+        status, body = self.req(
+            "GET",
+            API_BASE + "/backend-api/conversation/" + conv_id,
+            timeout=_cap_timeout(timeout),
+            total_timeout=_cap_timeout(timeout),
+        )
+        if status == 200:
+            # The MCP adapter scans the raw mapping once; do not parse it twice.
+            return None, body, status, None
+        return None, None, status, body
 
     def live_tail(self, conv_id, tries=2):
         for attempt in range(tries):
@@ -7701,9 +7828,9 @@ def _attempt_create(st, name, prompt_file, attempts, thinking=None):
 def _mark_success(st, name, conv, prompt_file, attempts):
     def mutate(s):
         s["created"][name] = s.get("created", {}).get(name, 0) + 1
-        pool = _effective_rotation_primary()
-        if name in pool:
-            s["cursor"] = (pool.index(name) + 1) % len(pool)
+        primary = _rotation_primary()
+        if name in primary:
+            s["cursor"] = (primary.index(name) + 1) % len(primary)
         else:
             # 兜底不推进游标：登录态恢复后仍按原均分顺序轮转，否则会白跳过一个账号的轮次
             s["fallback_uses"] = s.get("fallback_uses", 0) + 1
@@ -7717,8 +7844,10 @@ def _mark_success(st, name, conv, prompt_file, attempts):
                       "attempts": attempts}, ensure_ascii=False), flush=True)
 
 
-def create_chat_rotating(prompt_file, thinking=None):
-    """登录态优先建会话：acct1/acct2/acct3/acct4/acct5/acct6 均分轮转；
+def create_chat_rotating(
+    prompt_file, thinking=None, *, work_item_context=None, account=None
+):
+    """登录态优先建会话：动态发现的 acctN 均分轮转；
     仅当全部都 429 才用匿名兜底。
 
     匿名会话不进任何账号历史（会话列表恒为空），只按 conv_id 短期可读，
@@ -7726,6 +7855,8 @@ def create_chat_rotating(prompt_file, thinking=None):
 
     HTTP 413 是单次发送的终止结果，不允许轮换或匿名兜底。
     """
+    if account == "default":
+        account = "acct1"
     if thinking is None:
         thinking_requested = os.environ.get(
             "CHATGPT_THINKING", ""
@@ -7738,16 +7869,24 @@ def create_chat_rotating(prompt_file, thinking=None):
         st = mutate_rotation(purge_expired)
 
     outcomes, attempts, skipped = {}, [], {}
+    primary = _rotation_primary()
+    operator_disabled = set(_as_seq(st.get("operator_disabled")))
 
-    for name in ROTATION_PRIMARY:
-        if is_unavailable(st, name):
-            reason = _as_dict(
-                _as_dict(st.get("unavailable")).get(name)
-            ).get("reason", "unavailable")
+    for name in primary:
+        if name in operator_disabled or is_unavailable(st, name):
+            reason = (
+                "operator_disabled" if name in operator_disabled else
+                _as_dict(_as_dict(st.get("unavailable")).get(name)).get("reason", "unavailable")
+            )
             skipped[name] = reason
             outcomes[name] = "SKIP:" + reason
 
-    plan = [a for a in rotation_plan(st) if a not in skipped]
+    if account not in (None, "auto"):
+        if not _is_account_identity(account) or account not in primary:
+            raise ValueError("explicit account is not configured with valid credentials")
+        plan = [account] if account not in operator_disabled and not is_unavailable(st, account) else []
+    else:
+        plan = [a for a in rotation_plan(st) if a not in skipped]
 
     print(
         "rotation plan: %s (cursor=%s)%s" % (
@@ -7840,9 +7979,9 @@ def create_chat_rotating(prompt_file, thinking=None):
 
         return False
 
-    all_thinking_unavailable = all(
+    all_thinking_unavailable = bool(primary) and all(
         is_thinking_unavailable(outcomes.get(name))
-        for name in ROTATION_PRIMARY
+        for name in primary
     )
 
     if thinking_requested and all_thinking_unavailable:
@@ -7861,7 +8000,13 @@ def create_chat_rotating(prompt_file, thinking=None):
         )
         return 1
 
-    block = anon_fallback_block_reason(st, outcomes)
+    block = (
+        "explicit account pin forbids fallback"
+        if account not in (None, "auto")
+        else "trusted WorkItem sends cannot use anonymous sessions"
+        if work_item_context is not None
+        else anon_fallback_block_reason(st, outcomes)
+    )
 
     if block is None:
         print(
@@ -7923,20 +8068,23 @@ def create_chat_rotating(prompt_file, thinking=None):
 def rotation_summary():
     st = load_rotation()
     created = st.get("created", {})
-    prim = {a: _as_float(created.get(a), 0.0) for a in ROTATION_PRIMARY}   # F-30
+    primary = _rotation_primary()
+    prim = {a: _as_float(created.get(a), 0.0) for a in primary}   # F-30
     prim_total = sum(prim.values()) or 1
+    cursor = st["cursor"] % len(primary) if primary else 0
     return {
-        "policy": "acct1/acct2/acct3/acct4/acct5/acct6 均分轮转；nologin 仅在全部 429 时兜底（其会话不入历史）",
-        "primary": list(ROTATION_PRIMARY),
+        "policy": "自动发现凭证有效的 acctN 并均分轮转；nologin 仅在全部 429 时兜底",
+        "primary": primary,
         "fallback": list(ROTATION_FALLBACK),
-        "cursor": st["cursor"],
-        "next": ROTATION_PRIMARY[st["cursor"]],
+        "cursor": cursor,
+        "next": primary[cursor] if primary else None,
         "created": created,
         # share 只在登录态之间算，兜底的匿名次数单列，避免把 1/3 当成「没均分好」
         "share": {k: round(v / float(prim_total), 2) for k, v in prim.items()},
         "fallback_uses": st.get("fallback_uses", 0),
         "failures": st.get("failures", {}),
         "unavailable": st.get("unavailable", {}),
+        "operator_disabled": st.get("operator_disabled", []),
         "unavailable_ttl_sec": UNAVAILABLE_TTL,
         "last": st.get("last"),
         "updated": st.get("updated"),
@@ -8663,17 +8811,20 @@ def _main_impl():
         return 0 if res["consistency"] == "CONSISTENT" else 4
     if len(args) == 2 and args[0] in ("--rotation-enable", "--rotation-disable"):
         name = args[1]
-        if name not in ROTATION_ORDER:
-            print("usage: %s acct1|acct2|acct3|acct4|acct5|acct6|nologin" % args[0], flush=True)
+        if name != "nologin" and not _is_account_identity(name):
+            print("usage: %s acctN|nologin" % args[0], flush=True)
             return 2
         enable = args[0] == "--rotation-enable"
 
         def mutate(s):
+            disabled = set(_as_seq(s.get("operator_disabled")))
             if enable:
+                disabled.discard(name)
                 s["unavailable"].pop(name, None)
                 s["failures"][name] = 0
             else:
-                mark_unavailable(s, name, "manually disabled")
+                disabled.add(name)
+            s["operator_disabled"] = sorted(disabled, key=_account_sort_key)
 
         mutate_rotation(mutate)
         print(json.dumps(rotation_summary(), ensure_ascii=False, indent=2))
@@ -9013,7 +9164,7 @@ def _main_impl():
         apply_changes = "--apply" in supplied_flags
         include_nologin = "--include-nologin" in supplied_flags
 
-        configured_accounts = list(ROTATION_PRIMARY)
+        configured_accounts = list(_rotation_primary())
         if include_nologin:
             configured_accounts.append("nologin")
 
@@ -9408,7 +9559,7 @@ def _main_impl():
     # ---- 开新会话 ----
     if args[0] == "--new":
         if len(args) != 2:
-            print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin|auto] [--thinking] --new <prompt_file>", flush=True)
+            print("usage: [--account acctN|nologin|auto] [--thinking] --new <prompt_file>", flush=True)
             return 2
         if work_item_id is not None and (
             not explicit_account or account in ("auto", "nologin")
@@ -9419,7 +9570,7 @@ def _main_impl():
                         "result": "error",
                         "error": (
                             "--work-item --new requires an explicit logged-in "
-                            "--account acct1..acct6; automatic rotation and "
+                            "--account acctN; automatic rotation and "
                             "anonymous fallback cannot issue trusted landing evidence"
                         ),
                     },
@@ -9466,27 +9617,26 @@ def _main_impl():
             if status == 200 and conv:
                 record_conv(conv, account, args[1])
                 print("NEW_CONV %s account=%s" % (conv, account), flush=True)
-            if status == 429 and account in ROTATION_PRIMARY:
-                # 429 限流 → 换账号，换不动就匿名（用户裁定）。显式指定身份只约束
-                # 「用谁起」，不该约束「限速后还能干什么」：429 还没建成会话，
-                # 重试不会重复建会话、不会多花配额。
-                print("WARN: %s 返回 429 —— 换另一个登录态，都限速则走匿名通道" % account,
+            if status == 429 and (account == "default" or _is_account_identity(account)):
+                # 显式账户是 strict pin：记录冷却后返回，不得悄悄切换身份。
+                rotation_account = normalize_account_identity(account)
+                print("WARN: %s 返回 429；已记录冷却，显式账户不会自动切换" % rotation_account,
                       flush=True)
                 def mark(s):
-                    mark_unavailable(s, account, "HTTP 429 限速冷却", COOLDOWN_429)
+                    mark_unavailable(s, rotation_account, "HTTP 429 限速冷却", COOLDOWN_429)
                 mutate_rotation(mark)
-                return create_chat_rotating(args[1], thinking=True if thinking_flag else None)
+                return 1
             return _send_exit_code(status, conv)
-        # 默认：acct1/acct2/acct3/acct4/acct5/acct6 均分轮转，全部 429 才匿名兜底
+        # 默认：动态发现有效 acctN 均分轮转；WorkItem 调用禁用匿名兜底
         return create_chat_rotating(args[1], thinking=True if thinking_flag else None)
 
     # ---- 既有会话：未显式指定身份时按登记归属路由 ----
     # 先做参数校验，别在缺参数时索引越界（曾导致 `--tail` 空参数直接 IndexError）
     if args[0] == "--list" and len(args) != 1:
-        print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin] --list", flush=True)
+        print("usage: [--account acctN|nologin] --list", flush=True)
         return 2
     if args[0] == "--tail" and len(args) != 2:
-        print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin] --tail <conv_id>", flush=True)
+        print("usage: [--account acctN|nologin] --tail <conv_id>", flush=True)
         return 2
     raw_id = args[1] if args[0] == "--tail" else (args[0] if not args[0].startswith("--") else "")
     conv_id = cli_id(raw_id) if raw_id else ""
@@ -9585,7 +9735,7 @@ def _main_impl():
             return 1
         return 0
     if len(args) != 2:
-        print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin] <conv_id> <prompt_file>", flush=True)
+        print("usage: [--account acctN|nologin] <conv_id> <prompt_file>", flush=True)
         return 2
     if work_item_id is not None:
         if account == "nologin":

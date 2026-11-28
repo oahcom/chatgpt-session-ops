@@ -123,8 +123,7 @@ class TmpAccountDirs(unittest.TestCase):
         return os.path.join(self.accounts_dir, account, "access_token.txt")
 
     def write_token(self, account, content):
-        path = self.account_file(account) if account != "acct1" \
-            else os.path.join(self.skill_dir, "access_token.txt")
+        path = mcp_connector.token_path(account)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(content)
@@ -143,6 +142,30 @@ class TestLoadToken(GuardAssertions, TmpAccountDirs):
             mcp_connector.token_path("acct9"),
             self.account_file("acct9"),
         )
+
+    def test_acct1_prefers_canonical_accounts_directory(self):
+        canonical = os.path.join(self.accounts_dir, "acct1")
+        os.makedirs(canonical)
+        self.assertEqual(
+            mcp_connector.token_path("acct1"),
+            os.path.join(canonical, "access_token.txt"),
+        )
+
+    def test_acct1_symlink_directory_does_not_override_legacy_root(self):
+        external = os.path.join(self.root, "external")
+        os.makedirs(external)
+        os.symlink(external, os.path.join(self.accounts_dir, "acct1"))
+        legacy = os.path.join(self.skill_dir, "access_token.txt")
+        with open(legacy, "w", encoding="utf-8") as fh:
+            fh.write("legacy-token")
+        self.assertEqual(mcp_connector.token_path("acct1"), legacy)
+        self.assertEqual(mcp_connector.discover_accounts(), ["acct1"])
+
+    def test_token_path_rejects_noncanonical_account_names(self):
+        for account in ("acct0", "acct01", "acctx", "../acct1"):
+            with self.subTest(account=account):
+                with self.assertRaisesRegex(CheckError, "acctN"):
+                    mcp_connector.token_path(account)
 
     def test_missing_token_file_is_auth_missing(self):
         account = "acct9"
@@ -200,6 +223,41 @@ class TestLoadToken(GuardAssertions, TmpAccountDirs):
                     mcp_connector.load_token(account),
                     content.strip(),
                 )
+
+
+class TestDynamicAccountDiscovery(TmpAccountDirs):
+    def test_discover_accounts_uses_natural_numeric_order(self):
+        for name in ("acct10", "acct2", "acct1", "acct0", "acct01", "not-an-account"):
+            os.makedirs(os.path.join(self.accounts_dir, name))
+        self.assertEqual(mcp_connector.discover_accounts(), ["acct1", "acct2", "acct10"])
+
+    def test_main_rejects_noncanonical_explicit_account_names(self):
+        with mock.patch.object(sys, "stdout", io.StringIO()) as out:
+            rc = mcp_connector.main(["eligibility", "--account", "../acct1"])
+        self.assertEqual(rc, 1)
+        self.assertIn("INVALID_ARGUMENT", out.getvalue())
+
+    def test_accounts_all_reports_directory_permission_errors(self):
+        with mock.patch.object(os, "scandir", side_effect=PermissionError("denied")):
+            with mock.patch.object(sys, "stdout", io.StringIO()) as out:
+                rc = mcp_connector.main(["eligibility", "--accounts", "all"])
+        self.assertEqual(rc, 1)
+        self.assertIn("ACCOUNT_DISCOVERY_FAILED", out.getvalue())
+
+    def test_accounts_all_uses_dynamic_discovery(self):
+        for name in ("acct10", "acct2", "acct1"):
+            os.makedirs(os.path.join(self.accounts_dir, name))
+        seen = []
+
+        def fake_eligibility(account, capability):
+            seen.append(account)
+            return mcp_connector.Eligibility(account=account, capability=capability, status="OK")
+
+        with mock.patch.object(mcp_connector, "eligibility", side_effect=fake_eligibility):
+            with mock.patch.object(sys, "stdout", io.StringIO()):
+                rc = mcp_connector.main(["eligibility", "--accounts", "all"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen, ["acct1", "acct2", "acct10"])
 
 
 class TestMainAuthMissingExitCode(GuardAssertions, TmpAccountDirs):

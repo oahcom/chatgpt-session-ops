@@ -27,6 +27,9 @@ class SessionOpsError(RuntimeError):
         super().__init__(detail or code)
 
 
+CHATGPT_READ_HTTP_TIMEOUT_SECONDS = 15.0
+
+
 _DEFAULT_ACCOUNT_HEALTH = (
     ("acct4", "auth_unavailable", "upstream HTTP 401; awaiting authorized reauthentication and read-only probe"),
     ("acct5", "operator_disabled", "operator disabled; do not reauthenticate"),
@@ -54,12 +57,19 @@ class ChatGPTDirectClient:
         self.prompt_dir = self.runtime_dir / "prompts"
         # One in-process queue consumer only. Do not fan out CLI children
         # before durable account reservations and signed receipts exist.
-        if max_workers != 1 or max_queue_size < 1:
-            raise ValueError("the direct ChatGPT queue currently requires exactly one consumer")
+        if (
+            type(max_workers) is not int
+            or max_workers != 1
+            or type(max_queue_size) is not int
+            or not 1 <= max_queue_size <= 9
+        ):
+            raise ValueError("the direct ChatGPT queue requires one consumer and at most nine outstanding jobs")
         self.max_workers = max_workers
         self.max_queue_size = max_queue_size
         self._db_lock = threading.RLock()
         self._rotation_lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
+        self._closed = False
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="chatgpt-session")
         self._prepare_runtime()
         self._initialize_database(legacy_database_path)
@@ -79,6 +89,23 @@ class ChatGPTDirectClient:
             legacy_database_path=None,
         )
 
+    def start(self) -> None:
+        """ASGI lifespan hook; the durable executor is initialized in __init__."""
+        with self._lifecycle_lock:
+            if self._closed:
+                raise SessionOpsError("SERVICE_UNAVAILABLE", "ChatGPT executor is shutting down")
+
+    def stop(self) -> None:
+        """Drain the active send and cancel queued futures for restart recovery."""
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+        # Queued jobs remain status='queued' in SQLite and are recovered on
+        # the next process start. Only the single active remote operation is
+        # allowed to finish before the service exits.
+        self._executor.shutdown(wait=True, cancel_futures=True)
+
     def _connect(self):
         conn = sqlite3.connect(str(self.database_path), timeout=10)
         conn.row_factory = sqlite3.Row
@@ -91,23 +118,61 @@ class ChatGPTDirectClient:
         self.prompt_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         (self.runtime_dir / "logs").mkdir(exist_ok=True, mode=0o700)
+        self._sync_runtime_accounts()
+
+    def _sync_runtime_accounts(self):
+        """Mirror newly added read-only vault credentials into writable runtime dirs."""
         accounts_runtime = self.runtime_dir / "accounts"
+        if accounts_runtime.is_symlink():
+            raise SessionOpsError("DEPENDENCY_UNAVAILABLE", "runtime accounts directory must not be a symlink")
         accounts_runtime.mkdir(exist_ok=True, mode=0o700)
-        # Credentials remain in the account vault. Writable CLI state is kept
-        # under the SO-MCP runtime directory, not in the retired Sender tree.
-        for source in self.accounts_dir.iterdir():
-            if not re.fullmatch(r"acct[1-9][0-9]*", source.name) or source.is_symlink() or not source.is_dir():
+        try:
+            entries = list(self.accounts_dir.iterdir())
+        except FileNotFoundError:
+            entries = []
+        except OSError as exc:
+            raise SessionOpsError("DEPENDENCY_UNAVAILABLE", "cannot enumerate the ChatGPT account vault") from exc
+        sources = [
+            (entry.name, entry) for entry in entries
+            if re.fullmatch(r"acct[1-9][0-9]*", entry.name)
+        ]
+        # Backward compatibility: when no canonical accounts/acct1 directory
+        # exists, accept the legacy credential pair at the vault root.
+        if not (self.accounts_dir / "acct1").is_dir():
+            legacy_root = self.accounts_dir.parent
+            if (legacy_root / "cookies.json").is_file() and (legacy_root / "access_token.txt").is_file():
+                sources.append(("acct1", legacy_root))
+        sources.sort(key=lambda item: int(item[0][4:]))
+        for account_name, source in sources:
+            if source.is_symlink() or not source.is_dir():
                 continue
-            target = accounts_runtime / source.name
+            target = accounts_runtime / account_name
+            if target.is_symlink():
+                raise SessionOpsError("DEPENDENCY_UNAVAILABLE", "runtime account directory must not be a symlink")
             target.mkdir(exist_ok=True, mode=0o700)
             for filename in ("cookies.json", "access_token.txt"):
                 link, credential = target / filename, source / filename
-                if not credential.is_file():
+                if credential.is_symlink():
+                    raise SessionOpsError("DEPENDENCY_UNAVAILABLE", "account vault credentials must not be symlinks")
+                if not credential.is_file() or not os.access(credential, os.R_OK):
                     continue
                 if link.is_symlink():
-                    if link.resolve() != credential.resolve():
-                        raise SessionOpsError("DEPENDENCY_UNAVAILABLE", "runtime credential link target mismatch")
-                elif not link.exists():
+                    try:
+                        current_target = link.resolve(strict=True)
+                    except FileNotFoundError:
+                        # The canonical acct1 directory may have been removed
+                        # when migrating back to the legacy root credential pair.
+                        link.unlink()
+                        link.symlink_to(credential)
+                    else:
+                        if current_target != credential.resolve(strict=True):
+                            raise SessionOpsError("DEPENDENCY_UNAVAILABLE", "runtime credential link target mismatch")
+                elif link.exists():
+                    if not link.is_file():
+                        raise SessionOpsError("DEPENDENCY_UNAVAILABLE", "runtime credential path is not a regular file")
+                    # Atomic cookie refresh replaces the symlink itself with a
+                    # writable runtime overlay; preserve it across later syncs.
+                else:
                     link.symlink_to(credential)
             for dirname in ("replies", "conv-api", "timeouts"):
                 (target / dirname).mkdir(exist_ok=True, mode=0o700)
@@ -205,6 +270,7 @@ class ChatGPTDirectClient:
         sys.path.insert(0, str(self.repository_root))
         cli = importlib.import_module("scripts.chatgpt_send")
         cli.BASE = str(self.runtime_dir)
+        cli.AUTH_BASE = str(self.runtime_dir)
         cli.ROTATION_FILE = str(self.runtime_dir / "account-rotation.json")
         cli.CONV_MAP_FILE = str(self.runtime_dir / "conv-accounts.json")
         cli.ANON_SESSIONS_FILE = str(self.runtime_dir / "anon-sessions.json")
@@ -223,21 +289,19 @@ class ChatGPTDirectClient:
         return (row["state"], row["reason"]) if row else ("active", "")
 
     def _active_accounts(self):
-        accounts = []
-        if not self.accounts_dir.is_dir():
-            return ()
-        for entry in sorted(self.accounts_dir.iterdir()):
-            if not re.fullmatch(r"acct[1-9][0-9]*", entry.name) or entry.is_symlink() or not entry.is_dir():
-                continue
-            cookies, token = entry / "cookies.json", entry / "access_token.txt"
-            if (cookies.is_symlink() or token.is_symlink() or not cookies.is_file()
-                    or not token.is_file() or not os.access(cookies, os.R_OK | os.W_OK)
-                    or not os.access(token, os.R_OK | os.W_OK)):
-                continue
-            accounts.append(entry.name)
+        # The vault is intentionally read-only. Validate cookie/token structure
+        # from the runtime mirror; writable state remains under runtime_dir.
+        self._sync_runtime_accounts()
+        accounts = self._cli.discover_configured_accounts(str(self.runtime_dir))
+        rotation = self._cli.load_rotation()
+        operator_disabled = set(rotation.get("operator_disabled", []))
         with self._connect() as conn:
             health = {row["account"]: row["state"] for row in conn.execute("SELECT account,state FROM chatgpt_account_health")}
-        return tuple(a for a in accounts if health.get(a, "active") == "active")
+        return tuple(
+            account for account in accounts
+            if health.get(account, "active") == "active"
+            and account not in operator_disabled
+        )
 
     def _validate_create_account(self, requested_account: str) -> tuple[str, ...]:
         """Fail before enqueue when a pinned account is unhealthy or unavailable."""
@@ -250,7 +314,10 @@ class ChatGPTDirectClient:
             raise SessionOpsError("INVALID_ARGUMENT", "invalid account")
         if requested_account not in active:
             state, reason = self._account_health(requested_account)
-            if requested_account not in self._available_credential_accounts():
+            operator_disabled = set(self._cli.load_rotation().get("operator_disabled", []))
+            if requested_account in operator_disabled:
+                detail = f"account {requested_account} is operator-disabled"
+            elif requested_account not in self._available_credential_accounts():
                 detail = f"account {requested_account} has no complete credential set"
             else:
                 detail = f"account {requested_account} is unavailable ({state})"
@@ -260,17 +327,8 @@ class ChatGPTDirectClient:
         return active
 
     def _available_credential_accounts(self):
-        if not self.accounts_dir.is_dir():
-            return ()
-        return tuple(
-            entry.name for entry in sorted(self.accounts_dir.iterdir())
-            if re.fullmatch(r"acct[1-9][0-9]*", entry.name)
-            and not entry.is_symlink() and entry.is_dir()
-            and not (entry / "cookies.json").is_symlink()
-            and not (entry / "access_token.txt").is_symlink()
-            and (entry / "cookies.json").is_file()
-            and (entry / "access_token.txt").is_file()
-        )
+        self._sync_runtime_accounts()
+        return tuple(self._cli.discover_configured_accounts(str(self.runtime_dir)))
 
     def _write_prompt(self, prompt: str):
         if not isinstance(prompt, str) or not prompt or len(prompt) > 32768:
@@ -291,6 +349,8 @@ class ChatGPTDirectClient:
             self._executor.submit(self._execute_job, row["job_id"])
 
     def enqueue(self, *, principal_id, tenant_id, operation, arguments, idempotency_key):
+        if getattr(self, "_closed", False):
+            raise SessionOpsError("SERVICE_UNAVAILABLE", "ChatGPT executor is shutting down")
         if operation not in ("session.create", "session.send"):
             raise SessionOpsError("INVALID_ARGUMENT", "unsupported ChatGPT operation")
         args = dict(arguments or {})
@@ -349,7 +409,12 @@ class ChatGPTDirectClient:
                 )
             conn.execute("""INSERT INTO chatgpt_jobs(job_id,tenant_id,principal_id,operation,idempotency_key,status,conversation_id,requested_account,prompt_path,created_at,payload_hash)
                 VALUES(?,?,?,?,?,'queued',?,?,?,?,?)""", (job_id, tenant_id, principal_id, operation, idempotency_key, args.get("conversation_id"), requested_account, prompt_path, created, payload_hash))
-        self._executor.submit(self._execute_job, job_id)
+        try:
+            self._executor.submit(self._execute_job, job_id)
+        except RuntimeError:
+            # Shutdown raced with admission after the durable insert. Leave the
+            # job queued for restart recovery rather than dropping or replaying it.
+            pass
         return {"job_id": job_id, "operation": operation, "status": "queued", "created_at": created, "conversation_id": args.get("conversation_id")}
 
     def _execute_job(self, job_id):
@@ -384,26 +449,43 @@ class ChatGPTDirectClient:
             # Re-check at execution: health can change after enqueue preflight.
             active = self._validate_create_account(requested)
             with self._rotation_lock:
+                previous_pool = self._cli.ROTATION_PRIMARY
                 self._cli.ROTATION_PRIMARY = active
-                os.environ["CHATGPT_ANON_FALLBACK"] = "0"
-                os.environ.pop("CHATGPT_ALLOWED_ACCOUNTS", None)
-                if requested != "auto":
-                    api = self._cli.ChatGPTAPI(account=requested)
-                    status, path, conv = self._cli.send_prompt(api, None, prompt_path, new_chat=True)
-                    conversation_id = str(getattr(conv, "id", None) or conv or "")
-                    if status != 200 or not re.fullmatch(r"[0-9a-f-]{36}", conversation_id) or getattr(conv, "send_truncated", False):
-                        raise SessionOpsError("OUTCOME_UNKNOWN", "session create may have reached ChatGPT but was not fully verified; do not retry")
-                    self._cli.record_conv(conversation_id, api.account, prompt_path)
-                    account = api.account
-                else:
+                try:
+                    # WorkItem context disables anonymous fallback locally; do
+                    # not mutate process-global environment for other callers.
                     previous = (self._cli.load_rotation().get("last") or {}).get("conv_id")
-                    exit_code = self._cli.create_chat_rotating(prompt_path)
+                    exit_code = self._cli.create_chat_rotating(
+                        prompt_path,
+                        work_item_context={"job_id": row["job_id"], "tenant_id": tenant_id, "principal_id": principal_id},
+                        account=None if requested == "auto" else requested,
+                    )
                     state = self._cli.load_rotation()
                     last = state.get("last") or {}
                     conversation_id = last.get("conv_id")
                     account = last.get("account")
                     if exit_code != 0 or not conversation_id or conversation_id == previous or account not in active:
+                        unavailable = state.get("unavailable", {})
+                        if requested != "auto":
+                            reason = str(unavailable.get(requested, {}).get("reason", ""))
+                            if "429" in reason:
+                                raise SessionOpsError("RESOURCE_EXHAUSTED", "explicit account is rate limited and has been cooled down")
+                            if "401" in reason:
+                                raise SessionOpsError("UNAUTHENTICATED", "explicit account credentials are rejected")
+                            if "403" in reason:
+                                raise SessionOpsError("PERMISSION_DENIED", "explicit account is blocked by upstream policy")
+                        elif exit_code == 1:
+                            reasons = [str(unavailable.get(name, {}).get("reason", "")) for name in active]
+                            if active and all("429" in reason for reason in reasons):
+                                raise SessionOpsError("RESOURCE_EXHAUSTED", "all active accounts are rate limited and have been cooled down")
+                            if active and all("401" in reason for reason in reasons):
+                                raise SessionOpsError("UNAUTHENTICATED", "all active account credentials are rejected")
+                            if any("403" in reason for reason in reasons):
+                                raise SessionOpsError("PERMISSION_DENIED", "active accounts are blocked by upstream policy")
+                            raise SessionOpsError("RESOURCE_EXHAUSTED", "no active account could create a ChatGPT session")
                         raise SessionOpsError("OUTCOME_UNKNOWN", "session create may have reached ChatGPT but did not produce a uniquely verified result; do not retry")
+                finally:
+                    self._cli.ROTATION_PRIMARY = previous_pool
             self._store_owner(conversation_id, tenant_id, principal_id, account)
             return {"conversation_id": conversation_id, "account": account, "reply_state": "unverified", "receipt_durable": False}
 
@@ -475,7 +557,24 @@ class ChatGPTDirectClient:
         if owner["account"] not in self._active_accounts():
             raise SessionOpsError("RESOURCE_EXHAUSTED", "recorded session account is currently unavailable")
         api = self._cli.ChatGPTAPI(account=owner["account"])
-        tail, raw = api.live_tail(conversation_id, tries=2)
+        _tail, raw, status, upstream_error = api.live_tail_once(
+            conversation_id,
+            timeout=CHATGPT_READ_HTTP_TIMEOUT_SECONDS,
+        )
+        if status != 200:
+            detail = f"upstream conversation read returned HTTP {status}"
+            if status == 401:
+                raise SessionOpsError("UNAUTHENTICATED", detail)
+            if status == 429:
+                raise SessionOpsError("RESOURCE_EXHAUSTED", detail)
+            if status == 404:
+                raise SessionOpsError("NOT_FOUND", detail)
+            if status in (408, 504) or (
+                status == 0
+                and any(token in str(upstream_error).lower() for token in ("timeout", "timed out"))
+            ):
+                raise SessionOpsError("TIMEOUT", "upstream conversation read timed out")
+            raise SessionOpsError("DEPENDENCY_UNAVAILABLE", detail)
         if not raw:
             raise SessionOpsError("DEPENDENCY_UNAVAILABLE", "conversation read returned no mapping")
         rows, complete = self._cli._scan_mapping(raw)

@@ -6,12 +6,15 @@ repository's SDK isolation boundary.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import re
 import shutil
+import stat
 import sys
+import time
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit
@@ -20,6 +23,8 @@ import uvicorn
 
 from src.session_ops.authority import (
     PRINCIPAL_ID_RE,
+    NotAuthorized,
+    Principal,
     PrincipalRecord,
     SecureWorkItemStore,
     StaticPrincipalDirectory,
@@ -27,6 +32,8 @@ from src.session_ops.authority import (
 from src.session_ops.mcp_auth import JWTVerifier
 from src.session_ops.mcp_server import MCPToolService, build_mcp_server
 from src.session_ops.chatgpt_direct_client import ChatGPTDirectClient
+from src.session_ops.mcp_events import MCPEventsStore
+from src.session_ops.mcp_event_dispatcher import MCPEventDispatcher
 
 
 SUPPORTED_SCOPES = [
@@ -42,6 +49,8 @@ SUPPORTED_SCOPES = [
 
 MEMORY_STDIO_ENV = "SO_MCP_MEMORY_STDIO"
 PRINCIPAL_DIRECTORY_ENV = "SO_MCP_PRINCIPAL_DIRECTORY"
+EVENTS_KEY_FILE_ENV = "SO_MCP_EVENTS_KEY_FILE"
+EVENTS_DB_ENV = "SO_MCP_EVENTS_DB"
 
 #: The only keys a principal-directory entry may carry.
 PRINCIPAL_DIRECTORY_FIELDS = frozenset({"principal_id", "tenant_id", "enabled"})
@@ -436,6 +445,56 @@ def load_config() -> dict[str, Any]:
     return config
 
 
+def _load_events_encryption_key(path_value: str) -> bytes:
+    """Read a private raw 32-byte Events key without following symlinks."""
+    path = Path(path_value)
+    if not path.is_absolute():
+        raise RuntimeError(EVENTS_KEY_FILE_ENV + " must be an absolute path")
+    try:
+        path_metadata = path.lstat()
+        if not stat.S_ISREG(path_metadata.st_mode):
+            raise RuntimeError(EVENTS_KEY_FILE_ENV + " must reference a regular non-symlink file")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(str(path), flags)
+    except OSError as exc:
+        raise RuntimeError(EVENTS_KEY_FILE_ENV + " is unavailable") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_dev != path_metadata.st_dev
+            or metadata.st_ino != path_metadata.st_ino
+        ):
+            raise RuntimeError(EVENTS_KEY_FILE_ENV + " must reference a regular non-symlink file")
+        if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) not in (0o400, 0o600):
+            raise RuntimeError(EVENTS_KEY_FILE_ENV + " must be owned by the MCP service user and mode 0400/0600")
+        content = bytearray()
+        while len(content) < 33:
+            chunk = os.read(descriptor, 33 - len(content))
+            if not chunk:
+                break
+            content.extend(chunk)
+        key = bytes(content)
+    except OSError as exc:
+        raise RuntimeError(EVENTS_KEY_FILE_ENV + " is unavailable") from exc
+    finally:
+        os.close(descriptor)
+    if len(key) != 32:
+        raise RuntimeError(EVENTS_KEY_FILE_ENV + " must contain exactly 32 raw bytes")
+    return key
+
+
+def _authorize_event_resource(
+    store: SecureWorkItemStore, *, tenant_id: str, principal_id: str, job_id: str
+) -> bool:
+    """Re-check owner read access immediately before callback I/O."""
+    try:
+        store.get_work_item(Principal(tenant_id, principal_id), job_id)
+        return True
+    except NotAuthorized:
+        return False
+
+
 def _without_non_bearer_authorization(scope: dict[str, Any]) -> dict[str, Any]:
     """Remove non-Bearer or empty/malformed Authorization headers.
 
@@ -508,10 +567,14 @@ class DeploymentASGI:
         *,
         issuer: str,
         audience: str,
+        background_tasks: Optional[list[Any]] = None,
+        readiness_snapshot: Optional[Any] = None,
     ) -> None:
         self.inner = inner
         self.issuer = issuer
         self.audience = audience
+        self.background_tasks = list(background_tasks or [])
+        self.readiness_snapshot = readiness_snapshot
 
         resource = urlsplit(audience)
         self.endpoint_path = resource.path
@@ -565,6 +628,35 @@ class DeploymentASGI:
         )
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") == "lifespan" and self.background_tasks:
+            started_tasks: list[Any] = []
+            stop_attempted_tasks: set[int] = set()
+
+            async def receive_with_task_lifecycle() -> dict[str, Any]:
+                message = await receive()
+                if message.get("type") == "lifespan.startup":
+                    for task in self.background_tasks:
+                        task.start()
+                        started_tasks.append(task)
+                elif message.get("type") == "lifespan.shutdown":
+                    for task in reversed(started_tasks):
+                        task_id = id(task)
+                        if task_id in stop_attempted_tasks:
+                            continue
+                        stop_attempted_tasks.add(task_id)
+                        task.stop()
+                return message
+
+            try:
+                await self.inner(scope, receive_with_task_lifecycle, send)
+            finally:
+                for task in reversed(started_tasks):
+                    task_id = id(task)
+                    if task_id not in stop_attempted_tasks:
+                        stop_attempted_tasks.add(task_id)
+                        task.stop()
+            return
+
         if scope.get("type") != "http":
             await self.inner(scope, receive, send)
             return
@@ -579,6 +671,53 @@ class DeploymentASGI:
                 200,
                 self._health_body,
             )
+            return
+
+        if path == "/readyz" and method in ("GET", "HEAD"):
+            if self.readiness_snapshot is None:
+                readiness = {"status": "ready", "events": {"enabled": False}}
+                status_code = 200
+            else:
+                try:
+                    event_snapshot = await asyncio.to_thread(self.readiness_snapshot)
+                    dispatcher = event_snapshot.get("dispatcher", {})
+                    store = event_snapshot.get("store", {})
+                    outbox = store.get("outbox", {}) if isinstance(store, dict) else {}
+                    running = isinstance(dispatcher, dict) and dispatcher.get("running") is True
+                    last_loop_at = dispatcher.get("last_loop_at") if isinstance(dispatcher, dict) else None
+                    loop_age = (
+                        max(0, time.time() - float(last_loop_at))
+                        if isinstance(last_loop_at, (int, float)) else None
+                    )
+                    reasons = []
+                    if not running:
+                        reasons.append("dispatcher_stopped")
+                    if int(dispatcher.get("consecutive_errors", 0) or 0) > 0:
+                        reasons.append("dispatcher_errors")
+                    if loop_age is not None and loop_age > 60:
+                        reasons.append("dispatcher_stale")
+                    if loop_age is None and int(outbox.get("pending", 0) or 0) > 0:
+                        reasons.append("dispatcher_not_progressing")
+                    if int(outbox.get("oldest_pending_age_seconds", 0) or 0) > 120:
+                        reasons.append("old_pending_deliveries")
+                    if int(outbox.get("retry_exhausted", 0) or 0) > 0:
+                        reasons.append("retry_exhausted")
+                    healthy = not reasons
+                    readiness = {
+                        "status": "ready" if healthy else "degraded",
+                        "reasons": reasons,
+                        "events": {"enabled": True, **event_snapshot},
+                    }
+                    status_code = 200 if healthy else 503
+                except Exception:
+                    # Do not leak exception messages, DB paths, or payloads.
+                    readiness = {
+                        "status": "degraded",
+                        "events": {"enabled": True, "snapshot": "unavailable"},
+                    }
+                    status_code = 503
+            body = json.dumps(readiness, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            await self._respond(scope, send, status_code, body)
             return
 
         if path == self.metadata_path and method in ("GET", "HEAD"):
@@ -621,14 +760,31 @@ def create_application(
     *,
     session_ops: Any = None,
 ) -> Any:
-    """Initialize persistent storage and construct the authenticated app.
+    """Initialize the canonical DB, direct ChatGPT client, and optional Events."""
+    database_value = str(config["database_path"])
+    events_key_file = os.environ.get(EVENTS_KEY_FILE_ENV, "").strip()
+    events_db_path = os.environ.get(EVENTS_DB_ENV, "").strip()
+    if events_db_path and not events_key_file:
+        raise RuntimeError(EVENTS_DB_ENV + " requires " + EVENTS_KEY_FILE_ENV)
+    if database_value == ":memory:" and events_key_file:
+        raise RuntimeError("MCP Events requires a file-backed WorkItem database")
+    database_path = Path(database_value) if database_value == ":memory:" else Path(database_value).resolve()
+    if events_db_path and not Path(events_db_path).is_absolute():
+        raise RuntimeError(EVENTS_DB_ENV + " must be an absolute path")
 
-    ChatGPT session operations call the repository's local session engine
-    directly; there is no network Gateway or mTLS dependency.
-    """
+    events_store = None
+    if events_key_file:
+        encryption_key = _load_events_encryption_key(events_key_file)
+        if events_db_path and Path(events_db_path).resolve() != database_path:
+            raise RuntimeError(EVENTS_DB_ENV + " must use the WorkItem database for atomic completion events")
+        events_store = MCPEventsStore(str(database_path), encryption_key=encryption_key)
+
     store = SecureWorkItemStore(
-        Path(config["database_path"]),
+        database_path,
         principal_directory=config.get("principal_directory"),
+        completion_event_publisher=(
+            events_store.publish_job_completed_in_transaction if events_store is not None else None
+        ),
     )
     store.initialize()
 
@@ -642,7 +798,6 @@ def create_application(
 
     if session_ops is None:
         session_ops = ChatGPTDirectClient.from_env(store.database_path)
-
     logging.getLogger("so-mcp").info("ChatGPT session engine: in-process repository adapter")
 
     service = MCPToolService(
@@ -650,12 +805,32 @@ def create_application(
         memory_adapter=config.get("memory_adapter_command"),
         session_ops=session_ops,
     )
-    mcp_app = build_mcp_server(service, verifier)
 
+    background_tasks: list[Any] = []
+    if isinstance(session_ops, ChatGPTDirectClient):
+        background_tasks.append(session_ops)
+    readiness_snapshot = None
+    if events_store is not None:
+        def authorize_event(*, tenant_id: str, principal_id: str, job_id: str) -> bool:
+            return _authorize_event_resource(
+                store, tenant_id=tenant_id, principal_id=principal_id, job_id=job_id
+            )
+        dispatcher = MCPEventDispatcher(events_store, authorize=authorize_event)
+        background_tasks.append(dispatcher)
+
+        def readiness_snapshot() -> dict[str, Any]:
+            return {
+                "store": events_store.health_snapshot(),
+                "dispatcher": dispatcher.health_snapshot(),
+            }
+
+    mcp_app = build_mcp_server(service, verifier, events_store=events_store)
     return DeploymentASGI(
         mcp_app,
         issuer=config["issuer"],
         audience=config["audience"],
+        background_tasks=background_tasks,
+        readiness_snapshot=readiness_snapshot,
     )
 
 
@@ -696,6 +871,7 @@ def main() -> None:
         port=config["port"],
         log_level=config["log_level"],
         access_log=True,
+        timeout_graceful_shutdown=5,
     )
 
 
