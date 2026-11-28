@@ -67,3 +67,12 @@ Thumbs.db
 desktop.ini
 .idea/
 .vscode/
+
+# ==========================================================
+# proton-batch 运行态（账号库可解出凭据，配置含打码/接码密钥）
+# ==========================================================
+tools/proton-batch/data/
+tools/proton-batch/config.json
+tools/proton-batch/.venv/
+tools/proton-batch/accounts*.csv
+tools/proton-batch/accounts*.json
