@@ -1261,14 +1261,48 @@ class SecureWorkItemStore:
         target_principal_id: str,
         scope: Scope,
         request_id: Optional[str] = None,
-    ) -> None:
+    ) -> Dict[str, Any]:
         validate_work_item_id(work_item_id)
         _validate_scope(scope)
-        self._resolve_grant_target(principal, target_principal_id)
+        arguments = {
+            "work_item_id": work_item_id,
+            "target_principal_id": target_principal_id,
+            "scope": scope,
+        }
+        try:
+            self._resolve_grant_target(principal, target_principal_id)
+        except (InvalidPrincipal, PrincipalDirectoryUnavailable):
+            # Replay a committed grant even if the principal directory is now
+            # unavailable or the target was subsequently disabled.
+            if request_id is not None:
+                replay_conn = self._connect()
+                try:
+                    replay_conn.execute("BEGIN IMMEDIATE")
+                    self._require_owner(replay_conn, principal, work_item_id)
+                    replay = self._operation_begin(
+                        replay_conn, principal, "work_item.grant", request_id, arguments
+                    )
+                    if replay is not _NO_OPERATION_RECEIPT:
+                        replay_conn.execute("COMMIT")
+                        return replay
+                    replay_conn.execute("ROLLBACK")
+                except BaseException:
+                    if replay_conn.in_transaction:
+                        replay_conn.execute("ROLLBACK")
+                    raise
+                finally:
+                    replay_conn.close()
+            raise
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             self._require_owner(conn, principal, work_item_id)
+            replay = self._operation_begin(
+                conn, principal, "work_item.grant", request_id, arguments
+            )
+            if replay is not _NO_OPERATION_RECEIPT:
+                conn.execute("COMMIT")
+                return replay
             conn.execute(
                 "INSERT INTO work_item_grants"
                 "(work_item_id, principal_id, scope, granted_at) "
@@ -1281,7 +1315,17 @@ class SecureWorkItemStore:
                 target_principal_id=target_principal_id, scope=scope,
                 request_id=request_id,
             )
+            result = {
+                "work_item_id": work_item_id,
+                "target_principal_id": target_principal_id,
+                "scope": scope,
+                "granted": True,
+            }
+            self._operation_complete(
+                conn, principal, "work_item.grant", request_id, result
+            )
             conn.execute("COMMIT")
+            return result
         except BaseException:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
@@ -1296,14 +1340,25 @@ class SecureWorkItemStore:
         target_principal_id: str,
         scope: Scope,
         request_id: Optional[str] = None,
-    ) -> None:
+    ) -> Dict[str, Any]:
         validate_work_item_id(work_item_id)
         _validate_scope(scope)
         _validate_principal_id(target_principal_id, "target_principal_id")
+        arguments = {
+            "work_item_id": work_item_id,
+            "target_principal_id": target_principal_id,
+            "scope": scope,
+        }
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             self._require_owner(conn, principal, work_item_id)
+            replay = self._operation_begin(
+                conn, principal, "work_item.revoke", request_id, arguments
+            )
+            if replay is not _NO_OPERATION_RECEIPT:
+                conn.execute("COMMIT")
+                return replay
             conn.execute(
                 "DELETE FROM work_item_grants "
                 "WHERE work_item_id = ? AND principal_id = ? AND scope = ?",
@@ -1314,7 +1369,17 @@ class SecureWorkItemStore:
                 target_principal_id=target_principal_id, scope=scope,
                 request_id=request_id,
             )
+            result = {
+                "work_item_id": work_item_id,
+                "target_principal_id": target_principal_id,
+                "scope": scope,
+                "revoked": True,
+            }
+            self._operation_complete(
+                conn, principal, "work_item.revoke", request_id, result
+            )
             conn.execute("COMMIT")
+            return result
         except BaseException:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
@@ -1523,6 +1588,17 @@ class SecureWorkItemStore:
             # creation. Until Assignment-scoped capabilities are available,
             # only the WorkItem Owner may consume trusted landing evidence.
             self._require_owner(conn, principal, work_item_id)
+            replay = self._operation_begin(
+                conn, principal, "session.link", request_id,
+                {
+                    "session_id": session_id,
+                    "work_item_id": work_item_id,
+                    "attempt_id": attempt_id,
+                },
+            )
+            if replay is not _NO_OPERATION_RECEIPT:
+                conn.execute("COMMIT")
+                return SessionLink(**replay)
 
             item = conn.execute(
                 "SELECT status FROM work_items WHERE work_item_id = ?",
@@ -1621,6 +1697,16 @@ class SecureWorkItemStore:
                 link_id=link_id,
                 request_id=request_id,
             )
+            result = {
+                "link_id": link_id,
+                "session_id": session_id,
+                "work_item_id": work_item_id,
+                "linked_at": now,
+                "unlinked_at": None,
+            }
+            self._operation_complete(
+                conn, principal, "session.link", request_id, result
+            )
             conn.execute("COMMIT")
 
         except SessionAlreadyLinked:
@@ -1666,13 +1752,7 @@ class SecureWorkItemStore:
             if conn is not None:
                 conn.close()
 
-        return SessionLink(
-            link_id,
-            session_id,
-            work_item_id,
-            now,
-            None,
-        )
+        return SessionLink(**result)
 
     def unlink_session(
         self,
@@ -1685,23 +1765,42 @@ class SecureWorkItemStore:
         validate_conversation_id(session_id)
         if expected_link_id is not None:
             validate_link_id(expected_link_id)
+        arguments = {
+            "session_id": session_id,
+            "expected_link_id": expected_link_id,
+        }
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            replay = self._operation_begin(
+                conn, principal, "session.unlink", request_id, arguments
+            )
+            if replay is not _NO_OPERATION_RECEIPT:
+                conn.execute("COMMIT")
+                return SessionLink(**replay) if replay is not None else None
             row = conn.execute(
                 "SELECT link_id, session_id, work_item_id, linked_at, unlinked_at "
                 "FROM session_links WHERE session_id = ? AND unlinked_at IS NULL",
                 (session_id,),
             ).fetchone()
             if row is None:
+                self._operation_complete(
+                    conn, principal, "session.unlink", request_id, None
+                )
                 conn.execute("COMMIT")
                 return None
             if expected_link_id is not None and row["link_id"] != expected_link_id:
+                self._operation_complete(
+                    conn, principal, "session.unlink", request_id, None
+                )
                 conn.execute("COMMIT")
                 return None
             try:
                 self._require_owner(conn, principal, row["work_item_id"])
             except NotAuthorized:
+                self._operation_complete(
+                    conn, principal, "session.unlink", request_id, None
+                )
                 conn.execute("COMMIT")
                 return None
             now = _utc_now()
@@ -1717,11 +1816,18 @@ class SecureWorkItemStore:
                 work_item_id=row["work_item_id"], session_id=session_id,
                 link_id=row["link_id"], request_id=request_id,
             )
-            conn.execute("COMMIT")
-            return SessionLink(
-                row["link_id"], row["session_id"], row["work_item_id"],
-                row["linked_at"], now,
+            result = {
+                "link_id": row["link_id"],
+                "session_id": row["session_id"],
+                "work_item_id": row["work_item_id"],
+                "linked_at": row["linked_at"],
+                "unlinked_at": now,
+            }
+            self._operation_complete(
+                conn, principal, "session.unlink", request_id, result
             )
+            conn.execute("COMMIT")
+            return SessionLink(**result)
         except BaseException:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")

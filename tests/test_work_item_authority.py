@@ -412,6 +412,102 @@ class GrantTests(Base):
             )
 
 
+class OperationReceiptTests(Base):
+    def test_grant_and_revoke_receipts_replay_and_reject_changed_arguments(self):
+        item = self.store.create_work_item(self.alice)
+        grant = self.store.grant(
+            self.alice, item.work_item_id, "bob", "read",
+            request_id="grant-receipt-1",
+        )
+        replay = self.store.grant(
+            self.alice, item.work_item_id, "bob", "read",
+            request_id="grant-receipt-1",
+        )
+        self.assertEqual(replay, grant)
+
+        class BrokenDirectory:
+            def resolve(self, _principal_id):
+                raise RuntimeError("directory unavailable")
+
+        self.store._principal_directory = BrokenDirectory()
+        self.assertEqual(
+            self.store.grant(
+                self.alice, item.work_item_id, "bob", "read",
+                request_id="grant-receipt-1",
+            ),
+            grant,
+        )
+        with self.assertRaises(AuthorityError):
+            self.store.grant(
+                self.alice, item.work_item_id, "carol", "read",
+                request_id="grant-receipt-1",
+            )
+
+        revoke = self.store.revoke(
+            self.alice, item.work_item_id, "bob", "read",
+            request_id="revoke-receipt-1",
+        )
+        self.assertEqual(
+            self.store.revoke(
+                self.alice, item.work_item_id, "bob", "read",
+                request_id="revoke-receipt-1",
+            ),
+            revoke,
+        )
+        with self.assertRaises(AuthorityError):
+            self.store.revoke(
+                self.alice, item.work_item_id, "bob", "write",
+                request_id="revoke-receipt-1",
+            )
+        actions = [
+            event["action"] for event in self.store.list_audit_events(item.work_item_id)
+        ]
+        self.assertEqual(actions.count("work_item.grant"), 1)
+        self.assertEqual(actions.count("work_item.revoke"), 1)
+
+    def test_session_link_and_unlink_receipts_survive_restart(self):
+        item = self.store.create_work_item(self.alice)
+        sid = conversation_id()
+        attempt_id = self.record_landing(sid, item.work_item_id)
+        link = self.store.link_session(
+            self.alice, sid, item.work_item_id, attempt_id,
+            request_id="link-receipt-1",
+        )
+        self.assertEqual(
+            self.store.link_session(
+                self.alice, sid, item.work_item_id, attempt_id,
+                request_id="link-receipt-1",
+            ),
+            link,
+        )
+        with self.assertRaises(AuthorityError):
+            self.store.link_session(
+                self.alice, conversation_id(), item.work_item_id, attempt_id,
+                request_id="link-receipt-1",
+            )
+
+        unlinked = self.store.unlink_session(
+            self.alice, sid, expected_link_id=link.link_id,
+            request_id="unlink-receipt-1",
+        )
+        reopened = SecureWorkItemStore(
+            self.db, principal_directory=self.directory
+        )
+        reopened.initialize()
+        self.assertEqual(
+            reopened.unlink_session(
+                self.alice, sid, expected_link_id=link.link_id,
+                request_id="unlink-receipt-1",
+            ),
+            unlinked,
+        )
+        with self.assertRaises(AuthorityError):
+            reopened.unlink_session(
+                self.alice, sid, expected_link_id="sl_" + str(uuid.uuid4()),
+                request_id="unlink-receipt-1",
+            )
+
+
 class LandingEvidenceTests(Base):
     def test_caller_supplied_evidence_is_rejected(self) -> None:
         item = self.store.create_work_item(self.alice)

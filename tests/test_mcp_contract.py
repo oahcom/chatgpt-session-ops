@@ -135,12 +135,24 @@ class FakeStore:
         scope, request_id=None,
     ):
         self.calls.append(("grant", principal, target_principal_id, scope))
+        return {
+            "work_item_id": work_item_id,
+            "target_principal_id": target_principal_id,
+            "scope": scope,
+            "granted": True,
+        }
 
     def revoke(
         self, principal, work_item_id, target_principal_id,
         scope, request_id=None,
     ):
         self.calls.append(("revoke", principal, target_principal_id, scope))
+        return {
+            "work_item_id": work_item_id,
+            "target_principal_id": target_principal_id,
+            "scope": scope,
+            "revoked": True,
+        }
 
     def link_session(
         self,
@@ -732,14 +744,45 @@ class MCPContractTests(unittest.TestCase):
                 self.assertFalse(result["error"]["retryable"])
                 self.assertEqual(
                     result["error"]["details"],
-                    {"outcome": "indeterminate", "safe_to_retry": False},
+                    {
+                        "outcome": "indeterminate",
+                        "retry_with_same_request_id": True,
+                    },
                 )
             finally:
                 release.set()
 
             self.assertTrue(finished.wait(2), "late DB mutation did not finish")
-            page = store.list_work_items(Principal(TENANT, OWNER))
+            restarted_store = SecureWorkItemStore(
+                Path(directory) / "authority.sqlite3"
+            )
+            restarted_store.initialize()
+            replay = MCPToolService(restarted_store).dispatch(
+                "work_item.create", {}, self.auth, request_id="late-commit"
+            )
+            self.assertTrue(replay["ok"], replay)
+            page = restarted_store.list_work_items(Principal(TENANT, OWNER))
             self.assertEqual(len(page), 1)
+            self.assertEqual(
+                replay["data"]["work_item_id"], page[0].work_item_id
+            )
+
+    def test_zero_json_rpc_request_id_is_preserved_for_idempotency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = SecureWorkItemStore(Path(directory) / "authority.sqlite3")
+            store.initialize()
+            service = MCPToolService(store)
+            first = service.dispatch(
+                "work_item.create", {}, self.auth, request_id=0
+            )
+            replay = service.dispatch(
+                "work_item.create", {}, self.auth, request_id=0
+            )
+            self.assertTrue(first["ok"], first)
+            self.assertEqual(replay["data"], first["data"])
+            self.assertEqual(
+                len(store.list_work_items(Principal(TENANT, OWNER))), 1
+            )
 
     def test_queued_mutation_timeout_is_cancelled_before_execution(self):
         from concurrent.futures import Future

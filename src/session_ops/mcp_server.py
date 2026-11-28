@@ -1141,7 +1141,10 @@ def _exception_code(exc: BaseException) -> Tuple[str, Dict[str, Any]]:
         return "INVALID_ARGUMENT", {}
 
     if isinstance(exc, _IndeterminateOperation):
-        return "INDETERMINATE", {"outcome": "indeterminate", "safe_to_retry": False}
+        return "INDETERMINATE", {
+            "outcome": "indeterminate",
+            "retry_with_same_request_id": True,
+        }
     if isinstance(exc, _ResourceExhausted):
         return "RESOURCE_EXHAUSTED", {}
     if isinstance(exc, _DeadlineExceeded):
@@ -1172,6 +1175,11 @@ def _exception_code(exc: BaseException) -> Tuple[str, Dict[str, Any]]:
     if isinstance(exc, AuthorityError):
         message = str(exc).lower()
 
+        if "indeterminate" in message:
+            return "INDETERMINATE", {
+                "outcome": "indeterminate",
+                "reconciliation_required": True,
+            }
         if "changed" in message or "conflict" in message:
             return "CONFLICT", {}
 
@@ -1278,7 +1286,7 @@ class MCPToolService:
         request_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Execute one tool and always return the v0.1 envelope."""
-        request_id = request_id or str(uuid.uuid4())
+        request_id = str(request_id) if request_id is not None else str(uuid.uuid4())
         started = time.monotonic()
 
         try:
@@ -1359,7 +1367,7 @@ class MCPToolService:
                 data = _record_dict(result)
 
             elif name == "work_item.grant":
-                self._run_db(
+                data = self._run_db(
                     lambda: self.store.grant(
                         principal,
                         args["work_item_id"],
@@ -1370,15 +1378,8 @@ class MCPToolService:
                     mutation=True,
                 )
 
-                data = {
-                    "work_item_id": args["work_item_id"],
-                    "target_principal_id": args["target_principal_id"],
-                    "scope": args["scope"],
-                    "granted": True,
-                }
-
             elif name == "work_item.revoke":
-                self._run_db(
+                data = self._run_db(
                     lambda: self.store.revoke(
                         principal,
                         args["work_item_id"],
@@ -1388,13 +1389,6 @@ class MCPToolService:
                     ),
                     mutation=True,
                 )
-
-                data = {
-                    "work_item_id": args["work_item_id"],
-                    "target_principal_id": args["target_principal_id"],
-                    "scope": args["scope"],
-                    "revoked": True,
-                }
 
             elif name == "session.link":
                 result = self._run_db(
@@ -1681,7 +1675,9 @@ def build_mcp_server(
         return types.ListToolsResult(tools=tools)
 
     async def on_call_tool(ctx: Any, params: Any) -> Any:
-        request_id = str(ctx.request_id or uuid.uuid4())
+        request_id = str(
+            ctx.request_id if ctx.request_id is not None else uuid.uuid4()
+        )
         request = getattr(ctx, "request", None)
         auth = None
 
