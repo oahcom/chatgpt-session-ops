@@ -8,8 +8,9 @@ After=network-online.target
 [Service]
 Type=simple
 
-User=chatgpt-sender
-Group=chatgpt-sender
+User=ubuntu
+Group=ubuntu
+SupplementaryGroups=chatgpt-sender
 
 WorkingDirectory=/opt/so-mcp
 
