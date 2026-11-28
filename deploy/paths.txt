@@ -4,7 +4,6 @@ scripts/run_mcp_server.py
 # ChatGPT CLI and proof-of-work helper
 scripts/chatgpt_send.py
 scripts/pow_solver.py
-scripts/migrate_sender_owners.py
 
 # Application package
 src/session_ops/__init__.py
@@ -21,3 +20,4 @@ requirements-mcp.txt
 
 # Deployment integrity verifier
 tools/verify_deploy.py
+tools/migrate_sender_runtime_state.py
