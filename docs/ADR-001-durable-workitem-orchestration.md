@@ -67,7 +67,7 @@ Roles are `owner`, `coordinator`, `worker`, and `reviewer`. A role label is not 
 
 No Session may hold Owner/Coordinator and Worker/Reviewer roles for the same WorkItem. Worker cannot review its own Assignment; Reviewer cannot accept; Owner cannot be the Worker or Reviewer for the same slice. Different ChatGPT accounts are not required; Session and prompt/context separation is required. Session separation establishes agent-context independence, not independent human assurance.
 
-A WorkItem has at most one current Worker Assignment generation and at most one active Reviewer Assignment for a given Worker Assignment/head. Worker base SHA and Reviewer target head SHA are immutable. A changed head or Spec creates a new Worker revision Assignment when implementation continues and always requires a fresh Reviewer Session/Assignment for the new exact head. New commits are appended as Evidence; they do not mutate an Assignment's head. A changed head or Spec requires a fresh Reviewer Session and decision.
+A WorkItem has at most one current Worker Assignment generation and at most one active Reviewer Assignment for a given Worker Assignment/head. Worker base SHA and Reviewer target head SHA are immutable. A changed head or Spec creates a new Worker revision Assignment when implementation continues and always requires a fresh Reviewer Session/Assignment for the new exact head. New commits are appended as Evidence; they do not mutate an Assignment's head. Evidence tied to a prior head remains historical and cannot satisfy review or Acceptance for the new head.
 
 ### Authorization is separate from role
 
