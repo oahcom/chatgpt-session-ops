@@ -38,6 +38,11 @@ from src.session_ops.mcp_auth import (
     ScopeError,
     required_scopes_for_tool,
 )
+from src.session_ops.chatgpt_cli import ChatGPTCLIAdapter, SenderError
+from src.session_ops.chatgpt_sessions import (
+    ChatGPTSessionRegistry,
+    ChatGPTSessionRegistryError,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +72,8 @@ MAX_STRUCTURED_CONTENT_BYTES = MAX_MCP_RESPONSE_BYTES - 2048
 DB_DEADLINE_SECONDS = 3.0
 ADAPTER_DEADLINE_SECONDS = 8.0
 REQUEST_DEADLINE_SECONDS = 10.0
+CHATGPT_WRITE_DEADLINE_SECONDS = 1905.0
+CHATGPT_READ_DEADLINE_SECONDS = 30.0
 AUTH_VERIFY_DEADLINE_SECONDS = 3.5
 
 MCP_SERVER_NAME = "chatgpt-session-ops"
@@ -147,6 +154,12 @@ _STATUS = {
     "enum": ["active", "paused", "completed", "cancelled"],
 }
 _GRANT_SCOPE = {"type": "string", "enum": ["read", "write"]}
+_ACCOUNT = {"type": "string", "pattern": r"^(?:auto|default|acct[1-9][0-9]*)$", "default": "auto"}
+_PROMPT = {"type": "string", "minLength": 1, "maxLength": 32768}
+_MESSAGE_ID = {"type": "string", "minLength": 1, "maxLength": 256}
+_READ_LIMIT = {"type": "integer", "minimum": 1, "maximum": 50, "default": 20}
+_IDEMPOTENCY_KEY = {"type": "string", "pattern": r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"}
+_LIST_CURSOR = {"type": "string", "pattern": r"^[0-9]{1,10}$", "maxLength": 10}
 
 TOOL_SCHEMAS = {
     "work_item.create": _object_schema({}),
@@ -229,6 +242,25 @@ TOOL_SCHEMAS = {
         },
         ("session_id", "query"),
     ),
+    "chatgpt.session.create": _object_schema({
+        "account": _ACCOUNT,
+        "idempotency_key": _IDEMPOTENCY_KEY,
+    }),
+    "chatgpt.session.list": _object_schema({
+        "page_size": _PAGE_SIZE,
+        "cursor": _LIST_CURSOR,
+    }),
+    "chatgpt.session.send": _object_schema({
+        "conversation_id": _SESSION_ID,
+        "prompt": _PROMPT,
+        "account": _ACCOUNT,
+        "idempotency_key": _IDEMPOTENCY_KEY,
+    }, ("prompt",)),
+    "chatgpt.session.read": _object_schema({
+        "conversation_id": _SESSION_ID,
+        "after_message_id": _MESSAGE_ID,
+        "limit": _READ_LIMIT,
+    }, ("conversation_id",)),
 }
 
 TOOL_DESCRIPTIONS = {
@@ -242,6 +274,10 @@ TOOL_DESCRIPTIONS = {
     "session.unlink": "Unlink the active session link if it is visible.",
     "session.list": "List sessions linked to a visible WorkItem.",
     "session.context": "Retrieve memory only through the authorized active session link.",
+    "chatgpt.session.create": "Synchronously create a ChatGPT session using the local CLI and return its conversation id.",
+    "chatgpt.session.list": "List ChatGPT sessions owned by the authenticated principal.",
+    "chatgpt.session.send": "Synchronously send a prompt through the local CLI and return the completed send receipt.",
+    "chatgpt.session.read": "Read messages from a ChatGPT session owned by the authenticated principal.",
 }
 
 
@@ -373,6 +409,12 @@ def _validate_arguments(name: str, arguments: Any) -> Dict[str, Any]:
         supplied["include_unlinked"] = False
     if name == "session.context" and "limit" not in supplied:
         supplied["limit"] = MAX_CONTEXT_ENTRIES
+    if name in ("chatgpt.session.create", "chatgpt.session.send") and "account" not in supplied:
+        supplied["account"] = "auto"
+    if name == "chatgpt.session.list" and "page_size" not in supplied:
+        supplied["page_size"] = DEFAULT_PAGE_SIZE
+    if name == "chatgpt.session.read" and "limit" not in supplied:
+        supplied["limit"] = 20
 
     # cursor and query length are bounded by the schema maxLength enforced in
     # the per-type string branch above, so there is no separate check here.
@@ -406,6 +448,17 @@ def _page_dict(page: Any) -> Dict[str, Any]:
 
 
 def _exception_code(exc: BaseException) -> Tuple[str, Dict[str, Any]]:
+    if isinstance(exc, SenderError):
+        details = {"detail": exc.detail} if exc.detail else {}
+        if exc.upstream_status is not None:
+            details["upstream_status"] = exc.upstream_status
+        if exc.retry_after_seconds is not None:
+            details["retry_after_seconds"] = exc.retry_after_seconds
+        return exc.code, details
+
+    if isinstance(exc, ChatGPTSessionRegistryError):
+        return exc.code, {}
+
     if isinstance(exc, AuthenticationError):
         if getattr(exc, "category", "") == "dependency_unavailable":
             return "DEPENDENCY_UNAVAILABLE", {}
@@ -476,7 +529,7 @@ class MCPToolService:
     It is configuration, not a shared MemoryAdapterClient instance.
     """
 
-    def __init__(self, store: Any, *, memory_adapter: Optional[Sequence[str]] = None):
+    def __init__(self, store: Any, *, memory_adapter: Optional[Sequence[str]] = None, chatgpt_cli_path: Optional[str] = None):
         if store is None:
             raise ValueError("SecureWorkItemStore is required")
         self.store = store
@@ -489,6 +542,23 @@ class MCPToolService:
             if not command or not all(isinstance(part, str) and part for part in command):
                 raise ValueError("memory_adapter command is invalid")
             self.memory_adapter_command = command
+        self.chatgpt_registry = None
+        self.chatgpt_cli = None
+        if chatgpt_cli_path is not None:
+            if not isinstance(chatgpt_cli_path, str) or not chatgpt_cli_path:
+                raise ValueError("chatgpt_cli_path is invalid")
+            self.chatgpt_registry = ChatGPTSessionRegistry(store.database_path)
+            self.chatgpt_registry.initialize()
+            cli_root = __import__("os").path.dirname(__import__("os").path.dirname(chatgpt_cli_path))
+            self.chatgpt_cli = ChatGPTCLIAdapter(
+                chatgpt_cli_path,
+                timeout=1900.0,
+                read_timeout=20.0,
+                max_concurrency=4,
+                read_concurrency=2,
+                owner_lookup=self.chatgpt_registry.get_owner,
+                cwd=cli_root,
+            )
 
     @staticmethod
     def _run_db(function: Any) -> Any:
@@ -638,6 +708,99 @@ class MCPToolService:
                     started=started,
                 )
 
+            elif name == "chatgpt.session.create":
+                self._require_chatgpt_cli()
+                key = args.get("idempotency_key")
+                cached = self.chatgpt_registry.begin_idempotent(
+                    principal.tenant_id, principal.principal_id,
+                    name, key, {"account": args["account"]},
+                )
+                if cached is not None:
+                    data = cached
+                else:
+                    try:
+                        data = self.chatgpt_cli.create_session(args["account"])
+                        self.chatgpt_registry.register_session(
+                            data["conversation_id"], principal.tenant_id,
+                            principal.principal_id, data["account"],
+                        )
+                        self.chatgpt_registry.complete_idempotent(
+                            principal.tenant_id, principal.principal_id, name, key, data
+                        )
+                    except BaseException:
+                        self.chatgpt_registry.mark_unknown(
+                            principal.tenant_id, principal.principal_id, name, key
+                        )
+                        raise
+
+            elif name == "chatgpt.session.send":
+                self._require_chatgpt_cli()
+                key = args.get("idempotency_key")
+                payload = {
+                    "conversation_id": args.get("conversation_id"),
+                    "prompt": args["prompt"],
+                    "account": args["account"],
+                }
+                cached = self.chatgpt_registry.begin_idempotent(
+                    principal.tenant_id, principal.principal_id, name, key, payload
+                )
+                if cached is not None:
+                    data = cached
+                else:
+                    try:
+                        data = self.chatgpt_cli.send(
+                            args.get("conversation_id"), args["account"], args["prompt"],
+                            tenant_id=principal.tenant_id,
+                            principal_id=principal.principal_id,
+                        )
+                        self.chatgpt_registry.complete_idempotent(
+                            principal.tenant_id, principal.principal_id, name, key, data
+                        )
+                    except BaseException:
+                        self.chatgpt_registry.mark_unknown(
+                            principal.tenant_id, principal.principal_id, name, key
+                        )
+                        raise
+
+            elif name == "chatgpt.session.read":
+                self._require_chatgpt_cli()
+                data = self.chatgpt_cli.read(
+                    args["conversation_id"], None, args.get("after_message_id"),
+                    args["limit"], tenant_id=principal.tenant_id,
+                    principal_id=principal.principal_id,
+                )
+
+            elif name == "chatgpt.session.list":
+                self._require_chatgpt_cli()
+                all_items = []
+                partial = False
+                list_errors = []
+                next_cursor = None
+                for _ in range(100):
+                    page = self.chatgpt_cli.list_sessions(100, next_cursor)
+                    all_items.extend(page["items"])
+                    partial = partial or page.get("partial", False)
+                    list_errors.extend(page.get("errors", []))
+                    next_cursor = page.get("next_cursor")
+                    if next_cursor is None:
+                        break
+                else:
+                    raise _ResourceExhausted("ChatGPT session listing exceeded its page bound")
+                owned = self.chatgpt_registry.list_owned(
+                    principal.tenant_id, principal.principal_id
+                )
+                visible = [item for item in all_items if item["conversation_id"] in owned]
+                offset = int(args.get("cursor") or "0")
+                size = args["page_size"]
+                window = visible[offset:offset + size]
+                end = offset + size
+                data = {
+                    "items": window,
+                    "next_cursor": str(end) if end < len(visible) else None,
+                    "partial": partial,
+                    "errors": list_errors[:10],
+                }
+
             else:
                 raise ValueError("unknown tool")
 
@@ -649,6 +812,13 @@ class MCPToolService:
         except BaseException as exc:
             code, details = _exception_code(exc)
             return _error(code, request_id, details)
+
+    def _require_chatgpt_cli(self) -> None:
+        if self.chatgpt_cli is None or self.chatgpt_registry is None:
+            raise AuthenticationError(
+                "ChatGPT CLI is not configured",
+                category="dependency_unavailable",
+            )
 
     def _session_context(
         self,
@@ -771,6 +941,8 @@ def build_mcp_server(service: MCPToolService, token_provider: JWTVerifier) -> An
         "session_ops.session.read",
         "session_ops.session.write",
         "session_ops.context.read",
+        "session_ops.chatgpt.session.read",
+        "session_ops.chatgpt.session.write",
     )
     challenge_scope = " ".join(all_scopes)
 
@@ -809,10 +981,16 @@ def build_mcp_server(service: MCPToolService, token_provider: JWTVerifier) -> An
                     request_id=request_id,
                 ),
             )
+            if params.name in ("chatgpt.session.create", "chatgpt.session.send"):
+                tool_timeout = CHATGPT_WRITE_DEADLINE_SECONDS
+            elif params.name in ("chatgpt.session.read", "chatgpt.session.list"):
+                tool_timeout = CHATGPT_READ_DEADLINE_SECONDS
+            else:
+                tool_timeout = REQUEST_DEADLINE_SECONDS
             try:
                 envelope = await asyncio.wait_for(
                     future,
-                    timeout=REQUEST_DEADLINE_SECONDS,
+                    timeout=tool_timeout,
                 )
             except asyncio.TimeoutError:
                 envelope = _error("TIMEOUT", request_id)
