@@ -566,6 +566,87 @@ class OperationReceiptTests(Base):
         finally:
             conn.close()
 
+    def test_process_restart_during_indeterminate_transaction_rolls_back_and_replays(self):
+        import subprocess
+        import time
+
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "crash-recovery.sqlite3"
+            ready = Path(directory) / "transaction-open"
+            idempotency_key = str(uuid.uuid4())
+            child = r"""
+import sys
+import time
+from pathlib import Path
+from src.session_ops.authority import Principal, SecureWorkItemStore
+
+database, ready, tenant_id, principal_id, idempotency_key = sys.argv[1:]
+store = SecureWorkItemStore(database)
+store.initialize()
+
+def hold_before_receipt_commit(conn, principal, tool_name, receipt_key, result):
+    Path(ready).write_text("open", encoding="utf-8")
+    while True:
+        time.sleep(1)
+
+store._operation_complete = hold_before_receipt_commit
+store.create_work_item(
+    Principal(tenant_id, principal_id),
+    request_id="rpc-before-crash",
+    idempotency_key=idempotency_key,
+)
+"""
+            process = subprocess.Popen(
+                [
+                    sys.executable, "-c", child, str(database), str(ready),
+                    self.alice.tenant_id, self.alice.principal_id, idempotency_key,
+                ],
+                cwd=str(ROOT),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and not ready.exists():
+                    if process.poll() is not None:
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(
+                    ready.exists(),
+                    "child did not reach the uncommitted mutation/receipt transaction",
+                )
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                _stdout, stderr = process.communicate(timeout=5)
+
+            reopened = SecureWorkItemStore(
+                database, principal_directory=self.directory
+            )
+            reopened.initialize()
+            replay = reopened.create_work_item(
+                self.alice,
+                request_id="rpc-after-process-restart",
+                idempotency_key=idempotency_key,
+            )
+            conn = reopened._connect()
+            try:
+                work_items = conn.execute(
+                    "SELECT work_item_id FROM work_items"
+                ).fetchall()
+                receipts = conn.execute(
+                    "SELECT state FROM authority_operation_receipts WHERE request_id=?",
+                    (idempotency_key,),
+                ).fetchall()
+            finally:
+                conn.close()
+            self.assertEqual(len(work_items), 1)
+            self.assertEqual(work_items[0]["work_item_id"], replay.work_item_id)
+            self.assertEqual(len(receipts), 1)
+            self.assertEqual(receipts[0]["state"], "completed")
+
+
 class LandingEvidenceTests(Base):
     def test_caller_supplied_evidence_is_rejected(self) -> None:
         item = self.store.create_work_item(self.alice)
