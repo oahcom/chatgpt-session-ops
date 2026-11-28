@@ -483,6 +483,10 @@ def main(argv: list[str] | None = None) -> int:
     if not names:
         print('No configured acctN accounts found')
         return 1
+    invalid = [name for name in names if not re.fullmatch(r'acct[1-9][0-9]*', name)]
+    if invalid:
+        print('INVALID_ARGUMENT: account names must match acctN: ' + ', '.join(invalid))
+        return 1
     rows = [eligibility(n, args.capability) for n in names]
 
     if args.json:
