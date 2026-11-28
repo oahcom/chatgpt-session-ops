@@ -578,12 +578,12 @@ class AuthMiddlewarePathRegressionTests(unittest.TestCase):
     def test_mcp_endpoint_itself_is_authenticated(self):
         app, inner_calls = self.build_app_without_installed_mcp_sdk()
         messages = self.asgi_request(app, "/mcp")
-        status = next(
-            message["status"]
-            for message in messages
-            if message["type"] == "http.response.start"
-        )
+        response = next(message for message in messages if message["type"] == "http.response.start")
+        status = response["status"]
         self.assertEqual(status, 401)
+        challenge = dict(response["headers"])[b"www-authenticate"].decode("latin-1")
+        self.assertIn("session_ops.chatgpt.session.read", challenge)
+        self.assertIn("session_ops.chatgpt.session.write", challenge)
         self.assertEqual(inner_calls, [])
 
     def test_health_and_protected_resource_metadata_remain_public(self):

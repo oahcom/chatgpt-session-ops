@@ -786,6 +786,11 @@ def build_mcp_server(
         "session_ops.session.read",
         "session_ops.session.write",
         "session_ops.context.read",
+        # Events subscriptions have a separate lifecycle authority. Keep
+        # these scopes explicit in the OAuth challenge rather than silently
+        # aliasing them to generic session write access.
+        "session_ops.chatgpt.session.read",
+        "session_ops.chatgpt.session.write",
     )
     challenge_scope = " ".join(all_scopes)
 
