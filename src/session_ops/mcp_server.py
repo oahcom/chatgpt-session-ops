@@ -88,10 +88,14 @@ MCP_SERVER_VERSION = "0.1.0"
 
 # A bounded shared pool. A timed-out SQLite call is still bounded by the
 # authority store's own SQLite timeout/busy_timeout configuration.
+_DB_WORKERS = 8
 _DB_EXECUTOR = ThreadPoolExecutor(
-    max_workers=8,
+    max_workers=_DB_WORKERS,
     thread_name_prefix="session-ops-db",
 )
+# ThreadPoolExecutor has an unbounded internal queue. Match admission to the
+# worker count so timed-out calls cannot accumulate behind the pool.
+_DB_SLOTS = threading.BoundedSemaphore(_DB_WORKERS)
 
 # Unauthenticated requests must not consume the event loop's shared default
 # executor. Bound both active and queued verification work independently.
@@ -114,6 +118,11 @@ _SEND_MAX_INFLIGHT = 9  # one executing plus at most eight waiting
 
 class _DeadlineExceeded(Exception):
     pass
+
+
+class _IndeterminateOperation(Exception):
+    """A mutation started but did not finish before the caller deadline."""
+
 
 
 class _ResourceExhausted(Exception):
@@ -338,6 +347,7 @@ _ERROR_MESSAGES = {
     "RESOURCE_EXHAUSTED": "resource limit exceeded",
     "DEPENDENCY_UNAVAILABLE": "required dependency is unavailable",
     "TIMEOUT": "operation timed out",
+    "INDETERMINATE": "operation outcome is indeterminate; do not retry automatically",
     "INTERNAL": "internal error",
 }
 
@@ -351,6 +361,7 @@ _RETRYABLE = {
     "RESOURCE_EXHAUSTED": True,
     "DEPENDENCY_UNAVAILABLE": True,
     "TIMEOUT": True,
+    "INDETERMINATE": False,
     "INTERNAL": False,
 }
 
@@ -510,6 +521,9 @@ def _exception_code(exc: BaseException) -> Tuple[str, Dict[str, Any]]:
     if isinstance(exc, (InvalidIdentifier, InvalidPrincipal, ValueError, TypeError)):
         return "INVALID_ARGUMENT", {}
 
+    if isinstance(exc, _IndeterminateOperation):
+        return "INDETERMINATE", {"outcome": "indeterminate", "safe_to_retry": False}
+
     if isinstance(exc, _DeadlineExceeded):
         return "TIMEOUT", {}
 
@@ -575,13 +589,31 @@ class MCPToolService:
             self.memory_adapter_command = command
 
     @staticmethod
-    def _run_db(function: Any) -> Any:
-        future = _DB_EXECUTOR.submit(function)
+    def _run_db(function: Any, *, mutation: bool = False) -> Any:
+        if not _DB_SLOTS.acquire(blocking=False):
+            raise _ResourceExhausted("database operation capacity is full")
+        try:
+            future = _DB_EXECUTOR.submit(function)
+        except BaseException:
+            _DB_SLOTS.release()
+            raise
+        # Keep capacity occupied until the callable actually stops, including
+        # when the MCP caller times out or disconnects.
+        future.add_done_callback(lambda _future: _DB_SLOTS.release())
         try:
             return future.result(timeout=DB_DEADLINE_SECONDS)
         except FutureTimeout:
-            future.cancel()
-            raise _DeadlineExceeded("database operation exceeded deadline")
+            # A queued future can be cancelled safely. A running callable
+            # cannot: it may still commit after this request returns.
+            if future.cancel():
+                raise _DeadlineExceeded("database operation cancelled before start")
+            if future.done():
+                return future.result()
+            if mutation:
+                raise _IndeterminateOperation(
+                    "database mutation is still running after caller deadline"
+                )
+            raise _DeadlineExceeded("database read exceeded deadline")
 
     def dispatch(
         self,
@@ -607,7 +639,7 @@ class MCPToolService:
 
             if name == "work_item.create":
                 result = self._run_db(
-                    lambda: self.store.create_work_item(principal)
+                    lambda: self.store.create_work_item(principal), mutation=True
                 )
                 data = _record_dict(result)
 
@@ -636,7 +668,8 @@ class MCPToolService:
                         args["status"],
                         expected_updated_at=args.get("expected_updated_at"),
                         request_id=request_id,
-                    )
+                    ),
+                    mutation=True,
                 )
                 data = _record_dict(result)
 
@@ -648,7 +681,8 @@ class MCPToolService:
                         args["target_principal_id"],
                         args["scope"],
                         request_id=request_id,
-                    )
+                    ),
+                    mutation=True,
                 )
                 data = {
                     "work_item_id": args["work_item_id"],
@@ -665,7 +699,8 @@ class MCPToolService:
                         args["target_principal_id"],
                         args["scope"],
                         request_id=request_id,
-                    )
+                    ),
+                    mutation=True,
                 )
                 data = {
                     "work_item_id": args["work_item_id"],
@@ -683,7 +718,8 @@ class MCPToolService:
                         args.get("attempt_id"),
                         evidence=None,
                         request_id=request_id,
-                    )
+                    ),
+                    mutation=True,
                 )
                 data = _record_dict(result)
 
@@ -694,7 +730,8 @@ class MCPToolService:
                         args["session_id"],
                         expected_link_id=args.get("expected_link_id"),
                         request_id=request_id,
-                    )
+                    ),
+                    mutation=True,
                 )
                 data = {
                     "unlinked": result is not None,

@@ -10,6 +10,8 @@ or real Memory Adapter subprocess is used.
 
 import importlib
 import tempfile
+import threading
+import time
 import uuid
 import unittest
 from pathlib import Path
@@ -666,6 +668,75 @@ class MCPContractTests(unittest.TestCase):
                     },
                     "boolean argument required",
                 )
+
+    # --------------------------------------------------------------
+    # DB timeout certainty and bounded admission (#205)
+    # --------------------------------------------------------------
+
+    def test_running_mutation_timeout_is_indeterminate_and_can_commit_later(self):
+        from src.session_ops import mcp_server
+
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        with tempfile.TemporaryDirectory() as directory:
+            store = SecureWorkItemStore(Path(directory) / "authority.sqlite3")
+            store.initialize()
+            original_create = store.create_work_item
+
+            def delayed_create(principal):
+                started.set()
+                if not release.wait(2):
+                    raise AssertionError("test did not release delayed mutation")
+                try:
+                    return original_create(principal)
+                finally:
+                    finished.set()
+
+            store.create_work_item = delayed_create
+            service = MCPToolService(store)
+            try:
+                with patch.object(mcp_server, "DB_DEADLINE_SECONDS", 0.05):
+                    result = service.dispatch(
+                        "work_item.create", {}, self.auth, request_id="late-commit"
+                    )
+                self.assertTrue(started.wait(1), "DB mutation never started")
+                self.assert_error(result, "INDETERMINATE")
+                self.assertFalse(result["error"]["retryable"])
+                self.assertEqual(
+                    result["error"]["details"],
+                    {"outcome": "indeterminate", "safe_to_retry": False},
+                )
+            finally:
+                release.set()
+
+            self.assertTrue(finished.wait(2), "late DB mutation did not finish")
+            page = store.list_work_items(Principal(TENANT, OWNER))
+            self.assertEqual(len(page), 1)
+
+    def test_queued_mutation_timeout_is_cancelled_before_execution(self):
+        from concurrent.futures import Future
+        from src.session_ops import mcp_server
+
+        pending = Future()
+
+        class PendingExecutor:
+            def submit(self, function):
+                return pending
+
+        with patch.object(mcp_server, "_DB_EXECUTOR", PendingExecutor()):
+            with patch.object(mcp_server, "DB_DEADLINE_SECONDS", 0.01):
+                with self.assertRaises(mcp_server._DeadlineExceeded):
+                    MCPToolService._run_db(lambda: None, mutation=True)
+        self.assertTrue(pending.cancelled())
+
+    def test_db_executor_rejects_work_when_all_admission_slots_are_occupied(self):
+        from src.session_ops import mcp_server
+
+        with patch.object(mcp_server, "_DB_SLOTS", threading.BoundedSemaphore(0)):
+            result = self.dispatch("work_item.create")
+        self.assert_error(result, "RESOURCE_EXHAUSTED")
+        self.assertEqual(self.store.created, [])
 
     # --------------------------------------------------------------
     # Non-disclosure and trusted evidence
