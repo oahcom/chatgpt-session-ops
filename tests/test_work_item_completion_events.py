@@ -51,7 +51,7 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         callback_url: str = "https://events.example.test/work-item-completed",
         principal: Principal | None = None,
         job_id: str | None = None,
-    ) -> None:
+    ) -> str:
         principal = principal or self.principal
         auth = SimpleNamespace(principal=SimpleNamespace(
             tenant_id=principal.tenant_id,
@@ -63,11 +63,12 @@ class WorkItemCompletionEventTests(unittest.TestCase):
             "secret": "whsec_" + base64.b64encode(b"s" * 32).decode(),
         }
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
-            self.events.subscribe(auth, {
+            subscription = self.events.subscribe(auth, {
                 "name": "chatgpt.job.completed",
                 "arguments": ({"job_id": job_id} if job_id else {}),
                 "delivery": delivery,
             })
+        return subscription["id"]
 
     def _create_linked_item(self):
         item = self.store.create_work_item(self.principal)
@@ -205,6 +206,53 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         self.assertEqual(dict(delivered), {
             "https://events.example.test/owner-a": first.work_item_id,
             "https://events.example.test/owner-b": second.work_item_id})
+    def test_multiple_owners_can_share_one_destination_chat_without_cross_delivery(self):
+        other = Principal("tenant-a", "another-owner")
+        shared_callback = "https://events.example.test/shared-work-chat"
+        owner_a_subscription = self._subscribe(shared_callback, principal=self.principal)
+        owner_b_subscription = self._subscribe(shared_callback, principal=other)
+        self.assertNotEqual(owner_a_subscription, owner_b_subscription)
+
+        first = self.store.create_work_item(self.principal)
+        second = self.store.create_work_item(other)
+        self.store.finish_work_item(self.principal, first.work_item_id, "completed")
+        self.store.finish_work_item(other, second.work_item_id, "completed")
+
+        self.assertEqual(self.events.deliver_pending(), 2)
+        delivered = [
+            (url, json.loads(body))
+            for url, body, _headers in self.callback.requests
+            if json.loads(body).get("type") != "verification"
+        ]
+        self.assertEqual(len(delivered), 2)
+        self.assertEqual({url for url, _event in delivered}, {shared_callback})
+        self.assertEqual(
+            {event["data"]["job_id"] for _url, event in delivered},
+            {first.work_item_id, second.work_item_id},
+        )
+
+        with self.events._db() as db:
+            rows = db.execute(
+                """SELECT e.event_id, e.principal_id AS event_principal,
+                          s.principal_id AS subscription_principal
+                   FROM event_deliveries d
+                   JOIN event_outbox e ON e.event_id=d.event_id
+                   JOIN event_subscriptions s ON s.id=d.subscription_id"""
+            ).fetchall()
+        self.assertEqual(len(rows), 2)
+        owner_by_event = {row["event_id"]: row["event_principal"] for row in rows}
+        subscription_owner_by_event = {
+            row["event_id"]: row["subscription_principal"] for row in rows
+        }
+        self.assertEqual(owner_by_event, subscription_owner_by_event)
+        self.assertEqual(
+            set(owner_by_event.values()),
+            {self.principal.principal_id, other.principal_id},
+        )
+        self.assertEqual(
+            {event["eventId"] for _url, event in delivered}, set(owner_by_event)
+        )
+
     def test_subscribed_chat_receives_completion_without_source_session_link(self):
         self._subscribe()
         item = self.store.create_work_item(self.principal)
