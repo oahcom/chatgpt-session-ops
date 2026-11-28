@@ -4610,6 +4610,10 @@ class ThinkingModelUnavailable(RuntimeError):
         )
 
 
+class RemoteSendOutcomeUnknown(RuntimeError):
+    """The conversation POST may have been accepted; never rotate or replay."""
+
+
 def _cookie_domain_allowed(domain):
     """Cookie 持久化边界（DECISION-156）：只允许 OpenAI 自有域。
 
@@ -5221,10 +5225,18 @@ class ChatGPTAPI:
             body["conversation_id"] = conv_id
         if parent_message_id:  # 可选：GET 限速时省略，落点仍由 SSE 首事件唯一 id 校验
             body["parent_message_id"] = parent_message_id
-        return self.req("POST", API_BASE + "/backend-api/conversation", body, {
+        # Default to UNKNOWN before touching the network. A socket exception
+        # after the request write cannot prove that ChatGPT did not accept it.
+        self.last_send_certainty = "UNKNOWN"
+        status, response = self.req("POST", API_BASE + "/backend-api/conversation", body, {
             "OpenAI-Sentinel-Chat-Requirements-Token": req_token,
             "OpenAI-Sentinel-Proof-Token": proof,
         }, timeout=timeout)
+        if 200 <= status < 300:
+            self.last_send_certainty = "SUBMITTED"
+        elif status in (400, 401, 403, 404, 413, 422, 429):
+            self.last_send_certainty = "NOT_SUBMITTED"
+        return status, response
 
     # ---------- 思考模式 ----------
     @staticmethod
@@ -7123,6 +7135,18 @@ def _send_prompt_impl(
                   % (send_timeout, SEND_TIMEOUT_SOURCE or "env"), flush=True)
         st, resp = api.send(conv_id, text, tail, req_token, proof, model=model,
                             timeout=send_timeout)
+        send_certainty = getattr(api, "last_send_certainty", None)
+        if send_certainty is None:
+            send_certainty = (
+                "NOT_SUBMITTED"
+                if st in (400, 401, 403, 404, 413, 422, 429)
+                else "UNKNOWN"
+            )
+        if st != 200 and send_certainty in ("UNKNOWN", "SUBMITTED"):
+            raise RemoteSendOutcomeUnknown(
+                "ChatGPT conversation POST did not return an authoritative response "
+                "(status=%s); do not retry or rotate accounts" % st
+            )
         # 截断/超时被 _partial_result 折成 200 交回既有解析链路（不丢字节），但
         # `SEND ... -> 200` 是唯一送达凭证——截断响应绝不能打它，否则一次超时
         # 在日志、退出码、会话登记三个门禁上同时是绿的（DEF-ops-01）。
@@ -7630,6 +7654,12 @@ def _attempt_create(st, name, prompt_file, attempts, thinking=None):
         "status": status,
         "conv_id": conv,
     })
+
+    if isinstance(conv, ConvRef) and conv.mismatch:
+        # HTTP 200 with no unique verified conversation ID is already a
+        # possible remote create. Preserve the candidate but stop rotation.
+        attempts[-1]["status"] = "OUTCOME_UNKNOWN"
+        return "OUTCOME_UNKNOWN", None
 
     if status == 200:
         return status, conv
