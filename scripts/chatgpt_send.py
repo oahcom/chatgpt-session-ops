@@ -1711,7 +1711,7 @@ RUN_MAX_SEC = 3600    # 单次运行上限，超时记 TIMEOUT 并释放租约�
 
 
 def _slots_dir(base=None):
-    return os.path.join(base or BASE, "slots")
+    return os.path.join(base or STATE_DIR, "slots")
 
 
 def _lease_reclaimable(info, now=None, expect_run_id=None):
@@ -1769,7 +1769,7 @@ def _record_corruption(kind, path, why):
            "size": _size_of(path), "sha256": digest}
     ok = True
     try:
-        with open(os.path.join(BASE, "corrupt-registry.jsonl"), "a", encoding="utf-8") as f:
+        with open(os.path.join(STATE_DIR, "corrupt-registry.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()
     except OSError as e:
@@ -5656,7 +5656,7 @@ def anon_archive_path(conv_id):
     因此 `--anon-read ../../x` 之类不会在工作目录外写出文件。
     """
     short = id8(conv_id, "unknown")
-    base = os.path.join(BASE, "anon-sessions", short)
+    base = os.path.join(STATE_DIR, "anon-sessions", short)
     path = base + ".md"
     if os.path.exists(path):
         try:
@@ -6040,7 +6040,7 @@ def _quarantine_reply(api, target_conv, actual_conv, reply, resp, status, pfile)
 # 目录含私有对话内容，与 replies/ 同等级：已由 .gitignore 排除，绝不入库。
 
 def log_root():
-    return os.path.join(BASE, "logs")
+    return os.path.join(STATE_DIR, "logs")
 
 def log_dir():
     """已确认 conv_id 的会话日志。按 BASE 惰性解析——测试改 BASE 即自动隔离。"""
