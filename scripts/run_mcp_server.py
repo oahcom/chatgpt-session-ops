@@ -317,6 +317,15 @@ def load_config() -> dict[str, Any]:
         raise RuntimeError("ChatGPT CLI script is unavailable")
     chatgpt_cli_path = str(chatgpt_cli_path.resolve())
 
+    legacy_sender_db_value = os.environ.get("SO_MCP_LEGACY_SENDER_DB", "").strip()
+    legacy_sender_db_path = (
+        Path(legacy_sender_db_value).expanduser() if legacy_sender_db_value else None
+    )
+    if legacy_sender_db_path is not None:
+        if not legacy_sender_db_path.is_absolute() or not legacy_sender_db_path.is_file():
+            raise RuntimeError("SO_MCP_LEGACY_SENDER_DB must name an existing absolute database path")
+        legacy_sender_db_path = str(legacy_sender_db_path.resolve())
+
     return {
         "issuer": issuer,
         "audience": audience,
@@ -329,6 +338,7 @@ def load_config() -> dict[str, Any]:
         "discovery_url": discovery_url,
         "memory_adapter_command": memory_adapter_command,
         "chatgpt_cli_path": chatgpt_cli_path,
+        "legacy_sender_db_path": legacy_sender_db_path,
     }
 
 
@@ -531,6 +541,7 @@ def create_application(config: dict[str, Any]) -> Any:
         store,
         memory_adapter=config.get("memory_adapter_command"),
         chatgpt_cli_path=config.get("chatgpt_cli_path"),
+        legacy_sender_db_path=config.get("legacy_sender_db_path"),
     )
     mcp_app = build_mcp_server(service, verifier)
 
