@@ -181,7 +181,12 @@ def _rotation_order():
 
 ROTATION_FALLBACK = ("nologin",)
 
-STATE_DIR = os.path.abspath(os.environ.get("CHATGPT_STATE_DIR") or BASE)
+def _state_dir():
+    """Resolve runtime state lazily so tests can isolate BASE without global env."""
+    return os.path.abspath(os.environ.get("CHATGPT_STATE_DIR") or BASE)
+
+
+STATE_DIR = _state_dir()
 os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
 ROTATION_FILE = os.path.join(STATE_DIR, "account-rotation.json")
 CONV_MAP_FILE = os.path.join(STATE_DIR, "conv-accounts.json")
@@ -1711,7 +1716,7 @@ RUN_MAX_SEC = 3600    # 单次运行上限，超时记 TIMEOUT 并释放租约�
 
 
 def _slots_dir(base=None):
-    return os.path.join(base or STATE_DIR, "slots")
+    return os.path.join(base or _state_dir(), "slots")
 
 
 def _lease_reclaimable(info, now=None, expect_run_id=None):
@@ -1769,7 +1774,7 @@ def _record_corruption(kind, path, why):
            "size": _size_of(path), "sha256": digest}
     ok = True
     try:
-        with open(os.path.join(STATE_DIR, "corrupt-registry.jsonl"), "a", encoding="utf-8") as f:
+        with open(os.path.join(_state_dir(), "corrupt-registry.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()
     except OSError as e:
@@ -5656,7 +5661,7 @@ def anon_archive_path(conv_id):
     因此 `--anon-read ../../x` 之类不会在工作目录外写出文件。
     """
     short = id8(conv_id, "unknown")
-    base = os.path.join(STATE_DIR, "anon-sessions", short)
+    base = os.path.join(_state_dir(), "anon-sessions", short)
     path = base + ".md"
     if os.path.exists(path):
         try:
@@ -6040,7 +6045,7 @@ def _quarantine_reply(api, target_conv, actual_conv, reply, resp, status, pfile)
 # 目录含私有对话内容，与 replies/ 同等级：已由 .gitignore 排除，绝不入库。
 
 def log_root():
-    return os.path.join(STATE_DIR, "logs")
+    return os.path.join(_state_dir(), "logs")
 
 def log_dir():
     """已确认 conv_id 的会话日志。按 BASE 惰性解析——测试改 BASE 即自动隔离。"""
