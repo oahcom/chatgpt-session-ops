@@ -62,10 +62,11 @@ class SenderChildAccountRootsTests(unittest.TestCase):
         # acct1/default credentials live directly in CHATGPT_AUTH_DIR.
         (self.auth_root / "cookies.json").write_text("[]")
         (self.auth_root / "access_token.txt").write_text("fixture-acct1-token-not-a-secret")
-        # Gateway discovery scans SO_SENDER_ACCOUNTS_DIR/acctN. Model the
-        # compatibility layout with acct1 pointing back to the CLI auth root.
+        # acct1 is a real, empty legacy marker directory under the Gateway
+        # accounts root. Its credentials remain independently rooted at
+        # CHATGPT_AUTH_DIR; Gateway and CLI must agree on that mapping.
         self.accounts_root.mkdir(parents=True, exist_ok=True)
-        (self.accounts_root / "acct1").symlink_to(self.auth_root, target_is_directory=True)
+        (self.accounts_root / "acct1").mkdir()
         auth_account = self.accounts_root / "acct10"
         auth_account.mkdir(parents=True)
         (auth_account / "cookies.json").write_text("[]")
@@ -153,6 +154,31 @@ print(json.dumps({
             str(self.auth_root / "accounts/acct10"),
         )
         self.assertTrue(result["acct10_token_loaded"])
+
+    def test_gateway_discovery_rejects_symlink_account_dirs_and_credential_files(self):
+        sys.path.insert(0, str(self.root / "so-sender"))
+        try:
+            from sender_gateway.account_directory import discover_accounts
+        finally:
+            sys.modules.pop("sender_gateway.account_router", None)
+            sys.modules.pop("sender_gateway.account_directory", None)
+            sys.modules.pop("sender_gateway", None)
+            sys.path.remove(str(self.root / "so-sender"))
+
+        symlink_dir = self.accounts_root / "acct11"
+        symlink_dir.symlink_to(self.accounts_root / "acct10", target_is_directory=True)
+
+        symlink_file_dir = self.accounts_root / "acct12"
+        symlink_file_dir.mkdir()
+        (symlink_file_dir / "cookies.json").symlink_to(
+            self.accounts_root / "acct10/cookies.json"
+        )
+        (symlink_file_dir / "access_token.txt").write_text(
+            "fixture-acct12-token-not-a-secret"
+        )
+
+        found = discover_accounts(self.accounts_root, auth_root=self.auth_root)
+        self.assertEqual(found, ("acct1", "acct10"))
 
     def test_unset_roots_are_not_added_to_child_environment(self):
         os.environ.pop("SO_SENDER_ACCOUNTS_DIR", None)

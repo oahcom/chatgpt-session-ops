@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/so-sender/sender_gateway/account_directory.py
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,76 @@
 +"""Shared credential-directory contract for Sender Gateway and CLI."""
 +from __future__ import annotations
 +import os
@@ -9,7 +9,14 @@
 +_CREDENTIAL_FILES = ("cookies.json", "access_token.txt")
 +
 +def has_credentials(path: Path) -> bool:
-+    return path.is_dir() and all((path / name).is_file() for name in _CREDENTIAL_FILES)
++    # Preserve Gateway's no-symlink trust boundary for both account dirs and
++    # credential markers; Path.is_dir()/is_file() alone follow symlinks.
++    if path.is_symlink() or not path.is_dir():
++        return False
++    return all(
++        not (path / name).is_symlink() and (path / name).is_file()
++        for name in _CREDENTIAL_FILES
++    )
 +
 +class AccountDirectoryResolver:
 +    def __init__(self, auth_root, accounts_dir=None):
@@ -37,8 +44,6 @@
 +        if account in ("default", "acct1"):
 +            root_has = has_credentials(self.auth_root)
 +            legacy = self.accounts_dir / "acct1"
-+            if legacy.is_symlink() and legacy.resolve() == self.auth_root.resolve():
-+                return self.auth_root
 +            legacy_has = has_credentials(legacy)
 +            if root_has and legacy_has and legacy.resolve() != self.auth_root.resolve():
 +                raise ValueError("ambiguous acct1 credential directories")

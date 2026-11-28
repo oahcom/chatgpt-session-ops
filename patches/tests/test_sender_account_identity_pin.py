@@ -191,14 +191,16 @@ class SenderAccountIdentityPinTests(unittest.TestCase):
                 self.cli.resolve_proxy_info, self.cli.require_proxy, self.cli.build_opener_for
             ) = old_helpers
 
-    def test_shared_path_contract_acct1_symlink_and_acct2_plus(self):
+    def test_shared_path_contract_acct1_root_credentials_and_acct2_plus(self):
         auth_root = self.root / "contract-symlink-root"
         accounts_dir = auth_root / "accounts"
         self._write_synthetic_credentials(auth_root, "acct1-root-token")
         self._write_synthetic_credentials(accounts_dir / "acct2", "acct2-token")
         self._write_synthetic_credentials(accounts_dir / "acct10", "acct10-token")
         accounts_dir.mkdir(parents=True, exist_ok=True)
-        (accounts_dir / "acct1").symlink_to(auth_root, target_is_directory=True)
+        # Legacy Gateway marker is a real empty directory; acct1 credentials
+        # are independently rooted at CHATGPT_AUTH_DIR, never via a symlink.
+        (accounts_dir / "acct1").mkdir()
 
         os.environ["CHATGPT_AUTH_DIR"] = str(auth_root)
         os.environ["SO_SENDER_ACCOUNTS_DIR"] = str(accounts_dir)
