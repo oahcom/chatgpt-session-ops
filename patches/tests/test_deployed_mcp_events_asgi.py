@@ -139,8 +139,59 @@ class DeployedMCPEventsTests(unittest.TestCase):
         dispatcher._run(stop)
         self.assertEqual(collector.calls, 2)
         self.assertEqual(store.cleaned, 1)
-        self.assertEqual(store.deliveries, 2)
+        self.assertEqual(store.deliveries, 1)
         self.assertEqual(store.asserted_limit, 1)
+
+    def test_dispatcher_does_not_start_webhook_after_stop_during_collection(self):
+        import threading
+
+        stop = threading.Event()
+        class Collector:
+            def run_once(self):
+                stop.set()
+                return 0
+        class Store:
+            def __init__(self):
+                self.cleanup_calls = 0
+                self.delivery_calls = 0
+            def cleanup_expired(self):
+                self.cleanup_calls += 1
+            def deliver_pending(self, **_kwargs):
+                self.delivery_calls += 1
+                return 0
+
+        store = Store()
+        MCPEventDispatcher(Collector(), store, poll_seconds=0.05)._run(stop)
+        self.assertEqual(store.cleanup_calls, 0)
+        self.assertEqual(store.delivery_calls, 0)
+
+    def test_dispatcher_stop_waits_for_inflight_collection_to_finish(self):
+        import threading
+
+        entered = threading.Event()
+        release = threading.Event()
+        stopped = threading.Event()
+        class Collector:
+            def run_once(self):
+                entered.set()
+                release.wait(2)
+                return 0
+        class Store:
+            def cleanup_expired(self):
+                return None
+            def deliver_pending(self, **_kwargs):
+                return 0
+
+        dispatcher = MCPEventDispatcher(Collector(), Store(), poll_seconds=0.05)
+        dispatcher.start()
+        self.assertTrue(entered.wait(1))
+        stopper = threading.Thread(target=lambda: (dispatcher.stop(), stopped.set()))
+        stopper.start()
+        self.assertFalse(stopped.wait(0.05))
+        release.set()
+        stopper.join(2)
+        self.assertTrue(stopped.is_set())
+        self.assertIsNone(dispatcher._thread)
 
     def test_events_key_file_requires_private_service_owned_raw_key(self):
         with tempfile.TemporaryDirectory(dir="/dev/shm") as tmp:

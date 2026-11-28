@@ -12,7 +12,7 @@
  
  #: Top-level job fields the client owns; business arguments go in ``payload``.
  _RESERVED_JOB_FIELDS = frozenset({"operation", "idempotency_key", "payload"})
-@@ -755,6 +760,40 @@
+@@ -755,6 +760,42 @@
              timeout_code="TIMEOUT",
          )
  
@@ -28,6 +28,7 @@
 +            self._base_path + EVENTS_PATH + "/claim",
 +            {"worker_id": worker_id, "limit": limit},
 +            EVENT_DISPATCHER_IDENTITY,
++            timeout=min(self.read_timeout_seconds, 5.0),
 +            timeout_code="TIMEOUT",
 +        )
 +
@@ -47,6 +48,7 @@
 +            self._base_path + EVENTS_PATH + "/" + quote(event_id, safe="") + "/ack",
 +            {"lease_token": lease_token},
 +            EVENT_DISPATCHER_IDENTITY,
++            timeout=min(self.read_timeout_seconds, 5.0),
 +            timeout_code="TIMEOUT",
 +        )
 +

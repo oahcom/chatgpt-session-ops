@@ -772,6 +772,7 @@ class SenderGatewayClient:
             self._base_path + EVENTS_PATH + "/claim",
             {"worker_id": worker_id, "limit": limit},
             EVENT_DISPATCHER_IDENTITY,
+            timeout=min(self.read_timeout_seconds, 5.0),
             timeout_code="TIMEOUT",
         )
 
@@ -791,6 +792,7 @@ class SenderGatewayClient:
             self._base_path + EVENTS_PATH + "/" + quote(event_id, safe="") + "/ack",
             {"lease_token": lease_token},
             EVENT_DISPATCHER_IDENTITY,
+            timeout=min(self.read_timeout_seconds, 5.0),
             timeout_code="TIMEOUT",
         )
 

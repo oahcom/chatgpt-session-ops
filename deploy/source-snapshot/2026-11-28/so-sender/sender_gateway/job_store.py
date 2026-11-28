@@ -138,7 +138,8 @@ _SCHEMA_STATEMENTS: Sequence[str] = (
         event_name TEXT NOT NULL, payload_json TEXT NOT NULL,
         created_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
         attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL,
-        lease_until TEXT, lease_token TEXT, worker_id TEXT, delivered_at TEXT
+        lease_until TEXT, lease_token TEXT, worker_id TEXT, delivered_at TEXT,
+        event_version INTEGER NOT NULL DEFAULT 0, last_error TEXT
     )
     """,
     "CREATE INDEX IF NOT EXISTS ix_job_event_outbox_due"
@@ -393,9 +394,24 @@ class JobStore:
                 }
                 if "next_eligible_at" not in columns:
                     conn.execute("ALTER TABLE jobs ADD COLUMN next_eligible_at TEXT")
+                event_columns = {
+                    row["name"] for row in conn.execute("PRAGMA table_info(job_event_outbox)")
+                }
+                if "event_version" not in event_columns:
+                    # Existing outbox rows are legacy data. Keep them quarantined;
+                    # only rows explicitly written by this event contract are claimable.
+                    conn.execute(
+                        "ALTER TABLE job_event_outbox ADD COLUMN event_version INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "last_error" not in event_columns:
+                    conn.execute("ALTER TABLE job_event_outbox ADD COLUMN last_error TEXT")
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS ix_jobs_queued_eligible "
                     "ON jobs(status, next_eligible_at, created_at)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_job_event_outbox_due_v1 "
+                    "ON job_event_outbox(event_version, status, next_attempt_at, created_at)"
                 )
             except BaseException:
                 conn.execute("ROLLBACK")
@@ -697,8 +713,8 @@ class JobStore:
             txn.execute(
                 """INSERT INTO job_event_outbox
                    (event_id, job_id, tenant_id, principal_id, event_name, payload_json,
-                    created_at, status, attempts, next_attempt_at)
-                   VALUES (?, ?, ?, ?, 'chatgpt.job.completed', ?, ?, 'pending', 0, ?)
+                    created_at, status, attempts, next_attempt_at, event_version)
+                   VALUES (?, ?, ?, ?, 'chatgpt.job.completed', ?, ?, 'pending', 0, ?, 1)
                    ON CONFLICT(job_id) DO NOTHING""",
                 (event_id, job_id, row["tenant_id"], row["principal_id"],
                  canonical_json(event_payload), completed_at, completed_at),
@@ -787,8 +803,8 @@ class JobStore:
             txn.execute(
                 """INSERT INTO job_event_outbox
                    (event_id, job_id, tenant_id, principal_id, event_name, payload_json,
-                    created_at, status, attempts, next_attempt_at)
-                   VALUES (?, ?, ?, ?, 'chatgpt.job.completed', ?, ?, 'pending', 0, ?)
+                    created_at, status, attempts, next_attempt_at, event_version)
+                   VALUES (?, ?, ?, ?, 'chatgpt.job.completed', ?, ?, 'pending', 0, ?, 1)
                    ON CONFLICT(job_id) DO NOTHING""",
                 (event_id, job_id, row["tenant_id"], row["principal_id"],
                  canonical_json(event_payload), completed_at, completed_at),
@@ -857,11 +873,41 @@ class JobStore:
         with self.transaction() as txn:
             txn.execute("""UPDATE job_event_outbox SET status='pending', lease_until=NULL,
                          lease_token=NULL, worker_id=NULL
-                         WHERE status='sending' AND lease_until<=?""", (claimed_at,))
-            rows = txn.fetchall("""SELECT * FROM job_event_outbox WHERE status='pending'
+                         WHERE event_version=1 AND status='sending' AND lease_until<=?""", (claimed_at,))
+            rows = txn.fetchall("""SELECT * FROM job_event_outbox WHERE event_version=1 AND status='pending'
                                   AND next_attempt_at<=? ORDER BY created_at,event_id LIMIT ?""",
                                 (claimed_at, limit))
             for row in rows:
+                try:
+                    payload = json.loads(row["payload_json"])
+                except (TypeError, ValueError):
+                    payload = None
+                valid_payload = (
+                    isinstance(payload, dict)
+                    and payload.get("job_id") == row["job_id"]
+                    and payload.get("status") in {"succeeded", "failed"}
+                    and isinstance(payload.get("completed_at"), str)
+                    and bool(payload.get("completed_at"))
+                    and ("summary" not in payload or isinstance(payload["summary"], str))
+                    and ("conversation_id" not in payload or isinstance(payload["conversation_id"], str))
+                    and ("error_code" not in payload or isinstance(payload["error_code"], str))
+                    and ("outcome_unknown" not in payload or isinstance(payload["outcome_unknown"], bool))
+                )
+                if (
+                    row["event_name"] != "chatgpt.job.completed"
+                    or not row["tenant_id"]
+                    or not row["principal_id"]
+                    or not valid_payload
+                ):
+                    txn.execute(
+                        """UPDATE job_event_outbox SET status='dead', last_error=?
+                           WHERE event_id=? AND event_version=1 AND status='pending'""",
+                        (
+                            "invalid_payload_json" if payload is None else "invalid_event_payload",
+                            row["event_id"],
+                        ),
+                    )
+                    continue
                 token = uuid.uuid4().hex
                 cur = txn.execute("""UPDATE job_event_outbox SET status='sending',
                     attempts=attempts+1, worker_id=?, lease_until=?, lease_token=?
@@ -870,7 +916,7 @@ class JobStore:
                 if cur.rowcount == 1:
                     claimed.append({"event_id": row["event_id"], "job_id": row["job_id"],
                         "tenant_id": row["tenant_id"], "principal_id": row["principal_id"],
-                        "name": row["event_name"], "payload": json.loads(row["payload_json"]),
+                        "name": row["event_name"], "payload": payload,
                         "lease_token": token, "attempt": int(row["attempts"])+1})
         return claimed
 
@@ -879,8 +925,10 @@ class JobStore:
             raise StoreError("event_id and lease_token are required", code=ErrorCode.INVALID_ARGUMENT)
         at = now or self._now()
         with self.transaction() as txn:
-            row = txn.fetchone("SELECT status, lease_token, lease_until FROM job_event_outbox WHERE event_id=?", (event_id,))
+            row = txn.fetchone("SELECT status, lease_token, lease_until, event_version FROM job_event_outbox WHERE event_id=?", (event_id,))
             if row is None:
+                return False
+            if row["event_version"] != 1:
                 return False
             if row["status"] == "delivered":
                 return True
@@ -945,12 +993,15 @@ class JobStore:
         """Replace expired terminal jobs with minimal permanent ownership/idempotency tombstones."""
         with self.transaction() as txn:
             txn.execute(
-                "DELETE FROM job_event_outbox WHERE status='delivered' AND created_at < ?",
+                "DELETE FROM job_event_outbox WHERE event_version=1 AND status='delivered' AND created_at < ?",
                 (before,),
             )
             rows = txn.fetchall(
                 "SELECT * FROM jobs WHERE status IN ('succeeded','failed')"
-                " AND completed_at IS NOT NULL AND completed_at < ?",
+                " AND completed_at IS NOT NULL AND completed_at < ?"
+                " AND NOT EXISTS (SELECT 1 FROM job_event_outbox e"
+                " WHERE e.job_id=jobs.job_id AND e.event_version=1"
+                " AND e.status IN ('pending','sending'))",
                 (before,),
             )
             for row in rows:
@@ -986,7 +1037,10 @@ class JobStore:
                     )
             cursor = txn.execute(
                 "DELETE FROM jobs WHERE status IN ('succeeded','failed')"
-                " AND completed_at IS NOT NULL AND completed_at < ?",
+                " AND completed_at IS NOT NULL AND completed_at < ?"
+                " AND NOT EXISTS (SELECT 1 FROM job_event_outbox e"
+                " WHERE e.job_id=jobs.job_id AND e.event_version=1"
+                " AND e.status IN ('pending','sending'))",
                 (before,),
             )
             return cursor.rowcount

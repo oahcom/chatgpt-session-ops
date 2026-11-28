@@ -40,31 +40,50 @@ class MCPEventDispatcher:
         self._stop_event: threading.Event | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._operation_lock = threading.Lock()
 
     def _run(self, stop_event: threading.Event) -> None:
         last_cleanup = float("-inf")
         while not stop_event.is_set():
             did_work = False
             try:
-                did_work = self.collector.run_once() > 0 or did_work
+                with self._operation_lock:
+                    if stop_event.is_set():
+                        break
+                    did_work = self.collector.run_once() > 0 or did_work
             except Exception:
                 logging.exception("MCP Sender event collection failed")
+
+            # Shutdown may be requested while the Sender request is in flight.
+            # Finish that claim/ack cycle, but do not start cleanup or a new
+            # webhook request after the stop signal has arrived.
+            if stop_event.is_set():
+                break
 
             now = time.monotonic()
             if now - last_cleanup >= self.cleanup_interval_seconds:
                 try:
-                    self.events_store.cleanup_expired()
+                    with self._operation_lock:
+                        if stop_event.is_set():
+                            break
+                        self.events_store.cleanup_expired()
                 except Exception:
                     logging.exception("MCP event retention cleanup failed")
                     last_cleanup = now - self.cleanup_interval_seconds + min(60.0, self.cleanup_interval_seconds)
                 else:
                     last_cleanup = now
 
+            if stop_event.is_set():
+                break
+
             try:
-                delivered = self.events_store.deliver_pending(
-                    limit=self.delivery_batch_size,
-                    authorize=self.authorize,
-                )
+                with self._operation_lock:
+                    if stop_event.is_set():
+                        break
+                    delivered = self.events_store.deliver_pending(
+                        limit=self.delivery_batch_size,
+                        authorize=self.authorize,
+                    )
                 did_work = delivered > 0 or did_work
             except Exception:
                 logging.exception("MCP webhook delivery failed")
@@ -91,10 +110,14 @@ class MCPEventDispatcher:
         with self._lock:
             stop_event = self._stop_event
             thread = self._thread
-            if stop_event is not None:
-                stop_event.set()
+        if stop_event is not None:
+            stop_event.set()
+            # Wait for the one operation already in flight. Every network
+            # operation has a short explicit timeout, so shutdown stays bounded.
+            with self._operation_lock:
+                pass
         if thread is not None and thread.is_alive():
-            thread.join(timeout=10)
+            thread.join(timeout=2)
         with self._lock:
             if thread is None or not thread.is_alive():
                 self._thread = None

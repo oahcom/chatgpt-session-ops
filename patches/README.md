@@ -23,11 +23,11 @@ The feature stays disabled unless `SO_MCP_EVENTS_KEY_FILE` points to a raw 32-by
 
 ## Verification
 
-- Sender outbox and authenticated route tests: 11 passed.
+- Sender outbox and authenticated route tests: 12 passed.
 - MCP Events ASGI and Sender-to-MCP pipeline tests: 7 passed.
 - Python compilation passed for the reconstructed MCP and Sender modules.
 - Sender and MCP-client patches passed `git apply --check` against the current live source files; MCP server/runtime patches passed the same check against their current live source files; the additive module patch passed its clean-tree check.
-- Full project suite: **1295 passed, 7 skipped, 1573 subtests passed**.
+- Full project suite: **1299 passed, 7 skipped, 1573 subtests passed**.
 - `git diff --check` clean.
 
 No production files, databases, credentials, service configuration, or processes were changed. The historical outbox rows were not read, claimed, replayed, acknowledged, or deleted.

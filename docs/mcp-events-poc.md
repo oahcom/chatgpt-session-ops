@@ -1,96 +1,62 @@
-# MCP Events PoC: `chatgpt.job.completed`
+# MCP Events: `chatgpt.job.completed`
 
-## Status — rechecked 2026-11-28 18:33 +08
+## Status — 2026-11-28 21:20 +08
 
-MCP Events is implemented in the PoC and reconstructed against the exact current production source snapshot, but it is **not deployed or enabled in production**.
+The implementation and production-source patch set are ready for deployment review. **Nothing is deployed or enabled in production.**
 
-- Branch: `poc/mcp-events-20261127-r1`; PR #163 remains Draft and unmerged.
-- Live `/opt/so-mcp` and `/opt/so-sender` contain no Events implementation. The production Sender currently completes jobs without creating outbox events.
-- Production has no MCP Events key, Events database, collector, or webhook delivery worker. No real ChatGPT Work callback has been exercised.
-- A source-only snapshot was reconstructed at `deploy/source-snapshot/2026-11-28/`, with pre-feature and current SHA-256 manifests. It excludes runtime databases, environment files, credentials, certificates, private keys, account registries, proxy configuration, and virtual environments.
-- The snapshot adds atomic Sender terminal-event outbox writes, dispatcher-only claim/ack routes, and MCP client methods using the existing mTLS + signed-identity path. It also includes the MCP Events store, collector, protocol handlers, and ASGI worker lifecycle. These are repository artifacts only; live `/opt` files were not changed.
-- Sender outbox claim/ack now fences expired leases. MCP callback delivery is explicitly limited to batches of two; each callback lease is renewed and verified before external I/O.
-- The 75 historical rows in the production Sender database remain untouched. Do not claim, replay, acknowledge, or delete them until their reconciliation policy is approved.
+- Branch `poc/mcp-events-20261127-r1`; PR #163 remains Draft.
+- Live `/opt/so-mcp` and `/opt/so-sender` still have no Events code, key, or database. No real ChatGPT Work callback has been exercised.
+- `deploy/source-snapshot/2026-11-28/` contains the current source reconstruction. `BASE-SHA256SUMS` records live pre-patch files; `SHA256SUMS` records the patched snapshot. It also carries the separate PR #215 Sender Adapter ownership fix, not yet deployed. Runtime databases and credentials are excluded.
+- Sender writes one `event_version=1` outbox row atomically with each terminal job transition. Existing mTLS, Bearer token, and signed identity are reused for claim/ACK.
+- MCP uses one in-process `MCPEventDispatcher` thread for collection, persistence, ACK, and callback delivery. No extra Sender worker, second delivery thread, scheduler, queue service, Redis, or Kafka.
+- Existing OAuth session read/write scopes are reused. No Events-specific OAuth scope or new OAuth client is introduced.
+- Historical Sender rows remain version 0 and are excluded from claim, ACK, and pruning. The 75 historical rows have not been read, claimed, replayed, acknowledged, or deleted.
 
 ## Event contract
 
-Event name: `chatgpt.job.completed`
+Event: `chatgpt.job.completed`
 
-Optional subscription filter:
+Optional subscription filter: `{"job_id":"cgj_..."}`.
 
-```json
-{"job_id": "job_..."}
-```
+Payload fields: `job_id`, `conversation_id`, `status`, `summary`, `completed_at`, and on failure `error_code`/`outcome_unknown`.
 
-Payload:
+This is a completion notification, not a transcript dump. `conversation_id` lets the subscribed Work conversation read the actual messages through the existing session-read tool. The callback subscription associates the event with the original Work conversation; the server does not infer a UI conversation ID from an MCP session ID or OAuth subject.
 
-```json
-{
-  "job_id": "job_...",
-  "status": "succeeded | failed",
-  "summary": "...",
-  "completed_at": "2026-11-27T12:00:00Z",
-  "error_code": "OUTCOME_UNKNOWN",
-  "outcome_unknown": true
-}
-```
+## Implementation
 
-The event is intentionally a short completion summary. It does not embed model instructions or a full conversation transcript. The subscribed ChatGPT conversation is associated by the Events callback subscription; the server does not guess a ChatGPT UI conversation ID from an MCP session ID or OAuth subject.
+- Authenticated `events/list`, `events/subscribe`, and `events/unsubscribe`; advertises `capabilities.events`.
+- Subscription ownership is the authenticated tenant/principal. Fan-out is owner-scoped; optional `job_id` filters are validated at subscribe time.
+- Callback challenge and Standard Webhooks signatures are verified. Destinations require public HTTPS with pinned-address transport; redirects and proxies are disabled.
+- SQLite WAL stores subscriptions, event payloads, and per-subscription deliveries. Callback secrets are AES-GCM encrypted using a separate raw 32-byte key.
+- Supports bounded TTL, idempotent refresh/unsubscribe, and dual-signature secret rotation.
+- Sender `JobStore.complete()`/`fail()` writes the event in the same transaction as terminal status. MCP persists the stable event ID before ACK; replay after a crash is deduplicated.
+- Sender job pruning preserves jobs while their outbox event is pending/leased, then retains the existing owner/idempotency tombstone. This keeps callback authorization valid after the 14-day job-body retention window; the 30-day MCP event history does not require the full job row.
+- One dispatcher thread runs collection and callback delivery sequentially with batch size one. Shutdown finishes only the current bounded operation and starts no new callback after the stop signal.
+- Delivery retries are bounded, event IDs stay stable, each attempt gets a fresh signature timestamp, and payloads are capped at 256 KiB. No replay cursor is implemented (`cursor: null`).
+- `events/subscribe` performs optional Sender ownership lookup and callback verification outside the MCP event loop via `asyncio.to_thread`.
 
-## Implemented in the PoC
+## Production patch set
 
-- Registers `events/list`, `events/subscribe`, and `events/unsubscribe` on the authenticated MCP endpoint.
-- Adds `capabilities.events` to both `initialize` and `server/discover` responses.
-- Uses the authenticated tenant/principal as subscription ownership.
-- Validates the `whsec_` key (24–64 decoded bytes), verifies a fresh signed callback challenge, and emits JSON-RPC `-32015` with a reason on callback verification failure.
-- Validates callback destinations using the existing public-HTTPS resolver and pinned-address transport; redirects and proxy use are disabled.
-- Persists subscriptions and event deliveries in SQLite WAL mode.
-- Encrypts subscription secrets with AES-GCM; a 32-byte encryption key must be supplied by the caller. The key is not stored in SQLite.
-- Supports default expiry, bounded `ttlMs`, `ttlMs: null`, deterministic subscription IDs, idempotent refresh/unsubscribe, and 24-hour dual-signature secret rotation.
-- Creates an event outbox and per-subscription deliveries, filters by `job_id`, and claims deliveries with a lease so two workers do not normally send the same pending row concurrently.
-- Emits the same terminal event for both `running -> succeeded` and `running -> failed`; failure events include `error_code` and `outcome_unknown`.
-- Closes only the completion-vs-subscribe race: events completed after the subscribe request starts but before callback verification finishes are backfilled; older events are not replayed. Repeated subscribe/refresh remains idempotent.
-- Accepts the Sender Gateway's stable `event_id`, rejects cross-owner/payload ID reuse, and deduplicates replay before acknowledging the sender.
-- Includes `MCPEventCollector`: it claims Sender Gateway events, persists them in the MCP event store, then acknowledges the sender lease. The deployed-runtime patch supervises collector and webhook delivery workers through ASGI lifespan.
-- Signs Standard Webhooks payloads, keeps event IDs stable across retries, uses a fresh signing timestamp per attempt, enforces 256 KiB, and does not retry `410` or `413`.
+From `/opt/so-sender`: `sender-gateway-event-outbox.patch` (atomic outbox, claim/ACK routes, retention fencing).
 
-The PoC intentionally has no event replay cursor (`cursor: null`). A crashed or disconnected callback may miss an event after its bounded delivery attempts are exhausted.
+From `/opt/so-mcp`: `mcp-sender-event-client.patch`, `mcp-event-modules.patch`, `mcp-server-events.patch`, and `mcp-runtime-events.patch` (existing client methods, SQLite store/collector/dispatcher, protocol handlers, and ASGI lifespan wiring).
 
-## Reconstructed integration flow
+All patches passed `git apply --check` against copies of the current live source files; the additive module patch passed a clean-tree check. Regenerate and recheck before applying to any other source revision.
 
-The deployed system has two separate services and databases:
+## Remaining deployment gates
 
-1. MCP service: `/opt/so-mcp`, systemd unit `so-mcp.service`, user `ubuntu`.
-2. Sender Gateway: `/opt/so-sender`, systemd unit `so-sender.service`, user `chatgpt-sender`.
+1. Provision `/etc/so-mcp/events.key` as a raw 32-byte key, owned by the MCP service user, mode `0400`; provision `/var/lib/so-mcp/events/` mode `0700` and the database mode `0600`. None exists in production.
+2. Keep the 75 historical Sender rows quarantined. Their provenance and replay policy remain unapproved.
+3. Define terminal handling/diagnostics for a permanently malformed trusted Sender event so it cannot retry forever.
+4. Run the real ChatGPT Work acceptance test: subscribe in a Work conversation, submit a Sender job from it, leave it idle, then verify that same conversation receives the callback and reads the resulting messages without polling. Mock callback tests do not prove product-level resumption.
 
-The Sender Gateway owns the job state transition. Therefore the durable source event must be written atomically with `JobStore.complete()` in the Sender Gateway database, not only into the MCP event database.
-
-Recommended flow:
-
-1. `events/subscribe` stores the callback subscription in the MCP database.
-2. Sender Gateway `JobStore.complete()` or `JobStore.fail()` changes a job to its terminal state and inserts a job-completion outbox row in the *same SQLite transaction*.
-3. The MCP-side collector polls the Sender Gateway over the *existing* `SenderGatewayClient` mTLS connection using the reconstructed dispatcher-only `POST /internal/v1/events/claim` and `POST /internal/v1/events/{event_id}/ack` routes. The client reuses the mTLS certificate, service Bearer token, and short-lived HMAC identity assertion.
-4. Restrict those two routes to a dedicated service identity, for example principal `session_ops:event-dispatcher` in tenant `session_ops`. The existing identity assertion generator accepts non-empty service identities; the route must explicitly require this exact pair. Do not use an end-user identity to enumerate cross-tenant events.
-5. The collector persists the event in the MCP event store using the *same stable event_id*, then acknowledges the Sender Gateway lease. If the MCP process crashes before the ack, the Sender Gateway lease expires and the event is delivered again; MCP deduplication prevents a second fan-out.
-6. An MCP delivery worker sends the signed ChatGPT callback and updates per-subscription delivery state.
-
-This two-stage outbox prevents a crash between job completion and event publication from silently losing the event. The Sender Gateway derives tenant/principal from the job row, never from the caller-supplied event payload. The MCP event store accepts a sender-provided event ID and rejects reuse of that ID with a different owner or payload.
-
-## Integration blockers
-
-- Production source provenance is now captured as a versioned snapshot, but the original deployment markers (`8aa2597` for MCP and `dbdcf3c` for Sender) still do not resolve to canonical Git commits. The snapshot is a reproducible baseline, not proof of the original upstream commit.
-- Production key provisioning and OAuth authorization-server/client grants are not complete. Code-side scope advertisement does not prove a real token can acquire and use the Events scopes.
-- The 75 legacy Sender outbox rows require explicit reconciliation. Their job/owner/payload structure was validated in prior read-only work, but replay/content policy and end-to-end deduplication remain unapproved.
-- Sender job retention is 14 days by default while MCP event history is 30 days. The retention mismatch (#197) must be resolved before a long outage can cause otherwise-valid events to fail resource authorization.
-- Poison-event quarantine and bounded diagnostics need final policy (#173). The collector isolates each item and persists before ack, but permanently malformed trusted-source rows must not retry forever.
-- The real ChatGPT Work acceptance test (#174) remains mandatory: subscribe in a Work conversation, submit a job from that conversation, leave it idle, and prove the same conversation receives the callback and continues without polling. Mock receiver tests do not prove product-level resumption.
-- No production source, configuration, database, key, or service was modified in this repair pass.
+Original deployment markers (`8aa2597` for MCP, `dbdcf3c` for Sender) still do not resolve to canonical Git commits. The snapshot and patch hashes establish the files used for this reconstruction, not original upstream commit provenance.
 
 ## Verification
 
-- Full repository test suite: **1289 passed, 13 skipped, 1573 subtests passed**.
-- Exact reconstructed production snapshot tests: **10 passed**, covering MCP Events ASGI lifecycle, Sender terminal outbox atomicity/idempotency, rollback on outbox-write failure, dispatcher identity enforcement, per-event ack routing, expired/stale lease rejection, and the local mTLS + HMAC event pipeline to a mocked callback receiver.
-- MCP Events core/collector/worker focused tests: **39 passed**.
-- Python compilation checks passed. `git diff --check` passed.
+- Full repository suite: **1299 passed, 7 skipped, 1573 subtests passed**.
+- Sender outbox and authenticated route tests: **12 passed**.
+- MCP Events ASGI and Sender-to-MCP pipeline tests: **7 passed**.
+- Python compilation and exact production-base patch checks passed; `git diff --check` is clean.
 
-These tests establish the local implementation and reconstructed-source integration. They do not establish production activation or real ChatGPT Work conversation resumption.
+These checks establish local implementation and patch compatibility, not production activation or real ChatGPT Work conversation resumption. No production source, configuration, database, key, or service was modified.

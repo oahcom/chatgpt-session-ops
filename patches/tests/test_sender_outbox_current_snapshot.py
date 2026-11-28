@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import sqlite3
 import tempfile
 import threading
 from http.server import ThreadingHTTPServer
@@ -91,10 +92,12 @@ class TestSenderOutboxCurrentSnapshot:
         client.claim_events(worker_id="mcp", limit=1)
         args=client._request.call_args.args
         assert args[1] == "/gateway/internal/v1/events/claim" and args[3] == EVENT_DISPATCHER_IDENTITY
+        assert client._request.call_args.kwargs["timeout"] == 5.0
         event_id="evt_"+"a"*32
         client.ack_event(event_id=event_id, lease_token="lease")
         args=client._request.call_args.args
         assert args[1] == f"/gateway/internal/v1/events/{event_id}/ack" and args[3] == EVENT_DISPATCHER_IDENTITY
+        assert client._request.call_args.kwargs["timeout"] == 5.0
 
     def test_expired_and_reclaimed_event_leases_reject_stale_ack(self):
         job_id = self.enqueue_running()
@@ -106,3 +109,85 @@ class TestSenderOutboxCurrentSnapshot:
         assert second["lease_token"] != first["lease_token"]
         assert self.store.ack_event(first["event_id"], first["lease_token"], now=add_seconds(expired_at, 1)) is False
         assert self.store.ack_event(second["event_id"], second["lease_token"], now=add_seconds(expired_at, 1)) is True
+
+    def test_legacy_outbox_rows_are_quarantined_from_new_dispatcher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "legacy.sqlite3"
+            connection = sqlite3.connect(database)
+            connection.execute("""CREATE TABLE job_event_outbox (
+                event_id TEXT PRIMARY KEY, job_id TEXT NOT NULL UNIQUE,
+                tenant_id TEXT NOT NULL, principal_id TEXT NOT NULL,
+                event_name TEXT NOT NULL, payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL,
+                lease_until TEXT, lease_token TEXT, worker_id TEXT, delivered_at TEXT
+            )""")
+            connection.executemany(
+                """INSERT INTO job_event_outbox
+                   (event_id, job_id, tenant_id, principal_id, event_name,
+                    payload_json, created_at, status, attempts, next_attempt_at)
+                   VALUES (?, ?, 'legacy-tenant', 'legacy-owner',
+                           'chatgpt.job.completed', '{}', '2026-01-01T00:00:00Z',
+                           'pending', 0, '2026-01-01T00:00:00Z')""",
+                [(f"legacy-{index}", f"legacy-job-{index}") for index in range(75)],
+            )
+            connection.commit()
+            connection.close()
+
+            legacy_store = JobStore(database)
+            try:
+                assert legacy_store.claim_events("new-dispatcher", limit=25) == []
+                with legacy_store.transaction() as tx:
+                    legacy = tx.fetchall(
+                        "SELECT status, attempts, event_version FROM job_event_outbox ORDER BY event_id"
+                    )
+                assert len(legacy) == 75
+                assert all(row["status"] == "pending" and row["attempts"] == 0 for row in legacy)
+                assert all(row["event_version"] == 0 for row in legacy)
+                with legacy_store.transaction() as tx:
+                    tx.execute(
+                        "UPDATE job_event_outbox SET status='sending', lease_token='legacy-token', "
+                        "lease_until='2099-01-01T00:00:00Z' WHERE event_id='legacy-0'"
+                    )
+                assert legacy_store.ack_event("legacy-0", "legacy-token") is False
+                with legacy_store.transaction() as tx:
+                    row = tx.fetchone(
+                        "SELECT status, lease_token FROM job_event_outbox WHERE event_id='legacy-0'"
+                    )
+                assert row["status"] == "sending" and row["lease_token"] == "legacy-token"
+
+                job = legacy_store.enqueue(
+                    principal_id="p1", tenant_id="t1", operation="session.create",
+                    idempotency_key="new-event", payload={"prompt": "new"},
+                )
+                assert legacy_store.claim_next("worker") is not None
+                legacy_store.complete(job["job_id"], {"ok": True})
+                claimed = legacy_store.claim_events("new-dispatcher", limit=25)
+                assert len(claimed) == 1
+                assert claimed[0]["job_id"] == job["job_id"]
+                assert claimed[0]["event_id"].startswith("evt_")
+            finally:
+                legacy_store.close()
+
+    def test_malformed_new_event_is_dead_lettered_without_blocking_valid_event(self):
+        job_id = self.enqueue_running()
+        self.store.complete(job_id, {"ok": True})
+        with self.store.transaction() as tx:
+            tx.execute(
+                """INSERT INTO job_event_outbox
+                   (event_id, job_id, tenant_id, principal_id, event_name,
+                    payload_json, created_at, status, attempts, next_attempt_at,
+                    event_version)
+                   VALUES (?, 'broken-job', 'tenant-a', 'user-a',
+                           'chatgpt.job.completed', '{broken', ?, 'pending', 0, ?, 1)""",
+                ("evt_" + "0" * 32, self.store.now(), self.store.now()),
+            )
+        claimed = self.store.claim_events("dispatcher", limit=2)
+        assert [item["job_id"] for item in claimed] == [job_id]
+        with self.store.transaction() as tx:
+            bad = tx.fetchone(
+                "SELECT status, attempts, last_error FROM job_event_outbox WHERE job_id='broken-job'"
+            )
+        assert bad["status"] == "dead"
+        assert bad["attempts"] == 0
+        assert bad["last_error"] == "invalid_payload_json"

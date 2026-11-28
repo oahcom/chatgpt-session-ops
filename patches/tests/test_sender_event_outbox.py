@@ -123,9 +123,9 @@ class SenderOutboxTests(unittest.TestCase):
                     """INSERT INTO job_event_outbox
                        (event_id, job_id, tenant_id, principal_id, event_name, payload_json,
                         created_at, status, attempts, next_attempt_at, delivered_at,
-                        lease_until, lease_token, worker_id)
+                        lease_until, lease_token, worker_id, event_version)
                        VALUES (?, ?, 'tenant-a', 'user-a', 'chatgpt.job.completed',
-                               '{"job_id":"x"}', ?, ?, 0, ?, ?, ?, ?, NULL)""",
+                               '{"job_id":"x"}', ?, ?, 0, ?, ?, ?, ?, NULL, 1)""",
                     (event_id, job_id, created_at, status, created_at, delivered_at, lease_until, lease_token),
                 )
         self.store.prune_completed(FIXED)
@@ -141,6 +141,19 @@ class SenderOutboxTests(unittest.TestCase):
                 "job_current_pending": "pending",
             },
         )
+        old = add_seconds(FIXED, -31 * 24 * 60 * 60)
+        pending_job_id = self.create_job(now=old)
+        old_store = JobStore(self.db_path, now=lambda: old)
+        old_store.complete(pending_job_id, {"summary": "pending delivery"}, now=old)
+        old_store.close()
+        self.store.prune_completed(FIXED)
+        with self.store.transaction() as txn:
+            self.assertIsNotNone(txn.fetchone("SELECT job_id FROM jobs WHERE job_id=?", (pending_job_id,)))
+            txn.execute("UPDATE job_event_outbox SET status='delivered' WHERE job_id=?", (pending_job_id,))
+        self.store.prune_completed(FIXED)
+        with self.store.transaction() as txn:
+            self.assertIsNone(txn.fetchone("SELECT job_id FROM jobs WHERE job_id=?", (pending_job_id,)))
+            self.assertIsNotNone(txn.fetchone("SELECT job_id FROM job_tombstones WHERE job_id=?", (pending_job_id,)))
 
     def test_claim_lease_expiry_stale_ack_and_idempotent_ack(self):
         self.complete()

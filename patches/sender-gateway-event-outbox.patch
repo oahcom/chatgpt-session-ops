@@ -12,7 +12,7 @@
  from contextlib import contextmanager
  from pathlib import Path
  from typing import Any, Callable, Iterator, Sequence
-@@ -129,6 +131,18 @@
+@@ -129,6 +131,19 @@
      """,
      "CREATE INDEX IF NOT EXISTS ix_session_owners_owner"
      " ON session_owners(tenant_id, principal_id)",
@@ -23,7 +23,8 @@
 +        event_name TEXT NOT NULL, payload_json TEXT NOT NULL,
 +        created_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
 +        attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL,
-+        lease_until TEXT, lease_token TEXT, worker_id TEXT, delivered_at TEXT
++        lease_until TEXT, lease_token TEXT, worker_id TEXT, delivered_at TEXT,
++        event_version INTEGER NOT NULL DEFAULT 0
 +    )
 +    """,
 +    "CREATE INDEX IF NOT EXISTS ix_job_event_outbox_due"
@@ -31,7 +32,31 @@
  )
  
  _INSERT_JOB = """
-@@ -639,7 +653,10 @@
+@@ -379,10 +394,23 @@
+                 }
+                 if "next_eligible_at" not in columns:
+                     conn.execute("ALTER TABLE jobs ADD COLUMN next_eligible_at TEXT")
++                event_columns = {
++                    row["name"] for row in conn.execute("PRAGMA table_info(job_event_outbox)")
++                }
++                if "event_version" not in event_columns:
++                    # Existing outbox rows are legacy data. Keep them quarantined;
++                    # only rows explicitly written by this event contract are claimable.
++                    conn.execute(
++                        "ALTER TABLE job_event_outbox ADD COLUMN event_version INTEGER NOT NULL DEFAULT 0"
++                    )
+                 conn.execute(
+                     "CREATE INDEX IF NOT EXISTS ix_jobs_queued_eligible "
+                     "ON jobs(status, next_eligible_at, created_at)"
+                 )
++                conn.execute(
++                    "CREATE INDEX IF NOT EXISTS ix_job_event_outbox_due_v1 "
++                    "ON job_event_outbox(event_version, status, next_attempt_at, created_at)"
++                )
+             except BaseException:
+                 conn.execute("ROLLBACK")
+                 raise
+@@ -639,7 +667,10 @@
          completed_at = now or self._now()
  
          with self.transaction() as txn:
@@ -43,7 +68,7 @@
              if row is None:
                  raise JobStateError(f"unknown job {job_id}", code=ErrorCode.NOT_FOUND)
              status = row["status"]
-@@ -666,6 +683,26 @@
+@@ -666,6 +697,26 @@
                  raise JobStateError(
                      f"job {job_id} left the running state", code=ErrorCode.CONFLICT
                  )
@@ -61,8 +86,8 @@
 +            txn.execute(
 +                """INSERT INTO job_event_outbox
 +                   (event_id, job_id, tenant_id, principal_id, event_name, payload_json,
-+                    created_at, status, attempts, next_attempt_at)
-+                   VALUES (?, ?, ?, ?, 'chatgpt.job.completed', ?, ?, 'pending', 0, ?)
++                    created_at, status, attempts, next_attempt_at, event_version)
++                   VALUES (?, ?, ?, ?, 'chatgpt.job.completed', ?, ?, 'pending', 0, ?, 1)
 +                   ON CONFLICT(job_id) DO NOTHING""",
 +                (event_id, job_id, row["tenant_id"], row["principal_id"],
 +                 canonical_json(event_payload), completed_at, completed_at),
@@ -70,7 +95,7 @@
  
      def fail(
          self,
-@@ -695,7 +732,7 @@
+@@ -695,7 +746,7 @@
  
          with self.transaction() as txn:
              row = txn.fetchone(
@@ -79,7 +104,7 @@
                  (job_id,),
              )
              if row is None:
-@@ -737,6 +774,25 @@
+@@ -737,6 +788,25 @@
                  raise JobStateError(
                      f"job {job_id} left the running state", code=ErrorCode.CONFLICT
                  )
@@ -96,8 +121,8 @@
 +            txn.execute(
 +                """INSERT INTO job_event_outbox
 +                   (event_id, job_id, tenant_id, principal_id, event_name, payload_json,
-+                    created_at, status, attempts, next_attempt_at)
-+                   VALUES (?, ?, ?, ?, 'chatgpt.job.completed', ?, ?, 'pending', 0, ?)
++                    created_at, status, attempts, next_attempt_at, event_version)
++                   VALUES (?, ?, ?, ?, 'chatgpt.job.completed', ?, ?, 'pending', 0, ?, 1)
 +                   ON CONFLICT(job_id) DO NOTHING""",
 +                (event_id, job_id, row["tenant_id"], row["principal_id"],
 +                 canonical_json(event_payload), completed_at, completed_at),
@@ -105,7 +130,7 @@
  
      # -- lease reconciliation ------------------------------------------
  
-@@ -785,6 +841,58 @@
+@@ -785,6 +855,60 @@
              )
              return cursor.rowcount == 1
  
@@ -125,8 +150,8 @@
 +        with self.transaction() as txn:
 +            txn.execute("""UPDATE job_event_outbox SET status='pending', lease_until=NULL,
 +                         lease_token=NULL, worker_id=NULL
-+                         WHERE status='sending' AND lease_until<=?""", (claimed_at,))
-+            rows = txn.fetchall("""SELECT * FROM job_event_outbox WHERE status='pending'
++                         WHERE event_version=1 AND status='sending' AND lease_until<=?""", (claimed_at,))
++            rows = txn.fetchall("""SELECT * FROM job_event_outbox WHERE event_version=1 AND status='pending'
 +                                  AND next_attempt_at<=? ORDER BY created_at,event_id LIMIT ?""",
 +                                (claimed_at, limit))
 +            for row in rows:
@@ -147,8 +172,10 @@
 +            raise StoreError("event_id and lease_token are required", code=ErrorCode.INVALID_ARGUMENT)
 +        at = now or self._now()
 +        with self.transaction() as txn:
-+            row = txn.fetchone("SELECT status, lease_token, lease_until FROM job_event_outbox WHERE event_id=?", (event_id,))
++            row = txn.fetchone("SELECT status, lease_token, lease_until, event_version FROM job_event_outbox WHERE event_id=?", (event_id,))
 +            if row is None:
++                return False
++            if row["event_version"] != 1:
 +                return False
 +            if row["status"] == "delivered":
 +                return True
@@ -164,17 +191,36 @@
      # -- reads ---------------------------------------------------------
  
      def get(self, principal_id: str, tenant_id: str, job_id: str) -> dict | None:
-@@ -836,6 +944,10 @@
+@@ -836,9 +960,16 @@
      def prune_completed(self, before: str) -> int:
          """Replace expired terminal jobs with minimal permanent ownership/idempotency tombstones."""
          with self.transaction() as txn:
 +            txn.execute(
-+                "DELETE FROM job_event_outbox WHERE status='delivered' AND created_at < ?",
++                "DELETE FROM job_event_outbox WHERE event_version=1 AND status='delivered' AND created_at < ?",
 +                (before,),
 +            )
              rows = txn.fetchall(
                  "SELECT * FROM jobs WHERE status IN ('succeeded','failed')"
-                 " AND completed_at IS NOT NULL AND completed_at < ?",
+-                " AND completed_at IS NOT NULL AND completed_at < ?",
++                " AND completed_at IS NOT NULL AND completed_at < ?"
++                " AND NOT EXISTS (SELECT 1 FROM job_event_outbox e"
++                " WHERE e.job_id=jobs.job_id AND e.event_version=1"
++                " AND e.status IN ('pending','sending'))",
+                 (before,),
+             )
+             for row in rows:
+@@ -874,7 +1005,10 @@
+                     )
+             cursor = txn.execute(
+                 "DELETE FROM jobs WHERE status IN ('succeeded','failed')"
+-                " AND completed_at IS NOT NULL AND completed_at < ?",
++                " AND completed_at IS NOT NULL AND completed_at < ?"
++                " AND NOT EXISTS (SELECT 1 FROM job_event_outbox e"
++                " WHERE e.job_id=jobs.job_id AND e.event_version=1"
++                " AND e.status IN ('pending','sending'))",
+                 (before,),
+             )
+             return cursor.rowcount
 --- a/sender_gateway/app.py
 +++ b/sender_gateway/app.py
 @@ -10,6 +10,8 @@

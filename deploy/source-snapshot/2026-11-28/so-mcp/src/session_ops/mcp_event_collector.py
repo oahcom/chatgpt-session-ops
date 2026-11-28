@@ -20,7 +20,7 @@ class MCPEventCollector:
         events_store: Any,
         *,
         worker_id: str,
-        batch_size: int = 2,
+        batch_size: int = 1,
     ) -> None:
         if not isinstance(worker_id, str) or not worker_id.strip():
             raise ValueError("worker_id is required")
