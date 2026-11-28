@@ -1262,10 +1262,13 @@ def build_mcp_server(
                 raise AuthenticationError("verified authentication context required")
             if "session_ops.chatgpt.session.write" not in auth.scopes:
                 raise ScopeError(("session_ops.chatgpt.session.write",))
-            return events_store.unsubscribe(
-                auth,
-                params.model_dump(by_alias=True, exclude_unset=True),
-            )
+            def remove_subscription() -> Any:
+                return events_store.unsubscribe(
+                    auth,
+                    params.model_dump(by_alias=True, exclude_unset=True),
+                )
+
+            return await asyncio.to_thread(remove_subscription)
 
         server.add_request_handler("events/list", EventsListParams, on_events_list)
         server.add_request_handler("events/subscribe", EventsSubscribeParams, on_events_subscribe)
