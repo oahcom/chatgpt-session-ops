@@ -134,7 +134,9 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pow_solver import solve  # noqa: E402
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+BASE = os.path.abspath(
+    os.environ.get("CHATGPT_STATE_DIR") or os.path.dirname(os.path.abspath(__file__))
+)
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36 Edg/157.0.4341.60")
 CTX = ssl.create_default_context()
