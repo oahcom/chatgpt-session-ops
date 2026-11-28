@@ -3,6 +3,7 @@
 
 用法：
     python chatgpt_send.py <conv_id> <prompt_file>          # 投递到既有会话
+    python chatgpt_send.py [--timeout SECONDS] <conv_id> <prompt_file>  # 显式覆盖客户端超时（否则按 --thinking 分档）
     python chatgpt_send.py --new <prompt_file>              # 开全新会话（默认按身份轮转均分）
     python chatgpt_send.py --tail <conv_id>                 # 只收割末条 assistant 回复
     python chatgpt_send.py --account acct2 --tail <conv_id> # 显式选择账号
@@ -31,6 +32,7 @@
     python chatgpt_send.py --check-name "<名称>" [--argv "<命令串>"]  # B10/B11 命名与权限
     python chatgpt_send.py --check-schedule "FREQ=HOURLY;INTERVAL=1"  # B1 排程口径
     python chatgpt_send.py --check-oneshot 2026-11-19T16:00:00+08:00  # B4/B5 一次性窗口
+    python chatgpt_send.py --check-send-log <log> [--prompt <pfile>]  # 投递日志：SENT/TRUNCATED/IN_FLIGHT/NOT_SENT
 
 交付正文托管（A1/A2/A4 的机器判定，纯本地不触网）：
     定位器必须显式给：--between 两行标记（strip 后整行相等，各恰好 1 处）或 --fence 第 n 块。
@@ -62,7 +64,7 @@
           对不上就依次试其他留存设备并自动修正归属（--anon-devices 可查）。
 
 建会话身份优先级（--new 默认行为）：
-    第一优先：当前健康 allowlist 中的登录态账号均分轮转（游标只在允许账号之间推进）。
+    第一优先：acct1 / acct2 / acct3 / acct4 / acct5 / acct6 均分轮转（游标只在六个登录态之间推进）。
     兜底：仅当全部登录态都 429（本次命中或处于 429 冷却）时，才启用 nologin 匿名通道。
     不兜底的情形：401（认证失效，应重新提取凭据）、403（PoW/风控，短冷却后自愈）。
     为什么匿名只做兜底：匿名会话不入任何会话列表（list 恒为空），与设备身份(oai-did)绑定，
@@ -79,10 +81,10 @@
     quota          各账号最近一次响应的限速观测头（只读）
     errors         不可用账号 / 接口错误
 
-账号凭据放在 accounts/<acctN>/{cookies.json,access_token.txt}。
+账号凭据放在 accounts/<acct1|acct2|acct3|acct4|acct5|acct6>/{cookies.json,access_token.txt}。
 --list-all 只聚合各身份获准查看的会话；429 时停止扫描。
 
-前置：acct1/default 认证文件在本脚本目录；其他 acctN 账号分别位于 accounts/acctN/ 下：
+前置：acct1/default 认证文件在本脚本目录；acct2/acct3/acct4/acct5/acct6 分别在 accounts/acct2/、accounts/acct3/、accounts/acct4/、accounts/acct5/、accounts/acct6/ 下：
     cookies.json      由 extract_auth.py 从 Edge CDP 提取
     access_token.txt  同上（accessToken）
     pow_solver.py     PoW 解算器
@@ -100,16 +102,37 @@
       可用 conv-api/<id8>.json 缓存 tail 兜底 parent_message_id。
     - POST 200 即消息已提交；SSE 流只用于收割，需读到 EOF（勿提前关连接）。
     - HTTP 413 Payload Too Large → 本次发送终止；不轮换账号、不自动重试；检查实际请求体及服务端错误响应。
+
+投递超时（--timeout，优先级：命令行 > CHATGPT_SEND_TIMEOUT > --thinking 分档）：
+    作用于发送/收割这条 HTTP 读写路径的 socket 超时，不改变 --thinking 选择模型的语义。
+    **只有显式配置（--timeout 或 CHATGPT_SEND_TIMEOUT）才覆盖分档**；两者都没有时按
+    --thinking 分档（非思考 420s / 思考 1800s）。CLI 不再无条件写 600——那会把
+    思考模式的 1800s 分档在唯一可被操作者触达的路径上打死（DEF-ops-04）。
+    超时一律打印可机读标记，便于事后 grep 统计：
+      TIMEOUT_PARTIAL after Ns, M bytes buffered, saved to <path>   # 已收内容落盘（<auth>/timeouts/）
+      TIMEOUT_EMPTY after Ns                                       # 零字节
+    IncompleteRead（流被截断）同路：PARTIAL after Ns, M bytes buffered, saved to <path>，同样落盘。
+
+送达凭证（截断与完整必须分得开）：
+    完整响应      → `SEND <pfile> -> 200 respLen=<n> in <s>s`，exit 0（格式与旧版一致）
+    截断/超时     → `SEND_TRUNCATED pfile=<pfile> st=<st> bytes=<n>`，exit 3
+    截断路径仍走既有链路（GET 补全文 + 归档，不丢字节），但**绝不打 `SEND ... -> 200`**：
+    那行是唯一送达凭证，被截断响应冒充就等于门禁假绿（DEF-ops-01）。
+
+投递日志判定（NOT_SENT 的机读版）：
+    `--check-send-log <log> [--prompt <prompt_file>]` 按 CB-B8 判一次投递是否「没发出去」。
+    三合取（无 SEND + <200 字节 + mtime>5 分钟）之前必须**先看进程死活**：在飞投递的静默期
+    （tail GET + 最长 3600s 退避）同时满足三条，按三合取判死就会重复投递（DEF-ops-02）。
+    verdict：SENT / TRUNCATED / IN_FLIGHT / NOT_SENT；exit 0/3/0/1。
 """
 import base64
 import contextlib
-import fcntl
 import copy
+import csv
 import gzip
 import hashlib
 import http.client
 import inspect
-import io
 import ipaddress
 import json
 import os
@@ -134,9 +157,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pow_solver import solve  # noqa: E402
 
-BASE = os.path.abspath(
-    os.environ.get("CHATGPT_STATE_DIR") or os.path.dirname(os.path.abspath(__file__))
-)
+BASE = os.path.dirname(os.path.abspath(__file__))
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36 Edg/157.0.4341.60")
 CTX = ssl.create_default_context()
@@ -148,49 +169,275 @@ _OPENAI_COOKIE_DOMAINS = ("chatgpt.com", "openai.com")
 #   （http://127.0.0.1:17892，429 适配：账号层退避短路 + transport 换 ok）。
 API_BASE = os.environ.get("CHATGPT_BASE", "https://chatgpt.com").rstrip("/")
 
-# ---------- 建会话身份轮转 ----------
-# Gateway supplies the health-filtered pool. Standalone CLI fallback is
-# discovered from the credential directory; the two currently disabled
-# production identities remain excluded until an explicit operator action.
-def _effective_rotation_primary():
-    """Use the gateway's discovered, health-filtered accounts when supplied."""
-    raw = os.environ.get("CHATGPT_ALLOWED_ACCOUNTS")
+# ---------- 投递超时（可配置） ----------
+# 实测依据（162 次投递）：19 次卡在 ~1700s（16 次落在 1769–1773s，正是 1800s 客户端超时），
+# in-flight 累计 9.33h = 整段墙钟 18.12h 的 24.7%，其中 17 次最终 FAIL「回复完整性未证明」。
+# 正常投递中位数 182.5s，P90 完全由这个超时决定而非真实分布——所以它必须可配。
+# 注意：CLI 未显式给 --timeout / CHATGPT_SEND_TIMEOUT 时**不再**把它写进 SEND_TIMEOUT
+# （否则 --thinking 的 1800s 分档在 CLI 上会被 600s 无条件覆盖，DEF-ops-04）。
+# 保留常量是为了文档与外部导入兼容；实际分档见 _send_prompt_impl。
+DEFAULT_SEND_TIMEOUT = 600
+# None = 未覆盖（沿用 --thinking 的 420/1800 分档）；int = 覆盖值。
+# 只有 CLI（main）或环境变量会把它变成 int，库调用方直接调 send_prompt 仍保持旧行为。
+SEND_TIMEOUT = None
+
+
+def _parse_timeout(raw):
+    """把一次超时配置收敛成正整数秒；不可用返回 None（由调用方决定回退到哪个默认）。"""
     if raw is None:
-        allowed = _discover_account_credentials() - {"acct4", "acct5"}
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    try:
+        v = int(s, 10)
+    except (TypeError, ValueError):
+        print("WARN: 超时值不是整数：%r —— 按未指定处理" % (raw,), flush=True)
+        return None
+    if v <= 0:
+        print("WARN: 超时必须 > 0（收到 %r）—— 按未指定处理" % (raw,), flush=True)
+        return None
+    return v
+
+
+def _extract_timeout_flag(argv):
+    """从 argv 里摘出 `--timeout N` / `--timeout=N`，返回 (原始值或 None, 剩余 argv)。
+
+    为什么要先摘出来：这个脚本没有 argparse，`<conv_id> <prompt_file>` 的位置校验
+    是 `len(args) != 2`——`--timeout 600` 留在 args 里会被当成第三个位置参数，
+    所有既有调用方式（不带 --timeout）必须继续可用，带 --timeout 也不能变位置语义。
+    """
+    out, value, seen = [], None, False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--timeout" or a.startswith("--timeout="):
+            if seen:
+                raise ValueError("--timeout 重复指定")
+            if a == "--timeout":
+                if i + 1 >= len(argv):
+                    raise ValueError("--timeout 需要秒数（形如 --timeout 600）")
+                value = argv[i + 1]
+                i += 2
+            else:
+                value = a.split("=", 1)[1]
+                i += 1
+            seen = True
+            continue
+        out.append(a)
+        i += 1
+    return value, out
+
+
+SEND_TIMEOUT = _parse_timeout(os.environ.get("CHATGPT_SEND_TIMEOUT"))
+SEND_TIMEOUT_SOURCE = "env" if SEND_TIMEOUT is not None else ""
+
+
+def _cap_timeout(default):
+    """辅助请求（tail/GET 全文）的超时上限：只允许 --timeout 收紧，绝不放宽。
+
+    为什么不直接全用 --timeout：这些 GET 本来是 90/120s 的短请求，给 600s 只会让
+    卡死的 GET 更慢；给 --timeout 60 时它们必须跟着一起变短，否则探针仍会拖满 90s。
+    """
+    if SEND_TIMEOUT is None:
+        return default
+    return min(default, SEND_TIMEOUT)
+
+
+# ---------- 送达判定（CB-B8 三合取的机读版） ----------
+# 旧判据（无 SEND + <200 字节 + mtime>5 分钟）在**在飞**投递上三个条件全部成立：
+#   <conv_id> 路径发送前先 live_tail（两次 GET，各 ≤90s），失败后 _retry_after 最长退避
+#   3600s；这段静默期日志一个字节都不写，进程却在推进。按三合取判死 → 重投 →
+#   同一提示词两条回复、两个工作项。所以判死之前必须先看「进程是否还在」。
+NOT_SENT_MAX_BYTES = 200        # 旧判据：文件小于 200 字节
+NOT_SENT_MIN_AGE_SEC = 300      # 旧判据：mtime 超过 5 分钟
+INFLIGHT_BACKOFF_WINDOW = 3600  # api._retry_after 的退避上限＝最长零输出窗口
+
+# 完整投递的唯一送达凭证。SEND_TRUNCATED 不是它：截断只证明「发出去了一部分」。
+SEND_OK_RE = re.compile(r"^SEND .+ -> 200\b")
+SEND_TRUNCATED_RE = re.compile(r"^SEND_TRUNCATED\b")
+
+
+def read_log_text(path):
+    """按 BOM 读日志：UTF-8（含 BOM）默认，UTF-16LE/BE 也认。
+
+    为什么不能写死 utf-8：本机 PowerShell 重定向产出 UTF-16LE+BOM，按 utf-8 硬读时
+    每个 ASCII 字节前都有 0x00，`SEND` 这类判据全部漏匹配（CB-B10 / DEF-ops-08）。
+    """
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw.startswith(b"\xff\xfe\x00\x00") or raw.startswith(b"\xff\xfe"):
+        enc = "utf-16"
+    elif raw.startswith(b"\xfe\xff"):
+        enc = "utf-16-be"
+    elif raw.startswith(b"\xef\xbb\xbf"):
+        enc = "utf-8-sig"
     else:
-        allowed = {
-            part.strip() for part in raw.split(",")
-            if part.strip().startswith("acct") and part.strip()[4:].isdigit()
-        }
-    return tuple(sorted(allowed, key=lambda name: int(name[4:])))
+        enc = "utf-8"
+    return raw.decode(enc, "replace")
 
 
-# Backward-compatible snapshot for tests and external read-only consumers.
-# Runtime routing always calls _effective_rotation_primary() dynamically.
-ROTATION_PRIMARY = _effective_rotation_primary()
+def _iter_process_cmdlines():
+    """枚举 (pid, 命令行) 的尽力而为实现；返回 None 表示**枚举能力不可用**。
+
+    None ≠ 没有进程：读不到就按「可能还活着」处理（fail-closed），否则一次权限/工具
+    缺失就会把在飞投递判死并触发重投。顺序：/proc（精确、零依赖）→ psutil → wmic。
+    """
+    if os.path.isdir("/proc"):
+        rows = []
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open("/proc/%s/cmdline" % entry, "rb") as f:
+                    raw = f.read()
+            except OSError:
+                continue
+            rows.append((int(entry),
+                         raw.replace(b"\x00", b" ").decode("utf-8", "replace")))
+        return rows
+    try:
+        import psutil
+    except Exception:
+        psutil = None
+    if psutil is not None:
+        rows = []
+        for proc in psutil.process_iter(["pid", "cmdline"]):
+            try:
+                info = proc.info
+                cmd = info.get("cmdline") or []
+                rows.append((info.get("pid"), " ".join(str(c) for c in cmd)))
+            except Exception:
+                continue
+        return rows
+    if os.name == "nt":
+        try:
+            done = subprocess.run(
+                ["wmic", "process", "get", "ProcessId,CommandLine", "/format:csv"],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if done.returncode != 0:
+            return None
+        rows = []
+        for row in csv.reader(done.stdout.decode("utf-8", "replace").splitlines()):
+            if len(row) >= 3 and row[-1].strip().isdigit():
+                rows.append((int(row[-1]), ",".join(row[1:-1])))
+        return rows
+    return None
 
 
-def _rotation_order():
-    """All discovered account identities plus the legacy anonymous identity."""
-    names = {
-        name for name in _VALID_ACCOUNT_IDENTITIES
-        if name.startswith("acct") and name[4:].isdigit()
+def live_senders(prompt_file):
+    """命令行里提到该 pfile 的存活 pid 列表；None = 枚举不可用（当作「可能活着」）。"""
+    if not prompt_file:
+        return []
+    target = os.path.basename(str(prompt_file))
+    rows = _iter_process_cmdlines()
+    if rows is None:
+        return None
+    me = os.getpid()
+    out = []
+    for pid, cmdline in rows:
+        # 必须排除自己：判定器常以 `--check-send-log <log> --prompt <pfile>` 被调用，
+        # 自己的命令行里就含着 pfile——不排除的话每次都「找到存活进程」，
+        # NOT_SENT 永远判不出来（恒 IN_FLIGHT 的假红变假绿）。
+        if pid == me:
+            continue
+        if target and target in (cmdline or ""):
+            out.append(pid)
+    return out
+
+
+def judge_send_log(log_path, prompt_file=None, now=None, live_pids=None):
+    """判定一次投递日志：SENT / TRUNCATED / IN_FLIGHT / NOT_SENT。
+
+    顺序是有意为之，每一步都在堵一个已实测的假绿/假红：
+      ① `SEND ... -> 200` → SENT（唯一送达凭证；`SEND_TRUNCATED` 不匹配这个正则）
+      ② `SEND_TRUNCATED` → TRUNCATED（已发但完整性未证明，不能算 SENT，也不该重投）
+      ③ 三合取不成立（有 SEND/够大/够新）→ IN_FLIGHT（还可能成功）
+      ④ 三合取成立 → **先查进程死活**：
+         - 同 pfile 的进程还在 → IN_FLIGHT（静默期，最长 3600s）
+         - 枚举不到进程时按「可能活着」→ IN_FLIGHT（fail-closed）
+         - mtime 仍在 3600s 退避窗口内且首行是 `timeout:` → IN_FLIGHT
+         - 以上都不成立 → NOT_SENT（真的死了，可以重投）
+    `live_pids` 是给测试/调用方注入「已知存活 pid」的口子；None = 现场枚举。
+    """
+    if not os.path.isfile(log_path):
+        raise FileNotFoundError(log_path)
+    text = read_log_text(log_path)
+    lines = text.splitlines()
+    size = os.path.getsize(log_path)
+    mtime = os.path.getmtime(log_path)
+    base_now = time.time() if now is None else float(now)
+    age = max(0.0, base_now - mtime)
+
+    has_send = any(SEND_OK_RE.match(ln.strip()) for ln in lines)
+    has_truncated = any(SEND_TRUNCATED_RE.match(ln.strip()) for ln in lines)
+    first_line = ""
+    for ln in lines:
+        if ln.strip():
+            first_line = ln.strip()
+            break
+    window_open = age <= INFLIGHT_BACKOFF_WINDOW and first_line.startswith("timeout:")
+
+    pids = live_senders(prompt_file) if live_pids is None else list(live_pids)
+    alive_unknown = pids is None
+    alive = alive_unknown or bool(pids)
+
+    verdict, reasons = "IN_FLIGHT", []
+    if has_send:
+        verdict, reasons = "SENT", ["send_line"]
+    elif has_truncated:
+        verdict, reasons = "TRUNCATED", ["send_truncated_line"]
+    elif size >= NOT_SENT_MAX_BYTES:
+        reasons = ["log_has_bytes"]
+    elif age <= NOT_SENT_MIN_AGE_SEC:
+        reasons = ["log_is_fresh"]
+    elif alive:
+        reasons = ["sender_process_alive" if not alive_unknown else "liveness_unknown"]
+    elif window_open:
+        reasons = ["inside_backoff_window"]
+    else:
+        verdict, reasons = "NOT_SENT", ["no_send_line", "log_empty", "log_stale",
+                                        "no_sender_process"]
+
+    return {
+        "verdict": verdict,
+        "sent": verdict == "SENT",
+        "truncated": verdict == "TRUNCATED",
+        "not_sent": verdict == "NOT_SENT",
+        "in_flight": verdict == "IN_FLIGHT",
+        "bytes": size,
+        "age_sec": int(age),
+        "first_line": first_line,
+        "live_pids": [] if pids is None else pids,
+        "liveness_unknown": alive_unknown,
+        "reasons": reasons,
+        "log": os.path.abspath(log_path),
+        "prompt_file": os.path.abspath(prompt_file) if prompt_file else None,
     }
-    return tuple(sorted(names, key=lambda name: int(name[4:]))) + ("nologin",)
 
 
+def _send_exit_code(status, conv=None):
+    """投递类命令的退出码：截断优先于 200（SEND_TRUNCATED 绝不能以 0 收场）。
+
+    只判 conv 上的 send_truncated 标记，不判完整性：GET 之后 reply_complete 可能变 True，
+    但「发送时被截断」是既成事实，送达凭证已经缺失，exit 0 会让门禁假绿。
+    """
+    if getattr(conv, "send_truncated", False):
+        return 3
+    return 0 if status == 200 else 1
+
+# ---------- 建会话身份轮转 ----------
+# 优先登录态：acct1 / acct2 / acct3 / acct4 / acct5 / acct6 均分轮转；nologin（匿名）只作兜底——
+# 实测匿名会话不进任何会话历史（list 返回 0 条），随时可能被服务端回收，
+# 仅按 conv_id 在短期内可读，因此只在全部登录态都 429 时启用。
+ROTATION_ORDER = ("acct1", "acct2", "acct3", "acct4", "acct5", "acct6", "nologin")
+ROTATION_PRIMARY = ("acct1", "acct2", "acct3", "acct4", "acct5", "acct6")
 ROTATION_FALLBACK = ("nologin",)
-
-def _state_dir():
-    """Resolve runtime state lazily so tests can isolate BASE without global env."""
-    return os.path.abspath(os.environ.get("CHATGPT_STATE_DIR") or BASE)
-
-
-STATE_DIR = _state_dir()
-os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
-ROTATION_FILE = os.path.join(STATE_DIR, "account-rotation.json")
-CONV_MAP_FILE = os.path.join(STATE_DIR, "conv-accounts.json")
-ANON_SESSIONS_FILE = os.path.join(STATE_DIR, "anon-sessions.json")
+ROTATION_FILE = os.path.join(BASE, "account-rotation.json")
+CONV_MAP_FILE = os.path.join(BASE, "conv-accounts.json")
+ANON_SESSIONS_FILE = os.path.join(BASE, "anon-sessions.json")
 UNAVAILABLE_TTL = 6 * 3600  # 不可用标记有效期：过期后容许再试一次（凭据可能已刷新）
 COOLDOWN_429 = 180          # 429 只是临时限速，短冷却后重新纳入轮转
 COOLDOWN_403 = 900          # 403 多为 PoW/风控或隐性限速，15 分钟后允许重试
@@ -242,14 +489,11 @@ def cli_id(value):
 
 
 def _harden_perms(path):
-    """Keep secrets 0600; rotation counters are group-readable by the service operator."""
+    """凭据/状态文件在 POSIX 上收成 0600；Windows 无此语义，静默跳过。"""
     if os.name != "posix":
         return
-    rotation_path = globals().get("ROTATION_FILE")
     try:
-        mode = (0o640 if rotation_path and
-                os.path.abspath(path) == os.path.abspath(rotation_path) else 0o600)
-        os.chmod(path, mode)
+        os.chmod(path, 0o600)
     except OSError:
         pass
 
@@ -299,9 +543,6 @@ def _replace_with_bounded_retry(tmp, path):
                     % (tmp, path, cleanup_error)
                 )
             raise
-
-    # Defensive only: the loop either returns or raises.
-    raise RuntimeError("atomic replace retry loop exited unexpectedly")
 
 
 def _atomic_write(path, text):
@@ -1195,21 +1436,21 @@ def _load_json(path, default):
         return data
     except FileNotFoundError:
         return copy.deepcopy(default)
-    except OSError:
-        # Permission/I/O failures say nothing about JSON integrity. Never rename
-        # an unreadable file as corrupt or return an empty state that can later
-        # overwrite the original data. Let the caller fail closed.
-        raise
-    except ValueError as e:   # JSONDecodeError / invalid top-level shape only
-        bad = "%s.corrupt-%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
+    except (OSError, ValueError) as e:   # JSONDecodeError 是 ValueError 子类
         try:
-            os.replace(path, bad)
-        except OSError as quarantine_error:
-            # If quarantine cannot be completed, stop; do not continue with an
-            # empty state that a later save could overwrite.
-            raise quarantine_error from e
-        print("WARN: 状态文件损坏已隔离 %s -> %s（后续按空状态重建，旧内容在隔离文件里）"
-              % (os.path.basename(path), os.path.basename(bad)), flush=True)
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        if size > 0:
+            bad = "%s.corrupt-%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
+            try:
+                os.replace(path, bad)
+                print("WARN: 状态文件损坏已隔离 %s -> %s（后续按空状态重建，旧内容在隔离文件里）"
+                      % (os.path.basename(path), os.path.basename(bad)), flush=True)
+                return copy.deepcopy(default)
+            except OSError:
+                pass
+        print("WARN: 读取 %s 失败：%s" % (os.path.basename(path), e), flush=True)
         return copy.deepcopy(default)
 
 
@@ -1716,7 +1957,7 @@ RUN_MAX_SEC = 3600    # 单次运行上限，超时记 TIMEOUT 并释放租约�
 
 
 def _slots_dir(base=None):
-    return os.path.join(base or _state_dir(), "slots")
+    return os.path.join(base or BASE, "slots")
 
 
 def _lease_reclaimable(info, now=None, expect_run_id=None):
@@ -1774,7 +2015,7 @@ def _record_corruption(kind, path, why):
            "size": _size_of(path), "sha256": digest}
     ok = True
     try:
-        with open(os.path.join(_state_dir(), "corrupt-registry.jsonl"), "a", encoding="utf-8") as f:
+        with open(os.path.join(BASE, "corrupt-registry.jsonl"), "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
             f.flush()
     except OSError as e:
@@ -2374,7 +2615,10 @@ def _git_sha():
     try:
         out = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=os.path.dirname(os.path.abspath(__file__)),
-            capture_output=True, text=True, timeout=5,
+            # text=True 会按本机代码页解码（中文 Windows = cp936）；显式 UTF-8
+            # 才能与本仓库的编码约定一致，坏字节按 replace 保留而不是抛异常。
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -2539,21 +2783,14 @@ def _normalize_rotation(st):
     """
     if not isinstance(st, dict):
         st = {}
-    identities = {
-        name for name in _VALID_ACCOUNT_IDENTITIES
-        if name.startswith("acct") and name[4:].isdigit()
-    }
-    identities.add("nologin")
-    order = [a for a in _as_seq(st.get("order")) if a in identities]
-    for a in sorted(identities - {"nologin"}, key=lambda name: int(name[4:])):
+    order = [a for a in _as_seq(st.get("order")) if a in ROTATION_ORDER]
+    for a in ROTATION_ORDER:  # 保证全部身份齐全且顺序稳定
         if a not in order:
             order.append(a)
-    if "nologin" not in order:
-        order.append("nologin")
     st["order"] = order
     # 游标只在登录态身份之间推进（匿名是兜底，不参与均分）；
     # _as_int 不折叠 bool/float，垃圾游标归零而不是猜一个下标
-    st["cursor"] = _as_int(st.get("cursor"), 0) % max(len(_effective_rotation_primary()), 1)
+    st["cursor"] = _as_int(st.get("cursor"), 0) % len(ROTATION_PRIMARY)
     created, failures = _as_dict(st.get("created")), _as_dict(st.get("failures"))
     for a in order:
         created[a] = _as_int(created.get(a), 0)
@@ -2638,16 +2875,12 @@ def purge_expired(st):
 
 
 def rotation_plan(st):
-    """健康 allowlist 中的登录态身份从游标起顺次尝试；不可用的排到末尾（避免死锁）。
+    """登录态身份（acct1/acct2/acct3/acct4/acct5/acct6）从游标起顺次尝试；不可用的排到末尾（避免死锁）。
     匿名态不进入该计划——它只在**全部登录态**都 429 时由 anon_fallback_ready() 决定是否兜底。"""
     st = _as_dict(st)
     cur = _as_int(st.get("cursor"), 0)                          # F-34
-    pool = _effective_rotation_primary()
-    n = len(pool)
-    if not n:
-        return []
-    cur %= n
-    seq = [pool[(cur + i) % n] for i in range(n)]
+    n = len(ROTATION_PRIMARY)
+    seq = [ROTATION_PRIMARY[(cur + i) % n] for i in range(n)]
     return [a for a in seq if not is_unavailable(st, a)] + [a for a in seq if is_unavailable(st, a)]
 
 
@@ -2736,9 +2969,7 @@ def _normalize_conv_registry_record(conv_id, raw):
         return None, "conversation id requires normalization"
 
     if isinstance(raw, str):
-        # Historical ownership must survive even when an account is currently
-        # disabled for routing. Validate identity, not present-day health.
-        if raw not in _VALID_ACCOUNT_IDENTITIES:
+        if not validate_account_identity(raw):
             return None, "invalid legacy account identity"
 
         return {
@@ -2752,9 +2983,7 @@ def _normalize_conv_registry_record(conv_id, raw):
 
     account = raw.get("account")
 
-    # Preserve a disabled account's historical owner; health gating happens
-    # at routing/read/send boundaries, never by rewriting ownership metadata.
-    if account not in _VALID_ACCOUNT_IDENTITIES:
+    if not validate_account_identity(account):
         return None, "invalid or missing account identity"
 
     # Preserve every existing field, including note and free-form owner.
@@ -3343,63 +3572,16 @@ def restore_conv_map_minimal(candidate):
     }
 
 
-def _discover_account_identities():
-    """Discover configured acctN identities; adding credentials needs no code edit."""
-    from pathlib import Path
-    names = set()
-    roots = _account_discovery_roots()
-    for root in roots:
-        try:
-            entries = tuple(root.iterdir()) if root.is_dir() else ()
-        except OSError:
-            continue
-        for entry in entries:
-            try:
-                # Account identity survives missing credentials; symlinked
-                # account directories are not trusted as identities.
-                if (entry.is_symlink() or not entry.is_dir()
-                        or not re.fullmatch(r"acct[1-9][0-9]*", entry.name)):
-                    continue
-                names.add(entry.name)
-            except OSError:
-                continue
-    return frozenset({"default", "nologin", *names})
-
-
-def _account_discovery_roots():
-    from pathlib import Path
-    roots = []
-    configured = os.environ.get("SO_SENDER_ACCOUNTS_DIR")
-    if configured:
-        roots.append(Path(configured))
-    roots.append(Path(BASE) / "accounts")
-    return roots
-
-
-def _discover_account_credentials():
-    """Return only accounts with both regular credential files present."""
-    names = set()
-    for root in _account_discovery_roots():
-        try:
-            entries = tuple(root.iterdir()) if root.is_dir() else ()
-        except OSError:
-            continue
-        for entry in entries:
-            try:
-                if (entry.is_symlink() or not entry.is_dir()
-                        or not re.fullmatch(r"acct[1-9][0-9]*", entry.name)):
-                    continue
-                cookies, token = entry / "cookies.json", entry / "access_token.txt"
-                if (cookies.is_symlink() or token.is_symlink()
-                        or not cookies.is_file() or not token.is_file()):
-                    continue
-                names.add(entry.name)
-            except OSError:
-                continue
-    return frozenset(names)
-
-
-_VALID_ACCOUNT_IDENTITIES = _discover_account_identities()
+_VALID_ACCOUNT_IDENTITIES = frozenset((
+    "default",
+    "acct1",
+    "acct2",
+    "acct3",
+    "acct4",
+    "acct5",
+    "acct6",
+    "nologin",
+))
 
 
 def normalize_account_identity(account):
@@ -3417,14 +3599,12 @@ def normalize_account_identity(account):
 
 
 def validate_account_identity(account):
-    """Return True only for an account in the effective routing allowlist."""
+    """Return True only for a configured account identity."""
     try:
-        normalized = normalize_account_identity(account)
+        normalize_account_identity(account)
+        return True
     except ValueError:
         return False
-    if normalized == "nologin":
-        return True
-    return normalized in _effective_rotation_primary()
 
 
 def lookup_conversation_owner(conv_id):
@@ -3698,7 +3878,7 @@ def parse_cookie_header(cookie):
 #
 # 解析优先级：CHATGPT_PROXY > proxy.json > 系统 https_proxy/http_proxy/all_proxy > 本机端口探测
 # 兜底：一条都解析不到时拒绝联网（除非显式 CHATGPT_ALLOW_DIRECT=1）。
-PROXY_FILE = os.path.abspath(os.environ.get("CHATGPT_PROXY_FILE") or os.path.join(BASE, "proxy.json"))
+PROXY_FILE = os.path.join(BASE, "proxy.json")
 PROXY_AUTODETECT_PORTS = (7890, 7897, 10809, 1080, 8888)
 # 本机地址永不过代理：CDP / 本地闸口(CHATGPT_BASE) 一旦被塞进代理，代理挂了就全链路瘫痪
 PROXY_BYPASS_HOSTS = ("127.0.0.1", "localhost", "::1", "0.0.0.0")
@@ -4357,6 +4537,38 @@ def device_summary():
 
 # 思考模型解析：只缓存成功结果，失败必须允许后续重新解析。
 _THINKING_MODEL_CACHE = {}
+# 默认思考模型优先级：清单里存在该 slug 时优先选它（用户裁定 2026-11-26）。
+# 只影响“自动选择”的排序；CHATGPT_MODEL 显式指定仍然最高优先。
+# 环境变量 CHATGPT_PREFERRED_THINKING 可覆盖它；未设置时用下面的默认值。
+_DEFAULT_PREFERRED_THINKING_SLUG = "gpt-6-t-mini"
+_PREFERRED_THINKING_SLUG = _DEFAULT_PREFERRED_THINKING_SLUG
+_PREFERRED_THINKING_ENV = "CHATGPT_PREFERRED_THINKING"
+_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _preferred_thinking_slug():
+    """优先思考模型 slug：CHATGPT_PREFERRED_THINKING > 默认 gpt-6-t-mini。
+
+    返回 (slug, source)，source 取 "env" 或 "default"。
+
+    非法配置直接抛 ValueError，不悄悄退回默认值：配置写错却照常选出默认模型，
+    等于让操作者以为“我设的优先模型生效了”——A27 要堵的正是这种静默回退。
+    """
+    raw = os.environ.get(_PREFERRED_THINKING_ENV)
+    if raw is None:
+        return _DEFAULT_PREFERRED_THINKING_SLUG, "default"
+    slug = raw.strip()
+    if not slug:
+        raise ValueError(
+            "%s 为空：删掉该变量走默认 %s，或给一个含 -t- 的 slug"
+            % (_PREFERRED_THINKING_ENV, _DEFAULT_PREFERRED_THINKING_SLUG)
+        )
+    if not _SLUG_RE.match(slug) or "-t-" not in slug:
+        raise ValueError(
+            "%s=%r 不是思考模型 slug（必须含 -t-，只允许字母数字 . _ -）"
+            % (_PREFERRED_THINKING_ENV, raw)
+        )
+    return slug, "env"
 
 class ThinkingModelUnavailable(RuntimeError):
     """当前账号无法满足强制思考模式要求。
@@ -4414,21 +4626,12 @@ class ChatGPTAPI:
     def __init__(self, base_dir=None, account="default"):
         # CHATGPT_AUTH_DIR selects credential/cache root; account data stays isolated.
         root = base_dir or os.environ.get("CHATGPT_AUTH_DIR") or BASE
-        configured_accounts_root = os.environ.get("SO_SENDER_ACCOUNTS_DIR", "").strip()
         if account not in _VALID_ACCOUNT_IDENTITIES:
             raise ValueError(
                 "account must be one of %s"
                 % ", ".join(sorted(_VALID_ACCOUNT_IDENTITIES))
             )
-        if account != "nologin":
-            normalized = "acct1" if account == "default" else account
-            if normalized not in _effective_rotation_primary():
-                raise ValueError("account is not active for routing")
-        if base_dir is None and configured_accounts_root:
-            account_name = "acct1" if account in ("default", "acct1") else account
-            b = os.path.join(configured_accounts_root, account_name)
-        else:
-            b = root if account in ("default", "acct1") else os.path.join(root, "accounts", account)
+        b = root if account in ("default", "acct1") else os.path.join(root, "accounts", account)
         self.account = account
         self.base_dir = b
         self.is_anon = account == "nologin"  # 匿名态：走 /backend-anon/，POST 需浏览器过 Turnstile
@@ -4459,6 +4662,9 @@ class ChatGPTAPI:
         self.last_body = ""
         self.last_status = 0
         self.quota = {}  # 观测用：最近一次响应的限速相关头
+        self.last_truncated = False   # 上一次响应是否被截断（IncompleteRead / 超时）
+        self.last_partial_path = None  # 截断/超时已收内容的落盘路径（无则 None）
+        self.last_partial_bytes = 0    # 截断/超时实际收到的原始字节数（SEND_TRUNCATED 用）
 
     # ---------- 匿名态设备身份 ----------
     def device_cookie_path(self):
@@ -4626,9 +4832,8 @@ class ChatGPTAPI:
     def classify_failure(status, body):
         """失败定性（用户裁定 2026-11-19）：先分清代理/网络问题还是上游限速/风控。
 
-        返回 'proxy' | 'auth' | 'ratelimit' | 'risk' | 'other'。
+        返回 'proxy' | 'ratelimit' | 'risk' | 'other'。
         - proxy：连接层失败（SSL EOF、重置、超时、status 0）→ 修代理，不计时死等。
-        - auth：401/403 凭据或授权被拒 → 立即失败，不重试、不退避、不轮换账号。
         - ratelimit：429 或响应体带限速字段 → 按返回体时限退避。
         - risk：403 Unusual activity 等风控 → 补 cookie/PoW 流程。
         """
@@ -4643,8 +4848,6 @@ class ChatGPTAPI:
             return "risk"
         if status == 403 and b.lstrip().startswith("<html"):
             return "risk"  # Cloudflare 质询页 = 出口/指纹被拦，但归属风控处置链
-        if status in (401, 403):
-            return "auth"  # 凭据/授权被拒：立即失败，不重试、不轮换账号
         return "other"
 
     def repair_proxy(self):
@@ -4706,10 +4909,16 @@ class ChatGPTAPI:
             rq.add_header("Content-Type", "application/json")
         for k, v in (extra_headers or {}).items():
             rq.add_header(k, v)
+        t0 = time.time()
+        # 已收到的原始字节：超时/断流时这是唯一副本，必须边读边留（旧版 resp.read() 一次读完，
+        # 中途超时异常里没有已读字节 → 已收内容全丢，19 次卡死全部零留存）。
+        sink = []
+        self.last_partial_path = None
+        self.last_partial_bytes = 0
         try:
             with self._opener.open(rq, timeout=timeout) as resp:
-                data = resp.read()  # 读到 EOF，勿提前 close
-                data = self._decompress(data, resp.headers.get("Content-Encoding"))
+                self._read_stream(resp, sink)   # 读到 EOF，勿提前 close
+                data = self._decompress(b"".join(sink), resp.headers.get("Content-Encoding"))
                 self.last_headers = {k.lower(): v for k, v in resp.headers.items()}
                 self.quota = self._quota_from_headers(self.last_headers)
                 text = data.decode("utf-8", "replace")
@@ -4729,21 +4938,123 @@ class ChatGPTAPI:
             # 流被截断（实测：思考模式单条 SSE 可达 23MB，隧道中途断流）。
             # 关键：已收到的字节里通常已包含 conversation_id 与大部分回复，
             # 整包当失败会导致「换身份重投 → 同一 prompt 建出两个会话」。
-            partial = getattr(e, "partial", b"") or b""
-            self.last_truncated = True
+            # 现在与超时同路：明确标记 + 落盘，字节不丢。
+            # 注意：partial 已由 _read_stream() 在抛空前追加进 sink（它保证直接调用
+            # 也不丢字节），此处不能再追加一次，否则 13 字节变 26 字节、正文重复。
+            return self._partial_result(
+                b"".join(sink), t0, "IncompleteRead: %s" % (e,), marker="PARTIAL")
+        except (socket.timeout, TimeoutError) as e:
+            return self._timeout_result(sink, t0, timeout, str(e) or type(e).__name__)
+        except urllib.error.URLError as e:
+            reason = getattr(e, "reason", None)
+            if isinstance(reason, (socket.timeout, TimeoutError)) or "timed out" in str(reason):
+                return self._timeout_result(sink, t0, timeout, "urlopen: %s" % (reason,))
             self.last_headers = {}
             self.quota = {}
             self.last_body = ""
-            self.last_status = 200
-            print("WARN: 响应流被截断（IncompleteRead，已收 %d 字节），按已收内容解析，稍后用 GET 补全文"
-                  % len(partial), flush=True)
-            return 200, partial.decode("utf-8", "replace")
+            self.last_status = 0
+            return 0, "EXC " + str(e)
         except Exception as e:
             self.last_headers = {}
             self.quota = {}
             self.last_body = ""
             self.last_status = 0
             return 0, "EXC " + str(e)
+
+    @staticmethod
+    def _read_stream(resp, sink):
+        """分块读到 EOF，边读边把字节追加进 sink。
+
+        为什么不用 `resp.read()`：一次性读到底，中途 socket 超时抛出时异常对象里没有
+        已读到的字节——已收内容全部白丢（xhttp 层也无法回捞）。分块读保证已经返回的
+        chunk 都留在 sink 里，可以落盘保全。
+
+        `IncompleteRead` 的处理：异常携带的 `e.partial`（本次没读完整的那一块）由本函数
+        追加进 sink 后原样 re-raise，所以调用方（req()）直接拿 sink 落盘即可，**不得再
+        追加一次**，否则同一段字节会出现两遍。
+
+        注意：这里只覆盖 `read()` 阶段抛出的截断；若 `open()` / `__enter__` 阶段就抛
+        `IncompleteRead`，此时 sink 还是空的，本函数无从保全。stdlib 的 chunked 解码错误
+        都在 `read()` 内抛出，因此该分支现实不可达，无需额外处理。
+        """
+        while True:
+            try:
+                chunk = resp.read(16384)
+            except http.client.IncompleteRead as e:
+                part = getattr(e, "partial", b"") or b""
+                if part:
+                    sink.append(part)
+                raise
+            if not chunk:
+                return
+            sink.append(chunk)
+
+    def _save_partial(self, data):
+        """把已收到的原始字节落盘（不经过文本层，保持可再次解析）。"""
+        d = os.path.join(self.base_dir, "timeouts")
+        base = "partial-%s-%s-%d" % (self.account, datetime.now().strftime("%Y%m%d-%H%M%S"),
+                                     os.getpid())
+        for seq in range(0, 100):
+            name = base + ("" if seq == 0 else "-%d" % seq) + ".txt"
+            path = os.path.join(d, name)
+            if os.path.exists(path):
+                continue
+            try:
+                _atomic_write_bytes(path, data)
+                return path
+            except OSError as e:
+                print("WARN: 部分内容落盘失败（%s）" % e, flush=True)
+                return None
+        return None
+
+    def _timeout_result(self, sink, t0, budget, why):
+        """超时统一收敛点：可机读标记 + 部分内容保全，绝不静默丢字节。
+
+        标记格式固定（事后统计只认这两行）：
+          TIMEOUT_PARTIAL after Ns, M bytes buffered, saved to <path>
+          TIMEOUT_EMPTY after Ns
+        有部分内容时按 200 返回，让既有链路照常解析/对账——最终仍会落到
+        「FAIL: 回复完整性未证明」，标记只加在前面，判定口径不放宽。
+        """
+        elapsed = time.time() - t0
+        self.last_truncated = True
+        self.last_headers = {}
+        self.quota = {}
+        self.last_body = ""
+        if not sink:
+            self.last_status = 0
+            print("TIMEOUT_EMPTY after %.0fs" % elapsed, flush=True)
+            print("WARN: 超时边界 %ss（%s）——零字节返回，按连接层失败处理"
+                  % (budget, why), flush=True)
+            return 0, "TIMEOUT_EMPTY after %.0fs" % elapsed
+        return self._partial_result(b"".join(sink), t0, why,
+                                    marker="TIMEOUT_PARTIAL", budget=budget)
+
+    def _partial_result(self, data, t0, why, marker="PARTIAL", budget=None):
+        """部分内容的统一出口：落盘 + 打标记 + 按 200 交回既有解析链路。"""
+        elapsed = time.time() - t0
+        self.last_truncated = True
+        self.last_headers = {}
+        self.quota = {}
+        path = self._save_partial(data) if data else None
+        self.last_partial_path = path
+        self.last_partial_bytes = len(data) if data else 0
+        if path:
+            print("%s after %.0fs, %d bytes buffered, saved to %s"
+                  % (marker, elapsed, len(data), path), flush=True)
+        else:
+            print("%s after %.0fs, %d bytes buffered, saved to <FAILED>"
+                  % (marker, elapsed, len(data)), flush=True)
+        if budget is not None:
+            print("WARN: 超时边界 %ss（%s）——按已收内容解析，完整性仍由后续对账判定"
+                  % (budget, why), flush=True)
+        else:
+            print("WARN: 响应流被截断（%s）——按已收内容解析，稍后用 GET 补全文" % why,
+                  flush=True)
+        self.last_status = 200
+        text = data.decode("utf-8", "replace")
+        self.last_body = text
+        return 200, text
 
     # ---------- tail ----------
     @staticmethod
@@ -4792,21 +5103,12 @@ class ChatGPTAPI:
 
     def live_tail(self, conv_id, tries=2):
         for attempt in range(tries):
-            st, body = self.req("GET", API_BASE + "/backend-api/conversation/" + conv_id, timeout=90)
+            st, body = self.req("GET", API_BASE + "/backend-api/conversation/" + conv_id,
+                                timeout=_cap_timeout(90))
             if st == 200:
                 return self.tail_from_mapping(body), body
             kind = self.classify_failure(st, body)
-            _line = "GET %s -> %s (try %d, 定性=%s)" % (id8(conv_id), st, attempt + 1, kind)
-            if st == 429:
-                print(_line, file=sys.stderr, flush=True)
-                return None, None
-            if st in (401, 403):
-                # 401/403 fail-fast（Owner 裁定）：只允许一次 GET，不重试、不睡眠、不换号。
-                # 走 stderr：--json 读取路径会 redirect_stdout，Sidecar 仍须看到 `-> 401`。
-                print(_line, file=sys.stderr, flush=True)
-                print("认证/授权被拒（%s）——立即失败，不重试、不换号" % st, flush=True)
-                return None, None
-            print(_line, flush=True)
+            print("GET %s -> %s (try %d, 定性=%s)" % (id8(conv_id), st, attempt + 1, kind), flush=True)
             if attempt + 1 < tries:
                 if kind == "proxy":
                     self.repair_proxy()   # 修代理，不盲等
@@ -4925,9 +5227,12 @@ class ChatGPTAPI:
         account = getattr(api, "account", "unknown")
         explicit = os.environ.get("CHATGPT_MODEL") or ""
 
-        # 显式模型配置也参与 cache key，避免切换 CHATGPT_MODEL 后
-        # 错误复用之前账号的模型。
-        key = (account, explicit)
+        # 优先 slug 先解析：非法配置必须在任何请求之前就炸，不能等拿到清单才发现。
+        preferred, preferred_source = _preferred_thinking_slug()
+
+        # 显式模型配置与优先 slug 都参与 cache key，避免切换 CHATGPT_MODEL 或
+        # 改 CHATGPT_PREFERRED_THINKING 后错误复用之前选定的模型。
+        key = (account, explicit, preferred)
 
         if key in cache:
             return cache[key]
@@ -5014,11 +5319,29 @@ class ChatGPTAPI:
 
         chosen = ""
 
+        # 优先级 0：清单里存在优先 slug 时默认选它。
+        # 优先 slug 来自 CHATGPT_PREFERRED_THINKING，未设置时是默认值。
+        if preferred in by_slug:
+            chosen = preferred
+            print(
+                "thinking model: 优先命中 %s（source=%s）"
+                % (preferred, preferred_source),
+                flush=True,
+            )
+        else:
+            # 不能静默：优先候选缺失必须留下可 grep 的诊断，否则日志看起来
+            # 和“优先模型生效”一模一样。
+            print(
+                "thinking model: 优先候选 %s 不在清单里（source=%s），按后备顺序解析"
+                % (preferred, preferred_source),
+                flush=True,
+            )
+
         # 优先级 1：默认模型本身就是思考模型。
-        if "-t-" in default:
+        if not chosen and "-t-" in default:
             chosen = default
 
-        else:
+        elif not chosen:
             # 优先级 2：同标题的 -t- 变体。
             want_title = _as_dict(by_slug.get(default)).get("title")
 
@@ -5661,7 +5984,7 @@ def anon_archive_path(conv_id):
     因此 `--anon-read ../../x` 之类不会在工作目录外写出文件。
     """
     short = id8(conv_id, "unknown")
-    base = os.path.join(_state_dir(), "anon-sessions", short)
+    base = os.path.join(BASE, "anon-sessions", short)
     path = base + ".md"
     if os.path.exists(path):
         try:
@@ -5850,7 +6173,8 @@ class ConvRef(str):
     """
 
     def __new__(cls, conv_id, actual_conv_id=None, mismatch=False, reason="",
-                candidate_ids=None, evidence_complete=None, reply_complete=None):
+                candidate_ids=None, evidence_complete=None, reply_complete=None,
+                send_truncated=None):
         obj = super().__new__(cls, conv_id or "")
         obj.target_conv_id = conv_id or ""
         obj.actual_conv_id = actual_conv_id or ""
@@ -5861,6 +6185,9 @@ class ConvRef(str):
         # False = 隔离三件事有失败，机器调用方必须据此判「证据不完整」。
         obj.evidence_complete = evidence_complete
         obj.reply_complete = reply_complete
+        # 发送时响应是否被截断/超时（SEND_TRUNCATED）。只有完整响应才允许算送达凭证，
+        # 所以这个标记必须一路带到 CLI 退出码（exit 3），不能被 st=200 吞掉。
+        obj.send_truncated = send_truncated
         return obj
 
 
@@ -6045,7 +6372,7 @@ def _quarantine_reply(api, target_conv, actual_conv, reply, resp, status, pfile)
 # 目录含私有对话内容，与 replies/ 同等级：已由 .gitignore 排除，绝不入库。
 
 def log_root():
-    return os.path.join(_state_dir(), "logs")
+    return os.path.join(BASE, "logs")
 
 def log_dir():
     """已确认 conv_id 的会话日志。按 BASE 惰性解析——测试改 BASE 即自动隔离。"""
@@ -6663,8 +6990,6 @@ def load_prompt_text(prompt_file):
         raise RuntimeError("读不到提示词文件 %s：%s" % (prompt_file, e))
     validate_prompt_text(text, prompt_file)
     text = text.strip()
-    if not text:
-        raise RuntimeError("提示词没有正文：%s" % prompt_file)
     if not any(not l.strip().startswith("#") for l in text.splitlines()):
         raise RuntimeError("提示词没有正文（只有注释行）：%s" % prompt_file)
     return text
@@ -6686,6 +7011,8 @@ def _send_prompt_impl(
 
     返回 (status, reply_path, real_conv_id)；real_conv_id 用于登记会话归属。
     thinking=True 时用思考模型（`-t-` 变体）；None = 读 CHATGPT_THINKING 环境变量。
+    超时取模块级 SEND_TIMEOUT（--timeout / CHATGPT_SEND_TIMEOUT），只改 socket 超时，
+    不改模型选择。
     text 已给定时**不再读文件**——保证发送内容与日志留存内容是同一份。
     """
     if conv_id:
@@ -6764,9 +7091,31 @@ def _send_prompt_impl(
         t0 = time.time()
         # A16：思考模式单条实测可达 19 分钟，7 分钟会误杀；分档超时按是否思考给
         send_timeout = 1800 if (thinking and model) else 420
+        # --timeout / CHATGPT_SEND_TIMEOUT：在分档**之后**覆盖。
+        # 分档逻辑本身一字不动（--thinking 的语义不变），只是给这条 socket 超时一个可配值。
+        # 未显式配置时不打印 `timeout:` 行（分档值由 SEND 行的 `in Ns` 体现）——那行只是
+        # 人工排障用的旁证，不得反过来成为「必须打印」的默认值来源。
+        override = SEND_TIMEOUT
+        if override is not None:
+            send_timeout = override
+            print("timeout: %ss (source=%s)"
+                  % (send_timeout, SEND_TIMEOUT_SOURCE or "env"), flush=True)
         st, resp = api.send(conv_id, text, tail, req_token, proof, model=model,
                             timeout=send_timeout)
-        print("SEND %s -> %s respLen=%d in %.0fs" % (pfile, st, len(resp), time.time() - t0), flush=True)
+        # 截断/超时被 _partial_result 折成 200 交回既有解析链路（不丢字节），但
+        # `SEND ... -> 200` 是唯一送达凭证——截断响应绝不能打它，否则一次超时
+        # 在日志、退出码、会话登记三个门禁上同时是绿的（DEF-ops-01）。
+        send_truncated = bool(getattr(api, "last_truncated", False))
+        if send_truncated:
+            print("SEND_TRUNCATED pfile=%s st=%s bytes=%s"
+                  % (pfile, st, getattr(api, "last_partial_bytes", 0)), flush=True)
+        else:
+            print("SEND %s -> %s respLen=%d in %.0fs"
+                  % (pfile, st, len(resp), time.time() - t0), flush=True)
+        if send_truncated or "TIMEOUT_" in (resp or "") or getattr(api, "last_partial_path", None):
+            print("SEND_TIMEOUT_MARK pfile=%s budget=%ss st=%s partial_path=%s"
+                  % (pfile, send_timeout, st,
+                     getattr(api, "last_partial_path", None) or "-"), flush=True)
         if st == 403 and "Unusual activity" in (resp or "") and attempt == 1:
             print("403 Unusual activity —— 补 Cloudflare cookie 并重跑 requirements + PoW 重试一次", flush=True)
             api.warm_cookies()
@@ -6851,7 +7200,7 @@ def _send_prompt_impl(
         full = ""
         digest_ok = False
         gst, gbody = api.req("GET", API_BASE + "/backend-api/conversation/" + real_conv,
-                             timeout=120)
+                             timeout=_cap_timeout(120))
         if gst == 200:
             full, gcomplete = api.harvest_mapping_checked(gbody)
             if not gcomplete:
@@ -6933,7 +7282,8 @@ def _send_prompt_impl(
         return (LANDING_MISMATCH_STATUS, qpath,
                 ConvRef(conv_id, actual_conv_id=real_conv, mismatch=True,
                         reason="landing_mismatch: 投递目标与服务器实际落点不一致",
-                        evidence_complete=evidence_complete))
+                        evidence_complete=evidence_complete,
+                        send_truncated=send_truncated))
 
     # F-23：不完整的回复照归档（保住唯一副本），但归档文本自带醒目声明——
     # 下游看到这个标记就知道「这不是定稿」，不会把它当完整回复继续操作。
@@ -6962,6 +7312,7 @@ def _send_prompt_impl(
 
             landing_confirmed = (
                 st == 200
+                and not send_truncated
                 and first_cid == real_conv
                 and len(all_cids) == 1
                 and all_cids[0] == real_conv
@@ -6987,7 +7338,8 @@ def _send_prompt_impl(
                 % exc,
                 flush=True,
             )
-    return st, path, ConvRef(real_conv, reply_complete=reply_complete)
+    return st, path, ConvRef(real_conv, reply_complete=reply_complete,
+                             send_truncated=send_truncated)
 
 
 def _reply_state_of(status, reply, conv):
@@ -7162,30 +7514,14 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
     status, path, conv = (tuple(result) + (None, None, None))[:3]
     reply = getattr(api, "_last_reply_text", None)
     reply_state = _reply_state_of(status, reply, conv)
-    receipt_path = None
     try:
-        receipt_path = log_end(api, turn_id, begin_path, conv_id, conv, status, path,
-                               reply_state)
+        log_end(api, turn_id, begin_path, conv_id, conv, status, path,
+                reply_state)
     except Exception as le:
-        # The job-level receipt is still emitted from in-memory metadata; the
-        # durable Job row can preserve it even if the conversation log failed.
-        print("FAIL: 回复落盘失败（%s）——本轮只有 begin（提示词已存），"
+        # 回复已拿到但日志补写失败：明确报错，不静默。begin 行仍在，轮次可追溯。
+        print("FAIL: 回复留存失败（%s）——本轮只有 begin（提示词已存），"
               "状态将显示 unrecorded；回复正文在 %s" % (le, path or "未落盘"),
               flush=True)
-    reply_text = reply if isinstance(reply, str) else ""
-    receipt = {
-        "receipt_version": 1,
-        "turn_id": turn_id,
-        "conversation_id": _safe_conv_id(conv),
-        "message_id": getattr(conv, "message_id", None),
-        "status": status,
-        "reply_state": reply_state,
-        "reply_source": getattr(api, "reply_source", "api"),
-        "reply_chars": len(reply_text),
-        "reply_sha256": hashlib.sha256(reply_text.encode("utf-8")).hexdigest() if reply_text else "",
-        "receipt_durable": bool(receipt_path),
-    }
-    print("SEND_RECEIPT " + json.dumps(receipt, ensure_ascii=False, separators=(",", ":")), flush=True)
     return result
 
 
@@ -7307,8 +7643,8 @@ def _attempt_create(st, name, prompt_file, attempts, thinking=None):
 def _mark_success(st, name, conv, prompt_file, attempts):
     def mutate(s):
         s["created"][name] = s.get("created", {}).get(name, 0) + 1
-        if name in _effective_rotation_primary():
-            s["cursor"] = (_effective_rotation_primary().index(name) + 1) % len(_effective_rotation_primary())
+        if name in ROTATION_PRIMARY:
+            s["cursor"] = (ROTATION_PRIMARY.index(name) + 1) % len(ROTATION_PRIMARY)
         else:
             # 兜底不推进游标：登录态恢复后仍按原均分顺序轮转，否则会白跳过一个账号的轮次
             s["fallback_uses"] = s.get("fallback_uses", 0) + 1
@@ -7323,7 +7659,7 @@ def _mark_success(st, name, conv, prompt_file, attempts):
 
 
 def create_chat_rotating(prompt_file, thinking=None):
-    """登录态优先建会话：健康 allowlist 中的账号均分轮转；
+    """登录态优先建会话：acct1/acct2/acct3/acct4/acct5/acct6 均分轮转；
     仅当全部都 429 才用匿名兜底。
 
     匿名会话不进任何账号历史（会话列表恒为空），只按 conv_id 短期可读，
@@ -7344,7 +7680,7 @@ def create_chat_rotating(prompt_file, thinking=None):
 
     outcomes, attempts, skipped = {}, [], {}
 
-    for name in _effective_rotation_primary():
+    for name in ROTATION_PRIMARY:
         if is_unavailable(st, name):
             reason = _as_dict(
                 _as_dict(st.get("unavailable")).get(name)
@@ -7395,7 +7731,7 @@ def create_chat_rotating(prompt_file, thinking=None):
 
         if conv:
             _mark_success(st, name, conv, prompt_file, attempts)
-            return 0
+            return _send_exit_code(status, conv)
 
         if status == 200:
             print(
@@ -7431,7 +7767,7 @@ def create_chat_rotating(prompt_file, thinking=None):
 
     all_thinking_unavailable = all(
         is_thinking_unavailable(outcomes.get(name))
-        for name in _effective_rotation_primary()
+        for name in ROTATION_PRIMARY
     )
 
     if thinking_requested and all_thinking_unavailable:
@@ -7470,7 +7806,7 @@ def create_chat_rotating(prompt_file, thinking=None):
                 "勿用于需留存的长任务",
                 flush=True,
             )
-            return 0
+            return _send_exit_code(status, conv)
 
         if status == 200:
             print(
@@ -7512,15 +7848,14 @@ def create_chat_rotating(prompt_file, thinking=None):
 def rotation_summary():
     st = load_rotation()
     created = st.get("created", {})
-    pool = _effective_rotation_primary()
-    prim = {a: _as_float(created.get(a), 0.0) for a in pool}   # F-30
+    prim = {a: _as_float(created.get(a), 0.0) for a in ROTATION_PRIMARY}   # F-30
     prim_total = sum(prim.values()) or 1
     return {
-        "policy": "仅在持久化健康 allowlist 内轮转；nologin 仅在全部允许账号 429 时兜底",
-        "primary": list(pool),
+        "policy": "acct1/acct2/acct3/acct4/acct5/acct6 均分轮转；nologin 仅在全部 429 时兜底（其会话不入历史）",
+        "primary": list(ROTATION_PRIMARY),
         "fallback": list(ROTATION_FALLBACK),
         "cursor": st["cursor"],
-        "next": (pool[st["cursor"] % len(pool)] if pool else None),
+        "next": ROTATION_PRIMARY[st["cursor"]],
         "created": created,
         # share 只在登录态之间算，兜底的匿名次数单列，避免把 1/3 当成「没均分好」
         "share": {k: round(v / float(prim_total), 2) for k, v in prim.items()},
@@ -7847,6 +8182,8 @@ def require_trusted_worktree_root():
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
         if completed.returncode != 0:
@@ -7903,451 +8240,22 @@ def require_trusted_worktree_root():
 
     return root
 
+def main():
+    """CLI 入口：投递超时是**进程级**配置，跑完必须还原。
 
-# ---------------------------------------------------------------- 结构化 CLI
-# 规格：accounts/acct3/replies/reply-6b08568b-235927.md。
-# 这些分支只在显式给出新参数（--account-only / --json / --after-message-id /
-# --limit）时触发；不带新参数时 main() 的旧路径原样执行（输出与退出码不变）。
-
-
-def _cli_print_json(payload):
-    """结构化命令的唯一输出口径：单行 JSON。"""
-    print(json.dumps(payload, ensure_ascii=False), flush=True)
-
-
-def _cli_retry_after_seconds(api, default=60):
-    """Expose upstream Retry-After/reset metadata without contaminating JSON stdout."""
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            value = api._retry_after(default, getattr(api, "last_body", None))
-        value = float(value)
-    except Exception:
-        value = float(default)
-    return max(1, min(3600, int(value + 0.999)))
-
-
-def _cli_flag_present(args, flag):
-    return any(a == flag for a in args)
-
-
-def _cli_take_value_flags(args, flags):
-    """从 args 中摘出指定取值参数（`--flag value` 或 `--flag=value`）。
-
-    返回 (values, rest, error)。error 非 None = 参数错误（重复/缺值），
-    调用方按参数错误退出。不修改传入列表。
+    为什么要还原：同进程内的库调用（以及测试）不该被一次 CLI 调用留下的 600s 影响——
+    A16 的分档（非思考 420 / 思考 1800）在库调用路径上必须原样成立。
     """
-    values, rest, i = {}, [], 0
-    while i < len(args):
-        token = args[i]
-        name, sep, inline = token.partition("=")
-        if name in flags:
-            if name in values:
-                return values, rest, "duplicate %s" % name
-            if sep:
-                value = inline
-                i += 1
-            else:
-                if i + 1 >= len(args):
-                    return values, rest, "%s requires a value" % name
-                value = args[i + 1]
-                i += 2
-            if not value or value.startswith("--"):
-                return values, rest, "%s requires a value" % name
-            values[name] = value
-            continue
-        rest.append(token)
-        i += 1
-    return values, rest, None
-
-
-def _cli_safe_conv_id(raw):
+    prev_timeout, prev_source = SEND_TIMEOUT, SEND_TIMEOUT_SOURCE
     try:
-        return safe_id(raw, "conv_id")
-    except (TypeError, ValueError):
-        return None
+        return _main_impl()
+    finally:
+        globals()["SEND_TIMEOUT"] = prev_timeout
+        globals()["SEND_TIMEOUT_SOURCE"] = prev_source
 
 
-def _cli_same_account(left, right):
-    try:
-        return normalize_account_identity(left) == normalize_account_identity(right)
-    except (TypeError, ValueError):
-        return False
-
-
-def _cli_open_api(account):
-    """构造 ChatGPTAPI；失败返回 (None, detail)，由调用方输出 JSON 失败。"""
-    try:
-        return ChatGPTAPI(account=account), None
-    except (ValueError, OSError, json.JSONDecodeError) as e:
-        return None, str(e)
-
-
-def _cli_mapping_messages(raw_body):
-    """把会话 mapping 解析成带真实 message id 的结构化消息。
-
-    返回 (messages, complete)。messages 每项 {"id","role","content"}，
-    另带内部排序用的 create_time；对外输出前会剥掉。
-
-    与 _scan_mapping 的区别只有一个：**保留 message id**（结构化读取必须
-    给出 mapping 里的真实 ID，不能用序号充当）。畸形判定与现有扫描器同口径：
-    坏 node / 坏 author / 非法 part / 时间不可用 / mapping key 与消息节点 ID
-    不一致 / 消息 ID 缺失，一律 complete=False（不得把截断结果当完整）。
-    """
-    try:
-        data = json.loads(raw_body)
-    except Exception:
-        return [], False
-    if not isinstance(data, dict):
-        return [], False
-    mapping = data.get("mapping")
-    if not isinstance(mapping, dict):
-        return [], False
-    complete = True
-    rows = []
-    for node_id, node in mapping.items():
-        if not isinstance(node, dict):
-            complete = False
-            continue
-        message = node.get("message")
-        if message is None:
-            continue                     # 非消息节点（根节点等）——正常
-        if not isinstance(message, dict):
-            complete = False
-            continue
-        author = message.get("author")
-        if not isinstance(author, dict):
-            complete = False
-            continue
-        content = message.get("content")
-        if content is None:
-            parts = []
-        elif isinstance(content, dict):
-            parts = content.get("parts")
-            if parts is None:
-                content_type = content.get("content_type")
-                if content_type in ("code", "text") and isinstance(
-                        content.get("text"), str):
-                    parts = [content["text"]]
-                else:
-                    parts = []
-            elif not isinstance(parts, list):
-                complete = False
-                continue
-        else:
-            complete = False
-            continue
-        texts, structured, malformed = _split_parts(parts)
-        if malformed:
-            complete = False
-            continue
-        role = author.get("role")
-        if structured and role == "assistant":
-            complete = False
-            continue
-        time_ok, create_time = _as_ctime(message.get("create_time"))
-        if not time_ok:
-            complete = False
-        text = _assistant_text(texts)
-        if role not in ("user", "assistant") or not text:
-            continue
-        message_id = node_id if isinstance(node_id, str) and node_id else None
-        declared_id = message.get("id")
-        if isinstance(declared_id, str) and declared_id:
-            if message_id is None:
-                message_id = declared_id
-            elif declared_id != message_id:
-                # mapping key 与消息节点 ID 对不上 → 身份无法核对
-                complete = False
-        if not message_id:
-            complete = False             # 消息 ID 缺失：不得生成序号冒充
-            continue
-        rows.append({
-            "id": message_id,
-            "role": role,
-            "content": text,
-            "create_time": create_time,
-        })
-    # 时间升序；时间相同按 message ID 稳定排序。
-    rows.sort(key=lambda row: (row["create_time"], row["id"]))
-    return rows, complete
-
-
-def _cli_list_result(account):
-    """`--list --json`：结构化会话列表。"""
-    api, detail = _cli_open_api(account)
-    if api is None:
-        _cli_print_json({"event": "list_result", "ok": False,
-                         "reason": "auth_unavailable", "http_status": None,
-                         "detail": detail})
-        return 1
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            items, status, error = api.list_conversations()
-    except Exception as e:
-        _cli_print_json({"event": "list_result", "ok": False,
-                         "reason": "list_failed", "http_status": None,
-                         "detail": str(e)})
-        return 1
-    error = error or ""
-    if status != 200:
-        payload = {"event": "list_result", "ok": False,
-                   "reason": "rate_limited" if status == 429 else (error or "http_error"),
-                   "http_status": status}
-        if status == 429:
-            payload["retry_after_seconds"] = _cli_retry_after_seconds(api)
-        _cli_print_json(payload)
-        return 1
-    conversations = []
-    for item in items if isinstance(items, list) else []:
-        if not isinstance(item, dict):
-            continue
-        conversations.append({
-            "account": item.get("account") or account,
-            "id": item.get("id"),
-            "title": item.get("title") or "",
-            "updated": item.get("updated"),
-            # 没有可信来源时必须为 null：不得填 0、列表长度或估算值。
-            "message_count": None,
-        })
-    # 触发现有 page limit 错误 = 遍历不完整；分页逻辑无法确认下一页时
-    # 不得伪报 has_more=true，只能同时令 complete=false。
-    complete = not error
-    _cli_print_json({"event": "list_result", "complete": complete,
-                     "has_more": False, "conversations": conversations})
-    return 0
-
-
-def _cli_read_result(argv, account, explicit_account):
-    """`--tail <conv_id> --json`：结构化读取 + ID 校验 + 本地切页。"""
-    values, rest, error = _cli_take_value_flags(
-        argv, ("--after-message-id", "--limit"))
-    if error is not None:
-        _cli_print_json({"event": "read_result", "ok": False,
-                         "reason": "invalid_arguments", "detail": error})
-        return 2
-    positionals = [a for a in rest if a != "--json"]
-    if len(positionals) != 1:
-        _cli_print_json({"event": "read_result", "ok": False,
-                         "reason": "usage"})
-        return 2
-    conv_id = _cli_safe_conv_id(positionals[0])
-    if not conv_id:
-        _cli_print_json({"event": "read_result", "ok": False,
-                         "reason": "invalid_conversation_id"})
-        return 2
-    limit = None
-    if "--limit" in values:
-        limit = _as_int(values["--limit"], None)
-        if limit is None or limit <= 0:
-            _cli_print_json({"event": "read_result", "ok": False,
-                             "reason": "invalid_limit"})
-            return 2
-    anchor = values.get("--after-message-id")
-
-    resolution = resolve_conversation_account(
-        conv_id, account if explicit_account else None)
-    ownership = resolution["status"]
-    if ownership == "invalid":
-        _cli_print_json({"event": "read_result", "ok": False,
-                         "reason": "invalid_account_or_conversation",
-                         "conversation_id": conv_id})
-        return 2
-    if ownership == "conflict":
-        _cli_print_json({"event": "read_result", "ok": False,
-                         "reason": "ownership_conflict",
-                         "conversation_id": conv_id})
-        return 2
-    if ownership == "unknown" and not explicit_account:
-        _cli_print_json({"event": "read_result", "ok": False,
-                         "reason": "ownership_unknown",
-                         "conversation_id": conv_id})
-        return 2
-    resolved_account = resolution["account"] or account
-
-    api, detail = _cli_open_api(resolved_account)
-    if api is None:
-        _cli_print_json({"event": "read_result", "ok": False,
-                         "reason": "auth_unavailable",
-                         "conversation_id": conv_id, "detail": detail})
-        return 1
-    try:
-        # 进度/WARN 行会污染单行 JSON：只让最终结果进 stdout。
-        with contextlib.redirect_stdout(io.StringIO()):
-            _tail, raw = api.live_tail(conv_id, tries=2)
-    except Exception as e:
-        status = getattr(api, "last_status", None)
-        payload = {"event": "read_result", "ok": False,
-                   "reason": "rate_limited" if status == 429 else "read_failed",
-                   "http_status": status, "conversation_id": conv_id,
-                   "detail": str(e)}
-        if status == 429:
-            payload["retry_after_seconds"] = _cli_retry_after_seconds(api)
-        _cli_print_json(payload)
-        return 1
-    if not raw:
-        status = getattr(api, "last_status", None)
-        payload = {"event": "read_result", "ok": False,
-                   "reason": "rate_limited" if status == 429 else "read_failed",
-                   "http_status": status, "conversation_id": conv_id}
-        if status == 429:
-            payload["retry_after_seconds"] = _cli_retry_after_seconds(api)
-        _cli_print_json(payload)
-        return 1
-
-    messages, complete = _cli_mapping_messages(raw)
-    if anchor is not None:
-        anchor_index = next(
-            (n for n, row in enumerate(messages) if row["id"] == anchor), None)
-        if anchor_index is None:
-            # 排他锚点不存在 = 读取失败；不得静默从头读取。
-            _cli_print_json({"event": "read_result", "ok": False,
-                             "reason": "anchor_not_found",
-                             "conversation_id": conv_id,
-                             "after_message_id": anchor,
-                             "complete": False})
-            return 1
-        messages = messages[anchor_index + 1:]
-
-    has_more = False
-    if limit is not None and len(messages) > limit:
-        messages = messages[:limit]
-        has_more = True
-    # 空页（含锚点是最后一条）→ null；有下一页才给本页最后一条 ID。
-    next_after = messages[-1]["id"] if has_more and messages else None
-
-    _cli_print_json({
-        "event": "read_result",
-        "conversation_id": conv_id,
-        "complete": bool(complete),
-        "has_more": has_more,
-        "messages": [{"id": row["id"], "role": row["role"],
-                      "content": row["content"]} for row in messages],
-        "next_after_message_id": next_after,
-    })
-    return 0
-
-
-def _cli_send_result(api, conv_id, prompt_file, account, thinking=None):
-    """`<conv_id> <prompt_file> --json`：结构化发送结果。
-
-    HTTP 200 只算 HTTP 成功：ok=true 还必须拿到可核对的落点身份与可验证的
-    业务成功标志（reply_complete is True）；business_status 没有服务端来源时为
-    null，绝不拿 HTTP 状态填充。
-    """
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            status, _path, conv = send_prompt(
-                api, conv_id, prompt_file, thinking=thinking)
-    except Exception as e:
-        _cli_print_json({"event": "send_result", "ok": False,
-                         "account": account, "conversation_id": conv_id,
-                         "http_status": None, "business_status": None,
-                         "reason": "exception: %s" % e})
-        return 1
-
-    http_status = status if isinstance(status, int) else None
-    mismatch = bool(getattr(conv, "mismatch", False))
-    actual_id = str(conv) if conv else ""
-    identity_ok = bool(actual_id) and actual_id == conv_id
-    ok = bool(http_status == 200 and conv is not None and identity_ok
-              and getattr(conv, "reply_complete", None) is True
-              and not mismatch)
-
-    if ok:
-        try:
-            record_conv(conv_id, account, prompt_file)
-        except Exception as e:
-            _cli_print_json({"event": "send_result", "ok": False,
-                             "account": account, "conversation_id": conv_id,
-                             "http_status": http_status,
-                             "business_status": None,
-                             "reason": "record_failed: %s" % e})
-            return 1
-
-    reason = None
-    if not ok:
-        if mismatch:
-            reason = getattr(conv, "reason", "") or "landing_mismatch"
-        elif http_status != 200:
-            reason = {0: "transport_error", 413: "payload_too_large",
-                      429: "rate_limited"}.get(http_status, "http_error")
-        elif conv is None:
-            reason = "conversation_id_unresolved"
-        elif not identity_ok:
-            reason = "identity_mismatch"
-        else:
-            reason = "business_status_unverified"
-
-    payload = {"event": "send_result", "ok": ok, "account": account,
-               "conversation_id": conv_id, "http_status": http_status,
-               "business_status": None, "reason": reason}
-    if http_status == 429:
-        payload["retry_after_seconds"] = _cli_retry_after_seconds(api)
-    _cli_print_json(payload)
-    return 0 if ok else 1
-
-
-def _cli_account_only_create(account, prompt_file, thinking=None):
-    """`--new --account-only <acct>`：单账号创建，不轮转、不降级、不回退。
-
-    账号隔离靠 Adapter 回显（X-Adapter-Account）验证：回显缺失或与指定账号
-    不符一律按失败处理，绝不报告成功。
-    """
-    api, detail = _cli_open_api(account)
-    if api is None:
-        _cli_print_json({"event": "create_result", "ok": False,
-                         "reason": "auth_unavailable", "account": account,
-                         "detail": detail})
-        return 1
-    try:
-        with contextlib.redirect_stdout(io.StringIO()):
-            status, _path, conv = send_prompt(
-                api, None, prompt_file, new_chat=True, thinking=thinking)
-    except ThinkingModelUnavailable as e:
-        _cli_print_json({"event": "create_result", "ok": False,
-                         "reason": "thinking_model_unavailable",
-                         "account": account, "reason_code": e.reason_code,
-                         "detail": e.detail})
-        return 1
-    except Exception as e:
-        _cli_print_json({"event": "create_result", "ok": False,
-                         "reason": "exception", "account": account,
-                         "detail": str(e)})
-        return 1
-
-    if status == 429:
-        # 指定账号 429：立即停止，不换号、不在 CLI 内重试；Gateway 负责冷却后调度。
-        _cli_print_json({"event": "create_result", "ok": False,
-                         "reason": "rate_limited", "account": account,
-                         "http_status": 429,
-                         "retry_after_seconds": _cli_retry_after_seconds(api)})
-        return 1
-
-    headers = getattr(api, "last_headers", None)
-    actual_account = headers.get("x-adapter-account") if isinstance(
-        headers, dict) else None
-    if not isinstance(actual_account, str) or not actual_account:
-        actual_account = None
-    if actual_account is None or actual_account != account:
-        _cli_print_json({"event": "create_result", "ok": False,
-                         "reason": "account_echo_mismatch",
-                         "expected_account": account,
-                         "actual_account": actual_account})
-        return 1
-
-    if status == 200 and conv:
-        record_conv(str(conv), account, prompt_file)
-        _cli_print_json({"event": "create_result", "ok": True,
-                         "account": account, "conversation_id": str(conv),
-                         "http_status": 200, "reason": None})
-        return 0
-    _cli_print_json({"event": "create_result", "ok": False,
-                     "reason": "create_failed", "account": account,
-                     "http_status": status})
-    return 1
-
-
-def _main_unlocked():
+def _main_impl():
+    global SEND_TIMEOUT, SEND_TIMEOUT_SOURCE   # CLI 解析结果（用完由 main 还原）
     args = sys.argv[1:]
     thinking_flag = "--thinking" in args
     if thinking_flag:
@@ -8394,6 +8302,30 @@ def _main_unlocked():
         i += 2
     args = parsed_args
 
+    # ---- 投递超时：命令行 > 环境变量 > --thinking 分档 ----
+    # 位置不固定（`--timeout 600` 可以在任何地方），必须先摘出，否则会被
+    # `<conv_id> <prompt_file>` 的 `len(args) != 2` 位置校验当成第三个位置参数干掉。
+    try:
+        timeout_raw, args = _extract_timeout_flag(args)
+    except ValueError as e:
+        print("ERROR: %s" % e, flush=True)
+        return 2
+    if timeout_raw is not None:
+        cli_timeout = _parse_timeout(timeout_raw)
+        if cli_timeout is None:
+            print("ERROR: --timeout 需要正整数秒（收到 %r）" % (timeout_raw,), flush=True)
+            return 2
+        SEND_TIMEOUT, SEND_TIMEOUT_SOURCE = cli_timeout, "cli"
+    elif SEND_TIMEOUT is not None:
+        # 环境变量是显式配置：只补来源标签，值早就在 import 时解析好了。
+        SEND_TIMEOUT_SOURCE = "env"
+    else:
+        # **没有显式配置就保持 None**，让 _send_prompt_impl 按 --thinking 分档
+        # （非思考 420s / 思考 1800s）。旧版在这里无条件写 DEFAULT_SEND_TIMEOUT=600，
+        # 等于把 1800s 分档在唯一可被操作者触达的 CLI 路径上打死（DEF-ops-04）：
+        # `--thinking` 拿到的是 600s，日志里只看得到 source=default。
+        SEND_TIMEOUT_SOURCE = ""
+
     work_item_id = work_item_options.get("work_item_id")
     if work_item_id is None and any(
         key in work_item_options
@@ -8422,31 +8354,40 @@ def _main_unlocked():
         if not args:
             print(__doc__)
             return 1
-    # ---- 结构化 CLI 参数校验（--account-only 只能用于 --new）----
-    account_only_values, _account_only_rest, account_only_error = _cli_take_value_flags(
-        args, ("--account-only",))
-    if account_only_error is not None:
-        _cli_print_json({"event": "create_result", "ok": False,
-                         "reason": "invalid_arguments",
-                         "detail": account_only_error})
-        return 2
-    account_only = account_only_values.get("--account-only")
-    if account_only is not None:
-        if not validate_account_identity(account_only):
-            _cli_print_json({"event": "create_result", "ok": False,
-                             "reason": "invalid_account",
-                             "account": account_only})
+    # ---- 投递日志判定（纯本地，不触网；CB-B8 的机读版）----
+    if args and args[0] == "--check-send-log":
+        rest, prompt_arg, positional = args[1:], None, []
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a == "--prompt":
+                if i + 1 >= len(rest):
+                    print(json.dumps({"result": "error",
+                                      "error": "--prompt 需要一个提示词文件路径"},
+                                     ensure_ascii=False))
+                    return 2
+                prompt_arg = rest[i + 1]
+                i += 2
+            elif a.startswith("--prompt="):
+                prompt_arg = a.split("=", 1)[1]
+                i += 1
+            else:
+                positional.append(a)
+                i += 1
+        if len(positional) != 1:
+            print(json.dumps({"result": "error",
+                              "error": "--check-send-log 需要且只需要一个日志文件（收到 %d 个）"
+                                       % len(positional)},
+                             ensure_ascii=False))
             return 2
-        if "--new" not in args:
-            _cli_print_json({"event": "create_result", "ok": False,
-                             "reason": "account_only_requires_new",
-                             "account": account_only})
+        try:
+            verdict = judge_send_log(positional[0], prompt_arg)
+        except OSError as e:
+            print(json.dumps({"result": "error", "error": str(e)}, ensure_ascii=False))
             return 2
-        if explicit_account and not _cli_same_account(account, account_only):
-            _cli_print_json({"event": "create_result", "ok": False,
-                             "reason": "account_only_conflicts_with_account",
-                             "account": account_only})
-            return 2
+        print(json.dumps(verdict, ensure_ascii=False, indent=2))
+        # 0 = 已送达/仍在飞（不许重投），1 = NOT_SENT（可重投），3 = 已发但截断。
+        return {"SENT": 0, "IN_FLIGHT": 0, "NOT_SENT": 1, "TRUNCATED": 3}[verdict["verdict"]]
     # ---- 交付正文托管（纯本地，不触网；A1/A2/A4）----
     if args and args[0] == "--extract":
         rest, begin, end, fence, out, positional = args[1:], None, None, None, None, []
@@ -8647,8 +8588,8 @@ def _main_unlocked():
         return 0 if res["consistency"] == "CONSISTENT" else 4
     if len(args) == 2 and args[0] in ("--rotation-enable", "--rotation-disable"):
         name = args[1]
-        if name not in _rotation_order():
-            print("usage: %s acctN|nologin" % args[0], flush=True)
+        if name not in ROTATION_ORDER:
+            print("usage: %s acct1|acct2|acct3|acct4|acct5|acct6|nologin" % args[0], flush=True)
             return 2
         enable = args[0] == "--rotation-enable"
 
@@ -8978,7 +8919,7 @@ def _main_unlocked():
             if getattr(conv, "candidate_ids", None):
                 out["candidate_conv_ids"] = list(conv.candidate_ids)
         print(json.dumps(out, ensure_ascii=False))
-        return 0 if status == 200 else 1
+        return _send_exit_code(status, conv)
     # ---- 会话清单 ----
     if args and args[0] == "--list-all":
         allowed_flags = {"--apply", "--include-nologin"}
@@ -8997,7 +8938,7 @@ def _main_unlocked():
         apply_changes = "--apply" in supplied_flags
         include_nologin = "--include-nologin" in supplied_flags
 
-        configured_accounts = list(_effective_rotation_primary())
+        configured_accounts = list(ROTATION_PRIMARY)
         if include_nologin:
             configured_accounts.append("nologin")
 
@@ -9384,29 +9325,15 @@ def _main_unlocked():
             )
 
         print(json.dumps(output, ensure_ascii=False), flush=True)
+        if getattr(conv, "send_truncated", False):
+            # 截断优先于 link：SEND_TRUNCATED 没有送达凭证，exit 0 会让门禁假绿。
+            return 3
         return 0 if status == 200 and link is not None else 1
 
     # ---- 开新会话 ----
     if args[0] == "--new":
-        # 新增：--new --account-only <acct> 单账号白名单（不轮转、不降级）
-        if account_only is not None:
-            _ao_values, ao_rest, ao_error = _cli_take_value_flags(
-                args[1:], ("--account-only",))
-            ao_positionals = [a for a in ao_rest if a != "--json"]
-            if (ao_error is not None or len(ao_positionals) != 1
-                    or ao_positionals[0].startswith("--")):
-                _cli_print_json({"event": "create_result", "ok": False,
-                                 "reason": "new_requires_one_prompt_file"})
-                return 2
-            if work_item_id is not None:
-                _cli_print_json({"event": "create_result", "ok": False,
-                                 "reason": "account_only_incompatible_with_work_item"})
-                return 2
-            return _cli_account_only_create(
-                account_only, ao_positionals[0],
-                thinking=True if thinking_flag else None)
         if len(args) != 2:
-            print("usage: [--account acctN|nologin|auto] [--thinking] --new <prompt_file>", flush=True)
+            print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin|auto] [--thinking] --new <prompt_file>", flush=True)
             return 2
         if work_item_id is not None and (
             not explicit_account or account in ("auto", "nologin")
@@ -9417,7 +9344,7 @@ def _main_unlocked():
                         "result": "error",
                         "error": (
                             "--work-item --new requires an explicit logged-in "
-                            "--account acctN; automatic rotation and "
+                            "--account acct1..acct6; automatic rotation and "
                             "anonymous fallback cannot issue trusted landing evidence"
                         ),
                     },
@@ -9464,7 +9391,7 @@ def _main_unlocked():
             if status == 200 and conv:
                 record_conv(conv, account, args[1])
                 print("NEW_CONV %s account=%s" % (conv, account), flush=True)
-            if status == 429 and account in _effective_rotation_primary():
+            if status == 429 and account in ROTATION_PRIMARY:
                 # 429 限流 → 换账号，换不动就匿名（用户裁定）。显式指定身份只约束
                 # 「用谁起」，不该约束「限速后还能干什么」：429 还没建成会话，
                 # 重试不会重复建会话、不会多花配额。
@@ -9474,28 +9401,17 @@ def _main_unlocked():
                     mark_unavailable(s, account, "HTTP 429 限速冷却", COOLDOWN_429)
                 mutate_rotation(mark)
                 return create_chat_rotating(args[1], thinking=True if thinking_flag else None)
-            return 0 if status == 200 else 1
-        # 默认：健康 allowlist 中的账号均分轮转，全部 429 才匿名兜底
+            return _send_exit_code(status, conv)
+        # 默认：acct1/acct2/acct3/acct4/acct5/acct6 均分轮转，全部 429 才匿名兜底
         return create_chat_rotating(args[1], thinking=True if thinking_flag else None)
-
-    # ---- 结构化读取/列表分流（仅显式 --json；旧路径原样保留）----
-    if args and args[0] == "--list" and _cli_flag_present(args[1:], "--json"):
-        extra = [a for a in args[1:] if a != "--json"]
-        if extra:
-            _cli_print_json({"event": "list_result", "ok": False,
-                             "reason": "usage"})
-            return 2
-        return _cli_list_result(account)
-    if args and args[0] == "--tail" and _cli_flag_present(args[1:], "--json"):
-        return _cli_read_result(args[1:], account, explicit_account)
 
     # ---- 既有会话：未显式指定身份时按登记归属路由 ----
     # 先做参数校验，别在缺参数时索引越界（曾导致 `--tail` 空参数直接 IndexError）
     if args[0] == "--list" and len(args) != 1:
-        print("usage: [--account acctN|nologin] --list", flush=True)
+        print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin] --list", flush=True)
         return 2
     if args[0] == "--tail" and len(args) != 2:
-        print("usage: [--account acctN|nologin] --tail <conv_id>", flush=True)
+        print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin] --tail <conv_id>", flush=True)
         return 2
     raw_id = args[1] if args[0] == "--tail" else (args[0] if not args[0].startswith("--") else "")
     conv_id = cli_id(raw_id) if raw_id else ""
@@ -9577,27 +9493,6 @@ def _main_unlocked():
         )
         return 2
 
-    # ---- 结构化发送结果（仅显式 --json；旧路径原样保留）----
-    if (conv_id and work_item_id is None and args
-            and not args[0].startswith("--")
-            and _cli_flag_present(args[1:], "--json")):
-        positionals = [a for a in args if a != "--json"]
-        if len(positionals) != 2:
-            _cli_print_json({"event": "send_result", "ok": False,
-                             "account": account, "conversation_id": conv_id,
-                             "http_status": None, "business_status": None,
-                             "reason": "usage"})
-            return 2
-        json_api, json_detail = _cli_open_api(account)
-        if json_api is None:
-            _cli_print_json({"event": "send_result", "ok": False,
-                             "account": account, "conversation_id": conv_id,
-                             "http_status": None, "business_status": None,
-                             "reason": "auth_unavailable: %s" % json_detail})
-            return 1
-        return _cli_send_result(json_api, conv_id, positionals[1], account,
-                                thinking=True if thinking_flag else None)
-
     api = build(account)
     if api is None:
         return 2
@@ -9615,7 +9510,7 @@ def _main_unlocked():
             return 1
         return 0
     if len(args) != 2:
-        print("usage: [--account acctN|nologin] <conv_id> <prompt_file>", flush=True)
+        print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin] <conv_id> <prompt_file>", flush=True)
         return 2
     if work_item_id is not None:
         if account == "nologin":
@@ -9658,87 +9553,7 @@ def _main_unlocked():
             # F-17：id 歧义时把候选 id 列表也报出来
             "candidate_conv_ids": list(getattr(conv, "candidate_ids", []) or []),
         }, ensure_ascii=False), flush=True)
-    return 0 if status == 200 else 1
-
-
-def _account_mutation_lock_target(argv):
-    """Return the explicit account for a mutating CLI invocation, if any."""
-    args = list(argv)
-    account = None
-    if len(args) >= 2 and args[0] == "--account":
-        account, args = args[1], args[2:]
-    args = [item for item in args if item != "--thinking"]
-    account_only = None
-    for index, item in enumerate(args[:-1]):
-        if item == "--account-only":
-            account_only = args[index + 1]
-            break
-    positionals = []
-    index = 0
-    while index < len(args):
-        if args[index] in ("--work-item", "--principal", "--tenant", "--db", "--account-only"):
-            index += 2
-        else:
-            positionals.append(args[index])
-            index += 1
-    is_create = bool(positionals and positionals[0] == "--new")
-    is_send = bool(
-        len(positionals) >= 2
-        and not positionals[0].startswith("--")
-        and not positionals[1].startswith("--")
-    )
-    if not (is_create or is_send):
-        return None
-    target = account_only or account
-    if target == "default":
-        target = "acct1"
-    if target not in _VALID_ACCOUNT_IDENTITIES:
-        return None
-    return target
-
-
-def _try_account_mutation_lock(account):
-    """Acquire a cross-process, per-account exclusive lock without waiting."""
-    directory = os.environ.get(
-        "SO_SENDER_ACCOUNT_LOCK_DIR",
-        "/var/lib/chatgpt-session-ops/state/account-locks",
-    )
-    os.makedirs(directory, mode=0o700, exist_ok=True)
-    path = os.path.join(directory, "%s.lock" % account)
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        os.close(fd)
-        return None
-    return fd
-
-
-def main():
-    account = _account_mutation_lock_target(sys.argv[1:])
-    if account is None:
-        return _main_unlocked()
-    try:
-        lock_fd = _try_account_mutation_lock(account)
-    except OSError as exc:
-        print(json.dumps({
-            "event": "account_lock", "ok": False,
-            "reason": "account_lock_unavailable", "account": account,
-        }, ensure_ascii=False), flush=True)
-        return 75
-    if lock_fd is None:
-        print(json.dumps({
-            "event": "account_lock", "ok": False,
-            "reason": "account_busy", "account": account,
-        }, ensure_ascii=False), flush=True)
-        return 75
-    try:
-        return _main_unlocked()
-    finally:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        finally:
-            os.close(lock_fd)
+    return _send_exit_code(status, conv)
 
 
 if __name__ == "__main__":
