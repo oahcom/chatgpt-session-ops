@@ -495,6 +495,15 @@ file without following a final-component symlink and reads no more than 33
 bytes. The systemd unit already grants the service read/write access to
 `/var/lib/so-mcp`.
 
+Treat this key as immutable for the lifetime of the WorkItem/Events database;
+do not replace it during routine deployment. Back up the SQLite database with
+SQLite's online backup API (the database uses WAL mode; copying only the main
+file can omit committed WAL contents) and back up the matching key separately
+in an encrypted secret manager. Restore both as a pair. If the key is lost,
+restore its matching backup or follow the explicit subscription-reset recovery
+procedure in `docs/mcp-events-poc.md`; never start with a new key while leaving
+old encrypted subscriptions active.
+
 ### OAuth scope issuance is a separate gate
 
 The MCP resource metadata advertises the existing scopes
