@@ -2,7 +2,7 @@
 
 These tests exercise deployed-source patch artifacts without requiring production credentials or touching live databases.
 
-- `test_sender_account_identity_pin.py`: applies `patches/sender-account-identity-pin.patch` to a temporary copy of the 2026-11-28 Sender snapshot and tests explicit-account allowlist preflight, strict account pinning for 401/403/429, retained auto-rotation, and Adapter mismatch rejection. Account-discovery marker files are empty test fixtures; no credentials are read. Run with `python3 -m unittest -v patches.tests.test_sender_account_identity_pin`.
+- `test_sender_account_identity_pin.py`: applies `patches/sender-account-identity-pin.patch` to a temporary copy of the 2026-11-28 Sender snapshot and tests explicit-account allowlist preflight, explicit 403 single-account failure, explicit 429 no-rotation behavior, retained auto-rotation after 403/429, and Adapter mismatch rejection. Account-discovery marker files are empty test fixtures; no credentials are read. Run with `python3 -m unittest -v patches.tests.test_sender_account_identity_pin`.
 
 - `test_sender_event_outbox.py`: run with the isolated Sender Gateway source snapshot on `PYTHONPATH`.
 - `test_sender_mcp_event_pipeline.py`: runs a local mTLS Sender Gateway, MCP collector, SQLite outbox, and mocked HTTPS callback.

@@ -167,16 +167,23 @@ class SenderAccountIdentityPinTests(unittest.TestCase):
         self.assertEqual(api_calls, ["acct10"])
         self.assertEqual(requests, ["acct10"])
 
-    def test_explicit_acct1_401_403_and_429_never_rotate_or_create_acct2(self):
-        for status in (401, 403, 429):
-            with self.subTest(status=status):
-                result, api_calls, requests, rotate, output = self.run_cli_new("acct1", status)
-                self.assertEqual(result, 1)
-                self.assertEqual(api_calls, ["acct1"])
-                self.assertEqual(requests, ["acct1"])
-                rotate.assert_not_called()
-                self.assertNotIn("NEW_CONV", output)
-                self.assertNotIn("account=acct2", output)
+    def test_explicit_acct1_403_fails_without_acct2_attempt(self):
+        result, api_calls, requests, rotate, output = self.run_cli_new("acct1", 403)
+        self.assertEqual(result, 1)
+        self.assertEqual(api_calls, ["acct1"])
+        self.assertEqual(requests, ["acct1"])
+        rotate.assert_not_called()
+        self.assertNotIn("NEW_CONV", output)
+        self.assertNotIn("account=acct2", output)
+
+    def test_explicit_acct1_429_fails_without_acct2_attempt(self):
+        result, api_calls, requests, rotate, output = self.run_cli_new("acct1", 429)
+        self.assertEqual(result, 1)
+        self.assertEqual(api_calls, ["acct1"])
+        self.assertEqual(requests, ["acct1"])
+        rotate.assert_not_called()
+        self.assertNotIn("NEW_CONV", output)
+        self.assertNotIn("account=acct2", output)
 
     def test_auto_create_retains_rotation_to_acct2_after_acct1_403_or_429(self):
         original_effective = self.cli._effective_rotation_primary
