@@ -750,6 +750,53 @@ class TestDeploymentASGILifespan(unittest.TestCase):
         self.assertEqual(calls, ["start", "stop"])
 
 
+class TestDeploymentASGIReadiness(unittest.TestCase):
+    def _get_readyz(self, app):
+        sent = []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        asyncio.run(app(
+            {"type": "http", "method": "GET", "path": "/readyz", "headers": []},
+            receive,
+            send,
+        ))
+        start = next(message for message in sent if message["type"] == "http.response.start")
+        body = next(message for message in sent if message["type"] == "http.response.body")
+        return start["status"], json.loads(body["body"])
+
+    def test_readyz_distinguishes_disabled_live_and_stalled_dispatcher(self):
+        class Inner:
+            async def __call__(self, scope, receive, send):
+                raise AssertionError("readiness endpoint must not reach MCP transport")
+
+        base = {
+            "issuer": "https://issuer.example.test/realm",
+            "audience": "https://resource.example.test/mcp",
+        }
+        disabled = DeploymentASGI(Inner(), **base)
+        status, payload = self._get_readyz(disabled)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"status": "ready", "events": {"enabled": False}})
+
+        snapshot = {"store": {"outbox": {"pending": 3}}, "dispatcher": {"running": False}}
+        stalled = DeploymentASGI(Inner(), readiness_snapshot=lambda: snapshot, **base)
+        status, payload = self._get_readyz(stalled)
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["status"], "degraded")
+        self.assertEqual(payload["events"]["store"]["outbox"]["pending"], 3)
+
+        snapshot["dispatcher"]["running"] = True
+        live = DeploymentASGI(Inner(), readiness_snapshot=lambda: snapshot, **base)
+        status, payload = self._get_readyz(live)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["status"], "ready")
+
+
 class TestMCPEventsRuntimeWiring(unittest.TestCase):
     def test_create_application_wires_local_event_store_and_dispatcher(self):
         config = {
