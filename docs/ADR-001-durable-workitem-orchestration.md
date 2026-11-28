@@ -92,6 +92,8 @@ Attempt certainty is independent of Job status:
 - `SUBMITTED`: the remote side effect was accepted/observed, even if later parsing or harvesting failed.
 - `UNKNOWN`: the system cannot prove either outcome.
 
+Retryability is derived from side-effect certainty plus failure stage, not from a generic error-code allowlist. Legacy v0.1 currently advertises `TIMEOUT` and `DEPENDENCY_UNAVAILABLE` as retryable, but v2 must not preserve that global rule for side-effecting operations: a timeout after CLI execution/request transmission may have started is `UNKNOWN` and non-retryable unless structured evidence positively proves the consequential POST did not occur. A dependency error is `NOT_SUBMITTED` only when its stage proves it occurred before transmission; otherwise it is `UNKNOWN`. Read-only GET/list operations may use a separate bounded retry policy because they do not create remote side effects.
+
 A proven `NOT_SUBMITTED` Attempt is terminal once its Sender Job has been created/executed. After the cause is corrected and the Assignment/account reservation is revalidated, a deliberate new execution uses a new Attempt ID, Sender Job, and idempotency key. The only same-Attempt/same-key replay is enqueue recovery when SO may have lost the enqueue response before recording the Job ID; Sender must return the original Job. V1 does not requeue terminal Sender Jobs in place. `SUBMITTED` and `UNKNOWN` are never resent or automatically retried. A known submission with incomplete reply is harvest-pending and may only be read/harvested. UNKNOWN holds its Assignment reservation and blocks new Attempts/reassignment until reconciled.
 
 ### Current remote operation shapes
