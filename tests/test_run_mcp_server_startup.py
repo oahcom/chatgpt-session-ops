@@ -63,6 +63,7 @@ except ModuleNotFoundError:  # pragma: no cover
     sys.modules["uvicorn"] = types.ModuleType("uvicorn")
 
 from scripts.run_mcp_server import (  # noqa: E402
+    ChatGPTDirectClient,
     DeploymentASGI,
     MEMORY_STDIO_ENV,
     _load_events_encryption_key,
@@ -871,9 +872,7 @@ class TestMCPEventsRuntimeWiring(unittest.TestCase):
         }
         events_store = mock.Mock()
         dispatcher = mock.Mock()
-        direct_client = scripts.run_mcp_server.ChatGPTDirectClient.__new__(
-            scripts.run_mcp_server.ChatGPTDirectClient
-        )
+        direct_client = ChatGPTDirectClient.__new__(ChatGPTDirectClient)
         direct_client.start = mock.Mock()
         direct_client.stop = mock.Mock()
         mcp_app = object()
