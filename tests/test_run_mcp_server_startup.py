@@ -861,6 +861,7 @@ class TestMCPEventsRuntimeWiring(unittest.TestCase):
         self.assertIs(build_server.call_args.kwargs["events_store"], events_store)
         self.assertIs(app.inner, mcp_app)
         self.assertEqual(app.background_tasks, [dispatcher])
+        self.assertIsNotNone(app.readiness_snapshot)
 
     def test_events_reject_memory_database_and_relative_events_path(self):
         base_config = {
