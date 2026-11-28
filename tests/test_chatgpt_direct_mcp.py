@@ -80,6 +80,37 @@ class ChatGPTSessionRegistryTests(unittest.TestCase):
             )
         self.assertEqual(ctx.exception.code, "CONFLICT")
 
+    def test_legacy_gateway_owner_rows_migrate_once_but_jobs_do_not(self):
+        import sqlite3
+
+        legacy_path = Path(self.temp.name) / "sender-gateway.sqlite3"
+        legacy = sqlite3.connect(legacy_path)
+        legacy.execute(
+            "CREATE TABLE session_owners (conversation_id TEXT PRIMARY KEY, tenant_id TEXT, "
+            "principal_id TEXT, account TEXT, created_at TEXT)"
+        )
+        legacy.execute(
+            "INSERT INTO session_owners VALUES (?, ?, ?, ?, ?)",
+            (CONV_ID, "tenant-a", "principal-a", "acct2", "2026-01-01T00:00:00Z"),
+        )
+        legacy.execute("CREATE TABLE jobs (job_id TEXT PRIMARY KEY, status TEXT)")
+        legacy.execute("INSERT INTO jobs VALUES ('legacy-job', 'queued')")
+        legacy.commit()
+        legacy.close()
+
+        self.assertEqual(self.registry.migrate_legacy_owners(legacy_path), 1)
+        self.assertEqual(self.registry.migrate_legacy_owners(legacy_path), 1)
+        self.assertEqual(
+            self.registry.get_owner(CONV_ID),
+            {"tenant_id": "tenant-a", "principal_id": "principal-a", "account": "acct2"},
+        )
+        conn = sqlite3.connect(self.registry.database_path)
+        try:
+            self.assertEqual(conn.execute("SELECT count(*) FROM chatgpt_session_owners").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT count(*) FROM sqlite_master WHERE name='jobs'").fetchone()[0], 0)
+        finally:
+            conn.close()
+
 
 class ChatGPTCLIAdapterTests(unittest.TestCase):
     def setUp(self):
