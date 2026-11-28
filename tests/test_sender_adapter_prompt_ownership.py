@@ -23,7 +23,7 @@ class PromptDirectoryOwnershipTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
         self.cli = self.base / "fake_cli.py"
-        self.cli.write_text("pass\\n", encoding="utf-8")
+        self.cli.write_text("pass\n", encoding="utf-8")
 
     def test_caller_owned_root_and_sibling_adapter_survive_close(self):
         shared = self.base / "prompts"
