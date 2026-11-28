@@ -5,8 +5,17 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from src.session_ops.authority import Principal, SecureWorkItemStore
+from src.session_ops.authority import Principal, SecureWorkItemStore, _utc_now
+
+
+class UtcTimestampTests(unittest.TestCase):
+    def test_utc_timestamp_uses_one_wall_clock_sample(self) -> None:
+        with patch("src.session_ops.authority.time.time", return_value=1700000000.999999) as clock:
+            value = _utc_now()
+        clock.assert_called_once_with()
+        self.assertEqual(value, "2023-11-14T22:13:20.999999Z")
 
 
 class TerminalSessionLinkAuditTests(unittest.TestCase):

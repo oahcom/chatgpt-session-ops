@@ -43,7 +43,9 @@ class ChatGPTDirectClient:
         runtime_dir: str | Path,
         legacy_database_path: str | Path | None = None,
         max_workers: int = 1,
-        max_queue_size: int = 32,
+        # Capacity includes the active job: one executor slot plus eight
+        # durable queued jobs. Keep this aligned with the MCP admission bound.
+        max_queue_size: int = 9,
     ):
         self.database_path = Path(database_path)
         self.repository_root = Path(repository_root).resolve()

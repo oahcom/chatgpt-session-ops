@@ -32,6 +32,14 @@ def test_active_accounts_excludes_disabled_accounts(tmp_path):
     assert client._active_accounts() == ("acct1", "acct2")
 
 
+def test_default_send_queue_is_one_active_plus_eight_waiting(tmp_path):
+    client = make_client(tmp_path)
+    assert client.max_workers == 1
+    assert client._executor._max_workers == 1
+    # Capacity includes the active job, leaving eight durable waiting slots.
+    assert client.max_queue_size == 9
+
+
 def test_enqueue_is_idempotent_and_job_state_is_persistent(tmp_path):
     client = make_client(tmp_path)
 

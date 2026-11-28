@@ -317,9 +317,14 @@ class OrphanReport:
 
 
 def _utc_now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()) + ".%06dZ" % (
-        int((time.time() % 1) * 1000000),
-    )
+    # Capture the wall clock once. Calling time.time() separately for the
+    # seconds and fractional parts can straddle a second boundary and produce
+    # a timestamp almost one second in the past (violating linked_at <=
+    # unlinked_at under the session_links CHECK constraint).
+    timestamp = time.time()
+    whole_seconds = int(timestamp)
+    microseconds = int((timestamp - whole_seconds) * 1000000)
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(whole_seconds)) + ".%06dZ" % microseconds
 
 
 def _validate_principal_id(value: str, field: str = "principal_id") -> str:
