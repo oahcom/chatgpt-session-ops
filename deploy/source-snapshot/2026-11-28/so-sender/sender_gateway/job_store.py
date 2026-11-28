@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -56,6 +57,8 @@ from .models import (
     new_job_id,
     utc_now_iso,
 )
+
+MAX_EVENT_CLAIM_ATTEMPTS = 10
 
 #: Report section 2.5, verbatim column order, plus the additions the same
 #: section asks for (``idempotency_key``, ``attempt_count``, ``worker_id``,
@@ -705,11 +708,12 @@ class JobStore:
                 summary = "Job completed successfully."
             event_payload = {
                 "job_id": job_id,
-                "conversation_id": row["conversation_id"],
                 "status": "succeeded",
                 "summary": summary.strip()[:500],
                 "completed_at": completed_at,
             }
+            if row["conversation_id"] is not None:
+                event_payload["conversation_id"] = row["conversation_id"]
             txn.execute(
                 """INSERT INTO job_event_outbox
                    (event_id, job_id, tenant_id, principal_id, event_name, payload_json,
@@ -793,13 +797,14 @@ class JobStore:
             event_id = "evt_" + hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:32]
             event_payload = {
                 "job_id": job_id,
-                "conversation_id": row["conversation_id"],
                 "status": "failed",
                 "summary": f"Job failed with error code {code.value}.",
                 "completed_at": completed_at,
                 "error_code": code.value,
                 "outcome_unknown": outcome_unknown,
             }
+            if row["conversation_id"] is not None:
+                event_payload["conversation_id"] = row["conversation_id"]
             txn.execute(
                 """INSERT INTO job_event_outbox
                    (event_id, job_id, tenant_id, principal_id, event_name, payload_json,
@@ -871,9 +876,22 @@ class JobStore:
         lease_until = add_seconds(claimed_at, float(lease_seconds))
         claimed = []
         with self.transaction() as txn:
+            exhausted = txn.execute("""UPDATE job_event_outbox
+                         SET status='dead', last_error='max_claim_attempts_exceeded',
+                             lease_until=NULL, lease_token=NULL, worker_id=NULL
+                         WHERE event_version=1 AND attempts>=?
+                           AND (status='pending' OR (status='sending' AND lease_until<=?))""",
+                        (MAX_EVENT_CLAIM_ATTEMPTS, claimed_at)).rowcount
+            if exhausted:
+                logging.getLogger(__name__).error(
+                    "quarantined %d Sender event outbox rows after max claim attempts",
+                    exhausted,
+                )
             txn.execute("""UPDATE job_event_outbox SET status='pending', lease_until=NULL,
                          lease_token=NULL, worker_id=NULL
-                         WHERE event_version=1 AND status='sending' AND lease_until<=?""", (claimed_at,))
+                         WHERE event_version=1 AND status='sending' AND lease_until<=?
+                           AND attempts<?""",
+                        (claimed_at, MAX_EVENT_CLAIM_ATTEMPTS))
             rows = txn.fetchall("""SELECT * FROM job_event_outbox WHERE event_version=1 AND status='pending'
                                   AND next_attempt_at<=? ORDER BY created_at,event_id LIMIT ?""",
                                 (claimed_at, limit))
@@ -889,7 +907,7 @@ class JobStore:
                     and isinstance(payload.get("completed_at"), str)
                     and bool(payload.get("completed_at"))
                     and ("summary" not in payload or isinstance(payload["summary"], str))
-                    and ("conversation_id" not in payload or isinstance(payload["conversation_id"], str))
+                    and ("conversation_id" not in payload or payload["conversation_id"] is None or isinstance(payload["conversation_id"], str))
                     and ("error_code" not in payload or isinstance(payload["error_code"], str))
                     and ("outcome_unknown" not in payload or isinstance(payload["outcome_unknown"], bool))
                 )
@@ -899,13 +917,14 @@ class JobStore:
                     or not row["principal_id"]
                     or not valid_payload
                 ):
+                    reason = "invalid_payload_json" if payload is None else "invalid_event_payload"
                     txn.execute(
                         """UPDATE job_event_outbox SET status='dead', last_error=?
                            WHERE event_id=? AND event_version=1 AND status='pending'""",
-                        (
-                            "invalid_payload_json" if payload is None else "invalid_event_payload",
-                            row["event_id"],
-                        ),
+                        (reason, row["event_id"]),
+                    )
+                    logging.getLogger(__name__).error(
+                        "quarantined invalid Sender event %s: %s", row["event_id"], reason
                     )
                     continue
                 token = uuid.uuid4().hex
@@ -993,7 +1012,7 @@ class JobStore:
         """Replace expired terminal jobs with minimal permanent ownership/idempotency tombstones."""
         with self.transaction() as txn:
             txn.execute(
-                "DELETE FROM job_event_outbox WHERE event_version=1 AND status='delivered' AND created_at < ?",
+                "DELETE FROM job_event_outbox WHERE event_version=1 AND status IN ('delivered','dead') AND created_at < ?",
                 (before,),
             )
             rows = txn.fetchall(

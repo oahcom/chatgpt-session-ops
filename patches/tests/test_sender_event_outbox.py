@@ -155,6 +155,30 @@ class SenderOutboxTests(unittest.TestCase):
             self.assertIsNone(txn.fetchone("SELECT job_id FROM jobs WHERE job_id=?", (pending_job_id,)))
             self.assertIsNotNone(txn.fetchone("SELECT job_id FROM job_tombstones WHERE job_id=?", (pending_job_id,)))
 
+    def test_unacked_sender_events_become_dead_after_ten_claims(self):
+        job_id = self.create_job(now=FIXED)
+        self.store.complete(job_id, {"summary": "must not retry forever"})
+        now = FIXED
+        for attempt in range(10):
+            claimed = self.store.claim_events(
+                "mcp-events", limit=1, lease_seconds=1, now=now
+            )
+            self.assertEqual(len(claimed), 1, f"claim attempt {attempt + 1}")
+            now = add_seconds(now, 2)
+        self.assertEqual(
+            self.store.claim_events("mcp-events", limit=1, lease_seconds=1, now=now),
+            [],
+        )
+        with self.store.transaction() as txn:
+            row = txn.fetchone(
+                "SELECT status, attempts, last_error, lease_token FROM job_event_outbox WHERE job_id=?",
+                (job_id,),
+            )
+        self.assertEqual(row["status"], "dead")
+        self.assertEqual(row["attempts"], 10)
+        self.assertEqual(row["last_error"], "max_claim_attempts_exceeded")
+        self.assertIsNone(row["lease_token"])
+
     def test_claim_lease_expiry_stale_ack_and_idempotent_ack(self):
         self.complete()
         first = self.store.claim_events("mcp-a", limit=10, lease_seconds=10, now=FIXED)

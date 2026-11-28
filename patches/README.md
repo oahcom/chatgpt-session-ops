@@ -6,7 +6,7 @@ These patches describe the minimal production integration for ChatGPT Work MCP E
 
 Apply the Sender patch from `/opt/so-sender`:
 
-- `sender-gateway-event-outbox.patch` — adds the durable `job_event_outbox`, writes one event atomically with each terminal job transition, exposes the authenticated claim/ACK endpoints, and prunes delivered event history with existing job retention.
+- `sender-gateway-event-outbox.patch` — adds the durable `job_event_outbox`, writes one event atomically with each terminal job transition, exposes the authenticated claim/ACK endpoints, and prunes only version-1 delivered/dead event history with existing job retention. Legacy rows default to version 0 and are excluded from claim, ack, and pruning; malformed version-1 payloads are dead-lettered; transient handoff failures are capped at 10 claims and logged.
 
 Apply the MCP patches from `/opt/so-mcp`:
 
@@ -23,11 +23,10 @@ The feature stays disabled unless `SO_MCP_EVENTS_KEY_FILE` points to a raw 32-by
 
 ## Verification
 
-- Sender outbox and authenticated route tests: 12 passed.
-- MCP Events ASGI and Sender-to-MCP pipeline tests: 7 passed.
+- Current reconstructed Sender + MCP integration suite: **23 passed**.
+- Full repository suite: **1299 passed, 7 skipped, 1573 subtests passed**.
 - Python compilation passed for the reconstructed MCP and Sender modules.
 - Sender and MCP-client patches passed `git apply --check` against the current live source files; MCP server/runtime patches passed the same check against their current live source files; the additive module patch passed its clean-tree check.
-- Full project suite: **1299 passed, 7 skipped, 1573 subtests passed**.
 - `git diff --check` clean.
 
-No production files, databases, credentials, service configuration, or processes were changed. The historical outbox rows were not read, claimed, replayed, acknowledged, or deleted.
+No production files, databases, credentials, service configuration, or processes were changed. The production historical outbox rows were not read, claimed, replayed, acknowledged, or deleted. The migration behavior was tested only against an isolated fixture with 75 synthetic legacy rows.

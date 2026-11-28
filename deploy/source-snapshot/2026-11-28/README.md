@@ -26,8 +26,11 @@ fix from PR #215; that one file is not yet present in the live `/opt` tree.
   `chatgpt.job.completed` event into `job_event_outbox` in the same SQLite
   transaction as the terminal job transition. The event carries the job and
   conversation IDs so the original conversation can read the actual messages;
-  it does not copy the full job result into the notification. Job retention
-  keeps terminal jobs while their Sender event remains pending or leased.
+  it does not copy the full job result into the notification. New rows use
+  `event_version=1`; the startup migration tags existing rows version 0 and
+  excludes them from claim, ack, and pruning. Malformed new events are dead-lettered
+  with a bounded `last_error` rather than blocking the queue. Job retention keeps
+  terminal jobs while their Sender event remains pending or leased.
 - Sender exposes dispatcher-only `/internal/v1/events/claim` and
   `/internal/v1/events/{event_id}/ack` routes. The dispatcher identity is
   `session_ops:event-dispatcher` in tenant `session_ops`.
@@ -38,11 +41,13 @@ fix from PR #215; that one file is not yet present in the live `/opt` tree.
 ## Validation
 
 - Full repository tests: **1299 passed, 7 skipped, 1573 subtests passed**.
-- Current reconstructed production integration tests: **19 passed**.
+- Current reconstructed production integration tests: **23 passed**.
 - Sender and MCP patch series both apply cleanly to the current live source files
   in isolated temporary copies and pass Python compilation.
-- The legacy-outbox migration test seeds 75 pending version-0 rows, verifies that
-  none are claimed or mutated, then proves a new version-1 event is claimable.
+- The legacy-outbox migration test seeds 75 pending rows, verifies that migration
+  marks them version 0 and leaves them untouched, then proves a new version-1
+  event is claimable. A malformed version-1 event is dead-lettered without
+  blocking a valid event behind it.
 - Dispatcher shutdown tests verify no new webhook starts after the stop signal and
   shutdown waits for in-flight collection to finish.
 - No live `/opt` source, production database, environment file, or service was
