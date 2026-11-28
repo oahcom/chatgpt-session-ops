@@ -3,7 +3,7 @@
 > ChatGPT 会话操控与生命周期管理：API 直连投递 + PoW 绕过 + SSE 收割 + CDP 满员续接 + 匿名通道留存。
 > Session I/O and lifecycle tooling for ChatGPT — direct backend API, proof-of-work, SSE harvesting, CDP tab handoff, and self-persisted anonymous sessions.
 
-**English TL;DR** — A CLI for driving ChatGPT conversations from an agent: send a prompt into an existing conversation, harvest the reply, create fresh owner-style sessions, rotate across multiple accounts, survive 413 / 429 / 403, and keep anonymous (`/backend-anon`) sessions readable after the tab is gone. Pure Python stdlib plus one optional CDP helper. No third-party packages.
+**English TL;DR** — A CLI for driving ChatGPT conversations from an agent: send a prompt into an existing conversation, harvest the reply, create fresh owner-style sessions, rotate across multiple accounts, survive 413 / 429 / 403, and keep anonymous (`/backend-anon`) sessions readable after the tab is gone. CLI: Python stdlib plus one optional CDP helper. The optional remote MCP service uses the pinned dependencies in `requirements-mcp.txt`.
 
 ---
 
@@ -255,6 +255,33 @@ python scripts/chatgpt_send.py --proxy-set socks5h://user:pass@1.2.3.4:1080
 - 仅供账号持有人管理自己的会话。不要用它访问他人会话、绕过他人配额，或做任何违反 ChatGPT 服务条款的事。
 - 匿名通道只用于明确公开、服务端允许匿名访问的一次性短任务。
 - 匿名会话的设备 jar 等于该会话的全部凭据（`devices/` 被扫掉 = 永久失联），因此落盘即 chmod 600，且剔除登录态 token。
+
+---
+
+## SO MCP Server（与 CLI 同仓库）
+
+SO MCP 和 ChatGPT CLI 在同一个仓库、同一个部署单元中运行。MCP 工具直接调用 `scripts/chatgpt_send.py`，不经过独立 Sender Gateway：
+
+- `chatgpt.session.create`：同步创建会话，CLI 自己动态轮转账户。
+- `chatgpt.session.send`：同步发送并返回结果，不创建后台 Job。
+- `chatgpt.session.read` / `chatgpt.session.list`：读取消息或列出当前主体拥有的会话。
+- 会话账户归属与幂等记录保存在 `SO_MCP_DB`，按 tenant/principal 隔离。
+- 旧 Gateway 的 `session_owners` 在首次启动时迁移；旧 jobs/outbox 只归档，不再参与新执行链。
+
+运行服务：
+
+```bash
+python -m pip install -r requirements-mcp.txt
+SO_MCP_ISSUER=https://auth.example.com/realms/so-mcp \\
+SO_MCP_AUDIENCE=https://mcp.example.com/so-mcp \\
+SO_MCP_DB=/var/lib/so-mcp/work-items.sqlite3 \\
+SO_MCP_TENANT_CLAIM=tenant_id \\
+SO_SENDER_ACCOUNTS_DIR=/var/lib/chatgpt-session-ops/accounts \\
+CHATGPT_STATE_DIR=/var/lib/chatgpt-session-ops \\
+python -m scripts.run_mcp_server
+```
+
+完整服务配置、权限和状态迁移步骤见 [部署说明](docs/DEPLOY-so-mcp.md)；工具参数与 OAuth scope 见 [MCP 工具契约](references/mcp-tools.md)。
 
 ---
 
