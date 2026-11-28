@@ -28,11 +28,47 @@ class MCPEventDispatcher:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._operation_lock = threading.Lock()
+        self._metrics_lock = threading.Lock()
+        self._metrics = {
+            "start_count": 0,
+            "stop_count": 0,
+            "loop_count": 0,
+            "last_loop_at": None,
+            "last_delivery_at": None,
+            "last_exception_category": None,
+            "last_exception_at": None,
+            "consecutive_errors": 0,
+        }
+
+    def _record_error(self, exc: BaseException) -> None:
+        with self._metrics_lock:
+            self._metrics["last_exception_category"] = type(exc).__name__
+            self._metrics["last_exception_at"] = time.time()
+            self._metrics["consecutive_errors"] += 1
+
+    def _record_loop(self, delivered: int, had_error: bool) -> None:
+        now = time.time()
+        with self._metrics_lock:
+            self._metrics["loop_count"] += 1
+            self._metrics["last_loop_at"] = now
+            if delivered:
+                self._metrics["last_delivery_at"] = now
+            if not had_error:
+                self._metrics["consecutive_errors"] = 0
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """Return thread lifecycle and bounded progress counters."""
+        with self._lock:
+            running = self._thread is not None and self._thread.is_alive()
+            with self._metrics_lock:
+                return {"running": running, **dict(self._metrics)}
 
     def _run(self, stop_event: threading.Event) -> None:
         last_cleanup = float("-inf")
         while not stop_event.is_set():
             did_work = False
+            had_error = False
+            delivered = 0
             now = time.monotonic()
             if now - last_cleanup >= self.cleanup_interval_seconds:
                 try:
@@ -40,7 +76,9 @@ class MCPEventDispatcher:
                         if stop_event.is_set():
                             break
                         self.events_store.cleanup_expired()
-                except Exception:
+                except Exception as exc:
+                    had_error = True
+                    self._record_error(exc)
                     logging.exception("MCP event retention cleanup failed")
                     last_cleanup = now - self.cleanup_interval_seconds + min(60.0, self.cleanup_interval_seconds)
                 else:
@@ -55,8 +93,11 @@ class MCPEventDispatcher:
                         limit=self.delivery_batch_size, authorize=self.authorize
                     )
                 did_work = delivered > 0
-            except Exception:
+            except Exception as exc:
+                had_error = True
+                self._record_error(exc)
                 logging.exception("MCP webhook delivery failed")
+            self._record_loop(delivered, had_error)
             if not did_work:
                 stop_event.wait(self.poll_seconds)
 
@@ -70,6 +111,8 @@ class MCPEventDispatcher:
             self._stop_event = stop_event
             self._thread = thread
             thread.start()
+            with self._metrics_lock:
+                self._metrics["start_count"] += 1
 
     def stop(self) -> None:
         # Serialize the complete stop/join/clear sequence with start(). If the
@@ -80,6 +123,8 @@ class MCPEventDispatcher:
             stop_event, thread = self._stop_event, self._thread
             if stop_event is not None:
                 stop_event.set()
+                with self._metrics_lock:
+                    self._metrics["stop_count"] += 1
                 # The current operation is bounded by SQLite's 5s busy timeout
                 # or the callback's 5s network timeout. Leave margin for cleanup.
                 if not self._operation_lock.acquire(timeout=30):
