@@ -10,8 +10,11 @@ MCP SDK runtime: mcp==2.3.0
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import os
 import sqlite3
+import tempfile
 import threading
 import time
 import uuid
@@ -126,6 +129,8 @@ _ATTEMPT_ID = {
     "type": "string",
     "pattern": r"^att_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
 }
+_PROMPT = {"type": "string", "minLength": 1, "maxLength": 40000}
+_ACCOUNT = {"type": "string", "minLength": 1, "maxLength": 32}
 _SESSION_ID = {
     "type": "string",
     "pattern": r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
@@ -229,6 +234,25 @@ TOOL_SCHEMAS = {
         },
         ("session_id", "query"),
     ),
+    "chatgpt.session.send": _object_schema(
+        {
+            "work_item_id": _WORK_ITEM_ID,
+            "conversation_id": _SESSION_ID,
+            "prompt": _PROMPT,
+            "account": _ACCOUNT,
+            "attempt_id": _ATTEMPT_ID,
+        },
+        ("work_item_id", "prompt", "attempt_id"),
+    ),
+    "chatgpt.session.read": _object_schema(
+        {
+            "work_item_id": _WORK_ITEM_ID,
+            "conversation_id": _SESSION_ID,
+            "account": _ACCOUNT,
+            "max_chars": {"type": "integer", "minimum": 256, "maximum": 32768, "default": 12000},
+        },
+        ("work_item_id", "conversation_id"),
+    ),
 }
 
 TOOL_DESCRIPTIONS = {
@@ -242,6 +266,8 @@ TOOL_DESCRIPTIONS = {
     "session.unlink": "Unlink the active session link if it is visible.",
     "session.list": "List sessions linked to a visible WorkItem.",
     "session.context": "Retrieve memory only through the authorized active session link.",
+    "chatgpt.session.send": "Send a prompt through the in-repository ChatGPT execution path and link the confirmed session to a WorkItem.",
+    "chatgpt.session.read": "Read the current transcript from a ChatGPT session linked to the specified WorkItem.",
 }
 
 
@@ -469,7 +495,7 @@ def _exception_code(exc: BaseException) -> Tuple[str, Dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 class MCPToolService:
-    """Dispatch frozen MCP tools through SecureWorkItemStore only.
+    """Dispatch MCP tools through WorkItem authority and the local ChatGPT runtime.
 
     ``memory_adapter`` is the command sequence used to start the Memory
     Adapter, for example ``["python", "-m", "some_adapter_module"]``.
@@ -481,12 +507,10 @@ class MCPToolService:
         store: Any,
         *,
         memory_adapter: Optional[Sequence[str]] = None,
-        sender_gateway: Any = None,
     ):
         if store is None:
             raise ValueError("SecureWorkItemStore is required")
         self.store = store
-        self.sender_gateway = sender_gateway
         if memory_adapter is None:
             self.memory_adapter_command = None
         else:
@@ -645,6 +669,25 @@ class MCPToolService:
                     started=started,
                 )
 
+            elif name == "chatgpt.session.send":
+                data = self._chatgpt_session_send(
+                    principal=principal,
+                    work_item_id=args["work_item_id"],
+                    conversation_id=args.get("conversation_id"),
+                    prompt=args["prompt"],
+                    account=args.get("account"),
+                    attempt_id=args.get("attempt_id"),
+                )
+
+            elif name == "chatgpt.session.read":
+                data = self._chatgpt_session_read(
+                    principal=principal,
+                    work_item_id=args["work_item_id"],
+                    conversation_id=args["conversation_id"],
+                    account=args.get("account"),
+                    max_chars=args.get("max_chars", 12000),
+                )
+
             else:
                 raise ValueError("unknown tool")
 
@@ -656,6 +699,252 @@ class MCPToolService:
         except BaseException as exc:
             code, details = _exception_code(exc)
             return _error(code, request_id, details)
+
+    def _chatgpt_session_send(
+        self,
+        *,
+        principal: Any,
+        work_item_id: str,
+        conversation_id: Optional[str],
+        prompt: str,
+        account: Optional[str],
+        attempt_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """Send through the in-repository runtime with durable retry protection."""
+        from scripts import chatgpt_send as runtime
+
+        if not attempt_id:
+            raise ValueError("attempt_id is required and must be reused for retries")
+
+        explicit_account = None if account in (None, "", "auto") else account
+        request_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "work_item_id": work_item_id,
+                    "conversation_id": conversation_id,
+                    "prompt": prompt,
+                    "account": explicit_account,
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+        created, attempt = self._run_db(
+            lambda: self.store.reserve_send_attempt(
+                principal,
+                work_item_id,
+                attempt_id,
+                request_hash=request_hash,
+            )
+        )
+        if not created:
+            previous_status = attempt["status"]
+            response_status = (
+                "in_progress" if previous_status == "running" else previous_status
+            )
+            return {
+                "work_item_id": work_item_id,
+                "attempt_id": attempt_id,
+                "conversation_id": attempt.get("conversation_id"),
+                "account": attempt.get("account"),
+                "status": response_status,
+                "http_status": attempt.get("http_status"),
+                "error": attempt.get("error"),
+                "replayed": True,
+            }
+
+        prompt_path = None
+        api = None
+        resolved_account = None
+        try:
+            # All local authorization and account checks happen before the
+            # remote side effect. A failed preflight consumes this attempt ID
+            # as failed, so a retry cannot accidentally send under new inputs.
+            if conversation_id:
+                active_link = self._run_db(
+                    lambda: self.store.get_active_link(principal, conversation_id)
+                )
+                if active_link is None or active_link.work_item_id != work_item_id:
+                    raise NotAuthorized()
+                resolved = runtime.resolve_conversation_account(
+                    conversation_id,
+                    explicit_account=explicit_account,
+                )
+                if resolved.get("status") == "conflict":
+                    raise NotAuthorized()
+                if resolved.get("account") is None or (
+                    explicit_account is not None and resolved.get("account") != explicit_account
+                ):
+                    raise InvalidIdentifier("conversation account is unknown or does not match; specify the linked account")
+                resolved_account = resolved["account"]
+                api = runtime.ChatGPTAPI(account=resolved_account)
+
+            fd, prompt_path = tempfile.mkstemp(prefix="mcp-prompt-", suffix=".txt")
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(prompt)
+        except BaseException as exc:
+            try:
+                self._run_db(
+                    lambda: self.store.complete_send_attempt(
+                        principal,
+                        work_item_id,
+                        attempt_id,
+                        status="failed",
+                        error="%s: %s" % (type(exc).__name__, exc),
+                    )
+                )
+            except BaseException:
+                pass
+            if prompt_path is not None:
+                try:
+                    os.unlink(prompt_path)
+                except FileNotFoundError:
+                    pass
+            raise
+
+        try:
+            if conversation_id:
+                # Existing active link is already trusted. Reuse it; do not
+                # create a second landing event or attempt to link the session again.
+                result = runtime.send_prompt(api, conversation_id, prompt_path)
+                values = tuple(result) if isinstance(result, (tuple, list)) else ()
+                http_status = values[0] if values else None
+                resolved_conversation_id = (
+                    str(values[2]) if len(values) > 2 and values[2] else conversation_id
+                )
+                link = active_link
+                link_error = None
+            else:
+                context = {
+                    "store": self.store,
+                    "principal": principal,
+                    "work_item_id": work_item_id,
+                    "attempt_id": attempt_id,
+                }
+                runtime.create_chat_rotating(
+                    prompt_path,
+                    work_item_context=context,
+                    account=explicit_account,
+                )
+                link = context.get("link")
+                link_error = context.get("link_error")
+                http_status = context.get("status")
+                resolved_conversation_id = context.get("conversation_id")
+                resolved_account = context.get("account")
+
+            if link is not None:
+                status = "sent"
+            elif http_status == 200 and resolved_conversation_id:
+                status = "sent_unlinked"
+            elif (
+                http_status is None and (conversation_id is not None or resolved_account is not None)
+            ) or http_status == 200 or (
+                isinstance(http_status, int) and http_status in (408, 425) or
+                isinstance(http_status, int) and http_status >= 500
+            ):
+                # A timeout, server error, or accepted response without a
+                # conversation ID does not prove non-delivery.
+                status = "outcome_unknown"
+            else:
+                status = "failed"
+
+            record = self._run_db(
+                lambda: self.store.complete_send_attempt(
+                    principal,
+                    work_item_id,
+                    attempt_id,
+                    status=status,
+                    conversation_id=resolved_conversation_id,
+                    account=resolved_account,
+                    http_status=http_status,
+                    error=str(link_error)[:1000] if link_error else None,
+                )
+            )
+            return {
+                "work_item_id": work_item_id,
+                "attempt_id": attempt_id,
+                "conversation_id": record.get("conversation_id"),
+                "account": record.get("account"),
+                "status": record["status"],
+                "http_status": record.get("http_status"),
+                "error": record.get("error"),
+                "replayed": False,
+            }
+        except BaseException as exc:
+            # The remote side may already have accepted the prompt. Persist an
+            # unknown result and never replay this attempt automatically.
+            try:
+                self._run_db(
+                    lambda: self.store.complete_send_attempt(
+                        principal,
+                        work_item_id,
+                        attempt_id,
+                        status="outcome_unknown",
+                        error="%s: %s" % (type(exc).__name__, exc),
+                    )
+                )
+            except BaseException:
+                pass
+            raise
+        finally:
+            if prompt_path is not None:
+                try:
+                    os.unlink(prompt_path)
+                except FileNotFoundError:
+                    pass
+
+    def _chatgpt_session_read(
+        self,
+        *,
+        principal: Any,
+        work_item_id: str,
+        conversation_id: str,
+        account: Optional[str],
+        max_chars: int,
+    ) -> Dict[str, Any]:
+        """Read the linked ChatGPT conversation directly through ChatGPTAPI."""
+        from scripts import chatgpt_send as runtime
+
+        link = self._run_db(
+            lambda: self.store.get_session_link_for_work_item(
+                principal, work_item_id, conversation_id
+            )
+        )
+        if link is None:
+            raise NotAuthorized()
+        explicit_account = None if account in (None, "", "auto") else account
+        resolved = runtime.resolve_conversation_account(
+            conversation_id,
+            explicit_account=explicit_account,
+        )
+        if resolved.get("status") == "conflict":
+            raise NotAuthorized()
+        if resolved.get("account") is None:
+            raise InvalidIdentifier("conversation account is unknown; specify account")
+        api = runtime.ChatGPTAPI(account=resolved["account"])
+        tail, _body = api.live_tail(conversation_id, tries=2)
+        if tail is None:
+            return {
+                "work_item_id": work_item_id,
+                "conversation_id": conversation_id,
+                "account": resolved["account"],
+                "status": "unavailable",
+                "http_status": getattr(api, "last_status", None),
+                "text": "",
+                "truncated": False,
+            }
+        text = str(tail)
+        return {
+            "work_item_id": work_item_id,
+            "conversation_id": conversation_id,
+            "account": resolved["account"],
+            "status": "ok",
+            "http_status": getattr(api, "last_status", None),
+            "text": text[:max_chars],
+            "truncated": len(text) > max_chars,
+        }
 
     def _session_context(
         self,
@@ -743,7 +1032,6 @@ def build_mcp_server(
     token_provider: JWTVerifier,
     *,
     events_store: Any = None,
-    sender_gateway: Any = None,
 ) -> Any:
     """Build and return the authenticated Streamable HTTP ASGI application.
 
@@ -758,9 +1046,6 @@ def build_mcp_server(
         raise TypeError("service must be MCPToolService")
     if not callable(getattr(token_provider, "verify", None)):
         raise TypeError("token_provider must be a JWTVerifier instance")
-    if sender_gateway is None:
-        sender_gateway = getattr(service, "sender_gateway", None)
-
     # The optional SDK is deliberately imported only here.
     from mcp import types
     from mcp.server import Server
@@ -894,29 +1179,10 @@ def build_mcp_server(
                 raise AuthenticationError("verified authentication context required")
             if "session_ops.chatgpt.session.write" not in auth.scopes:
                 raise ScopeError(("session_ops.chatgpt.session.write",))
-            arguments = params.arguments or {}
-            job_id = arguments.get("job_id")
-
             def create_subscription() -> Any:
-                if job_id is not None:
-                    if sender_gateway is None:
-                        from mcp.shared.exceptions import MCPError
-                        raise MCPError(code=-32003, message="Event authorization service unavailable")
-                    try:
-                        sender_gateway.get_job(
-                            principal_id=auth.principal.principal_id,
-                            tenant_id=auth.principal.tenant_id,
-                            job_id=job_id,
-                        )
-                    except Exception as exc:
-                        if getattr(exc, "code", None) in ("NOT_FOUND", "PERMISSION_DENIED"):
-                            from mcp.shared.exceptions import MCPError
-                            raise MCPError(
-                                code=-32602,
-                                message="Invalid event subscription",
-                                data={"reason": "job_not_accessible"},
-                            ) from exc
-                        raise
+                # Event rows and subscriptions are scoped to the verified
+                # tenant/principal in MCPEventsStore; no external job service
+                # is involved in subscription authorization.
                 return events_store.subscribe(
                     auth,
                     params.model_dump(by_alias=True, exclude_unset=True),

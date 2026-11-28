@@ -248,6 +248,7 @@ class MCPEventsStore:
                 "properties": {
                     "job_id": {"type": "string"},
                     "conversation_id": {"type": "string"},
+                    "conversation_ids": {"type": "array", "items": {"type": "string"}},
                     "status": {"type": "string", "enum": ["succeeded", "failed"]},
                     "summary": {"type": "string"},
                     "completed_at": {"type": "string", "format": "date-time"},
@@ -416,17 +417,69 @@ class MCPEventsStore:
         event_id: str | None = None,
         completed_at: str | None = None,
         conversation_id: str | None = None,
+        conversation_ids: list[str] | None = None,
         status: str = "succeeded",
         error_code: str | None = None,
         outcome_unknown: bool | None = None,
     ) -> str:
-        """Persist one completion event; sender-provided IDs make ingestion idempotent."""
+        """Persist one completion event in its own transaction."""
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            return self.publish_job_completed_in_transaction(
+                db,
+                tenant_id,
+                principal_id,
+                job_id,
+                summary,
+                event_id=event_id,
+                completed_at=completed_at,
+                conversation_id=conversation_id,
+                conversation_ids=conversation_ids,
+                status=status,
+                error_code=error_code,
+                outcome_unknown=outcome_unknown,
+            )
+
+    def publish_job_completed_in_transaction(
+        self,
+        db: sqlite3.Connection,
+        tenant_id: str,
+        principal_id: str,
+        job_id: str,
+        summary: str,
+        *,
+        event_id: str,
+        completed_at: str,
+        conversation_id: str | None = None,
+        conversation_ids: list[str] | None = None,
+        status: str = "succeeded",
+        error_code: str | None = None,
+        outcome_unknown: bool | None = None,
+    ) -> str:
+        """Insert an event using the caller's transaction (same SQLite file)."""
         if not all(isinstance(value, str) and value for value in (tenant_id, principal_id, job_id)):
             raise ValueError("tenant, principal, and job identifiers are required")
+        if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+            raise ValueError("an active SQLite transaction is required")
+        if self.database != ":memory:":
+            main_path = next(
+                (row[2] for row in db.execute("PRAGMA database_list") if row[1] == "main"),
+                "",
+            )
+            if not main_path or os.path.realpath(main_path) != os.path.realpath(self.database):
+                raise ValueError("completion event and WorkItem must share the same SQLite database")
         if not isinstance(summary, str):
             raise ValueError("job summary must be text")
         if conversation_id is not None and (not isinstance(conversation_id, str) or not conversation_id):
             raise ValueError("conversation_id must be nonempty text or null")
+        if conversation_ids is not None and (
+            not isinstance(conversation_ids, list)
+            or any(not isinstance(value, str) or not value for value in conversation_ids)
+            or len(set(conversation_ids)) != len(conversation_ids)
+        ):
+            raise ValueError("conversation_ids must be a list of unique nonempty strings")
+        if conversation_id is not None and conversation_ids is not None:
+            raise ValueError("use conversation_id or conversation_ids, not both")
         if status not in ("succeeded", "failed"):
             raise ValueError("job status must be succeeded or failed")
         if error_code is not None and (not isinstance(error_code, str) or not error_code):
@@ -456,39 +509,39 @@ class MCPEventsStore:
         }
         if conversation_id is not None:
             data["conversation_id"] = conversation_id
+        if conversation_ids is not None:
+            data["conversation_ids"] = conversation_ids
         if error_code is not None:
             data["error_code"] = error_code
         if outcome_unknown is not None:
             data["outcome_unknown"] = outcome_unknown
         canonical_data = _canonical_json(data)
-        with self._db() as db:
-            db.execute("BEGIN IMMEDIATE")
-            existing = db.execute(
-                "SELECT tenant_id, principal_id, name, data_json FROM event_outbox WHERE event_id=?",
-                (event_id,),
-            ).fetchone()
-            if existing is not None:
-                if (existing["tenant_id"], existing["principal_id"], existing["name"], existing["data_json"]) != (
-                    tenant_id, principal_id, "chatgpt.job.completed", canonical_data
-                ):
-                    raise ValueError("event_id was reused with a different event")
-                return event_id
+        existing = db.execute(
+            "SELECT tenant_id, principal_id, name, data_json FROM event_outbox WHERE event_id=?",
+            (event_id,),
+        ).fetchone()
+        if existing is not None:
+            if (existing["tenant_id"], existing["principal_id"], existing["name"], existing["data_json"]) != (
+                tenant_id, principal_id, "chatgpt.job.completed", canonical_data
+            ):
+                raise ValueError("event_id was reused with a different event")
+            return event_id
+        db.execute(
+            "INSERT INTO event_outbox VALUES (?, ?, ?, ?, ?, ?)",
+            (event_id, tenant_id, principal_id, "chatgpt.job.completed", canonical_data, event_created_at),
+        )
+        subscriptions = db.execute(
+            "SELECT id, arguments_json, generation FROM event_subscriptions WHERE tenant_id=? AND principal_id=? AND name='chatgpt.job.completed' AND active=1 AND (expires_at IS NULL OR expires_at>?)",
+            (tenant_id, principal_id, now),
+        ).fetchall()
+        for sub in subscriptions:
+            filters = json.loads(sub["arguments_json"])
+            if filters.get("job_id") not in (None, job_id):
+                continue
             db.execute(
-                "INSERT INTO event_outbox VALUES (?, ?, ?, ?, ?, ?)",
-                (event_id, tenant_id, principal_id, "chatgpt.job.completed", canonical_data, event_created_at),
+                "INSERT INTO event_deliveries(event_id, subscription_id, status, generation) VALUES (?, ?, 'pending', ?)",
+                (event_id, sub["id"], sub["generation"]),
             )
-            subscriptions = db.execute(
-                "SELECT id, arguments_json, generation FROM event_subscriptions WHERE tenant_id=? AND principal_id=? AND name='chatgpt.job.completed' AND active=1 AND (expires_at IS NULL OR expires_at>?)",
-                (tenant_id, principal_id, now),
-            ).fetchall()
-            for sub in subscriptions:
-                filters = json.loads(sub["arguments_json"])
-                if filters.get("job_id") not in (None, job_id):
-                    continue
-                db.execute(
-                    "INSERT INTO event_deliveries(event_id, subscription_id, status, generation) VALUES (?, ?, 'pending', ?)",
-                    (event_id, sub["id"], sub["generation"]),
-                )
         return event_id
 
     def cleanup_expired(self, *, retention_seconds: int = 30 * 24 * 60 * 60) -> dict[str, int]:

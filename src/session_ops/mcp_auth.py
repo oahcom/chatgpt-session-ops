@@ -13,6 +13,7 @@ import base64
 import http.client
 import ipaddress
 import json
+import queue
 import re
 import socket
 import threading
@@ -30,6 +31,8 @@ MAX_TOKEN_BYTES = 16384
 MAX_JWKS_BYTES = 1048576
 MAX_DISCOVERY_BYTES = 65536
 DEFAULT_HTTP_TIMEOUT_SECONDS = 3.0
+DNS_RESOLUTION_TIMEOUT_SECONDS = 5.0
+_DNS_RESOLVER_SLOTS = threading.BoundedSemaphore(2)
 DEFAULT_CACHE_SECONDS = 300.0
 DEFAULT_CLOCK_SKEW_SECONDS = 30.0
 MIN_RSA_BITS = 2048
@@ -124,6 +127,14 @@ TOOL_REQUIRED_SCOPES = {
     ),
     "session.context": (
         "session_ops.context.read",
+        "session_ops.session.read",
+        "session_ops.work_item.read",
+    ),
+    "chatgpt.session.send": (
+        "session_ops.session.write",
+        "session_ops.work_item.write",
+    ),
+    "chatgpt.session.read": (
         "session_ops.session.read",
         "session_ops.work_item.read",
     ),
@@ -461,6 +472,40 @@ def _validate_https_url(value: Any, description: str) -> str:
     return value
 
 
+def _getaddrinfo_bounded(host: str, port: int) -> list[tuple[Any, ...]]:
+    """Run libc DNS resolution behind a deadline and a fixed thread bound.
+
+    getaddrinfo has no portable timeout. A daemon resolver thread prevents a
+    stuck system resolver from pinning the MCP dispatcher or process shutdown;
+    the semaphore prevents repeated timeouts from creating unbounded threads.
+    """
+    if not _DNS_RESOLVER_SLOTS.acquire(timeout=0.1):
+        raise AuthenticationError("DNS resolver capacity is temporarily exhausted")
+    result: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+
+    def resolve() -> None:
+        try:
+            result.put((True, socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)))
+        except BaseException as exc:
+            result.put((False, exc))
+        finally:
+            _DNS_RESOLVER_SLOTS.release()
+
+    worker = threading.Thread(target=resolve, name="mcp-dns-resolver", daemon=True)
+    try:
+        worker.start()
+    except BaseException:
+        _DNS_RESOLVER_SLOTS.release()
+        raise
+    try:
+        succeeded, value = result.get(timeout=DNS_RESOLUTION_TIMEOUT_SECONDS)
+    except queue.Empty as exc:
+        raise AuthenticationError("DNS hostname resolution timed out") from exc
+    if not succeeded:
+        raise value
+    return value
+
+
 def _resolve_validated_address(value: Any, description: str) -> str:
     """Validate an HTTPS URL and return the address the connection must use.
 
@@ -484,11 +529,7 @@ def _resolve_validated_address(value: Any, description: str) -> str:
         addresses = [literal]
     except ValueError:
         try:
-            records = socket.getaddrinfo(
-                host,
-                parsed.port or 443,
-                type=socket.SOCK_STREAM,
-            )
+            records = _getaddrinfo_bounded(host, parsed.port or 443)
         except OSError as exc:
             raise AuthenticationError(
                 "%s hostname could not be resolved" % description

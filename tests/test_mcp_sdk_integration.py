@@ -393,7 +393,6 @@ class MCPSDKIntegrationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(dir="/dev/shm") as tmp:
             callback_thread_ids = []
-            sender_thread_ids = []
 
             def post_json(_url, body, _headers):
                 callback_thread_ids.append(threading.get_ident())
@@ -407,24 +406,15 @@ class MCPSDKIntegrationTests(unittest.TestCase):
                 encryption_key=b"h" * 32,
                 post_json=post_json,
             )
-            class Sender:
-                def get_job(self, **kwargs):
-                    sender_thread_ids.append(threading.get_ident())
-                    return {"job_id": kwargs["job_id"]}
-
-            sender = Sender()
             app = build_mcp_server(
                 self.service,
                 TokenProvider(),
                 events_store=store,
-                sender_gateway=sender,
             )
             asyncio.run(run_protocol(app, store))
             loop_thread_id = threading.get_ident()
             self.assertTrue(callback_thread_ids)
-            self.assertTrue(sender_thread_ids)
             self.assertNotEqual(callback_thread_ids[0], loop_thread_id)
-            self.assertNotEqual(sender_thread_ids[0], loop_thread_id)
 
     def test_real_tools_call_rejects_missing_request_authentication(self):
         server = self._find_server()

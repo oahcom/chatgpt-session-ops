@@ -7372,6 +7372,7 @@ def send_prompt_for_work_item(
     prompt_file,
     new_chat=False,
     thinking=None,
+    attempt_id=None,
 ):
     """Send one WorkItem attempt, record its landing, then link it.
 
@@ -7398,7 +7399,16 @@ def send_prompt_for_work_item(
             "anonymous sends cannot establish trusted landing evidence"
         )
 
-    attempt_id = "att_" + str(uuid.uuid4())
+    if attempt_id is None:
+        attempt_id = "att_" + str(uuid.uuid4())
+    elif (
+        not isinstance(attempt_id, str)
+        or re.fullmatch(
+            r"att_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+            attempt_id,
+        ) is None
+    ):
+        raise ValueError("attempt_id must be a valid att_UUIDv4")
 
     # Match main's R373-07 flow: read and validate once, before logging or sending.
     text = load_prompt_text(prompt_file)
@@ -7525,7 +7535,9 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
     return result
 
 
-def _attempt_create(st, name, prompt_file, attempts, thinking=None):
+def _attempt_create(
+    st, name, prompt_file, attempts, thinking=None, work_item_context=None
+):
     """用指定身份建会话并记录结果；返回 (status, conv_id)。
 
     HTTP 413 是本次发送的终止信号，不是账号级故障，
@@ -7548,13 +7560,31 @@ def _attempt_create(st, name, prompt_file, attempts, thinking=None):
         return "INIT_FAIL", None
 
     try:
-        status, _path, conv = send_prompt(
-            api,
-            None,
-            prompt_file,
-            new_chat=True,
-            thinking=thinking,
-        )
+        if work_item_context is None:
+            status, _path, conv = send_prompt(
+                api,
+                None,
+                prompt_file,
+                new_chat=True,
+                thinking=thinking,
+            )
+        else:
+            result, link, link_error = send_prompt_for_work_item(
+                api,
+                work_item_context["store"],
+                work_item_context["principal"],
+                work_item_context["work_item_id"],
+                None,
+                prompt_file,
+                new_chat=True,
+                thinking=thinking,
+                attempt_id=work_item_context["attempt_id"],
+            )
+            status, _path, conv = (tuple(result) + (None, None, None))[:3]
+            work_item_context["status"] = status
+            work_item_context["api"] = api
+            work_item_context["link"] = link
+            work_item_context["link_error"] = link_error
 
     except ThinkingModelUnavailable as e:
         # 思考模型不可用是账号级失败，不是整个进程的退出信号。
@@ -7658,7 +7688,9 @@ def _mark_success(st, name, conv, prompt_file, attempts):
                       "attempts": attempts}, ensure_ascii=False), flush=True)
 
 
-def create_chat_rotating(prompt_file, thinking=None):
+def create_chat_rotating(
+    prompt_file, thinking=None, *, work_item_context=None, account=None
+):
     """登录态优先建会话：acct1/acct2/acct3/acct4/acct5/acct6 均分轮转；
     仅当全部都 429 才用匿名兜底。
 
@@ -7688,7 +7720,12 @@ def create_chat_rotating(prompt_file, thinking=None):
             skipped[name] = reason
             outcomes[name] = "SKIP:" + reason
 
-    plan = [a for a in rotation_plan(st) if a not in skipped]
+    if account not in (None, "auto"):
+        if account not in ROTATION_PRIMARY:
+            raise ValueError("account is not a configured authenticated account")
+        plan = [account] if not is_unavailable(st, account) else []
+    else:
+        plan = [a for a in rotation_plan(st) if a not in skipped]
 
     print(
         "rotation plan: %s (cursor=%s)%s" % (
@@ -7701,13 +7738,23 @@ def create_chat_rotating(prompt_file, thinking=None):
     )
 
     for name in plan:
-        status, conv = _attempt_create(
-            st,
-            name,
-            prompt_file,
-            attempts,
-            thinking_requested,
-        )
+        if work_item_context is None:
+            status, conv = _attempt_create(
+                st,
+                name,
+                prompt_file,
+                attempts,
+                thinking_requested,
+            )
+        else:
+            status, conv = _attempt_create(
+                st,
+                name,
+                prompt_file,
+                attempts,
+                thinking_requested,
+                work_item_context=work_item_context,
+            )
         outcomes[name] = status
 
         # Terminal failure: stop immediately.
@@ -7731,6 +7778,9 @@ def create_chat_rotating(prompt_file, thinking=None):
 
         if conv:
             _mark_success(st, name, conv, prompt_file, attempts)
+            if work_item_context is not None:
+                work_item_context["account"] = name
+                work_item_context["conversation_id"] = str(conv)
             return _send_exit_code(status, conv)
 
         if status == 200:
@@ -7786,7 +7836,11 @@ def create_chat_rotating(prompt_file, thinking=None):
         )
         return 1
 
-    block = anon_fallback_block_reason(st, outcomes)
+    block = (
+        "trusted WorkItem sends cannot use anonymous sessions"
+        if work_item_context is not None
+        else anon_fallback_block_reason(st, outcomes)
+    )
 
     if block is None:
         print(

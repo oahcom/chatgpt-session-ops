@@ -1,5 +1,0 @@
-fa938a966b4d79c8f316a9070d78d0aa427eeeabef1b5280f326f03545451892  /opt/so-sender/sender_gateway/app.py
-71346e5cf79c5b6cbb0a2204ca2c39315bc4df271fc95f6e462bd832b7f02536  /opt/so-sender/sender_gateway/job_store.py
-56528ccebde3035b0dc469a67cfdf844ce9f1aea7040d2fa53fd1522b191b260  /opt/so-mcp/src/session_ops/sender_gateway_client.py
-4f09e588ffa512b5e26c78b6a2c6278a1f5f02c93f3b8f791a4763cbd4b09b4c  /opt/so-mcp/src/session_ops/mcp_server.py
-a2a4c41b9a3cbdfb2a3c7623d6de4cad3e35efcfaa87eb0d7088fba30b89173b  /opt/so-mcp/scripts/run_mcp_server.py

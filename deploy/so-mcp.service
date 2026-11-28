@@ -11,19 +11,20 @@ Type=simple
 User=ubuntu
 Group=ubuntu
 
-WorkingDirectory=/opt/so-mcp
+WorkingDirectory=/home/ubuntu/ai-projects/chatgpt-session-ops
 
 EnvironmentFile=/etc/so-mcp/so-mcp.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 
-ExecStart=/opt/so-mcp/.venv/bin/python -m scripts.run_mcp_server
+ExecStart=/home/ubuntu/ai-projects/chatgpt-session-ops/.venv/bin/python -m scripts.run_mcp_server
 
 Restart=on-failure
 RestartSec=5s
 
 TimeoutStartSec=30
-TimeoutStopSec=15
+# Allow ChatGPT preflight/read plus its 420s send timeout, Uvicorn drain, and MCP event drain.
+TimeoutStopSec=600
 KillSignal=SIGTERM
 
 StandardOutput=journal
@@ -33,7 +34,7 @@ SyslogIdentifier=so-mcp
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
+ProtectHome=read-only
 
 ReadWritePaths=/var/lib/so-mcp
 

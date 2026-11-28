@@ -13,20 +13,17 @@ import re
 import shutil
 import stat
 import sys
-import uuid
 from pathlib import Path
 from typing import Any, Optional, Sequence
 from urllib.parse import urlsplit
 
 import uvicorn
 
-from src.session_ops.authority import SecureWorkItemStore
+from src.session_ops.authority import NotAuthorized, Principal, SecureWorkItemStore
 from src.session_ops.mcp_auth import JWTVerifier
 from src.session_ops.mcp_server import MCPToolService, build_mcp_server
 from src.session_ops.mcp_events import MCPEventsStore
-from src.session_ops.mcp_event_collector import MCPEventCollector
 from src.session_ops.mcp_event_dispatcher import MCPEventDispatcher
-from src.session_ops.sender_gateway_client import SenderGatewayClient
 
 
 SUPPORTED_SCOPES = [
@@ -43,7 +40,6 @@ SUPPORTED_SCOPES = [
 MEMORY_STDIO_ENV = "SO_MCP_MEMORY_STDIO"
 EVENTS_KEY_FILE_ENV = "SO_MCP_EVENTS_KEY_FILE"
 EVENTS_DB_ENV = "SO_MCP_EVENTS_DB"
-SENDER_URL_ENV = "SO_MCP_SENDER_URL"
 
 _SECRET_ARGUMENT_RE = re.compile(
     r"(token|password|passwd|secret|credential|"
@@ -394,6 +390,24 @@ def _add_access_manage_to_challenge(value: bytes) -> bytes:
     return value[:match.start(1)] + replacement + value[match.end(1):]
 
 
+def _authorize_event_resource(
+    store: SecureWorkItemStore,
+    *,
+    tenant_id: str,
+    principal_id: str,
+    job_id: str,
+) -> bool:
+    """Re-check current read or write access immediately before callback I/O."""
+    principal = Principal(tenant_id, principal_id)
+    for scope in ("read", "write"):
+        try:
+            store.require_access(principal, job_id, scope)
+            return True
+        except NotAuthorized:
+            continue
+    return False
+
+
 def _load_events_encryption_key(path_value: str) -> bytes:
     """Read the private raw 32-byte key used to encrypt webhook secrets."""
     path = Path(path_value)
@@ -486,7 +500,7 @@ class DeploymentASGI:
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         if scope.get("type") == "lifespan" and self.background_tasks:
             started_tasks: list[Any] = []
-            stopped_tasks: set[int] = set()
+            stop_attempted_tasks: set[int] = set()
 
             async def receive_with_task_lifecycle() -> dict[str, Any]:
                 message = await receive()
@@ -496,15 +510,22 @@ class DeploymentASGI:
                         started_tasks.append(task)
                 elif message.get("type") == "lifespan.shutdown":
                     for task in reversed(started_tasks):
+                        task_id = id(task)
+                        if task_id in stop_attempted_tasks:
+                            continue
+                        # Record before calling stop(): if it raises, finally
+                        # must not repeat the same bounded wait a second time.
+                        stop_attempted_tasks.add(task_id)
                         task.stop()
-                        stopped_tasks.add(id(task))
                 return message
 
             try:
                 await self.inner(scope, receive_with_task_lifecycle, send)
             finally:
                 for task in reversed(started_tasks):
-                    if id(task) not in stopped_tasks:
+                    task_id = id(task)
+                    if task_id not in stop_attempted_tasks:
+                        stop_attempted_tasks.add(task_id)
                         task.stop()
             return
 
@@ -561,8 +582,32 @@ class DeploymentASGI:
 
 def create_application(config: dict[str, Any]) -> Any:
     """Initialize persistent storage and construct the authenticated app."""
+    database_path = Path(config["database_path"]).resolve()
+
+    events_key_file = os.environ.get(EVENTS_KEY_FILE_ENV, "").strip()
+    events_db_path = os.environ.get(EVENTS_DB_ENV, "").strip()
+    if events_db_path and not events_key_file:
+        raise RuntimeError(EVENTS_DB_ENV + " requires " + EVENTS_KEY_FILE_ENV)
+
+    events_store = None
+    if events_key_file:
+        encryption_key = _load_events_encryption_key(events_key_file)
+        if events_db_path and Path(events_db_path).resolve() != database_path:
+            raise RuntimeError(EVENTS_DB_ENV + " must use the WorkItem database for atomic completion events")
+        # The completion event and terminal WorkItem transition share one
+        # SQLite commit. A separate outbox database would reintroduce a loss
+        # window between the business transaction and event publication.
+        events_store = MCPEventsStore(
+            str(database_path),
+            encryption_key=encryption_key,
+        )
+
     store = SecureWorkItemStore(
-        Path(config["database_path"]),
+        database_path,
+        completion_event_publisher=(
+            events_store.publish_job_completed_in_transaction
+            if events_store is not None else None
+        ),
     )
     store.initialize()
 
@@ -574,75 +619,29 @@ def create_application(config: dict[str, Any]) -> Any:
         discovery_url=config["discovery_url"],
     )
 
-    sender_gateway = None
-    if os.environ.get(SENDER_URL_ENV, "").strip():
-        sender_gateway = SenderGatewayClient.from_env()
-
     service = MCPToolService(
         store,
         memory_adapter=config.get("memory_adapter_command"),
-        sender_gateway=sender_gateway,
     )
 
-    events_key_file = os.environ.get(EVENTS_KEY_FILE_ENV, "").strip()
-    events_db_path = os.environ.get(EVENTS_DB_ENV, "").strip()
-    if events_db_path and not events_key_file:
-        raise RuntimeError(EVENTS_DB_ENV + " requires " + EVENTS_KEY_FILE_ENV)
-
-    events_store = None
     background_tasks: list[Any] = []
-    if events_key_file:
-        if sender_gateway is None:
-            raise RuntimeError(EVENTS_KEY_FILE_ENV + " requires " + SENDER_URL_ENV)
-        encryption_key = _load_events_encryption_key(events_key_file)
-        if events_db_path and not Path(events_db_path).is_absolute():
-            raise RuntimeError(EVENTS_DB_ENV + " must be an absolute path")
-        if not events_db_path:
-            events_db_path = str(
-                Path(config["database_path"]).parent / "events" / "events.sqlite3"
-            )
-        if not all(
-            callable(getattr(sender_gateway, method, None))
-            for method in ("claim_events", "ack_event", "get_job")
-        ):
-            raise RuntimeError("Sender client lacks MCP Events claim/ACK/authorization methods")
-
-        events_store = MCPEventsStore(
-            events_db_path,
-            encryption_key=encryption_key,
-        )
-        collector = MCPEventCollector(
-            sender_gateway,
-            events_store,
-            worker_id="mcp-events-" + uuid.uuid4().hex,
-        )
-
+    if events_store is not None:
         def authorize_event(*, tenant_id: str, principal_id: str, job_id: str) -> bool:
-            try:
-                sender_gateway.get_job(
-                    principal_id=principal_id,
-                    tenant_id=tenant_id,
-                    job_id=job_id,
-                )
-                return True
-            except Exception as exc:
-                if getattr(exc, "code", None) in ("NOT_FOUND", "PERMISSION_DENIED"):
-                    return False
-                raise
+            return _authorize_event_resource(
+                store,
+                tenant_id=tenant_id,
+                principal_id=principal_id,
+                job_id=job_id,
+            )
 
         background_tasks.append(
-            MCPEventDispatcher(
-                collector,
-                events_store,
-                authorize=authorize_event,
-            )
+            MCPEventDispatcher(events_store, authorize=authorize_event)
         )
 
     mcp_app = build_mcp_server(
         service,
         verifier,
         events_store=events_store,
-        sender_gateway=sender_gateway,
     )
 
     return DeploymentASGI(
@@ -690,6 +689,7 @@ def main() -> None:
         port=config["port"],
         log_level=config["log_level"],
         access_log=True,
+        timeout_graceful_shutdown=5,
     )
 
 

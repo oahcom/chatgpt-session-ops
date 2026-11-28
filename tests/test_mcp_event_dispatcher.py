@@ -4,15 +4,6 @@ import unittest
 from src.session_ops.mcp_event_dispatcher import MCPEventDispatcher
 
 
-class Collector:
-    def __init__(self):
-        self.called = threading.Event()
-
-    def run_once(self):
-        self.called.set()
-        return 0
-
-
 class Store:
     def __init__(self):
         self.cleanup_calls = 0
@@ -30,12 +21,10 @@ class Store:
 
 
 class MCPEventDispatcherTests(unittest.TestCase):
-    def test_single_dispatcher_collects_and_delivers_without_extra_threads(self):
-        collector = Collector()
+    def test_single_dispatcher_delivers_local_events_without_collector(self):
         store = Store()
         authorize = lambda **_kwargs: True
         dispatcher = MCPEventDispatcher(
-            collector,
             store,
             authorize=authorize,
             poll_seconds=0.05,
@@ -44,7 +33,6 @@ class MCPEventDispatcherTests(unittest.TestCase):
         )
         dispatcher.start()
         try:
-            self.assertTrue(collector.called.wait(1))
             self.assertTrue(store.delivered.wait(1))
             self.assertEqual(dispatcher._thread.name, "mcp-events")
             self.assertFalse(dispatcher._thread.daemon)
@@ -55,9 +43,8 @@ class MCPEventDispatcherTests(unittest.TestCase):
         self.assertIsNone(dispatcher._thread)
 
     def test_start_is_idempotent_and_stop_joins_the_only_thread(self):
-        collector = Collector()
         store = Store()
-        dispatcher = MCPEventDispatcher(collector, store, poll_seconds=0.05)
+        dispatcher = MCPEventDispatcher(store, poll_seconds=0.05)
         dispatcher.start()
         first_thread = dispatcher._thread
         dispatcher.start()
@@ -79,7 +66,7 @@ class MCPEventDispatcherTests(unittest.TestCase):
             def join(self, timeout=None):
                 raise AssertionError("join must not run while operation lock is busy")
 
-        dispatcher = MCPEventDispatcher(Collector(), Store())
+        dispatcher = MCPEventDispatcher(Store())
         dispatcher._operation_lock = BusyLock()
         dispatcher._stop_event = threading.Event()
         dispatcher._thread = LiveThread()
@@ -99,7 +86,7 @@ class MCPEventDispatcherTests(unittest.TestCase):
             def join(self, timeout=None):
                 return None
 
-        dispatcher = MCPEventDispatcher(Collector(), Store())
+        dispatcher = MCPEventDispatcher(Store())
         dispatcher._operation_lock = AvailableLock()
         dispatcher._stop_event = threading.Event()
         dispatcher._thread = StuckThread()

@@ -57,7 +57,9 @@ class MCPEventsStoreTests(unittest.TestCase):
         properties = definition["payloadSchema"]["properties"]
         required = definition["payloadSchema"]["required"]
         self.assertEqual(properties["conversation_id"], {"type": "string"})
+        self.assertEqual(properties["conversation_ids"], {"type": "array", "items": {"type": "string"}})
         self.assertNotIn("conversation_id", required)
+        self.assertNotIn("conversation_ids", required)
 
     def test_subscribe_verifies_challenge_and_persists_subscription(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):

@@ -643,9 +643,48 @@ class TestDeploymentASGILifespan(unittest.TestCase):
             ["lifespan.startup.complete", "lifespan.shutdown.complete"],
         )
 
+    def test_failed_stop_is_not_retried_from_finally(self):
+        calls = []
+
+        class Task:
+            def start(self):
+                calls.append("start")
+
+            def stop(self):
+                calls.append("stop")
+                raise TimeoutError("dispatcher did not drain")
+
+        class Inner:
+            async def __call__(self, scope, receive, send):
+                await receive()
+                await send({"type": "lifespan.startup.complete"})
+                await receive()
+
+        messages = iter((
+            {"type": "lifespan.startup"},
+            {"type": "lifespan.shutdown"},
+        ))
+
+        async def receive():
+            return next(messages)
+
+        async def send(_message):
+            return None
+
+        app = DeploymentASGI(
+            Inner(),
+            issuer="https://issuer.example.test/realm",
+            audience="https://resource.example.test/mcp",
+            background_tasks=[Task()],
+        )
+        with self.assertRaisesRegex(TimeoutError, "did not drain"):
+            asyncio.run(app({"type": "lifespan"}, receive, send))
+
+        self.assertEqual(calls, ["start", "stop"])
+
 
 class TestMCPEventsRuntimeWiring(unittest.TestCase):
-    def test_create_application_wires_sender_store_and_dispatcher(self):
+    def test_create_application_wires_local_event_store_and_dispatcher(self):
         config = {
             "database_path": "/tmp/session-ops-runtime-test.sqlite3",
             "issuer": "https://issuer.example.test/realm",
@@ -655,9 +694,7 @@ class TestMCPEventsRuntimeWiring(unittest.TestCase):
             "discovery_url": None,
             "memory_adapter_command": None,
         }
-        sender = mock.Mock()
         events_store = mock.Mock()
-        collector = mock.Mock()
         dispatcher = mock.Mock()
         mcp_app = object()
 
@@ -665,39 +702,64 @@ class TestMCPEventsRuntimeWiring(unittest.TestCase):
             key_path = Path(tmp) / "events.key"
             key_path.write_bytes(b"e" * 32)
             key_path.chmod(0o400)
-            events_db = str(Path(tmp) / "events.sqlite3")
+            events_db = config["database_path"]
 
             with (
                 mock.patch.dict(os.environ, {
-                    "SO_MCP_SENDER_URL": "https://sender.example.test",
                     "SO_MCP_EVENTS_KEY_FILE": str(key_path),
                     "SO_MCP_EVENTS_DB": events_db,
                 }),
                 mock.patch("scripts.run_mcp_server.SecureWorkItemStore") as store_type,
                 mock.patch("scripts.run_mcp_server.JWTVerifier"),
-                mock.patch("scripts.run_mcp_server.SenderGatewayClient.from_env", return_value=sender),
                 mock.patch("scripts.run_mcp_server.MCPEventsStore", return_value=events_store) as events_type,
-                mock.patch("scripts.run_mcp_server.MCPEventCollector", return_value=collector) as collector_type,
                 mock.patch("scripts.run_mcp_server.MCPEventDispatcher", return_value=dispatcher) as dispatcher_type,
                 mock.patch("scripts.run_mcp_server.build_mcp_server", return_value=mcp_app) as build_server,
             ):
                 app = create_application(config)
 
         store_type.return_value.initialize.assert_called_once_with()
-        events_type.assert_called_once_with(events_db, encryption_key=b"e" * 32)
-        collector_type.assert_called_once_with(
-            sender,
-            events_store,
-            worker_id=mock.ANY,
+        events_type.assert_called_once_with(str(Path(events_db).resolve()), encryption_key=b"e" * 32)
+        store_type.assert_called_once_with(
+            Path(events_db).resolve(),
+            completion_event_publisher=events_store.publish_job_completed_in_transaction,
         )
         dispatcher_type.assert_called_once()
+        self.assertIs(dispatcher_type.call_args.args[0], events_store)
+        self.assertTrue(callable(dispatcher_type.call_args.kwargs["authorize"]))
         build_server.assert_called_once()
+        self.assertIs(build_server.call_args.kwargs["events_store"], events_store)
         self.assertIs(app.inner, mcp_app)
         self.assertEqual(app.background_tasks, (dispatcher,))
 
 
 class TestMain(unittest.TestCase):
     """L537: startup failure is logged then re-raised unchanged."""
+
+    def test_uvicorn_graceful_shutdown_budget_is_explicit(self):
+        config = {
+            "issuer": "https://issuer.example.test/realm",
+            "audience": "https://resource.example.test/mcp",
+            "host": "127.0.0.1",
+            "port": 8791,
+            "log_level": "info",
+            "discovery_url": None,
+            "memory_adapter_command": None,
+        }
+        app = object()
+        with (
+            mock.patch("scripts.run_mcp_server.load_config", return_value=config),
+            mock.patch("scripts.run_mcp_server.create_application", return_value=app),
+            mock.patch("scripts.run_mcp_server.uvicorn.run", create=True) as run,
+        ):
+            main()
+        run.assert_called_once_with(
+            app,
+            host="127.0.0.1",
+            port=8791,
+            log_level="info",
+            access_log=True,
+            timeout_graceful_shutdown=5,
+        )
 
     def test_load_config_failure_propagates(self):
         boom = RuntimeError("SO_MCP_PORT must be an integer")

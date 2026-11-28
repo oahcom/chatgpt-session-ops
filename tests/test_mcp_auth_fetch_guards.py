@@ -29,6 +29,8 @@ Run with:
 
 import socket
 import ssl
+import time
+import threading
 import unittest
 import urllib.request
 from unittest.mock import patch
@@ -111,6 +113,34 @@ class TestResolveValidatedAddress(unittest.TestCase):
                     "https://issuer.example.test/keys", "JWKS"
                 )
         self.assertEqual(str(ctx.exception), "JWKS hostname could not be resolved")
+
+    def test_getaddrinfo_timeout_is_bounded_and_resolver_thread_is_released(self):
+        from src.session_ops import mcp_auth
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+
+        def slow_resolver(*_args, **_kwargs):
+            started.set()
+            release.wait(1.0)
+            finished.set()
+            return public_record("93.184.216.34")
+
+        started_at = time.monotonic()
+        try:
+            with (
+                patch("src.session_ops.mcp_auth.socket.getaddrinfo", side_effect=slow_resolver),
+                patch("src.session_ops.mcp_auth.DNS_RESOLUTION_TIMEOUT_SECONDS", 0.02),
+            ):
+                with self.assertRaisesRegex(AuthenticationError, "DNS hostname resolution timed out"):
+                    _resolve_validated_address("https://issuer.example.test/keys", "JWKS")
+            self.assertTrue(started.is_set())
+            self.assertLess(time.monotonic() - started_at, 0.2)
+        finally:
+            release.set()
+        self.assertTrue(finished.wait(1.0))
+        self.assertTrue(mcp_auth._DNS_RESOLVER_SLOTS.acquire(timeout=0.1))
+        mcp_auth._DNS_RESOLVER_SLOTS.release()
 
     def test_unparseable_address_record_rejected(self):
         bad = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("999.1.1.1", 443))]

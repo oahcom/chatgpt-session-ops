@@ -23,7 +23,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Tuple, Union
 
 from src.session_ops.work_items import (
     ALLOWED_TRANSITIONS,
@@ -127,6 +127,33 @@ ON work_item_grants(principal_id, work_item_id, scope);
 
 CREATE INDEX IF NOT EXISTS ix_authority_landing_pending
 ON authority_landing_events(session_id, consumed_at, created_at);
+
+CREATE TABLE IF NOT EXISTS work_item_send_attempts (
+    attempt_id TEXT PRIMARY KEY NOT NULL,
+    tenant_id TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    work_item_id TEXT NOT NULL,
+    request_hash TEXT NOT NULL CHECK (length(request_hash) = 64),
+    status TEXT NOT NULL CHECK (
+        status IN ('running', 'sent', 'sent_unlinked', 'failed', 'outcome_unknown')
+    ),
+    conversation_id TEXT,
+    account TEXT,
+    http_status INTEGER,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    lease_until REAL NOT NULL,
+    FOREIGN KEY (work_item_id) REFERENCES work_items(work_item_id)
+        ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS ix_work_item_send_attempts_work_item
+ON work_item_send_attempts(work_item_id, created_at);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_work_item_send_attempts_unresolved
+ON work_item_send_attempts(work_item_id)
+WHERE status IN ('running', 'outcome_unknown', 'sent_unlinked');
 
 CREATE TABLE IF NOT EXISTS authority_audit_events (
     audit_id TEXT PRIMARY KEY NOT NULL,
@@ -390,10 +417,12 @@ class SecureWorkItemStore:
         database_path: Path,
         store: Optional[WorkItemStore] = None,
         principal_directory: Optional[PrincipalDirectory] = None,
+        completion_event_publisher: Optional[Callable[..., Any]] = None,
     ) -> None:
         self.database_path = Path(database_path)
         self._store = store or WorkItemStore(self.database_path)
         self._principal_directory = principal_directory or DenyAllPrincipalDirectory()
+        self._completion_event_publisher = completion_event_publisher
 
     def initialize(self) -> None:
         self._store.initialize()
@@ -795,6 +824,22 @@ class SecureWorkItemStore:
         if grant is None:
             raise NotAuthorized()
 
+    def require_access(
+        self,
+        principal: Principal,
+        work_item_id: str,
+        scope: Scope,
+    ) -> None:
+        """Check WorkItem access without reading or mutating its contents."""
+        validate_work_item_id(work_item_id)
+        if scope not in ("read", "write"):
+            raise AuthorityError("unknown WorkItem access scope")
+        conn = self._connect()
+        try:
+            self._require(conn, principal, work_item_id, scope)
+        finally:
+            conn.close()
+
     def _require_owner(
         self, conn: sqlite3.Connection, principal: Principal, work_item_id: str
     ) -> None:
@@ -978,6 +1023,45 @@ class SecureWorkItemStore:
                         "ORDER BY linked_at, link_id",
                         (work_item_id,),
                     ).fetchall()
+                    if self._completion_event_publisher is not None:
+                        # Events belong to the WorkItem owner, not necessarily
+                        # the delegated principal that performed this update.
+                        owner = conn.execute(
+                            "SELECT tenant_id, owner_principal_id FROM work_item_owners "
+                            "WHERE work_item_id = ?",
+                            (work_item_id,),
+                        ).fetchone()
+                        if owner is None:
+                            raise AuthorityError("WorkItem owner is missing")
+                        # One WorkItem transition is one completion event.
+                        # Include every still-active session link in stable
+                        # linked_at/link_id order; one WorkItem still emits one
+                        # event and one delivery per matching owner subscription.
+                        event_id = "evt_" + uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            "chatgpt-session-ops:%s" % work_item_id,
+                        ).hex
+                        terminal_status = "succeeded" if status == "completed" else "failed"
+                        summary = "Work item completed" if status == "completed" else "Work item cancelled"
+                        conversation_ids = [link["session_id"] for link in active_links]
+                        event_conversation = (
+                            {"conversation_id": conversation_ids[0]}
+                            if len(conversation_ids) == 1
+                            else {"conversation_ids": conversation_ids}
+                            if conversation_ids
+                            else {}
+                        )
+                        self._completion_event_publisher(
+                            conn,
+                            tenant_id=owner["tenant_id"],
+                            principal_id=owner["owner_principal_id"],
+                            job_id=work_item_id,
+                            summary=summary,
+                            event_id=event_id,
+                            completed_at=changed_at,
+                            status=terminal_status,
+                            **event_conversation,
+                        )
                     for link in active_links:
                         changed = conn.execute(
                             "UPDATE session_links SET unlinked_at = ? "
@@ -1085,6 +1169,198 @@ class SecureWorkItemStore:
 
     # -- Trusted landing evidence and Session links -------------------------
 
+
+    def reserve_send_attempt(
+        self,
+        principal: Principal,
+        work_item_id: str,
+        attempt_id: str,
+        *,
+        request_hash: str,
+        lease_seconds: int = 480,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Durably reserve an MCP send before any remote side effect.
+
+        Reusing an attempt ID returns its recorded state and never starts a
+        second send. Expired in-flight attempts become outcome_unknown rather
+        than being replayed automatically.
+        """
+        validate_work_item_id(work_item_id)
+        if (
+            not isinstance(attempt_id, str)
+            or re.fullmatch(
+                r"att_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                attempt_id,
+            ) is None
+        ):
+            raise InvalidIdentifier("attempt_id must be a canonical att_UUIDv4")
+        if not isinstance(request_hash, str) or re.fullmatch(r"[0-9a-f]{64}", request_hash) is None:
+            raise ValueError("request_hash must be a lowercase SHA-256 digest")
+        if isinstance(lease_seconds, bool) or not isinstance(lease_seconds, int) or not 60 <= lease_seconds <= 900:
+            raise ValueError("send attempt lease must be between 60 and 900 seconds")
+
+        now_epoch = time.time()
+        now_text = _utc_now()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._require(conn, principal, work_item_id, "write")
+            existing = conn.execute(
+                "SELECT * FROM work_item_send_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["tenant_id"] != principal.tenant_id
+                    or existing["principal_id"] != principal.principal_id
+                    or existing["work_item_id"] != work_item_id
+                ):
+                    raise NotAuthorized()
+                if existing["request_hash"] != request_hash:
+                    raise InvalidIdentifier("attempt_id was reused with different request parameters")
+                if existing["status"] == "running" and existing["lease_until"] <= now_epoch:
+                    conn.execute(
+                        "UPDATE work_item_send_attempts SET status = 'outcome_unknown', updated_at = ? "
+                        "WHERE attempt_id = ? AND status = 'running'",
+                        (now_text, attempt_id),
+                    )
+                    existing = conn.execute(
+                        "SELECT * FROM work_item_send_attempts WHERE attempt_id = ?",
+                        (attempt_id,),
+                    ).fetchone()
+                result = dict(existing)
+                conn.execute("COMMIT")
+                return False, result
+
+            unresolved = conn.execute(
+                "SELECT attempt_id, status, lease_until FROM work_item_send_attempts "
+                "WHERE work_item_id = ? AND status IN ('running', 'outcome_unknown', 'sent_unlinked') "
+                "ORDER BY created_at LIMIT 1",
+                (work_item_id,),
+            ).fetchone()
+            if unresolved is not None:
+                if unresolved["status"] == "running" and unresolved["lease_until"] <= now_epoch:
+                    conn.execute(
+                        "UPDATE work_item_send_attempts SET status = 'outcome_unknown', updated_at = ? "
+                        "WHERE attempt_id = ? AND status = 'running'",
+                        (now_text, unresolved["attempt_id"]),
+                    )
+                    conn.execute("COMMIT")
+                raise InvalidTransition(
+                    "a previous send attempt has an unresolved outcome; reuse its attempt_id to inspect it"
+                )
+
+            item = conn.execute(
+                "SELECT status FROM work_items WHERE work_item_id = ?",
+                (work_item_id,),
+            ).fetchone()
+            if item is None:
+                raise NotAuthorized()
+            if item["status"] != "active":
+                raise InvalidTransition("ChatGPT sends require an active WorkItem")
+
+            conn.execute(
+                "INSERT INTO work_item_send_attempts "
+                "(attempt_id, tenant_id, principal_id, work_item_id, request_hash, status, created_at, updated_at, lease_until) "
+                "VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?)",
+                (
+                    attempt_id,
+                    principal.tenant_id,
+                    principal.principal_id,
+                    work_item_id,
+                    request_hash,
+                    now_text,
+                    now_text,
+                    now_epoch + lease_seconds,
+                ),
+            )
+            conn.execute("COMMIT")
+            return True, {
+                "attempt_id": attempt_id,
+                "tenant_id": principal.tenant_id,
+                "principal_id": principal.principal_id,
+                "work_item_id": work_item_id,
+                "request_hash": request_hash,
+                "status": "running",
+                "conversation_id": None,
+                "account": None,
+                "http_status": None,
+                "error": None,
+                "created_at": now_text,
+                "updated_at": now_text,
+                "lease_until": now_epoch + lease_seconds,
+            }
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def complete_send_attempt(
+        self,
+        principal: Principal,
+        work_item_id: str,
+        attempt_id: str,
+        *,
+        status: str,
+        conversation_id: Optional[str] = None,
+        account: Optional[str] = None,
+        http_status: Optional[int] = None,
+        error: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Record the final result for a previously reserved send attempt."""
+        validate_work_item_id(work_item_id)
+        if status not in ("sent", "sent_unlinked", "failed", "outcome_unknown"):
+            raise ValueError("invalid terminal send attempt status")
+        if conversation_id is not None and (not isinstance(conversation_id, str) or not conversation_id):
+            raise ValueError("conversation_id must be nonempty text or null")
+        if account is not None and (not isinstance(account, str) or not account):
+            raise ValueError("account must be nonempty text or null")
+        if http_status is not None and (isinstance(http_status, bool) or not isinstance(http_status, int)):
+            raise ValueError("http_status must be an integer or null")
+        if error is not None and not isinstance(error, str):
+            raise ValueError("error must be text or null")
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM work_item_send_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if row is None or (
+                row["tenant_id"] != principal.tenant_id
+                or row["principal_id"] != principal.principal_id
+                or row["work_item_id"] != work_item_id
+            ):
+                raise NotAuthorized()
+            if row["status"] in ("running", "outcome_unknown"):
+                conn.execute(
+                    "UPDATE work_item_send_attempts SET status = ?, conversation_id = ?, account = ?, "
+                    "http_status = ?, error = ?, updated_at = ? WHERE attempt_id = ?",
+                    (
+                        status,
+                        conversation_id,
+                        account,
+                        http_status,
+                        error[:1000] if error is not None else None,
+                        _utc_now(),
+                        attempt_id,
+                    ),
+                )
+            result = dict(conn.execute(
+                "SELECT * FROM work_item_send_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone())
+            conn.execute("COMMIT")
+            return result
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
 
     def _record_trusted_landing(
         self,
@@ -1369,6 +1645,15 @@ class SecureWorkItemStore:
                 """,
                 (link_id, session_id, work_item_id, now),
             )
+            # A previously confirmed send whose automatic link failed is
+            # resolved by this exact trusted landing link. No new prompt is
+            # needed, and the WorkItem can accept the next explicit attempt.
+            conn.execute(
+                "UPDATE work_item_send_attempts SET status = 'sent', updated_at = ? "
+                "WHERE attempt_id = ? AND work_item_id = ? "
+                "AND status IN ('sent_unlinked', 'outcome_unknown')",
+                (now, attempt_id, work_item_id),
+            )
 
             self._audit(
                 conn,
@@ -1577,6 +1862,32 @@ class SecureWorkItemStore:
                 conn.execute("COMMIT")
                 return None
             result = _row_to_session_link(row)
+            conn.execute("COMMIT")
+            return result
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def get_session_link_for_work_item(
+        self, principal: Principal, work_item_id: str, session_id: str
+    ) -> Optional[SessionLink]:
+        """Return the latest link, including a link closed at WorkItem completion."""
+        validate_work_item_id(work_item_id)
+        validate_conversation_id(session_id)
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN")
+            self._require(conn, principal, work_item_id, "read")
+            row = conn.execute(
+                "SELECT link_id, session_id, work_item_id, linked_at, unlinked_at "
+                "FROM session_links WHERE work_item_id = ? AND session_id = ? "
+                "ORDER BY linked_at DESC, link_id DESC LIMIT 1",
+                (work_item_id, session_id),
+            ).fetchone()
+            result = _row_to_session_link(row) if row is not None else None
             conn.execute("COMMIT")
             return result
         except BaseException:
