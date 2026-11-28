@@ -40,7 +40,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 
-ReadWritePaths=/var/lib/so-mcp /var/lib/chatgpt-session-ops/mcp-state /var/lib/chatgpt-session-ops/accounts
+ReadWritePaths=/var/lib/so-mcp /var/lib/chatgpt-session-ops/mcp-state /var/lib/chatgpt-session-ops/accounts /var/lib/chatgpt-session-ops/replies
 
 [Install]
 WantedBy=multi-user.target
