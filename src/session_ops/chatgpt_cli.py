@@ -5,7 +5,7 @@
 
 本模块只做一件事：把固定子进程接口包成 ``ChatGPTCLIAdapter`` 的四个方法。
 调用方（worker / app）无法传入任意命令、路径或环境变量；CLI 参数协议全部来自
-``docs/SENDER-GATEWAY.md`` 的「CLI 契约实测」一节，依据是 b74d9ff 的
+``docs/CHATGPT-MCP.md`` 的「CLI 契约实测」一节，依据是 b74d9ff 的
 ``scripts/chatgpt_send.py`` 源码与 ``tests/test_aid_2026_011_stage3_cli.py``。
 
 硬约束（方案 §2.3 第 1–8 条）：
@@ -63,7 +63,7 @@ CODE_TIMEOUT = "TIMEOUT"
 CODE_INTERNAL = "INTERNAL"
 
 # ---------------------------------------------------------------------------
-# CLI 契约常量（证据见 docs/SENDER-GATEWAY.md「CLI 契约实测」）
+# CLI 契约常量（证据见 docs/CHATGPT-MCP.md「CLI 契约实测」）
 # ---------------------------------------------------------------------------
 
 # scripts/chatgpt_send.py:5939-5940：conv_id 必须是带连字符的小写 UUID。
@@ -133,6 +133,7 @@ _ENV_ALLOWLIST = (
     "LC_ALL",
     "HOME",
     "SO_SENDER_ACCOUNTS_DIR",
+    "CHATGPT_STATE_DIR",
     "CHATGPT_AUTH_DIR",
     "CHATGPT_BASE",
     "CHATGPT_PROXY",
@@ -153,7 +154,7 @@ _ENV_FORCED = {
 }
 
 # 建会话没有 CLI 侧 prompt 语义（--new 必带 prompt_file），这里固定引导语；
-# 真正的会话内容由后续 send 提供。TODO 见 docs/SENDER-GATEWAY.md「缺口」。
+# 真正的会话内容由后续 send 提供。TODO 见 docs/CHATGPT-MCP.md「缺口」。
 _DEFAULT_CREATE_PROMPT = "ping"
 
 _PROMPT_MAX_CHARS = 32768
