@@ -977,8 +977,6 @@ class ChatGPTSenderAdapter:
         )
 
     def _parse_list(self, result):
-        if result.exit_code != 0:
-            raise self._classify_failure(result, "sender CLI exited non-zero")
         try:
             data = json.loads(result.stdout.strip())
         except ValueError:
