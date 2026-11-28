@@ -431,11 +431,12 @@ only the message and the traceback frame differ.
 
 `SO_MCP_DB` is only checked against the literal `:memory:`, not for being
 absolute; a relative path resolves against `WorkingDirectory=/opt/so-mcp`. The
-unit is `ProtectSystem=strict` with `ReadWritePaths=/var/lib/so-mcp`, so the
-database must live under `/var/lib/so-mcp` or SQLite fails to create its WAL
-files at runtime. Use the path shown above. The same file is also what
-`scripts/chatgpt_send.py` opens for trusted WorkItem delivery (`--db`, or the
-`SO_MCP_DB` environment variable in that process), so both must name one path.
+unit is `ProtectSystem=strict` with `ReadWritePaths=/var/lib/so-mcp /var/lib/chatgpt-session-ops`,
+so the WorkItem database must live under `/var/lib/so-mcp` and the direct CLI
+runtime state must live under `/var/lib/chatgpt-session-ops`. The MCP server
+stores ChatGPT conversation ownership and idempotency receipts in `SO_MCP_DB`;
+the CLI stores account rotation, conversation mapping, proxy state and logs in
+`CHATGPT_STATE_DIR`.
 
 `scripts/run_mcp_server.py` also reads `LOG_LEVEL` for the Python logger
 (`logging.basicConfig`). It is not validated, has no failure mode, and is not
