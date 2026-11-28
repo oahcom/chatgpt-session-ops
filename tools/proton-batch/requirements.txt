@@ -1,0 +1,6 @@
+# proton-batch runtime requirements (Python >= 3.10)
+requests>=2.31
+requests[socks]>=2.31
+
+# 仅测试用（离线，不触网）
+# python -m unittest discover -s tests -v

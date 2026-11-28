@@ -383,6 +383,7 @@ s.pop("last", None)
 | L1 读路径 | `--account <acct> --list` | token 被服务端接受，会话列表可拉 | 401 → 认证失效；403/429 → 风控；超时 → 网络 |
 | L2 写路径 | `--account <acct> --new <probe.txt>` | **完整链路可用**：PoW、发送、流式响应、落盘 | 才叫「不可用」 |
 
+
 L2 的探针文件内容写成 `Reply with exactly: PROBE_OK`，回复正文（`replies/reply-*.md` 去掉首行注释）应恰好是 `PROBE_OK`——**收到非空且符合预期的正文**才算通过，`status:200` 本身不算。单账号 L2 约 5–8 秒，六账号串行约 45 秒；L1 单账号 30–45 秒，六账号约 90 秒。**探针要设足前台 timeout 一次跑完（契约 CB-B9）**：不要短超时后台发射再结束回合。日志 0 字节本身不能证明 POST 未发生、后台进程已终止或投递失败；不得仅凭 0 字节判定未投递。
 
 故意不带 conversation_id。用于：各工作会话自产"Owner 裁决提示词"（自包含：背景、精确基线、待裁决项、可选裁决、记录格式）→ **原样**收集（回复中最长代码块，一字不改）→ 投递给全新 ChatGPT 会话扮演 Owner → 收割裁决记录（ACCEPT / ACCEPT WITH AMENDMENTS / NEEDS REVISION / REJECT + 理由 + 执行边界）→ 原文引用回灌工作会话。
