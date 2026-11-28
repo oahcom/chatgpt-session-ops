@@ -807,6 +807,8 @@ def create_application(
     )
 
     background_tasks: list[Any] = []
+    if isinstance(session_ops, ChatGPTDirectClient):
+        background_tasks.append(session_ops)
     readiness_snapshot = None
     if events_store is not None:
         def authorize_event(*, tenant_id: str, principal_id: str, job_id: str) -> bool:
