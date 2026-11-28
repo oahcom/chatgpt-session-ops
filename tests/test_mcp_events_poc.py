@@ -188,6 +188,29 @@ class MCPEventsStoreTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT count(*) FROM event_key_metadata").fetchone()[0], 1)
             self.assertEqual(db.execute("SELECT count(*) FROM event_outbox WHERE event_id='evt_key_loss'").fetchone()[0], 1)
 
+    def test_health_snapshot_reports_aggregate_delivery_metrics_without_identifiers(self):
+        with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
+            self.subscribe()
+        self.publish_job_completed(
+            "tenant-a", "issuer:user-a", "job-health", "Finished",
+            event_id="evt_health_private",
+        )
+        self.assertEqual(self.store.deliver_pending(), 1)
+
+        snapshot = self.store.health_snapshot()
+        self.assertEqual(snapshot["outbox"]["delivered"], 1)
+        self.assertEqual(snapshot["outbox"]["pending"], 0)
+        self.assertEqual(snapshot["subscriptions"]["active"], 1)
+        self.assertEqual(snapshot["callbacks"]["callback_count"], 2)
+        self.assertEqual(snapshot["callbacks"]["callback_status_2xx"], 2)
+        self.assertGreater(snapshot["callbacks"]["callback_latency_ms_total"], 0)
+        self.assertGreater(snapshot["storage"]["database_bytes"], 0)
+        serialized = json.dumps(snapshot, sort_keys=True)
+        self.assertNotIn("evt_health_private", serialized)
+        self.assertNotIn("job-health", serialized)
+        self.assertNotIn("callback_url", serialized)
+        self.assertNotIn(self.delivery["url"], serialized)
+
     def test_callback_challenge_mismatch_rejects_subscription(self):
         self.store.post_json = lambda url, body, headers: (200, b'{"challenge":"wrong"}')
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
