@@ -736,6 +736,7 @@ def create_application(
                     principal_id=principal_id,
                     tenant_id=tenant_id,
                     job_id=job_id,
+                    timeout=5.0,
                 )
                 return True
             except Exception as exc:

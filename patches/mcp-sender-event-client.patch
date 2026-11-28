@@ -12,7 +12,23 @@
  
  #: Top-level job fields the client owns; business arguments go in ``payload``.
  _RESERVED_JOB_FIELDS = frozenset({"operation", "idempotency_key", "payload"})
-@@ -755,6 +760,42 @@
+@@ -675,6 +680,7 @@
+         principal_id: str,
+         tenant_id: str,
+         job_id: str,
++        timeout: float | None = None,
+     ) -> Dict[str, Any]:
+         path = "%s%s/%s" % (
+             self._base_path,
+@@ -690,6 +696,7 @@
+                 "principal_id": principal_id,
+                 "tenant_id": tenant_id,
+             },
++            timeout=timeout,
+         )
+ 
+     def list_sessions(
+@@ -755,6 +762,42 @@
              timeout_code="TIMEOUT",
          )
  

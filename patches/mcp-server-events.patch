@@ -1,6 +1,6 @@
 --- a/src/session_ops/mcp_server.py
 +++ b/src/session_ops/mcp_server.py
-@@ -1580,6 +1580,9 @@
+@@ -1636,6 +1636,9 @@
  def build_mcp_server(
      service: MCPToolService,
      token_provider: JWTVerifier,
@@ -10,7 +10,7 @@
  ) -> Any:
      """Build and return the authenticated Streamable HTTP ASGI application."""
      if not isinstance(service, MCPToolService):
-@@ -1707,6 +1710,103 @@
+@@ -1766,6 +1769,103 @@
          on_call_tool=on_call_tool,
      )
  

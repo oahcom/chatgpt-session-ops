@@ -102,7 +102,7 @@
          if scope.get("type") != "http":
              await self.inner(scope, receive, send)
              return
-@@ -649,12 +701,68 @@
+@@ -649,12 +701,69 @@
          memory_adapter=config.get("memory_adapter_command"),
          sender_gateway=sender_gateway,
      )
@@ -142,6 +142,7 @@
 +                    principal_id=principal_id,
 +                    tenant_id=tenant_id,
 +                    job_id=job_id,
++                    timeout=5.0,
 +                )
 +                return True
 +            except Exception as exc:

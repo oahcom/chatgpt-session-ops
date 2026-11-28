@@ -47,6 +47,7 @@ class MCPEventDispatcherTests(unittest.TestCase):
             self.assertTrue(collector.called.wait(1))
             self.assertTrue(store.delivered.wait(1))
             self.assertEqual(dispatcher._thread.name, "mcp-events")
+            self.assertFalse(dispatcher._thread.daemon)
             self.assertEqual(store.cleanup_calls, 1)
             self.assertEqual(store.delivery_calls[0], (1, authorize))
         finally:
@@ -64,3 +65,43 @@ class MCPEventDispatcherTests(unittest.TestCase):
         dispatcher.stop()
         self.assertFalse(first_thread.is_alive())
         self.assertIsNone(dispatcher._thread)
+
+    def test_stop_fails_closed_when_inflight_operation_does_not_finish(self):
+        class BusyLock:
+            def acquire(self, timeout=None):
+                return False
+            def release(self):
+                raise AssertionError("release must not be called")
+
+        class LiveThread:
+            def is_alive(self):
+                return True
+            def join(self, timeout=None):
+                raise AssertionError("join must not run while operation lock is busy")
+
+        dispatcher = MCPEventDispatcher(Collector(), Store())
+        dispatcher._operation_lock = BusyLock()
+        dispatcher._stop_event = threading.Event()
+        dispatcher._thread = LiveThread()
+        with self.assertRaises(TimeoutError):
+            dispatcher.stop()
+
+    def test_stop_fails_if_thread_remains_alive_after_join(self):
+        class AvailableLock:
+            def acquire(self, timeout=None):
+                return True
+            def release(self):
+                return None
+
+        class StuckThread:
+            def is_alive(self):
+                return True
+            def join(self, timeout=None):
+                return None
+
+        dispatcher = MCPEventDispatcher(Collector(), Store())
+        dispatcher._operation_lock = AvailableLock()
+        dispatcher._stop_event = threading.Event()
+        dispatcher._thread = StuckThread()
+        with self.assertRaises(RuntimeError):
+            dispatcher.stop()

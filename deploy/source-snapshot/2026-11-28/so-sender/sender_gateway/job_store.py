@@ -907,7 +907,7 @@ class JobStore:
                     and isinstance(payload.get("completed_at"), str)
                     and bool(payload.get("completed_at"))
                     and ("summary" not in payload or isinstance(payload["summary"], str))
-                    and ("conversation_id" not in payload or payload["conversation_id"] is None or isinstance(payload["conversation_id"], str))
+                    and ("conversation_id" not in payload or payload["conversation_id"] is None or (isinstance(payload["conversation_id"], str) and bool(payload["conversation_id"])))
                     and ("error_code" not in payload or isinstance(payload["error_code"], str))
                     and ("outcome_unknown" not in payload or isinstance(payload["outcome_unknown"], bool))
                 )

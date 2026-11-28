@@ -100,7 +100,7 @@ class MCPEventDispatcher:
                 target=self._run,
                 args=(stop_event,),
                 name="mcp-events",
-                daemon=True,
+                daemon=False,
             )
             self._stop_event = stop_event
             self._thread = thread
@@ -114,10 +114,13 @@ class MCPEventDispatcher:
             stop_event.set()
             # Wait for the one operation already in flight. Every network
             # operation has a short explicit timeout, so shutdown stays bounded.
-            with self._operation_lock:
-                pass
+            if not self._operation_lock.acquire(timeout=12):
+                raise TimeoutError("MCP event dispatcher did not leave its in-flight operation")
+            self._operation_lock.release()
         if thread is not None and thread.is_alive():
             thread.join(timeout=2)
+            if thread.is_alive():
+                raise RuntimeError("MCP event dispatcher thread did not terminate")
         with self._lock:
             if thread is None or not thread.is_alive():
                 self._thread = None

@@ -83,7 +83,7 @@ def _signed_headers(
     }
 
 
-def _post_public_https(url: str, body: bytes, headers: Mapping[str, str], timeout: float = 10.0) -> tuple[int, bytes]:
+def _post_public_https(url: str, body: bytes, headers: Mapping[str, str], timeout: float = 5.0) -> tuple[int, bytes]:
     """POST to a pinned public HTTPS address; proxies and redirects are disabled."""
     pinned_ip = _resolve_validated_address(url, "MCP Events callback")
     request = urllib.request.Request(url, data=body, headers=dict(headers), method="POST")
@@ -193,7 +193,7 @@ class MCPEventsStore:
             os.chmod(database, 0o600)
 
     def _connect(self) -> sqlite3.Connection:
-        db = sqlite3.connect(self.database, timeout=15)
+        db = sqlite3.connect(self.database, timeout=5)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
         return db
@@ -414,6 +414,7 @@ class MCPEventsStore:
         *,
         event_id: str | None = None,
         completed_at: str | None = None,
+        conversation_id: str | None = None,
         status: str = "succeeded",
         error_code: str | None = None,
         outcome_unknown: bool | None = None,
@@ -423,6 +424,8 @@ class MCPEventsStore:
             raise ValueError("tenant, principal, and job identifiers are required")
         if not isinstance(summary, str):
             raise ValueError("job summary must be text")
+        if conversation_id is not None and (not isinstance(conversation_id, str) or not conversation_id):
+            raise ValueError("conversation_id must be nonempty text or null")
         if status not in ("succeeded", "failed"):
             raise ValueError("job status must be succeeded or failed")
         if error_code is not None and (not isinstance(error_code, str) or not error_code):
@@ -450,6 +453,8 @@ class MCPEventsStore:
             "summary": summary[:4000],
             "completed_at": completed_at,
         }
+        if conversation_id is not None:
+            data["conversation_id"] = conversation_id
         if error_code is not None:
             data["error_code"] = error_code
         if outcome_unknown is not None:

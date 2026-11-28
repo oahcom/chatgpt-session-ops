@@ -12,7 +12,7 @@ Apply the MCP patches from `/opt/so-mcp`:
 
 - `mcp-sender-event-client.patch` — adds claim/ACK methods to the existing Sender client, reusing mTLS, the existing service token, and the existing HMAC identity key.
 - `mcp-event-modules.patch` — adds the SQLite Events store, Sender collector, and one in-process `MCPEventDispatcher` thread. It does not add a Sender worker, scheduler, queue service, Redis, or Kafka.
-- `mcp-server-events.patch` — registers `events/list`, `events/subscribe`, and `events/unsubscribe`, and advertises the Events capability. Blocking Sender authorization and callback verification are offloaded from the MCP event loop.
+- `mcp-server-events.patch` — registers the Events protocol handlers, advertises the capability, and offloads blocking subscription checks. It preserves the request-scoped idempotency behavior already present in the live MCP base.
 - `mcp-runtime-events.patch` — loads the event encryption key, conditionally enables Events, and starts/stops the single dispatcher through the existing ASGI lifespan.
 
 The Sender event dispatcher identity is `session_ops:event-dispatcher` in tenant `session_ops`. It uses the existing mTLS + Bearer + signed identity path; no new OAuth client or account credential is introduced.
@@ -23,7 +23,7 @@ The feature stays disabled unless `SO_MCP_EVENTS_KEY_FILE` points to a raw 32-by
 
 ## Verification
 
-- Current reconstructed Sender + MCP integration suite: **23 passed**.
+- Current reconstructed Sender + MCP integration suite: **25 passed**.
 - Full repository suite: **1299 passed, 7 skipped, 1573 subtests passed**.
 - Python compilation passed for the reconstructed MCP and Sender modules.
 - Sender and MCP-client patches passed `git apply --check` against the current live source files; MCP server/runtime patches passed the same check against their current live source files; the additive module patch passed its clean-tree check.

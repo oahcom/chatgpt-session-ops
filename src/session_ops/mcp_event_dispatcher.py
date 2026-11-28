@@ -40,13 +40,17 @@ class MCPEventDispatcher:
         self._stop_event: threading.Event | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._operation_lock = threading.Lock()
 
     def _run(self, stop_event: threading.Event) -> None:
         last_cleanup = float("-inf")
         while not stop_event.is_set():
             did_work = False
             try:
-                did_work = self.collector.run_once() > 0 or did_work
+                with self._operation_lock:
+                    if stop_event.is_set():
+                        break
+                    did_work = self.collector.run_once() > 0 or did_work
             except Exception:
                 logging.exception("MCP Sender event collection failed")
 
@@ -59,7 +63,10 @@ class MCPEventDispatcher:
             now = time.monotonic()
             if now - last_cleanup >= self.cleanup_interval_seconds:
                 try:
-                    self.events_store.cleanup_expired()
+                    with self._operation_lock:
+                        if stop_event.is_set():
+                            break
+                        self.events_store.cleanup_expired()
                 except Exception:
                     logging.exception("MCP event retention cleanup failed")
                     last_cleanup = now - self.cleanup_interval_seconds + min(60.0, self.cleanup_interval_seconds)
@@ -70,10 +77,13 @@ class MCPEventDispatcher:
                 break
 
             try:
-                delivered = self.events_store.deliver_pending(
-                    limit=self.delivery_batch_size,
-                    authorize=self.authorize,
-                )
+                with self._operation_lock:
+                    if stop_event.is_set():
+                        break
+                    delivered = self.events_store.deliver_pending(
+                        limit=self.delivery_batch_size,
+                        authorize=self.authorize,
+                    )
                 did_work = delivered > 0 or did_work
             except Exception:
                 logging.exception("MCP webhook delivery failed")
@@ -90,7 +100,7 @@ class MCPEventDispatcher:
                 target=self._run,
                 args=(stop_event,),
                 name="mcp-events",
-                daemon=True,
+                daemon=False,
             )
             self._stop_event = stop_event
             self._thread = thread
@@ -100,10 +110,17 @@ class MCPEventDispatcher:
         with self._lock:
             stop_event = self._stop_event
             thread = self._thread
-            if stop_event is not None:
-                stop_event.set()
+        if stop_event is not None:
+            stop_event.set()
+            # Wait for the one operation already in flight. Every network
+            # operation has a short explicit timeout, so shutdown stays bounded.
+            if not self._operation_lock.acquire(timeout=12):
+                raise TimeoutError("MCP event dispatcher did not leave its in-flight operation")
+            self._operation_lock.release()
         if thread is not None and thread.is_alive():
-            thread.join(timeout=12)
+            thread.join(timeout=2)
+            if thread.is_alive():
+                raise RuntimeError("MCP event dispatcher thread did not terminate")
         with self._lock:
             if thread is None or not thread.is_alive():
                 self._thread = None

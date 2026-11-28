@@ -11,9 +11,11 @@ import logging
 import os
 import re
 import shutil
+import stat
 import sys
+import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Sequence
 from urllib.parse import urlsplit
 
 import uvicorn
@@ -21,6 +23,10 @@ import uvicorn
 from src.session_ops.authority import SecureWorkItemStore
 from src.session_ops.mcp_auth import JWTVerifier
 from src.session_ops.mcp_server import MCPToolService, build_mcp_server
+from src.session_ops.mcp_events import MCPEventsStore
+from src.session_ops.mcp_event_collector import MCPEventCollector
+from src.session_ops.mcp_event_dispatcher import MCPEventDispatcher
+from src.session_ops.sender_gateway_client import SenderGatewayClient
 
 
 SUPPORTED_SCOPES = [
@@ -35,6 +41,9 @@ SUPPORTED_SCOPES = [
 ]
 
 MEMORY_STDIO_ENV = "SO_MCP_MEMORY_STDIO"
+EVENTS_KEY_FILE_ENV = "SO_MCP_EVENTS_KEY_FILE"
+EVENTS_DB_ENV = "SO_MCP_EVENTS_DB"
+SENDER_URL_ENV = "SO_MCP_SENDER_URL"
 
 _SECRET_ARGUMENT_RE = re.compile(
     r"(token|password|passwd|secret|credential|"
@@ -385,6 +394,28 @@ def _add_access_manage_to_challenge(value: bytes) -> bytes:
     return value[:match.start(1)] + replacement + value[match.end(1):]
 
 
+def _load_events_encryption_key(path_value: str) -> bytes:
+    """Read the private raw 32-byte key used to encrypt webhook secrets."""
+    path = Path(path_value)
+    if not path.is_absolute():
+        raise RuntimeError(EVENTS_KEY_FILE_ENV + " must be an absolute path")
+    try:
+        metadata = path.stat()
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError(EVENTS_KEY_FILE_ENV + " must reference a regular file")
+        if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
+            raise RuntimeError(
+                EVENTS_KEY_FILE_ENV
+                + " must be owned by the MCP service user and mode 0400/0600"
+            )
+        key = path.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(EVENTS_KEY_FILE_ENV + " is unavailable") from exc
+    if len(key) != 32:
+        raise RuntimeError(EVENTS_KEY_FILE_ENV + " must contain exactly 32 raw bytes")
+    return key
+
+
 class DeploymentASGI:
     """Add health and RFC 9728 metadata endpoints around the MCP ASGI app."""
 
@@ -394,10 +425,12 @@ class DeploymentASGI:
         *,
         issuer: str,
         audience: str,
+        background_tasks: Optional[Sequence[Any]] = None,
     ) -> None:
         self.inner = inner
         self.issuer = issuer
         self.audience = audience
+        self.background_tasks = tuple(background_tasks or ())
 
         resource = urlsplit(audience)
         self.endpoint_path = resource.path
@@ -451,6 +484,30 @@ class DeploymentASGI:
         )
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") == "lifespan" and self.background_tasks:
+            started_tasks: list[Any] = []
+            stopped_tasks: set[int] = set()
+
+            async def receive_with_task_lifecycle() -> dict[str, Any]:
+                message = await receive()
+                if message.get("type") == "lifespan.startup":
+                    for task in self.background_tasks:
+                        task.start()
+                        started_tasks.append(task)
+                elif message.get("type") == "lifespan.shutdown":
+                    for task in reversed(started_tasks):
+                        task.stop()
+                        stopped_tasks.add(id(task))
+                return message
+
+            try:
+                await self.inner(scope, receive_with_task_lifecycle, send)
+            finally:
+                for task in reversed(started_tasks):
+                    if id(task) not in stopped_tasks:
+                        task.stop()
+            return
+
         if scope.get("type") != "http":
             await self.inner(scope, receive, send)
             return
@@ -517,16 +574,82 @@ def create_application(config: dict[str, Any]) -> Any:
         discovery_url=config["discovery_url"],
     )
 
+    sender_gateway = None
+    if os.environ.get(SENDER_URL_ENV, "").strip():
+        sender_gateway = SenderGatewayClient.from_env()
+
     service = MCPToolService(
         store,
         memory_adapter=config.get("memory_adapter_command"),
+        sender_gateway=sender_gateway,
     )
-    mcp_app = build_mcp_server(service, verifier)
+
+    events_key_file = os.environ.get(EVENTS_KEY_FILE_ENV, "").strip()
+    events_db_path = os.environ.get(EVENTS_DB_ENV, "").strip()
+    if events_db_path and not events_key_file:
+        raise RuntimeError(EVENTS_DB_ENV + " requires " + EVENTS_KEY_FILE_ENV)
+
+    events_store = None
+    background_tasks: list[Any] = []
+    if events_key_file:
+        if sender_gateway is None:
+            raise RuntimeError(EVENTS_KEY_FILE_ENV + " requires " + SENDER_URL_ENV)
+        encryption_key = _load_events_encryption_key(events_key_file)
+        if events_db_path and not Path(events_db_path).is_absolute():
+            raise RuntimeError(EVENTS_DB_ENV + " must be an absolute path")
+        if not events_db_path:
+            events_db_path = str(
+                Path(config["database_path"]).parent / "events" / "events.sqlite3"
+            )
+        if not all(
+            callable(getattr(sender_gateway, method, None))
+            for method in ("claim_events", "ack_event", "get_job")
+        ):
+            raise RuntimeError("Sender client lacks MCP Events claim/ACK/authorization methods")
+
+        events_store = MCPEventsStore(
+            events_db_path,
+            encryption_key=encryption_key,
+        )
+        collector = MCPEventCollector(
+            sender_gateway,
+            events_store,
+            worker_id="mcp-events-" + uuid.uuid4().hex,
+        )
+
+        def authorize_event(*, tenant_id: str, principal_id: str, job_id: str) -> bool:
+            try:
+                sender_gateway.get_job(
+                    principal_id=principal_id,
+                    tenant_id=tenant_id,
+                    job_id=job_id,
+                )
+                return True
+            except Exception as exc:
+                if getattr(exc, "code", None) in ("NOT_FOUND", "PERMISSION_DENIED"):
+                    return False
+                raise
+
+        background_tasks.append(
+            MCPEventDispatcher(
+                collector,
+                events_store,
+                authorize=authorize_event,
+            )
+        )
+
+    mcp_app = build_mcp_server(
+        service,
+        verifier,
+        events_store=events_store,
+        sender_gateway=sender_gateway,
+    )
 
     return DeploymentASGI(
         mcp_app,
         issuer=config["issuer"],
         audience=config["audience"],
+        background_tasks=background_tasks,
     )
 
 

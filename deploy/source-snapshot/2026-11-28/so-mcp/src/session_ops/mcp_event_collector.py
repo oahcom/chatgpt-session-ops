@@ -70,6 +70,7 @@ class MCPEventCollector:
                     summary,
                     event_id=event_id,
                     completed_at=completed_at,
+                    conversation_id=payload.get("conversation_id"),
                     status=payload["status"],
                     error_code=payload.get("error_code"),
                     outcome_unknown=payload.get("outcome_unknown"),

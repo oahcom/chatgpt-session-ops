@@ -6,6 +6,7 @@ only when importing the top-level ``mcp`` package raises ImportError.
 """
 
 import asyncio
+import threading
 import unittest
 from unittest.mock import patch
 from urllib.parse import urlsplit
@@ -391,16 +392,24 @@ class MCPSDKIntegrationTests(unittest.TestCase):
                 self.assertEqual(unsubscribed["result"], {})
 
         with tempfile.TemporaryDirectory(dir="/dev/shm") as tmp:
+            callback_thread_ids = []
+            sender_thread_ids = []
+
+            def post_json(_url, body, _headers):
+                callback_thread_ids.append(threading.get_ident())
+                return (
+                    200,
+                    json.dumps({"challenge": json.loads(body)["challenge"]}).encode(),
+                )
+
             store = MCPEventsStore(
                 str(Path(tmp) / "events.sqlite3"),
                 encryption_key=b"h" * 32,
-                post_json=lambda _url, body, _headers: (
-                    200,
-                    json.dumps({"challenge": json.loads(body)["challenge"]}).encode(),
-                ),
+                post_json=post_json,
             )
             class Sender:
                 def get_job(self, **kwargs):
+                    sender_thread_ids.append(threading.get_ident())
                     return {"job_id": kwargs["job_id"]}
 
             sender = Sender()
@@ -411,6 +420,11 @@ class MCPSDKIntegrationTests(unittest.TestCase):
                 sender_gateway=sender,
             )
             asyncio.run(run_protocol(app, store))
+            loop_thread_id = threading.get_ident()
+            self.assertTrue(callback_thread_ids)
+            self.assertTrue(sender_thread_ids)
+            self.assertNotEqual(callback_thread_ids[0], loop_thread_id)
+            self.assertNotEqual(sender_thread_ids[0], loop_thread_id)
 
     def test_real_tools_call_rejects_missing_request_authentication(self):
         server = self._find_server()

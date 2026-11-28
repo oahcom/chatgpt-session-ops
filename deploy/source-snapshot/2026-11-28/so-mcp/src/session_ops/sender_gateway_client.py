@@ -680,6 +680,7 @@ class SenderGatewayClient:
         principal_id: str,
         tenant_id: str,
         job_id: str,
+        timeout: float | None = None,
     ) -> Dict[str, Any]:
         path = "%s%s/%s" % (
             self._base_path,
@@ -695,6 +696,7 @@ class SenderGatewayClient:
                 "principal_id": principal_id,
                 "tenant_id": tenant_id,
             },
+            timeout=timeout,
         )
 
     def list_sessions(

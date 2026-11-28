@@ -61,6 +61,7 @@ except ModuleNotFoundError:  # pragma: no cover
     sys.modules["uvicorn"] = types.ModuleType("uvicorn")
 
 from scripts.run_mcp_server import (  # noqa: E402
+    DeploymentASGI,
     MEMORY_STDIO_ENV,
     _realm_namespace_from_issuer,
     _resolve_memory_executable,

@@ -5,6 +5,8 @@ import os
 import tempfile
 import time
 import unittest
+import uuid
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,7 +15,8 @@ from src.session_ops.mcp_auth import AuthContext
 from src.session_ops.mcp_events import MCPEventsStore
 from src.session_ops.mcp_event_collector import MCPEventCollector
 from src.session_ops.mcp_event_dispatcher import MCPEventDispatcher
-from src.session_ops.mcp_server import MCPToolService, build_mcp_server
+from src.session_ops.mcp_server import MCPToolService, build_mcp_server, _mcp_session_id
+from src.session_ops.sender_gateway_client import SenderGatewayClient
 from scripts.run_mcp_server import DeploymentASGI, _load_events_encryption_key, create_application
 
 
@@ -80,12 +83,74 @@ async def _asgi_rpc(app, payload, session_id=None, *, disconnect_after=0.05):
     return start["status"], response_headers, json.loads(data)
 
 
+class MCPRequestIdempotencyTests(unittest.TestCase):
+    def test_legacy_send_retry_uses_stable_request_scoped_key(self):
+        class Sender(SenderGatewayClient):
+            def __init__(self):
+                self.calls = []
+
+            def enqueue(self, **kwargs):
+                self.calls.append(kwargs)
+                return {
+                    "job_id": "cgj_12345678-1234-4234-8234-123456789abc",
+                    "status": "queued",
+                    "created_at": "2026-11-28T12:00:00Z",
+                }
+
+        sender = Sender()
+        service = MCPToolService(object(), sender_gateway=sender)
+        auth = AuthContext(
+            Principal("tenant-a", "user-a"),
+            ["session_ops.chatgpt.session.write"],
+            "https://issuer.example.test/realms/session-ops",
+            "user-a",
+            "session-ops",
+        )
+        arguments = {"account": "acct1", "prompt": "do the work"}
+        first = service.dispatch(
+            "chatgpt.session.send", arguments, auth,
+            request_id="rpc-42", request_session_id="mcp-session-a",
+        )
+        retry = service.dispatch(
+            "chatgpt.session.send", arguments, auth,
+            request_id="rpc-42", request_session_id="mcp-session-a",
+        )
+        new_request = service.dispatch(
+            "chatgpt.session.send", arguments, auth,
+            request_id="rpc-43", request_session_id="mcp-session-a",
+        )
+        self.assertTrue(first["ok"])
+        self.assertTrue(retry["ok"])
+        self.assertTrue(new_request["ok"])
+        keys = [call["idempotency_key"] for call in sender.calls]
+        self.assertEqual(keys[0], keys[1])
+        self.assertNotEqual(keys[1], keys[2])
+        self.assertEqual(uuid.UUID(keys[0]).version, 4)
+
+        explicit_key = str(uuid.uuid4())
+        service.dispatch(
+            "chatgpt.session.send",
+            {**arguments, "idempotency_key": explicit_key},
+            auth,
+            request_id="rpc-44",
+            request_session_id="mcp-session-a",
+        )
+        self.assertEqual(sender.calls[-1]["idempotency_key"], explicit_key)
+
+    def test_mcp_session_id_is_read_from_streamable_http_header(self):
+        request = SimpleNamespace(
+            scope={"headers": [(b"mcp-session-id", b"mcp-session-a")]}
+        )
+        self.assertEqual(_mcp_session_id(request), "mcp-session-a")
+
+
+
 class DeployedMCPEventsTests(unittest.TestCase):
     def test_collector_isolates_bad_rows_and_still_acks_good_rows(self):
         good = {
             "event_id": "event-good", "job_id": "job-good", "tenant_id": "tenant-a",
             "principal_id": "user-a", "name": "chatgpt.job.completed", "lease_token": "lease-good",
-            "payload": {"job_id": "job-good", "status": "succeeded", "summary": "done", "completed_at": "2026-11-28T12:00:00Z"},
+            "payload": {"job_id": "job-good", "status": "succeeded", "summary": "done", "completed_at": "2026-11-28T12:00:00Z", "conversation_id": "conv-original"},
         }
 
         class Sender:
@@ -110,6 +175,7 @@ class DeployedMCPEventsTests(unittest.TestCase):
         log.assert_called_once()
         self.assertEqual(sender.acked, [("event-good", "lease-good")])
         self.assertEqual(len(store.events), 1)
+        self.assertEqual(store.events[0][1]["conversation_id"], "conv-original")
 
     def test_dispatcher_runs_collection_delivery_and_cleanup_then_stops(self):
         import threading
@@ -184,6 +250,7 @@ class DeployedMCPEventsTests(unittest.TestCase):
 
         dispatcher = MCPEventDispatcher(Collector(), Store(), poll_seconds=0.05)
         dispatcher.start()
+        self.assertFalse(dispatcher._thread.daemon)
         self.assertTrue(entered.wait(1))
         stopper = threading.Thread(target=lambda: (dispatcher.stop(), stopped.set()))
         stopper.start()
@@ -192,6 +259,27 @@ class DeployedMCPEventsTests(unittest.TestCase):
         stopper.join(2)
         self.assertTrue(stopped.is_set())
         self.assertIsNone(dispatcher._thread)
+
+    def test_dispatcher_stop_reports_inflight_timeout_and_live_thread(self):
+        import threading
+
+        class BusyLock:
+            def acquire(self, timeout=None):
+                return False
+            def release(self):
+                raise AssertionError("release must not be called")
+        class LiveThread:
+            def is_alive(self):
+                return True
+            def join(self, timeout=None):
+                raise AssertionError("join must not run while operation is busy")
+
+        dispatcher = MCPEventDispatcher(object(), object())
+        dispatcher._operation_lock = BusyLock()
+        dispatcher._stop_event = threading.Event()
+        dispatcher._thread = LiveThread()
+        with self.assertRaises(TimeoutError):
+            dispatcher.stop()
 
     def test_events_key_file_requires_private_service_owned_raw_key(self):
         with tempfile.TemporaryDirectory(dir="/dev/shm") as tmp:

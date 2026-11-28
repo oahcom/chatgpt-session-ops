@@ -41,7 +41,7 @@ fix from PR #215; that one file is not yet present in the live `/opt` tree.
 ## Validation
 
 - Full repository tests: **1299 passed, 7 skipped, 1573 subtests passed**.
-- Current reconstructed production integration tests: **23 passed**.
+- Current reconstructed production integration tests: **25 passed**.
 - Sender and MCP patch series both apply cleanly to the current live source files
   in isolated temporary copies and pass Python compilation.
 - The legacy-outbox migration test seeds 75 pending rows, verifies that migration
