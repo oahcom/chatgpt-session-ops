@@ -188,12 +188,21 @@ class MCPSDKIntegrationTests(unittest.TestCase):
                 encryption_key=b"e" * 32,
             )
             from src.session_ops.authority import NotAuthorized
+            from mcp.shared.exceptions import MCPError
 
             class WorkItemAuthority:
                 def require_owner(self, principal, work_item_id):
                     if principal.principal_id != "session_ops:user-a":
                         raise NotAuthorized()
                     if work_item_id != "wi_12345678-1234-4234-8234-123456789abc":
+                        raise NotAuthorized()
+
+                def require_conversation_owner(self, principal, conversation_id):
+                    owned_destinations = {
+                        "session_ops:user-a": "12345678-1234-4234-8234-123456789abc",
+                        "session_ops:delegate": "22345678-1234-4234-8234-123456789abc",
+                    }
+                    if owned_destinations.get(principal.principal_id) != conversation_id:
                         raise NotAuthorized()
 
             service = MCPToolService(WorkItemAuthority())
@@ -255,6 +264,21 @@ class MCPSDKIntegrationTests(unittest.TestCase):
                 ))
             self.assertTrue(subscribed["id"].startswith("sub_"))
 
+            # A canonical UUID is not proof of destination ownership. Reject
+            # another conversation before DNS or callback challenge I/O.
+            foreign_destination = EventsSubscribeParams.model_validate({
+                "name": "chatgpt.job.completed",
+                "arguments": {"conversation_id": "22345678-1234-4234-8234-123456789abc"},
+                "delivery": {
+                    "mode": "webhook",
+                    "url": "https://events.example.test/foreign-destination",
+                    "secret": "whsec_" + base64.b64encode(b"x" * 32).decode(),
+                },
+            })
+            with self.assertRaises(MCPError) as destination_error:
+                asyncio.run(handlers[1].handler(context, foreign_destination))
+            self.assertEqual(destination_error.exception.data, {"reason": "invalid_subscription"})
+
             # Filtered subscriptions must be owned by the authenticated principal.
             filtered_params = EventsSubscribeParams.model_validate({
                 "name": "chatgpt.job.completed",
@@ -281,9 +305,20 @@ class MCPSDKIntegrationTests(unittest.TestCase):
             )
             delegate_context = self._request_context("events/subscribe")
             delegate_context.request = SimpleNamespace(scope={"state": {"session_ops_auth": delegate_auth}})
-            from mcp.shared.exceptions import MCPError
+            delegate_filtered_params = EventsSubscribeParams.model_validate({
+                "name": "chatgpt.job.completed",
+                "arguments": {
+                    "job_id": "wi_12345678-1234-4234-8234-123456789abc",
+                    "conversation_id": "22345678-1234-4234-8234-123456789abc",
+                },
+                "delivery": {
+                    "mode": "webhook",
+                    "url": "https://events.example.test/delegate-filtered-owner",
+                    "secret": "whsec_" + base64.b64encode(b"d" * 32).decode(),
+                },
+            })
             with self.assertRaises(MCPError) as ownership_error:
-                asyncio.run(handlers[1].handler(delegate_context, filtered_params))
+                asyncio.run(handlers[1].handler(delegate_context, delegate_filtered_params))
             self.assertEqual(ownership_error.exception.data, {"reason": "job_not_owned"})
 
             store.post_json = lambda _url, _body, _headers: (200, b'{"challenge":"wrong"}')
@@ -446,8 +481,22 @@ class MCPSDKIntegrationTests(unittest.TestCase):
                 encryption_key=b"h" * 32,
                 post_json=post_json,
             )
+            from src.session_ops.authority import NotAuthorized
+
+            class DestinationAuthority:
+                def require_conversation_owner(self, principal, conversation_id):
+                    if (
+                        principal.principal_id != "session_ops:user-a"
+                        or conversation_id != "12345678-1234-4234-8234-123456789abc"
+                    ):
+                        raise NotAuthorized()
+
+                def require_owner(self, principal, work_item_id):
+                    if principal.principal_id != "session_ops:user-a":
+                        raise NotAuthorized()
+
             app = build_mcp_server(
-                self.service,
+                MCPToolService(DestinationAuthority()),
                 TokenProvider(),
                 events_store=store,
             )

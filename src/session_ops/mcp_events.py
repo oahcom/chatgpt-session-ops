@@ -97,10 +97,11 @@ def _post_public_https(url: str, body: bytes, headers: Mapping[str, str], timeou
         def redirect_request(self, req, fp, code, msg, response_headers, newurl):
             return None
 
+    pinned_handler = _PinnedHTTPSHandler(pinned_ip, total_timeout=timeout)
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
         NoRedirect(),
-        _PinnedHTTPSHandler(pinned_ip),
+        pinned_handler,
     )
     try:
         with opener.open(request, timeout=timeout) as response:
@@ -110,6 +111,10 @@ def _post_public_https(url: str, body: bytes, headers: Mapping[str, str], timeou
     except urllib.error.HTTPError as exc:
         # HTTPError is the response object for 3xx/4xx/5xx; no redirect is followed.
         return int(exc.code), exc.read(MAX_CALLBACK_RESPONSE_BYTES + 1)
+    finally:
+        # urllib's timeout is an inactivity timeout. The pinned connection's
+        # watchdog enforces a wall-clock deadline and is cancelled on completion.
+        pinned_handler.cancel_deadlines()
 
 
 class MCPEventsStore:
@@ -126,6 +131,10 @@ class MCPEventsStore:
         if database == ":memory:":
             raise ValueError("MCP Events requires a file-backed SQLite database")
         self.database = database
+        # Serialize delivery start/finish with unsubscribe in this process.
+        # Once unsubscribe returns, no callback that was merely between its
+        # final lease check and POST can still begin afterward.
+        self._delivery_lock = threading.RLock()
         self.post_json = post_json or _post_public_https
         self.clock = clock
         self._metrics_lock = threading.Lock()
@@ -430,7 +439,7 @@ class MCPEventsStore:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "conversation_id": {"type": "string", "minLength": 36, "maxLength": 36, "description": "The canonical ChatGPT Work conversation UUID that receives this owner’s WorkItem completion events."},
+                    "conversation_id": {"type": "string", "minLength": 36, "maxLength": 36, "pattern": r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", "description": "The canonical ChatGPT Work conversation UUID that receives this owner’s WorkItem completion events."},
                     "job_id": {"type": "string", "description": "Optional WorkItem ID filter. Omit it to receive all WorkItem completion events owned by this authenticated principal in the destination conversation."}
                 },
                 "required": ["conversation_id"],
@@ -620,20 +629,21 @@ class MCPEventsStore:
         tenant_id, principal_id = self._identity(auth)
         delivery = params.get("delivery") or {}
         arguments = _canonical_json(params.get("arguments") or {})
-        with self._db() as db:
-            row = db.execute(
-                """SELECT id FROM event_subscriptions
-                   WHERE tenant_id=? AND principal_id=? AND name=? AND arguments_json=? AND callback_url=?""",
-                (tenant_id, principal_id, params.get("name"), arguments, delivery.get("url")),
-            ).fetchone()
-            if row is not None:
-                db.execute("UPDATE event_subscriptions SET active=0, generation=generation+1 WHERE id=?", (row["id"],))
-                db.execute(
-                    """UPDATE event_deliveries SET status='failed', last_status=410,
-                       next_attempt_at=0, lease_until=NULL, lease_token=NULL
-                       WHERE subscription_id=? AND status IN ('pending','sending')""",
-                    (row["id"],),
-                )
+        with self._delivery_lock:
+            with self._db() as db:
+                row = db.execute(
+                    """SELECT id FROM event_subscriptions
+                       WHERE tenant_id=? AND principal_id=? AND name=? AND arguments_json=? AND callback_url=?""",
+                    (tenant_id, principal_id, params.get("name"), arguments, delivery.get("url")),
+                ).fetchone()
+                if row is not None:
+                    db.execute("UPDATE event_subscriptions SET active=0, generation=generation+1 WHERE id=?", (row["id"],))
+                    db.execute(
+                        """UPDATE event_deliveries SET status='failed', last_status=410,
+                           next_attempt_at=0, lease_until=NULL, lease_token=NULL
+                           WHERE subscription_id=? AND status IN ('pending','sending')""",
+                        (row["id"],),
+                    )
         return {}
 
     def publish_job_completed(
@@ -836,6 +846,11 @@ class MCPEventsStore:
 
     def deliver_pending(self, *, limit: int = 100, authorize: Any = None) -> int:
         """Deliver bounded work with generation-fenced leases."""
+        with self._delivery_lock:
+            return self._deliver_pending_locked(limit=limit, authorize=authorize)
+
+    def _deliver_pending_locked(self, *, limit: int, authorize: Any = None) -> int:
+        """Run delivery while holding the lifecycle lock shared with unsubscribe."""
         if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("limit must be a positive integer")
         # Bound the sequential batch to the 30s lease / 10s callback budget.
