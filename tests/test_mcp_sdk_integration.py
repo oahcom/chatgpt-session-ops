@@ -245,7 +245,7 @@ class MCPSDKIntegrationTests(unittest.TestCase):
                     context,
                     EventsSubscribeParams.model_validate({
                         "name": "chatgpt.job.completed",
-                        "arguments": {"conversation_id": "12345678-1234-4234-8234-123456789abc"},
+                        "arguments": {},
                         "delivery": {
                             "mode": "webhook",
                             "url": "https://events.example.test/callback",
@@ -260,7 +260,6 @@ class MCPSDKIntegrationTests(unittest.TestCase):
                 "name": "chatgpt.job.completed",
                 "arguments": {
                     "job_id": "wi_12345678-1234-4234-8234-123456789abc",
-                    "conversation_id": "12345678-1234-4234-8234-123456789abc",
                 },
                 "delivery": {
                     "mode": "webhook",
@@ -293,7 +292,7 @@ class MCPSDKIntegrationTests(unittest.TestCase):
                         context,
                         EventsSubscribeParams.model_validate({
                             "name": "chatgpt.job.completed",
-                            "arguments": {"conversation_id": "12345678-1234-4234-8234-123456789abc"},
+                            "arguments": {},
                             "delivery": {
                                 "mode": "webhook",
                                 "url": "https://events.example.test/second-callback",
@@ -411,7 +410,7 @@ class MCPSDKIntegrationTests(unittest.TestCase):
                         "jsonrpc": "2.0", "id": 3, "method": "events/subscribe",
                         "params": {
                             "name": "chatgpt.job.completed",
-                            "arguments": {"conversation_id": "12345678-1234-4234-8234-123456789abc"},
+                            "arguments": {},
                             "delivery": {"mode": "webhook", "url": "https://events.example.test/callback", "secret": secret},
                             "ttlMs": None,
                         },
@@ -424,7 +423,7 @@ class MCPSDKIntegrationTests(unittest.TestCase):
                     "jsonrpc": "2.0", "id": 4, "method": "events/unsubscribe",
                     "params": {
                         "name": "chatgpt.job.completed",
-                        "arguments": {"conversation_id": "12345678-1234-4234-8234-123456789abc"},
+                        "arguments": {},
                         "delivery": {"mode": "webhook", "url": "https://events.example.test/callback"},
                     },
                 }, session_id)

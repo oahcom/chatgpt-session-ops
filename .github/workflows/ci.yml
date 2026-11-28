@@ -123,13 +123,40 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          python -m pip install --disable-pip-version-check -r requirements-mcp.txt
+          python -m pip install --disable-pip-version-check -r requirements-mcp.txt pytest
 
       - name: Run unit tests
         shell: bash
         run: |
           set -o pipefail
           python -m unittest discover -s tests -v 2>&1 | tee unit.log
+
+      - name: Run direct ChatGPT client pytest suite
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_chatgpt_direct_client.py -q 2>&1 | tee direct-client-pytest.log
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          expected = len(re.findall(
+              r"^def test_", Path("tests/test_chatgpt_direct_client.py").read_text(),
+              re.M,
+          ))
+          output = Path("direct-client-pytest.log").read_text()
+          match = re.search(r"(\d+) passed", output)
+          passed = int(match.group(1)) if match else 0
+          if passed != expected:
+              sys.exit(
+                  "direct client pytest suite ran %d tests; expected %d"
+                  % (passed, expected)
+              )
+          if re.search(r"\d+ (?:failed|error|skipped)", output):
+              sys.exit("direct client pytest suite failed or skipped tests")
+          print("PASS: direct client pytest ran all %d tests" % passed)
+          PY
 
       - name: Assert the unit run is real and did not lose tests
         shell: bash
