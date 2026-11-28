@@ -38,7 +38,7 @@ import threading
 import uuid
 
 __all__ = [
-    "ChatGPTSenderAdapter",
+    "ChatGPTCLIAdapter",
     "SenderError",
     "CODE_INVALID_ARGUMENT",
     "CODE_UNAUTHENTICATED",
@@ -220,7 +220,7 @@ class SenderError(RuntimeError):
         super().__init__("%s: %s" % (code, self.detail))
 
 
-class ChatGPTSenderAdapter:
+class ChatGPTCLIAdapter:
     """固定 CLI 的窄接口。构造参数全部可注入，便于测试与部署。"""
 
     def __init__(
