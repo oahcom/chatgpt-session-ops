@@ -1432,19 +1432,25 @@ runtime state is copied into this directory before cutover, so the CLI no
 longer needs to read code or configuration from `/opt/so-sender`.
 
 
-Before switching the service, copy the existing runtime state files once. The
-script verifies each SHA-256, refuses to overwrite a different destination,
-and sets the target owner/group and mode:
+Before switching the service, drain the old sender and wait until its
+`jobs` table has no `running` rows. Then stop `so-sender.service` so both the
+CLI state and source database are quiescent.
+
+Copy the existing runtime state files once. The script verifies each SHA-256,
+refuses to overwrite a different destination, sets target owner/group and mode,
+and imports the legacy account health states into the CLI's native
+`account-rotation.json`. Existing CLI disable reasons are preserved;
+`auth_unavailable` and `operator_disabled` accounts remain disabled until an
+operator explicitly re-enables them with `--rotation-enable acctN`.
 
 ```bash
 sudo python tools/migrate_sender_runtime_state.py \
   --source /opt/so-sender/cli \
-  --state /var/lib/chatgpt-session-ops/mcp-state
+  --state /var/lib/chatgpt-session-ops/mcp-state \
+  --legacy-db /var/lib/chatgpt-session-ops/state/sender-gateway.sqlite3
 ```
 
-Before the first start of the updated MCP, drain the old sender and wait
-until its `jobs` table has no `running` rows. Then stop `so-sender.service` so
-the source database is quiescent. Temporarily add this line to
+Before the first start of the updated MCP, temporarily add this line to
 `/etc/so-mcp/so-mcp.env`:
 
 ```bash
