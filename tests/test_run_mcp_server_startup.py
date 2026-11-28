@@ -458,7 +458,17 @@ class TestRealmNamespaceFromIssuer(unittest.TestCase):
 
 
 class TestLoadConfig(unittest.TestCase):
-    """The 5 guards of ``load_config`` (L266,276,281,284,295) + happy path."""
+    """The 5 guards of ``load_config`` plus direct CLI path checks."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.accounts_dir = Path(self._tmp.name) / "accounts"
+        self.state_dir = Path(self._tmp.name) / "state"
+        self.accounts_dir.mkdir()
+        self.state_dir.mkdir()
+
+    def tearDown(self):
+        self._tmp.cleanup()
 
     def _base_env(self):
         return {
@@ -469,6 +479,8 @@ class TestLoadConfig(unittest.TestCase):
             "SO_MCP_HOST": "127.0.0.1",
             "SO_MCP_PORT": "8791",
             "UVICORN_LOG_LEVEL": "info",
+            "SO_SENDER_ACCOUNTS_DIR": str(self.accounts_dir),
+            "CHATGPT_STATE_DIR": str(self.state_dir),
         }
 
     def _env_with(self, **overrides):
@@ -507,6 +519,8 @@ class TestLoadConfig(unittest.TestCase):
                 "chatgpt_cli_path": str(
                     Path(__file__).resolve().parents[1] / "scripts" / "chatgpt_send.py"
                 ),
+                "chatgpt_accounts_dir": str(self.accounts_dir.resolve()),
+                "chatgpt_state_dir": str(self.state_dir.resolve()),
                 "legacy_sender_db_path": None,
             },
         )
