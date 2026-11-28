@@ -52,8 +52,6 @@ MAX_RESPONSE_BYTES = 65536
 
 JOBS_PATH = "/internal/v1/jobs"
 SESSIONS_PATH = "/internal/v1/sessions"
-EVENTS_PATH = "/internal/v1/events"
-EVENT_DISPATCHER_IDENTITY = {"principal_id": "session_ops:event-dispatcher", "tenant_id": "session_ops"}
 
 #: Top-level job fields the client owns; business arguments go in ``payload``.
 _RESERVED_JOB_FIELDS = frozenset({"operation", "idempotency_key", "payload"})
@@ -95,11 +93,14 @@ class SenderGatewayConfigError(ValueError):
 class SenderGatewayError(Exception):
     """A failed Sidecar call, carrying a frozen public error code."""
 
-    def __init__(self, code: str, message: str = "") -> None:
+    def __init__(
+        self, code: str, message: str = "", *, retry_after_seconds: Optional[float] = None
+    ) -> None:
         if code not in PUBLIC_ERROR_CODES:
             code = "INTERNAL"
         self.code = code
         self.message = message
+        self.retry_after_seconds = retry_after_seconds
         super().__init__(message or code)
 
 
@@ -668,22 +669,6 @@ class SenderGatewayClient:
             },
         )
 
-    def claim_events(self, *, worker_id: str, limit: int = 1) -> Dict[str, Any]:
-        if not isinstance(worker_id, str) or not worker_id.strip():
-            raise SenderGatewayError("INVALID_ARGUMENT", "worker_id is required")
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 25:
-            raise SenderGatewayError("INVALID_ARGUMENT", "limit must be in 1..25")
-        return self._request("POST", self._base_path + EVENTS_PATH + "/claim",
-            {"worker_id": worker_id, "limit": limit}, EVENT_DISPATCHER_IDENTITY,
-            timeout=self.read_timeout_seconds, timeout_code="TIMEOUT")
-
-    def ack_event(self, *, event_id: str, lease_token: str) -> Dict[str, Any]:
-        if not isinstance(event_id, str) or not event_id or not isinstance(lease_token, str) or not lease_token:
-            raise SenderGatewayError("INVALID_ARGUMENT", "event_id and lease_token are required")
-        return self._request("POST", self._base_path + EVENTS_PATH + "/" + quote(event_id, safe="") + "/ack",
-            {"event_id": event_id, "lease_token": lease_token}, EVENT_DISPATCHER_IDENTITY,
-            timeout=self.read_timeout_seconds, timeout_code="TIMEOUT")
-
     def get_job(
         self,
         *,
@@ -804,9 +789,15 @@ def _error_from_response(
         if isinstance(code, str) and code in PUBLIC_ERROR_CODES:
             message = error.get("message")
 
+            retry_after = error.get("retry_after_seconds")
+            try:
+                retry_after = float(retry_after) if retry_after is not None else None
+            except (TypeError, ValueError):
+                retry_after = None
             return SenderGatewayError(
                 code,
                 message if isinstance(message, str) else code,
+                retry_after_seconds=retry_after,
             )
 
     if status == 401:
