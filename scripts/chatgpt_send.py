@@ -1330,6 +1330,75 @@ def _scan_mapping(raw_body):
     return rows, complete
 
 
+def _scan_mapping_messages(raw_body):
+    """Return ordered message IDs and text for the MCP read contract."""
+    complete = _scan_mapping(raw_body)[1]
+    try:
+        data = json.loads(raw_body)
+        mapping = data.get("mapping") if isinstance(data, dict) else None
+    except Exception:
+        return [], False
+    if not isinstance(mapping, dict):
+        return [], False
+
+    messages = []
+    for node in mapping.values():
+        if not isinstance(node, dict):
+            complete = False
+            continue
+        message = node.get("message")
+        if message is None:
+            continue
+        if not isinstance(message, dict):
+            complete = False
+            continue
+        message_id = message.get("id")
+        author = message.get("author")
+        content = message.get("content")
+        if not isinstance(message_id, str) or not message_id:
+            complete = False
+            continue
+        if not isinstance(author, dict):
+            complete = False
+            continue
+        if content is None:
+            parts = []
+        elif isinstance(content, dict):
+            parts = content.get("parts")
+            if parts is None:
+                kind = content.get("content_type")
+                parts = [content["text"]] if (
+                    kind in ("code", "text") and isinstance(content.get("text"), str)
+                ) else []
+            elif not isinstance(parts, list):
+                complete = False
+                continue
+        else:
+            complete = False
+            continue
+        texts, structured, malformed = _split_parts(parts)
+        role = author.get("role")
+        if malformed or (structured and role == "assistant"):
+            complete = False
+            continue
+        ok, created_at = _as_ctime(message.get("create_time"))
+        if not ok:
+            complete = False
+        text = _assistant_text(texts)
+        if role in ("user", "assistant") and text:
+            messages.append({
+                "id": message_id,
+                "role": role,
+                "content": text,
+                "created_at": created_at if ok else None,
+            })
+    messages.sort(key=lambda item: (
+        item["created_at"] if item["created_at"] is not None else float("inf"),
+        item["id"],
+    ))
+    return messages, complete
+
+
 def reply_digest(raw_body):
     """A12：把一条 assistant 消息的 parts 统计出来，用于核对「GET 全文是否完整」。
 
@@ -9410,9 +9479,36 @@ def _main_impl():
     if args[0] == "--list" and len(args) != 1:
         print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin] --list", flush=True)
         return 2
-    if args[0] == "--tail" and len(args) != 2:
-        print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin] --tail <conv_id>", flush=True)
-        return 2
+    tail_json = False
+    tail_after_message_id = None
+    tail_limit = 20
+    if args[0] == "--tail":
+        if len(args) < 2:
+            print("usage: [--account acctN] --tail <conv_id> [--json] [--after-message-id ID] [--limit N]", flush=True)
+            return 2
+        i = 2
+        while i < len(args):
+            flag = args[i]
+            if flag == "--json" and not tail_json:
+                tail_json = True
+                i += 1
+            elif flag == "--after-message-id" and tail_after_message_id is None and i + 1 < len(args):
+                tail_after_message_id = args[i + 1]
+                i += 2
+            elif flag == "--limit" and i + 1 < len(args):
+                try:
+                    tail_limit = int(args[i + 1])
+                except ValueError:
+                    tail_limit = 0
+                i += 2
+            else:
+                print("usage: [--account acctN] --tail <conv_id> [--json] [--after-message-id ID] [--limit N]", flush=True)
+                return 2
+        if not 1 <= tail_limit <= 50 or (
+            tail_after_message_id is not None and not tail_json
+        ):
+            print("ERROR: invalid tail JSON pagination arguments", flush=True)
+            return 2
     raw_id = args[1] if args[0] == "--tail" else (args[0] if not args[0].startswith("--") else "")
     conv_id = cli_id(raw_id) if raw_id else ""
     if raw_id and conv_id is None:
@@ -9502,6 +9598,33 @@ def _main_impl():
         return 0 if status == 200 and not error else 1
     if args[0] == "--tail":
         tail, raw = api.live_tail(conv_id, tries=2)
+        if tail_json:
+            if not raw:
+                print("tail: unavailable", flush=True)
+                return 1
+            messages, complete = _scan_mapping_messages(raw)
+            if tail_after_message_id is None:
+                selected = messages[-tail_limit:]
+                has_more = False
+            else:
+                positions = [
+                    index for index, item in enumerate(messages)
+                    if item["id"] == tail_after_message_id
+                ]
+                if not positions:
+                    print("tail: after_message_id not found", flush=True)
+                    return 1
+                remaining = messages[positions[0] + 1:]
+                selected = remaining[:tail_limit]
+                has_more = len(remaining) > tail_limit
+            next_after = selected[-1]["id"] if has_more and selected else None
+            print(json.dumps({
+                "complete": bool(complete),
+                "has_more": bool(has_more),
+                "next_after_message_id": next_after,
+                "messages": selected,
+            }, ensure_ascii=False, separators=(",", ":")), flush=True)
+            return 0
         print("tail:", tail)
         if raw:
             print(api.harvest_mapping(raw)[-4000:])
