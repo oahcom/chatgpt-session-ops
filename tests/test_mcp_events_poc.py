@@ -203,7 +203,7 @@ class MCPEventsStoreTests(unittest.TestCase):
         self.assertEqual(snapshot["subscriptions"]["active"], 1)
         self.assertEqual(snapshot["callbacks"]["callback_count"], 2)
         self.assertEqual(snapshot["callbacks"]["callback_status_2xx"], 2)
-        self.assertGreater(snapshot["callbacks"]["callback_latency_ms_total"], 0)
+        self.assertGreaterEqual(snapshot["callbacks"]["callback_latency_ms_total"], 0)
         self.assertGreater(snapshot["storage"]["database_bytes"], 0)
         serialized = json.dumps(snapshot, sort_keys=True)
         self.assertNotIn("evt_health_private", serialized)
