@@ -165,6 +165,11 @@ def _effective_rotation_primary():
     return tuple(sorted(allowed, key=lambda name: int(name[4:])))
 
 
+# Backward-compatible snapshot for tests and external read-only consumers.
+# Runtime routing always calls _effective_rotation_primary() dynamically.
+ROTATION_PRIMARY = _effective_rotation_primary()
+
+
 def _rotation_order():
     """All discovered account identities plus the legacy anonymous identity."""
     names = {
