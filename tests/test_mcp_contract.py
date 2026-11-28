@@ -33,8 +33,11 @@ from src.session_ops.mcp_server import (
     MAX_QUERY_CHARS,
     MAX_STRUCTURED_CONTENT_BYTES,
     MCPToolService,
+    _error,
+    _exception_code,
     _validate_arguments,
 )
+from src.session_ops.chatgpt_direct_client import SessionOpsError
 
 
 TENANT = "tenant-a"
@@ -836,6 +839,15 @@ class MCPContractTests(unittest.TestCase):
     def test_unknown_adapter_error_code_falls_through_to_internal(self):
         result = self.dispatch_with_adapter_error("ADAPTER_CODE_UNSPECIFIED")
         self.assert_error(result, "INTERNAL")
+
+    def test_unknown_remote_side_effect_is_never_retryable(self):
+        code, details = _exception_code(
+            SessionOpsError("OUTCOME_UNKNOWN", "remote send may have been accepted")
+        )
+        self.assertEqual(code, "OUTCOME_UNKNOWN")
+        self.assertIn("detail", details)
+        envelope = _error(code, "test-request", details)
+        self.assertFalse(envelope["error"]["retryable"])
 
     def test_oversized_response_becomes_resource_exhausted(self):
         class OversizedStore(FakeStore):

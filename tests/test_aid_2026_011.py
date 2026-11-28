@@ -247,6 +247,24 @@ class AID2026011Tests(unittest.TestCase):
         self.assertEqual(calls, ["acct1"])
         self.assertNotIn("nologin", calls)
 
+    def test_unknown_send_outcome_stops_account_rotation(self):
+        calls = []
+
+        def fake_attempt(st, name, prompt_file, attempts, thinking=None):
+            calls.append(name)
+            attempts.append({"account": name, "status": "OUTCOME_UNKNOWN"})
+            return "OUTCOME_UNKNOWN", None
+
+        with (
+            mock.patch.object(m, "_attempt_create", side_effect=fake_attempt),
+            mock.patch("builtins.print"),
+        ):
+            result = m.create_chat_rotating("unused-prompt.txt")
+
+        self.assertEqual(result, 2)
+        self.assertEqual(calls, ["acct1"])
+        self.assertNotIn("nologin", calls)
+
     def test_401_403_429_preserve_failure_and_cooldown_behavior(self):
         """Assert failure counts, unavailable reasons, and existing TTLs."""
 

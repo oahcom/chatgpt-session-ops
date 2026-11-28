@@ -7,6 +7,7 @@ queued jobs are executed by a bounded in-process executor.
 from __future__ import annotations
 
 import importlib
+import hashlib
 import json
 import os
 import re
@@ -41,7 +42,7 @@ class ChatGPTDirectClient:
         accounts_dir: str | Path,
         runtime_dir: str | Path,
         legacy_database_path: str | Path | None = None,
-        max_workers: int = 4,
+        max_workers: int = 1,
         max_queue_size: int = 32,
     ):
         self.database_path = Path(database_path)
@@ -49,8 +50,10 @@ class ChatGPTDirectClient:
         self.accounts_dir = Path(accounts_dir).resolve()
         self.runtime_dir = Path(runtime_dir).resolve()
         self.prompt_dir = self.runtime_dir / "prompts"
-        if max_workers < 1 or max_queue_size < max_workers:
-            raise ValueError("max_queue_size must be >= max_workers >= 1")
+        # One in-process queue consumer only. Do not fan out CLI children
+        # before durable account reservations and signed receipts exist.
+        if max_workers != 1 or max_queue_size < 1:
+            raise ValueError("the direct ChatGPT queue currently requires exactly one consumer")
         self.max_workers = max_workers
         self.max_queue_size = max_queue_size
         self._db_lock = threading.RLock()
@@ -159,8 +162,12 @@ class ChatGPTDirectClient:
                 "INSERT OR IGNORE INTO chatgpt_account_health(account,state,reason,updated_at) VALUES(?,?,?,?)",
                 [(account, state, reason, _now()) for account, state, reason in _DEFAULT_ACCOUNT_HEALTH],
             )
-            # There is no queue: only an interrupted in-request operation can
-            # remain running, and its upstream delivery outcome is unknown.
+            job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(chatgpt_jobs)")}
+            if "payload_hash" not in job_columns:
+                conn.execute("ALTER TABLE chatgpt_jobs ADD COLUMN payload_hash TEXT")
+            # Queued jobs are durable and safe to resume. A running operation
+            # may already have reached ChatGPT, so its outcome is unknown and
+            # it must never be replayed automatically.
             conn.execute("""UPDATE chatgpt_jobs SET status='failed', completed_at=?,
                 outcome_unknown=1, error_json=? WHERE status='running'""",
                 (_now(), json.dumps({"code": "OUTCOME_UNKNOWN", "retryable": False})))
@@ -286,12 +293,22 @@ class ChatGPTDirectClient:
             raise SessionOpsError("INVALID_ARGUMENT", "unsupported ChatGPT operation")
         args = dict(arguments or {})
         requested_account = args.get("account", "auto")
+        effective_args = dict(args)
+        effective_args.setdefault("account", "auto")
+        if operation == "session.create":
+            effective_args.setdefault("prompt", "ping")
+        payload_hash = hashlib.sha256(json.dumps(
+            {"operation": operation, "arguments": effective_args},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
         # Idempotent retries return the original job even if account health has
         # changed since it was accepted. New creates are preflighted before a
         # prompt file or queued job is created.
         with self._db_lock, self._connect() as conn:
-            existing = conn.execute("""SELECT * FROM chatgpt_jobs WHERE tenant_id=? AND principal_id=? AND operation=? AND idempotency_key=?""", (tenant_id, principal_id, operation, idempotency_key)).fetchone()
+            existing = conn.execute("""SELECT * FROM chatgpt_jobs WHERE tenant_id=? AND principal_id=? AND idempotency_key=?""", (tenant_id, principal_id, idempotency_key)).fetchone()
             if existing:
+                if existing["operation"] != operation or existing["payload_hash"] != payload_hash:
+                    raise SessionOpsError("CONFLICT", "idempotency key was already used for a different or unverifiable request")
                 return self._job_payload(existing)
         if operation == "session.create":
             self._validate_create_account(requested_account)
@@ -311,10 +328,12 @@ class ChatGPTDirectClient:
         with self._db_lock, self._connect() as conn:
             # Serialize capacity check + insert across concurrent MCP requests.
             conn.execute("BEGIN IMMEDIATE")
-            existing = conn.execute("""SELECT * FROM chatgpt_jobs WHERE tenant_id=? AND principal_id=? AND operation=? AND idempotency_key=?""", (tenant_id, principal_id, operation, idempotency_key)).fetchone()
+            existing = conn.execute("""SELECT * FROM chatgpt_jobs WHERE tenant_id=? AND principal_id=? AND idempotency_key=?""", (tenant_id, principal_id, idempotency_key)).fetchone()
             if existing:
                 if prompt_path:
                     Path(prompt_path).unlink(missing_ok=True)
+                if existing["operation"] != operation or existing["payload_hash"] != payload_hash:
+                    raise SessionOpsError("CONFLICT", "idempotency key was already used for a different or unverifiable request")
                 return self._job_payload(existing)
             outstanding = conn.execute(
                 "SELECT count(*) FROM chatgpt_jobs WHERE status IN ('queued','running')"
@@ -326,8 +345,8 @@ class ChatGPTDirectClient:
                     "RESOURCE_EXHAUSTED",
                     f"ChatGPT job queue is full ({outstanding}/{self.max_queue_size}); retry after capacity is available",
                 )
-            conn.execute("""INSERT INTO chatgpt_jobs(job_id,tenant_id,principal_id,operation,idempotency_key,status,conversation_id,requested_account,prompt_path,created_at)
-                VALUES(?,?,?,?,?,'queued',?,?,?,?)""", (job_id, tenant_id, principal_id, operation, idempotency_key, args.get("conversation_id"), requested_account, prompt_path, created))
+            conn.execute("""INSERT INTO chatgpt_jobs(job_id,tenant_id,principal_id,operation,idempotency_key,status,conversation_id,requested_account,prompt_path,created_at,payload_hash)
+                VALUES(?,?,?,?,?,'queued',?,?,?,?,?)""", (job_id, tenant_id, principal_id, operation, idempotency_key, args.get("conversation_id"), requested_account, prompt_path, created, payload_hash))
         self._executor.submit(self._execute_job, job_id)
         return {"job_id": job_id, "operation": operation, "status": "queued", "created_at": created, "conversation_id": args.get("conversation_id")}
 
@@ -371,7 +390,7 @@ class ChatGPTDirectClient:
                     status, path, conv = self._cli.send_prompt(api, None, prompt_path, new_chat=True)
                     conversation_id = str(getattr(conv, "id", None) or conv or "")
                     if status != 200 or not re.fullmatch(r"[0-9a-f-]{36}", conversation_id) or getattr(conv, "send_truncated", False):
-                        raise SessionOpsError("DEPENDENCY_UNAVAILABLE", "session create was not confirmed")
+                        raise SessionOpsError("OUTCOME_UNKNOWN", "session create may have reached ChatGPT but was not fully verified; do not retry")
                     self._cli.record_conv(conversation_id, api.account, prompt_path)
                     account = api.account
                 else:
@@ -382,9 +401,9 @@ class ChatGPTDirectClient:
                     conversation_id = last.get("conv_id")
                     account = last.get("account")
                     if exit_code != 0 or not conversation_id or conversation_id == previous or account not in active:
-                        raise SessionOpsError("DEPENDENCY_UNAVAILABLE", "session create did not produce a confirmed conversation id")
+                        raise SessionOpsError("OUTCOME_UNKNOWN", "session create may have reached ChatGPT but did not produce a uniquely verified result; do not retry")
             self._store_owner(conversation_id, tenant_id, principal_id, account)
-            return {"conversation_id": conversation_id, "account": account, "receipt_durable": True, "reply_state": "captured"}
+            return {"conversation_id": conversation_id, "account": account, "reply_state": "unverified", "receipt_durable": False}
 
         conversation_id = row["conversation_id"]
         owner = self._owner(conversation_id, tenant_id, principal_id)

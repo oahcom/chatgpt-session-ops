@@ -7611,12 +7611,19 @@ def _attempt_create(st, name, prompt_file, attempts, thinking=None):
         return status, None
 
     except Exception as e:
-        status, conv = 0, None
-
+        # An exception after entering send_prompt does not prove that the
+        # remote POST was never accepted. Stop account rotation: another
+        # account could create a duplicate remote session for this intent.
+        attempts.append({
+            "account": name,
+            "status": "OUTCOME_UNKNOWN",
+            "detail": "%s: %s" % (type(e).__name__, e),
+        })
         print(
-            "rotate: %s 通道异常（%s）" % (name, e),
+            "rotate: %s 通道异常，远端副作用未知；停止轮转（%s）" % (name, e),
             flush=True,
         )
+        return "OUTCOME_UNKNOWN", None
 
     attempts.append({
         "account": name,
@@ -7731,6 +7738,22 @@ def create_chat_rotating(prompt_file, thinking=None):
             thinking_requested,
         )
         outcomes[name] = status
+
+        if status == "OUTCOME_UNKNOWN":
+            print(
+                json.dumps(
+                    {
+                        "result": "outcome_unknown",
+                        "terminal": True,
+                        "account": name,
+                        "outcomes": outcomes,
+                        "attempts": attempts,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            return 2
 
         # Terminal failure: stop immediately.
         # Never attempt another account or anonymous fallback.

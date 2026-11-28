@@ -58,6 +58,42 @@ def test_enqueue_is_idempotent_and_job_state_is_persistent(tmp_path):
     assert retry["status"] == "succeeded"
 
 
+def test_idempotency_key_rejects_different_payload_or_operation(tmp_path):
+    client = make_client(tmp_path)
+
+    class DeferredExecutor:
+        def submit(self, function, *args):
+            return None
+
+    client._executor.shutdown(wait=True)
+    client._executor = DeferredExecutor()
+    client._store_owner("c1", "t1", "p1", "acct1")
+    first = client.enqueue(
+        principal_id="p1", tenant_id="t1", operation="session.send",
+        arguments={"conversation_id": "c1", "prompt": "first", "account": "auto"},
+        idempotency_key="stable-key",
+    )
+    with client._connect() as conn:
+        stored_hash = conn.execute(
+            "SELECT payload_hash FROM chatgpt_jobs WHERE job_id=?", (first["job_id"],)
+        ).fetchone()[0]
+    assert len(stored_hash) == 64
+
+    for operation, arguments in (
+        ("session.send", {"conversation_id": "c1", "prompt": "changed", "account": "auto"}),
+        ("session.create", {"account": "auto"}),
+    ):
+        try:
+            client.enqueue(
+                principal_id="p1", tenant_id="t1", operation=operation,
+                arguments=arguments, idempotency_key="stable-key",
+            )
+        except SessionOpsError as exc:
+            assert exc.code == "CONFLICT"
+        else:
+            raise AssertionError("idempotency key reuse with a different request was accepted")
+
+
 def test_job_and_session_ownership_are_scoped(tmp_path):
     client = make_client(tmp_path)
     client._store_owner("conv-1", "tenant-a", "principal-a", "acct1")

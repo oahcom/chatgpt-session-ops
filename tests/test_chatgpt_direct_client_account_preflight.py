@@ -45,6 +45,7 @@ class ChatGPTDirectClientAccountPreflightTests(unittest.TestCase):
                     resolved_account TEXT, prompt_path TEXT, created_at TEXT NOT NULL,
                     started_at TEXT, completed_at TEXT, result_json TEXT,
                     error_json TEXT, outcome_unknown INTEGER NOT NULL DEFAULT 0,
+                    payload_hash TEXT,
                     UNIQUE(tenant_id, principal_id, operation, idempotency_key)
                 );
                 INSERT INTO chatgpt_account_health VALUES
