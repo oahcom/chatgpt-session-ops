@@ -30,6 +30,8 @@ SUPPORTED_SCOPES = [
     "session_ops.session.write",
     "session_ops.context.read",
     "session_ops.access.manage",
+    "session_ops.chatgpt.session.read",
+    "session_ops.chatgpt.session.write",
 ]
 
 MEMORY_STDIO_ENV = "SO_MCP_MEMORY_STDIO"

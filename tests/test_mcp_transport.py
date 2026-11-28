@@ -6,6 +6,7 @@ deterministic fakes. Run with:
 """
 
 import asyncio
+import json
 import socket
 import ssl
 import sys
@@ -476,6 +477,18 @@ class DiscoverySSRFRegressionTests(unittest.TestCase):
 
 
 class AuthMiddlewarePathRegressionTests(unittest.TestCase):
+
+    def test_deployment_metadata_advertises_dedicated_events_scopes(self):
+        with patch.dict(sys.modules, {"uvicorn": types.ModuleType("uvicorn")}):
+            from scripts.run_mcp_server import DeploymentASGI
+        deployment = DeploymentASGI(
+            lambda *_args: None,
+            issuer="https://identity.example.test/realms/so-mcp",
+            audience="https://resource.example.test/mcp",
+        )
+        metadata = json.loads(deployment._metadata_body)
+        self.assertIn("session_ops.chatgpt.session.read", metadata["scopes_supported"])
+        self.assertIn("session_ops.chatgpt.session.write", metadata["scopes_supported"])
 
     def build_app_without_installed_mcp_sdk(self):
         """Build the real middleware while stubbing only the optional SDK."""
