@@ -17,7 +17,7 @@ connector. This tool inspects endpoints and reports eligibility facts only.
 Usage:
     python mcp_connector.py inspect --url https://example.com/mcp [--json]
     python mcp_connector.py eligibility --account acct1 [--json]
-    python mcp_connector.py eligibility --accounts acct1,acct2,acct3,acct4,acct5,acct6
+    python mcp_connector.py eligibility --accounts acct1,acct2,acct10
 
 Exit codes:
     0  every requested check completed (including a clean "denied" verdict)
@@ -37,6 +37,7 @@ import argparse
 import ipaddress
 import json
 import os
+import re
 import socket
 import sys
 import urllib.error
@@ -278,9 +279,36 @@ def inspect(url: str) -> InspectResult:
 # ---------------------------------------------------------------- accounts
 
 def token_path(account: str) -> str:
+    if not re.fullmatch(r'acct[1-9][0-9]*', account):
+        raise CheckError('INVALID_ARGUMENT', 'account must match acctN')
     if account == 'acct1':
+        canonical = os.path.join(ACCOUNTS_DIR, 'acct1')
+        if os.path.isdir(canonical):
+            return os.path.join(canonical, 'access_token.txt')
         return os.path.join(SKILL_DIR, 'access_token.txt')
     return os.path.join(ACCOUNTS_DIR, account, 'access_token.txt')
+
+
+def discover_accounts() -> list[str]:
+    """Discover configured acctN directories in natural numeric order."""
+    names = []
+    acct1_dir = os.path.join(ACCOUNTS_DIR, 'acct1')
+    legacy_acct1_token = os.path.join(SKILL_DIR, 'access_token.txt')
+    if os.path.isdir(acct1_dir) or os.path.isfile(legacy_acct1_token):
+        names.append('acct1')
+    try:
+        with os.scandir(ACCOUNTS_DIR) as entries:
+            for entry in entries:
+                if (entry.name != 'acct1'
+                        and re.fullmatch(r'acct[1-9][0-9]*', entry.name)
+                        and entry.is_dir(follow_symlinks=False)):
+                    names.append(entry.name)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise CheckError('ACCOUNT_DISCOVERY_FAILED',
+                         f'cannot enumerate account directory: {ACCOUNTS_DIR}') from exc
+    return sorted(set(names), key=lambda name: int(name[4:]))
 
 
 def load_token(account: str) -> str:
@@ -445,9 +473,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if not r.error else 1
 
     # eligibility
-    names = ['acct%d' % i for i in range(1, 7)] if args.accounts == 'all' \
+    names = discover_accounts() if args.accounts == 'all' \
         else (args.accounts or args.account).split(',')
     names = [n.strip() for n in names if n.strip()]
+    if not names:
+        print('No configured acctN accounts found')
+        return 1
     rows = [eligibility(n, args.capability) for n in names]
 
     if args.json:

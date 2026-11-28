@@ -76,9 +76,9 @@ ChatGPT 会话操控与生命周期管理。把"手和眼"（I/O、投递、收�
 
 ## 前置：认证
 
-账号凭据隔离：acct1 复用既有默认目录（`CHATGPT_AUTH_DIR` 或脚本同目录），acct2 / acct3 / acct4 / acct5 / acct6 使用 `scripts/accounts/acct2/`、`scripts/accounts/acct3/`、`scripts/accounts/acct4/`、`scripts/accounts/acct5/`、`scripts/accounts/acct6/`，各自读取 `cookies.json` 与 `access_token.txt`。**凭据属个人数据，不随仓库分发**：按 `scripts/accounts/README.md` 的结构自行放入即可，acct2 / acct3 / acct4 / acct5 / acct6 装好即与 acct1 等价参与轮转。
+账号凭据隔离：所有登录态统一使用 `scripts/accounts/acctN/`，每个目录读取 `cookies.json` 与 `access_token.txt`；仅当 `accounts/acct1/` 不存在时，acct1 兼容既有默认认证目录（`CHATGPT_AUTH_DIR` 或脚本同目录）。**凭据属个人数据，不随仓库分发**：按 `scripts/accounts/README.md` 的结构自行放入即可，新增 acct7、acct10 等不需要改代码或白名单。
 
-**身份优先级：登录态优先，匿名只做兜底。** `--new` 默认在 `acct1 / acct2 / acct3 / acct4 / acct5 / acct6` 之间均分轮转；`nologin`（匿名）**仅当全部登录态都 429**（本次命中或处于 429 冷却）时才启用，401/403 不触发兜底。`CHATGPT_ANON_FALLBACK=0` 可彻底禁用。需要匿名时也可显式 `--account nologin --new`。
+**身份优先级：登录态优先，匿名只做兜底。** `--new` 默认在凭据目录中动态发现的有效 acctN 之间按数字自然序均分轮转；`nologin`（匿名）**仅当全部有效登录态都 429**（本次命中或处于 429 冷却）时才启用，401/403 不触发兜底。`CHATGPT_ANON_FALLBACK=0` 可彻底禁用。需要匿名时也可显式 `--account nologin --new`。
 
 **身份状态变更记录（历史不倒签）：**
 
@@ -353,7 +353,7 @@ s.pop("last", None)
 
 用法文案里列了 `auto` 是为了 `--new` 的可读性，不代表它是通用身份。
 
-轮转规则：`acct1 → acct2 → acct3 → acct4 → acct5 → acct6 → acct1 …` 均分（游标持久化在 `scripts/account-rotation.json`，只在登录态之间推进）。匿名仅在全部登录态都 429 时兜底，且创建后打印 `WARN` 提示不入历史。每次成功都把 `conv_id → 账号` 登记到 `scripts/conv-accounts.json`；之后投递/收割该会话、未显式指定 `--account` 时自动路由。
+轮转规则：动态发现的有效 acctN 按数字自然序均分（游标持久化在 `scripts/account-rotation.json`，只在当前有效登录态之间推进）。匿名仅在全部有效登录态都 429 时兜底，且创建后打印 `WARN` 提示不入历史。每次成功都把 `conv_id → 账号` 登记到 `scripts/conv-accounts.json`；之后投递/收割该会话、未显式指定 `--account` 时自动路由。
 
 轮转容错：
 
@@ -514,7 +514,7 @@ python scripts/chatgpt_send.py --proxy-clear                # 清掉 proxy.json 
 ```bash
 python scripts/mcp_connector.py inspect --url https://mcp.example.com/mcp
 python scripts/mcp_connector.py eligibility --account acct1
-python scripts/mcp_connector.py eligibility --accounts acct1,acct2,acct3,acct4,acct5,acct6
+python scripts/mcp_connector.py eligibility --accounts acct1,acct2,acct10
 python scripts/mcp_connector.py eligibility --account acct1 --capability CUSTOM_MCP_READ_FETCH
 ```
 
@@ -585,7 +585,7 @@ python scripts/chatgpt_send.py --work-item wi_<uuid> \
 
 输出是 JSON：`result` / `status` / `work_item_id` / `link` / `link_error`。`link` 成功时是 `{link_id, session_id}`；link 失败时 `link_error` 非空、`link` 为 null，而发送结果仍然保留（`status` 仍是 200），并多一个 `message` 提示需要手工关联。**两者分开报，不把一个折叠成另一个**。退出码 `0` 要求**发送成功且 link 已建**，只有其一时是 `1`。
 
-`--work-item --new` 强制要求显式登录账号（`--account acct1..acct6`）：给 `auto` 或 `nologin` 直接 `exit 2`，因为自动轮转与匿名通道发不出可信的 landing 证据。
+`--work-item --new` 强制要求显式登录账号（`--account acctN`）：给 `auto` 或 `nologin` 直接 `exit 2`，因为自动轮转与匿名通道发不出可信的 landing 证据。
 
 ## 故障速查
 

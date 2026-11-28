@@ -9514,7 +9514,7 @@ def _main_impl():
     # ---- 开新会话 ----
     if args[0] == "--new":
         if len(args) != 2:
-            print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin|auto] [--thinking] --new <prompt_file>", flush=True)
+            print("usage: [--account acctN|nologin|auto] [--thinking] --new <prompt_file>", flush=True)
             return 2
         if work_item_id is not None and (
             not explicit_account or account in ("auto", "nologin")
@@ -9525,7 +9525,7 @@ def _main_impl():
                         "result": "error",
                         "error": (
                             "--work-item --new requires an explicit logged-in "
-                            "--account acct1..acct6; automatic rotation and "
+                            "--account acctN; automatic rotation and "
                             "anonymous fallback cannot issue trusted landing evidence"
                         ),
                     },
@@ -9588,10 +9588,10 @@ def _main_impl():
     # ---- 既有会话：未显式指定身份时按登记归属路由 ----
     # 先做参数校验，别在缺参数时索引越界（曾导致 `--tail` 空参数直接 IndexError）
     if args[0] == "--list" and len(args) != 1:
-        print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin] --list", flush=True)
+        print("usage: [--account acctN|nologin] --list", flush=True)
         return 2
     if args[0] == "--tail" and len(args) != 2:
-        print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin] --tail <conv_id>", flush=True)
+        print("usage: [--account acctN|nologin] --tail <conv_id>", flush=True)
         return 2
     raw_id = args[1] if args[0] == "--tail" else (args[0] if not args[0].startswith("--") else "")
     conv_id = cli_id(raw_id) if raw_id else ""
@@ -9690,7 +9690,7 @@ def _main_impl():
             return 1
         return 0
     if len(args) != 2:
-        print("usage: [--account acct1|acct2|acct3|acct4|acct5|acct6|nologin] <conv_id> <prompt_file>", flush=True)
+        print("usage: [--account acctN|nologin] <conv_id> <prompt_file>", flush=True)
         return 2
     if work_item_id is not None:
         if account == "nologin":
