@@ -464,6 +464,66 @@ outside it.
 required; it is not part of the set above because `load_config()` does not
 read it.
 
+## 2c. Enabling MCP Events (explicit opt-in)
+
+MCP Events are disabled when `SO_MCP_EVENTS_KEY_FILE` is unset. Do not set
+`SO_MCP_EVENTS_DB` on its own: startup rejects that combination. The default
+is intentional — once the key is configured, the event outbox is created in
+the same SQLite file named by `SO_MCP_DB`, so a terminal WorkItem transition
+and its completion event remain one transaction.
+
+Provision the key once, as the service account, without overwriting an
+existing key:
+
+```bash
+sudo -u ubuntu sh -c '
+  set -eu
+  test ! -e /var/lib/so-mcp/events.key
+  umask 077
+  openssl rand -out /var/lib/so-mcp/events.key 32
+  chmod 0600 /var/lib/so-mcp/events.key
+'
+sudo stat -c '%U:%G %a %s %n' /var/lib/so-mcp/events.key
+```
+
+The required result is `ubuntu:ubuntu 600 32 /var/lib/so-mcp/events.key`.
+Never print or copy the key into a ticket, shell transcript, deployment
+manifest, or chat. Add this line to `/etc/so-mcp/so-mcp.env`:
+
+```ini
+SO_MCP_EVENTS_KEY_FILE=/var/lib/so-mcp/events.key
+```
+
+Leave `SO_MCP_EVENTS_DB` unset unless there is a specific operational reason
+to set it; if set, it must resolve to exactly the `SO_MCP_DB` file. The
+service validates the key file owner, restrictive mode, regular-file type,
+and exact 32-byte length at startup. The systemd unit already grants the
+service read/write access to `/var/lib/so-mcp`.
+
+### OAuth scope issuance is a separate gate
+
+The MCP resource metadata advertises the existing scopes
+`session_ops.chatgpt.session.read` and `session_ops.chatgpt.session.write`.
+Events do not introduce a separate OAuth scope: `events/list` requires the
+read scope, while `events/subscribe` and `events/unsubscribe` require the
+write scope. This is only the resource-server contract; it does not prove that
+the configured authorization server/client actually issues those scopes.
+
+Before enabling Events, obtain a token through the real ChatGPT OAuth flow
+and verify (without logging the token) that its verified `scope` claim
+contains both scopes. Also verify that the authorization server's client
+configuration permits them. A metadata `scopes_supported` response or a
+successful OAuth discovery response alone is not evidence of scope issuance.
+If either scope is absent, fix the authorization-server/client grant first;
+do not weaken the MCP checks or infer a grant from this repository's code.
+
+After provisioning, restart only in the approved deployment window and
+verify startup, the configured database identity, and callback HTTPS egress.
+Keep `SO_MCP_CHATGPT_MAINTENANCE=1` until the real ChatGPT Work subscription,
+idle-conversation callback/resumption, and unsubscribe acceptance test has
+passed. Provisioning the key alone is not authorization to enable production
+delivery.
+
 ### Deriving the realm namespace
 
 When `SO_MCP_REALM_NAMESPACE` is unset, the realm is taken from the issuer: the

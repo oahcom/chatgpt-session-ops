@@ -28,3 +28,14 @@ def test_service_uses_the_immutable_runtime_artifact():
     assert "Environment=CHATGPT_STATE_DIR=/var/lib/so-mcp/runtime" in service
     assert "Environment=CHATGPT_AUTH_DIR=/var/lib/so-mcp" in service
     assert "ReadWritePaths=/var/lib/so-mcp" in service
+
+
+def test_deploy_runbook_documents_events_opt_in_and_oauth_scope_gate():
+    root = Path(__file__).resolve().parents[1]
+    docs = (root / "docs" / "DEPLOY-so-mcp.md").read_text()
+    assert "SO_MCP_EVENTS_KEY_FILE" in docs
+    assert "SO_MCP_EVENTS_DB" in docs
+    assert "session_ops.chatgpt.session.read" in docs
+    assert "session_ops.chatgpt.session.write" in docs
+    assert "does not prove" in docs
+    assert "real ChatGPT Work" in docs
