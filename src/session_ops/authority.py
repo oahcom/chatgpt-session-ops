@@ -1810,13 +1810,13 @@ class SecureWorkItemStore:
             ).fetchone()
             if row is None:
                 self._operation_complete(
-                    conn, principal, "session.unlink", request_id, None
+                    conn, principal, "session.unlink", operation_id, None
                 )
                 conn.execute("COMMIT")
                 return None
             if expected_link_id is not None and row["link_id"] != expected_link_id:
                 self._operation_complete(
-                    conn, principal, "session.unlink", request_id, None
+                    conn, principal, "session.unlink", operation_id, None
                 )
                 conn.execute("COMMIT")
                 return None
@@ -1824,7 +1824,7 @@ class SecureWorkItemStore:
                 self._require_owner(conn, principal, row["work_item_id"])
             except NotAuthorized:
                 self._operation_complete(
-                    conn, principal, "session.unlink", request_id, None
+                    conn, principal, "session.unlink", operation_id, None
                 )
                 conn.execute("COMMIT")
                 return None
@@ -1849,7 +1849,7 @@ class SecureWorkItemStore:
                 "unlinked_at": now,
             }
             self._operation_complete(
-                conn, principal, "session.unlink", request_id, result
+                conn, principal, "session.unlink", operation_id, result
             )
             conn.execute("COMMIT")
             return SessionLink(**result)
