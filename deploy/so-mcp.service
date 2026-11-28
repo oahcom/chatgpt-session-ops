@@ -8,8 +8,8 @@ After=network-online.target
 [Service]
 Type=simple
 
-User=ubuntu
-Group=ubuntu
+User=chatgpt-sender
+Group=chatgpt-sender
 SupplementaryGroups=chatgpt-sender
 
 WorkingDirectory=/opt/so-mcp
@@ -17,6 +17,9 @@ WorkingDirectory=/opt/so-mcp
 EnvironmentFile=/etc/so-mcp/so-mcp.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=SO_SENDER_ACCOUNTS_DIR=/var/lib/chatgpt-session-ops/accounts
+Environment=CHATGPT_STATE_DIR=/var/lib/so-mcp/chatgpt-cli
+Environment=CHATGPT_PROXY_FILE=/opt/so-sender/cli/proxy.json
 
 ExecStart=/opt/so-mcp/.venv/bin/python -m scripts.run_mcp_server
 
