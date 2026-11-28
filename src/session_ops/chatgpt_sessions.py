@@ -67,8 +67,113 @@ class ChatGPTSessionRegistry:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (tenant_id, principal_id, operation, idempotency_key)
                 );
+                CREATE TABLE IF NOT EXISTS chatgpt_session_migrations (
+                    migration_name TEXT PRIMARY KEY,
+                    source_path TEXT NOT NULL,
+                    imported_rows INTEGER NOT NULL,
+                    applied_at TEXT NOT NULL
+                );
                 """
             )
+        finally:
+            conn.close()
+
+    def migrate_legacy_owners(self, legacy_database_path: str | Path) -> int:
+        """Import legacy Gateway session ownership once; never migrate jobs."""
+        source_path = Path(legacy_database_path)
+        if not source_path.is_file():
+            raise ChatGPTSessionRegistryError(
+                "DEPENDENCY_UNAVAILABLE", "legacy session ownership database is missing"
+            )
+        if source_path.resolve() == self.database_path.resolve():
+            raise ChatGPTSessionRegistryError(
+                "INVALID_ARGUMENT", "legacy and MCP databases must be different files"
+            )
+        source = sqlite3.connect(str(source_path), timeout=3.0)
+        source.row_factory = sqlite3.Row
+        try:
+            source.execute("PRAGMA query_only = ON")
+            table = source.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_owners'"
+            ).fetchone()
+            if table is None:
+                raise ChatGPTSessionRegistryError(
+                    "DEPENDENCY_UNAVAILABLE", "legacy database has no session_owners table"
+                )
+            required = {"conversation_id", "tenant_id", "principal_id", "account", "created_at"}
+            columns = {
+                row[1] for row in source.execute("PRAGMA table_info(session_owners)")
+            }
+            if not required.issubset(columns):
+                raise ChatGPTSessionRegistryError(
+                    "DEPENDENCY_UNAVAILABLE", "legacy session_owners schema is incomplete"
+                )
+            rows = source.execute(
+                "SELECT conversation_id, tenant_id, principal_id, account, created_at "
+                "FROM session_owners ORDER BY created_at, conversation_id"
+            ).fetchall()
+        finally:
+            source.close()
+
+        migration_name = "sender_gateway_session_owners_v1"
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            marker = conn.execute(
+                "SELECT imported_rows FROM chatgpt_session_migrations WHERE migration_name = ?",
+                (migration_name,),
+            ).fetchone()
+            if marker is not None:
+                conn.execute("COMMIT")
+                return int(marker["imported_rows"])
+            for row in rows:
+                conversation_id = row["conversation_id"]
+                tenant_id = row["tenant_id"]
+                principal_id = row["principal_id"]
+                account = row["account"]
+                created_at = row["created_at"] or _utc_now()
+                if (
+                    not isinstance(conversation_id, str)
+                    or not _CONVERSATION_ID.fullmatch(conversation_id)
+                    or not isinstance(tenant_id, str) or not tenant_id
+                    or not isinstance(principal_id, str) or not principal_id
+                    or not isinstance(account, str) or not _ACCOUNT_ID.fullmatch(account)
+                ):
+                    raise ChatGPTSessionRegistryError(
+                        "DEPENDENCY_UNAVAILABLE", "legacy session ownership contains an invalid row"
+                    )
+                existing = conn.execute(
+                    "SELECT tenant_id, principal_id, account FROM chatgpt_session_owners "
+                    "WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()
+                if existing is not None:
+                    if (
+                        existing["tenant_id"] != tenant_id
+                        or existing["principal_id"] != principal_id
+                        or existing["account"] != account
+                    ):
+                        raise ChatGPTSessionRegistryError(
+                            "CONFLICT", "legacy ownership conflicts with an existing MCP owner"
+                        )
+                    continue
+                conn.execute(
+                    "INSERT INTO chatgpt_session_owners "
+                    "(conversation_id, tenant_id, principal_id, account, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (conversation_id, tenant_id, principal_id, account, created_at),
+                )
+            conn.execute(
+                "INSERT INTO chatgpt_session_migrations "
+                "(migration_name, source_path, imported_rows, applied_at) VALUES (?, ?, ?, ?)",
+                (migration_name, str(source_path.resolve()), len(rows), _utc_now()),
+            )
+            conn.execute("COMMIT")
+            return len(rows)
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
         finally:
             conn.close()
 
