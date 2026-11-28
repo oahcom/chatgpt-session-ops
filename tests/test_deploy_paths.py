@@ -31,8 +31,10 @@ def test_service_uses_the_immutable_runtime_artifact():
     assert "Environment=CHATGPT_SESSION_OPS_RUNTIME_DIR=/var/lib/so-mcp/chatgpt-session-ops" in service
     assert "ReadWritePaths=/var/lib/so-mcp" in service
     assert "ReadOnlyPaths=/var/lib/chatgpt-session-ops/accounts" in service
-    assert "TimeoutStopSec=45" in service
+    assert "TimeoutStopSec=1900" in service
     assert "UMask=0077" in service
+    assert "Group=chatgpt-sender" in service
+    assert "ReadOnlyPaths=/var/lib/chatgpt-session-ops/accounts" in service
 
 
 def test_deploy_runbook_documents_events_opt_in_and_oauth_scope_gate():
