@@ -137,14 +137,36 @@ jobs:
           set -o pipefail
           python -m pytest -q tests/test_chatgpt_direct_client.py 2>&1 | tee direct-client-pytest.log
           python - <<'PY'
+          import ast
           from pathlib import Path
           import re
           import sys
 
-          expected = len(re.findall(
-              r"^def test_", Path("tests/test_chatgpt_direct_client.py").read_text(),
-              re.M,
-          ))
+          tree = ast.parse(Path("tests/test_chatgpt_direct_client.py").read_text())
+
+          def pytest_case_count(function):
+              count = 1
+              for decorator in function.decorator_list:
+                  if (isinstance(decorator, ast.Call)
+                          and isinstance(decorator.func, ast.Attribute)
+                          and decorator.func.attr == "parametrize"
+                          and len(decorator.args) >= 2):
+                      values = decorator.args[1]
+                      if isinstance(values, (ast.List, ast.Tuple)):
+                          count *= len(values.elts)
+              return count
+
+          expected = 0
+          for node in tree.body:
+              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_"):
+                  expected += pytest_case_count(node)
+              elif isinstance(node, ast.ClassDef):
+                  expected += sum(
+                      pytest_case_count(child)
+                      for child in node.body
+                      if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                      and child.name.startswith("test_")
+                  )
           output = Path("direct-client-pytest.log").read_text()
           match = re.search(r"(\d+) passed", output)
           passed = int(match.group(1)) if match else 0
