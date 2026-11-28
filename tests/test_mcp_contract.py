@@ -49,6 +49,7 @@ OTHER = "realm-b:other"
 
 WORK_ITEM_ID = "wi_12345678-1234-4234-8234-123456789abc"
 SESSION_ID = "12345678-1234-4234-8234-123456789abc"
+IDEMPOTENCY_KEY = "123e4567-e89b-42d3-a456-426614174000"
 LINK_ID = "sl_12345678-1234-4234-8234-123456789abc"
 
 ALL_SCOPES = (
@@ -246,9 +247,15 @@ class MCPContractTests(unittest.TestCase):
         self.auth = make_auth()
 
     def dispatch(self, name, arguments=None, service=None):
+        payload = dict(arguments or {})
+        if name in {
+            "work_item.create", "work_item.update", "work_item.finish",
+            "work_item.grant", "work_item.revoke", "session.link", "session.unlink",
+        }:
+            payload.setdefault("idempotency_key", str(uuid.uuid4()))
         return (service or self.service).dispatch(
             name,
-            arguments or {},
+            payload,
             self.auth,
             request_id="test-request",
         )
@@ -300,7 +307,11 @@ class MCPContractTests(unittest.TestCase):
         service = MCPToolService(store)
         result = service.dispatch(
             "work_item.finish",
-            {"work_item_id": WORK_ITEM_ID, "status": "completed"},
+            {
+                "work_item_id": WORK_ITEM_ID,
+                "status": "completed",
+                "idempotency_key": IDEMPOTENCY_KEY,
+            },
             make_auth(),
         )
         self.assertTrue(result["ok"])
@@ -787,23 +798,17 @@ class MCPContractTests(unittest.TestCase):
                 replay["data"]["work_item_id"], page[0].work_item_id
             )
 
-    def test_zero_json_rpc_request_id_is_preserved_for_idempotency(self):
+    def test_db_mutation_rejects_missing_caller_idempotency_key(self):
         with tempfile.TemporaryDirectory() as directory:
             store = SecureWorkItemStore(Path(directory) / "authority.sqlite3")
             store.initialize()
             service = MCPToolService(store)
-            first = service.dispatch(
-                "work_item.create", {}, self.auth, request_id=0,
-                request_session_id="zero-id-session"
+            result = service.dispatch(
+                "work_item.create", {}, self.auth, request_id="reusable-jsonrpc-id"
             )
-            replay = service.dispatch(
-                "work_item.create", {}, self.auth, request_id=0,
-                request_session_id="zero-id-session"
-            )
-            self.assertTrue(first["ok"], first)
-            self.assertEqual(replay["data"], first["data"])
+            self.assert_error(result, "INVALID_ARGUMENT")
             self.assertEqual(
-                len(store.list_work_items(Principal(TENANT, OWNER))), 1
+                len(store.list_work_items(Principal(TENANT, OWNER))), 0
             )
 
     def test_explicit_idempotency_key_replays_across_mcp_sessions(self):
@@ -825,28 +830,6 @@ class MCPContractTests(unittest.TestCase):
             self.assertEqual(replay["data"], first["data"])
             self.assertEqual(
                 len(store.list_work_items(Principal(TENANT, OWNER))), 1
-            )
-
-    def test_legacy_fallback_idempotency_is_scoped_to_mcp_session(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = SecureWorkItemStore(Path(directory) / "authority.sqlite3")
-            store.initialize()
-            service = MCPToolService(store)
-            first = service.dispatch(
-                "work_item.create", {}, self.auth,
-                request_id="reused-jsonrpc-id", request_session_id="mcp-session-one",
-            )
-            second = service.dispatch(
-                "work_item.create", {}, self.auth,
-                request_id="reused-jsonrpc-id", request_session_id="mcp-session-two",
-            )
-            self.assertTrue(first["ok"], first)
-            self.assertTrue(second["ok"], second)
-            self.assertNotEqual(
-                first["data"]["work_item_id"], second["data"]["work_item_id"]
-            )
-            self.assertEqual(
-                len(store.list_work_items(Principal(TENANT, OWNER))), 2
             )
 
     def test_explicit_idempotency_key_rejects_changed_arguments_across_sessions(self):
@@ -959,6 +942,7 @@ class MCPContractTests(unittest.TestCase):
                     "session_id": SESSION_ID,
                     "work_item_id": item.work_item_id,
                     "attempt_id": "att_" + str(uuid.uuid4()),
+                    "idempotency_key": str(uuid.uuid4()),
                 },
                 self.auth,
                 request_id="test-request",
@@ -1080,7 +1064,7 @@ class MCPContractTests(unittest.TestCase):
         service = MCPToolService(OversizedStore())
         result = service.dispatch(
             "work_item.create",
-            {},
+            {"idempotency_key": IDEMPOTENCY_KEY},
             self.auth,
             request_id="test-request",
         )

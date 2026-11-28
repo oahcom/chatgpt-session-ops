@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
+import subprocess
 import sys
+import time
 import tempfile
 import unittest
 import uuid
@@ -464,6 +467,111 @@ class OperationReceiptTests(Base):
         ]
         self.assertEqual(actions.count("work_item.grant"), 1)
         self.assertEqual(actions.count("work_item.revoke"), 1)
+
+    def test_process_restart_after_commit_before_response_replays_receipt(self):
+        operation_key = "stable-crash-recovery-1"
+        marker = Path(self._tmp.name) / "mutation-committed.marker"
+        child_code = r"""
+import sys, time
+from pathlib import Path
+from src.session_ops.authority import Principal, PrincipalRecord, SecureWorkItemStore, StaticPrincipalDirectory
+
+database_path, marker_path, operation_key = sys.argv[1:]
+directory = StaticPrincipalDirectory([PrincipalRecord("alice", "t1")])
+store = SecureWorkItemStore(database_path, principal_directory=directory)
+store.initialize()
+original_create = store.create_work_item
+
+def create_then_lose_response(*args, **kwargs):
+    result = original_create(*args, **kwargs)
+    # The SQLite transaction and receipt are committed; the caller never gets
+    # the result because the parent kills this process before it returns.
+    Path(marker_path).write_text("committed", encoding="ascii")
+    time.sleep(60)
+    return result
+
+store.create_work_item = create_then_lose_response
+store.create_work_item(
+    Principal("t1", "alice"),
+    request_id="before-crash-rpc",
+    idempotency_key=operation_key,
+)
+"""
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(ROOT) + os.pathsep + environment.get("PYTHONPATH", "")
+        process = subprocess.Popen(
+            [sys.executable, "-c", child_code, str(self.db), str(marker), operation_key],
+            cwd=str(ROOT),
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not marker.exists():
+                if process.poll() is not None:
+                    stdout, stderr = process.communicate()
+                    self.fail(f"child exited before commit marker: {stdout} {stderr}")
+                time.sleep(0.01)
+            self.assertTrue(marker.exists(), "child did not commit the mutation")
+            process.terminate()
+            stdout, stderr = process.communicate(timeout=10)
+            self.assertNotEqual(process.returncode, 0, "child was not terminated")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=10)
+
+        restarted = SecureWorkItemStore(
+            self.db, principal_directory=self.directory
+        )
+        restarted.initialize()
+        replay = restarted.create_work_item(
+            self.alice, request_id="after-restart-rpc", idempotency_key=operation_key
+        )
+        self.assertTrue(replay.work_item_id.startswith("wi_"))
+        conn = restarted._connect()
+        try:
+            self.assertEqual(
+                conn.execute("SELECT count(*) FROM work_items").fetchone()[0], 1
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT count(*) FROM authority_operation_receipts "
+                    "WHERE request_id = ? AND state = 'completed'",
+                    (operation_key,),
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            conn.close()
+
+    def test_update_and_finish_receipts_use_the_stable_idempotency_key(self):
+        item = self.store.create_work_item(self.alice)
+        updated = self.store.set_status(
+            self.alice, item.work_item_id, "paused",
+            request_id="update-rpc-1", idempotency_key="stable-update-1",
+        )
+        update_replay = self.store.set_status(
+            self.alice, item.work_item_id, "paused",
+            request_id="update-rpc-2", idempotency_key="stable-update-1",
+        )
+        self.assertEqual(update_replay, updated)
+        finished = self.store.finish_work_item(
+            self.alice, item.work_item_id, "completed",
+            request_id="finish-rpc-1", idempotency_key="stable-finish-1",
+        )
+        finish_replay = self.store.finish_work_item(
+            self.alice, item.work_item_id, "completed",
+            request_id="finish-rpc-2", idempotency_key="stable-finish-1",
+        )
+        self.assertEqual(finish_replay, finished)
+        with self.assertRaises(AuthorityError):
+            self.store.finish_work_item(
+                self.alice, item.work_item_id, "cancelled",
+                request_id="finish-rpc-3", idempotency_key="stable-finish-1",
+            )
 
     def test_session_link_and_unlink_receipts_survive_restart(self):
         item = self.store.create_work_item(self.alice)

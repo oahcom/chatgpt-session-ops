@@ -37,7 +37,7 @@ There is no re-encryption migration, so interrupted rotation and rotation rollba
 
 ## Lifecycle boundary
 
-`work_item.finish` is a narrow v0.1 Owner-only terminal operation. It prevents generic `work_item.update` from setting terminal statuses and atomically commits the terminal projection, audit, SessionLink unlink, request receipt, and optional completion Outbox event. It is not the full Owner Acceptance/cancellation model: there is no immutable Acceptance record bound to WorkItemSpec, Assignment, head SHA, and required Evidence, and cancellation has no separate immutable cancellation record or required reason. A delivered `chatgpt.job.completed` event is a terminal-state notification, not Acceptance evidence. Keep #196/#166 open until those lifecycle semantics are implemented; the event publisher must ultimately be called by the authoritative Acceptance/cancellation transaction.
+`work_item.finish` is a narrow v0.1 Owner-only terminal operation. It prevents generic `work_item.update` from setting terminal statuses and atomically commits the terminal projection, audit, SessionLink unlink, stable idempotency receipt, and optional completion Outbox event. It is not the full Owner Acceptance/cancellation model: there is no immutable Acceptance record bound to WorkItemSpec, Assignment, head SHA, and required Evidence, and cancellation has no separate immutable cancellation record or required reason. A delivered `chatgpt.job.completed` event is a terminal-state notification, not Acceptance evidence. Keep #196/#166 open until those lifecycle semantics are implemented; the event publisher must ultimately be called by the authoritative Acceptance/cancellation transaction.
 
 ## Direct ChatGPT execution
 
@@ -52,15 +52,15 @@ There is no re-encryption migration, so interrupted rotation and rotation rollba
 ## Reliability and security
 
 - Event creation and terminal WorkItem state commit or roll back together. A process crash cannot leave a completed WorkItem without its outbox event.
-- Tenant and principal identity come from verified MCP authentication, never from event payload arguments. Subscription identity includes the destination conversation and optional WorkItem filter. Owner-level aggregation is strictly scoped by the authenticated tenant/principal in the outbox query; another owner’s events cannot enter the subscription. Before each callback, current WorkItem read/write access for the event owner is rechecked; an authorization failure is terminal for that delivery and sends no callback.
+- Tenant and principal identity come from verified MCP authentication, never from event payload arguments. Subscription identity is the authenticated tenant/principal, event name, callback URL, and optional WorkItem filter; there is no caller-supplied destination conversation ID. Owner-level aggregation is strictly scoped by the authenticated tenant/principal in the outbox query; another owner’s events cannot enter the subscription. Before each callback, current WorkItem read/write access for the event owner is rechecked; an authorization failure is terminal for that delivery and sends no callback.
 - Subscription secrets are AES-GCM encrypted. Callback challenge verification and per-delivery Standard Webhooks signatures are enforced. Subscribe challenge I/O and unsubscribe database mutations run off the ASGI event loop.
 - Callback destinations require public HTTPS; DNS is validated and the selected public address is pinned for the request. Redirects and ambient proxies are not used.
 - Delivery uses leases, bounded retry/backoff, idempotent event IDs, and retention cleanup. A single dispatcher thread is supervised by the MCP ASGI lifespan.
-- Dispatcher shutdown waits at most 30 seconds for an in-flight operation and 3 seconds for thread exit. Uvicorn has a 5-second graceful request-shutdown budget. The 600-second systemd stop budget covers in-flight ChatGPT sends (up to 420 seconds), request drain, and bounded event drain.
+- Dispatcher shutdown waits at most 30 seconds for an in-flight operation and 3 seconds for thread exit. Uvicorn has a 5-second graceful request-shutdown budget. The 1900-second systemd stop budget covers in-flight ChatGPT sends (up to 1800 seconds), request drain, and bounded event drain.
 
 ## Verification
 
-- Latest tested code head: `212c0f5914f195fe6cf4a47a908f550304ff027f`.
-- GitHub Actions CI run **#872** on this exact code head passed all four jobs: unit tests (**1,377 run, 7 skipped**), tools/tests guards, real MCP SDK integration (**6 passed**), and real memory-stdio E2E.
-- The tested head includes immutable Events key binding/recovery, owner-shared destination routing, aggregate secret-free `/readyz` metrics, transaction-coupled mutation receipts, read-only credential-vault preflight, and explicit graceful shutdown of the in-process ChatGPT executor.
-- Earlier local full-suite verification on `786c4f0`: **1,359 passed, 13 skipped, 1,587 subtests passed**. Python compilation, `git diff --check`, and systemd unit verification passed on that earlier local head; the latest exact code head is covered by CI.
+- Local full-suite run on the current source tree: **1,419 passed, 13 skipped, 1,612 subtests passed**. The unittest discovery pass ran **1,409 tests** with 13 expected skips; the direct-client pytest suite ran **20 passed**; tools/tests guards ran **58 passed**.
+- Python compilation and `git diff --check` passed. The SO-MCP unit has no unit-specific `systemd-analyze verify` errors; the host may emit unrelated warnings for other installed system units.
+- GitHub Actions run **#908** on ancestor head `091ca8a` passed all four jobs, including direct-client pytest, real MCP SDK integration, and real memory-stdio E2E. Run **#910** is validating parent head `90b9dc3`; the new exact PR head must receive its own green CI run before merge.
+- These checks do not replace real ChatGPT Work callback/resumption acceptance, actual OAuth scope verification, production deployment preflight, or the staged `TimeoutStopSec=1900` migration. PR #163 remains Draft until those external gates are closed.

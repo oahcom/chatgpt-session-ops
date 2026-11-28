@@ -371,7 +371,7 @@ TOOL_DESCRIPTIONS = {
     "work_item.finish": "Complete or cancel a WorkItem as its immutable owner; terminal state, session unlink, and completion event are atomic. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
     "work_item.grant": "Grant a same-tenant principal read or write access. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
     "work_item.revoke": "Revoke a same-tenant principal read or write access. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
-    "session.link": "Link a confirmed session to a visible WorkItem. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
+    "session.link": "Link a confirmed session to a visible WorkItem using its verified attempt_id. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
     "session.unlink": "Unlink the active session link if it is visible. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
     "session.list": "List sessions linked to a visible WorkItem.",
     "session.context": "Retrieve memory only through the authorized active session link.",
@@ -1307,23 +1307,20 @@ class MCPToolService:
             auth.require(*required_scopes_for_tool(name))
             principal = auth.principal
             normalized_arguments = arguments
-            if name in _DB_MUTATION_TOOLS or name in (
-                "chatgpt.session.create", "chatgpt.session.send"
-            ):
+            if name in ("chatgpt.session.create", "chatgpt.session.send"):
                 if arguments is None:
                     normalized_arguments = {}
                 if isinstance(normalized_arguments, Mapping):
                     normalized_arguments = dict(normalized_arguments)
-                    if name in _DB_MUTATION_TOOLS and not request_session_id:
-                        # Stateless legacy calls have no stable session scope.
-                        # Avoid collisions; cross-session retries must provide
-                        # a caller-stable idempotency_key.
-                        fallback_key = str(uuid.uuid4())
-                    else:
-                        fallback_key = _request_scoped_idempotency_key(
+                    normalized_arguments.setdefault(
+                        "idempotency_key",
+                        _request_scoped_idempotency_key(
                             name, principal, request_id, request_session_id
-                        )
-                    normalized_arguments.setdefault("idempotency_key", fallback_key)
+                        ),
+                    )
+            # WorkItem and SessionLink mutations never synthesize a durable key
+            # from JSON-RPC request_id. JSON-RPC ids are response-correlation
+            # values and may be reused; callers must provide a stable UUIDv4.
             args = _validate_arguments(name, normalized_arguments)
 
             if name == "work_item.create":

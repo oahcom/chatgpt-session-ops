@@ -145,30 +145,32 @@ def test_stop_cancels_waiting_futures_and_restart_recovers_durable_queue(tmp_pat
 
     recovered_started = threading.Event()
 
-    def recovered_run(_self, _row):
+    def recovered_run(_row):
         recovered_started.set()
         return {"conversation_id": "recovered", "account": "acct1", "receipt_durable": True}
 
-    with patch.object(ChatGPTDirectClient, "_run_operation", recovered_run):
+    # Recovery is submitted asynchronously in __init__; keep the static stub
+    # patched until the worker has completed the recovered job.
+    with patch.object(ChatGPTDirectClient, "_run_operation", staticmethod(recovered_run)):
         restarted = ChatGPTDirectClient(
             client.database_path,
             repository_root=client.repository_root,
             accounts_dir=client.accounts_dir,
             runtime_dir=client.runtime_dir,
         )
-        assert recovered_started.wait(1), "restart did not dispatch the durable queued job"
-    try:
-        deadline = time.time() + 2
-        while time.time() < deadline:
-            recovered = restarted.get_job(
-                principal_id="p1", tenant_id="t1", job_id=second["job_id"]
-            )
-            if recovered["status"] == "succeeded":
-                break
-            time.sleep(0.01)
-        assert recovered["status"] == "succeeded"
-    finally:
-        restarted.stop()
+        try:
+            assert recovered_started.wait(1), "restart did not dispatch the durable queued job"
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                recovered = restarted.get_job(
+                    principal_id="p1", tenant_id="t1", job_id=second["job_id"]
+                )
+                if recovered["status"] == "succeeded":
+                    break
+                time.sleep(0.01)
+            assert recovered["status"] == "succeeded"
+        finally:
+            restarted.stop()
 
 
 def test_default_send_queue_is_one_active_plus_eight_waiting(tmp_path):
