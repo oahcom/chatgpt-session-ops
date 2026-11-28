@@ -105,6 +105,8 @@ A proven `NOT_SUBMITTED` Attempt is terminal once its Sender Job has been create
 
 Sender's AccountRouter reservation is authoritative. CLI must use strict account-only create and must not rotate inside an already reserved Job. If an account is unavailable before POST, return proven `NOT_SUBMITTED`; any deliberate new reservation is a separately authorized Attempt. Preserve HTTP status, submission stage, candidate IDs, account echo, response digest, and archive completeness independently of process exit code.
 
+Out-of-band direct CLI invocations (for example, an administrative RMC process launching the CLI without a Sender Job) are not a v1 Worker/Reviewer execution path: they bypass the Sender Job ledger, AccountRouter reservation, Attempt correlation and WorkItem evidence. Normal Worker/Reviewer work must go through SO → Sender. An emergency direct invocation requires an explicit account-scoped maintenance fence and audit record; it cannot create trusted Assignment/SessionLink or Acceptance evidence.
+
 ## 5. Assignment reservation and crash recovery
 
 Before a remote provisioning side effect, SO preallocates immutable Assignment ID and monotonic generation and reserves the role slot using CAS in the same transaction as the Attempt/outbox. One canonical assignment-head/reservation projection per `(WorkItem, role)` tracks generation, active Assignment, provisioning Attempt, active Attempt, and revision. The projection is rebuildable from immutable events.
