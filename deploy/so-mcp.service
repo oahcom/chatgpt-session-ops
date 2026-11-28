@@ -9,7 +9,7 @@ After=network-online.target
 Type=simple
 
 User=ubuntu
-Group=ubuntu
+Group=chatgpt-sender
 
 WorkingDirectory=/opt/so-mcp
 
@@ -25,7 +25,7 @@ Restart=on-failure
 RestartSec=5s
 
 TimeoutStartSec=30
-TimeoutStopSec=600
+TimeoutStopSec=45
 UMask=0077
 KillSignal=SIGTERM
 
@@ -38,10 +38,11 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 
-# SO-MCP now invokes the repository's session engine directly. The account
-# vault is the only additional writable path; credentials remain owned by
-# chatgpt-sender and are group-accessible only to the SO-MCP service account.
-ReadWritePaths=/var/lib/so-mcp /var/lib/chatgpt-session-ops/accounts
+# The repository runtime is writable; the existing account vault is read-only.
+# Group=chatgpt-sender grants traversal/read access without granting the MCP
+# process permission to replace or mutate stored credentials.
+ReadWritePaths=/var/lib/so-mcp
+ReadOnlyPaths=/var/lib/chatgpt-session-ops/accounts
 
 [Install]
 WantedBy=multi-user.target

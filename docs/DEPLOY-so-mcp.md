@@ -198,20 +198,18 @@ The application tree is immutable at runtime. The service unit sets:
 - `CHATGPT_SESSION_OPS_ACCOUNTS_DIR=/var/lib/chatgpt-session-ops/accounts` for the credential vault. Credentials remain in the existing account directories and are not copied into the application tree.
 - `CHATGPT_SESSION_OPS_RUNTIME_DIR=/var/lib/so-mcp/chatgpt-session-ops` for mutable CLI state, prompt files, logs, and per-account runtime state.
 
-Prepare these directories before installing credentials or starting the
-service. They must be accessible to the `ubuntu` service account; credential
-files remain mode `0600`.
+The service runs as `User=ubuntu`, `Group=chatgpt-sender`. Keep the existing
+credential vault owned by `chatgpt-sender:chatgpt-sender` with directories
+mode `0750` and credential files mode `0660`; the service needs read/traverse
+access, not write access. The runtime directory is owned by `ubuntu:ubuntu`
+with mode `0700`. Do not recursively chown the existing vault to `ubuntu`.
 
 ```bash
 sudo install -d -o ubuntu -g ubuntu -m 0700 \
-  /var/lib/so-mcp/chatgpt-session-ops \
-  /var/lib/chatgpt-session-ops/accounts \
-  /var/lib/chatgpt-session-ops/accounts/acct1 \
-  /var/lib/chatgpt-session-ops/accounts/acct2 \
-  /var/lib/chatgpt-session-ops/accounts/acct3 \
-  /var/lib/chatgpt-session-ops/accounts/acct4 \
-  /var/lib/chatgpt-session-ops/accounts/acct5 \
-  /var/lib/chatgpt-session-ops/accounts/acct6
+  /var/lib/so-mcp/chatgpt-session-ops
+# Credentials and account directories are provisioned by the existing
+# account-management workflow. Do not recreate, chown, or chmod the vault here.
+sudo -u ubuntu -g chatgpt-sender test -r /var/lib/chatgpt-session-ops/accounts
 ```
 
 Do not put mutable rotation/ownership/proxy files or live credentials under
@@ -448,7 +446,7 @@ only the message and the traceback frame differ.
 
 `SO_MCP_DB` is only checked against the literal `:memory:`, not for being
 absolute; a relative path resolves against `WorkingDirectory=/opt/so-mcp`. The
-unit is `ProtectSystem=strict` with `ReadWritePaths=/var/lib/so-mcp /var/lib/chatgpt-session-ops/accounts`, so the database must live under `/var/lib/so-mcp` or SQLite fails to create its WAL files at runtime. The WorkItem database is also the Events outbox database; a separate Events database is rejected to preserve atomic terminal-state publication.
+unit is `ProtectSystem=strict` with `ReadWritePaths=/var/lib/so-mcp` and `ReadOnlyPaths=/var/lib/chatgpt-session-ops/accounts`. The database must live under `/var/lib/so-mcp` or SQLite fails to create its WAL files at runtime. The service's `chatgpt-sender` primary group grants read-only access to the existing credential vault; do not grant the MCP process write access to credentials. The WorkItem database is also the Events outbox database; a separate Events database is rejected to preserve atomic terminal-state publication.
 
 `CHATGPT_SESSION_OPS_ACCOUNTS_DIR` and `CHATGPT_SESSION_OPS_RUNTIME_DIR` are the only runtime path settings for the in-process direct client. Do not override them to point into `/opt/so-mcp`: the application tree is intentionally read-only.
 
@@ -535,6 +533,11 @@ then restart the single MCP service in the approved window; leases recover
 automatically after expiry. If the key/database pair is suspect, follow the
 immutable-key recovery procedure above rather than generating a replacement
 key in place.
+
+`TimeoutStopSec=45` leaves margin for the dispatcher's bounded shutdown: it
+waits at most 30 seconds for an in-flight callback/SQLite operation and 3
+seconds for its thread to exit. Keep this budget aligned with those code-level
+bounds.
 
 `/healthz` remains a liveness check; a 200 there does not imply event
 delivery readiness. Keep the dispatcher in-process; this endpoint adds no

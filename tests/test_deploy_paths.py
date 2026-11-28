@@ -26,10 +26,12 @@ def test_service_uses_the_immutable_runtime_artifact():
     assert "WorkingDirectory=/opt/so-mcp" in service
     assert "ExecStart=/opt/so-mcp/.venv/bin/python -m scripts.run_mcp_server" in service
     assert "SenderGatewayClient" not in service
+    assert "Group=chatgpt-sender" in service
     assert "Environment=CHATGPT_SESSION_OPS_ACCOUNTS_DIR=/var/lib/chatgpt-session-ops/accounts" in service
     assert "Environment=CHATGPT_SESSION_OPS_RUNTIME_DIR=/var/lib/so-mcp/chatgpt-session-ops" in service
-    assert "ReadWritePaths=/var/lib/so-mcp /var/lib/chatgpt-session-ops/accounts" in service
-    assert "TimeoutStopSec=600" in service
+    assert "ReadWritePaths=/var/lib/so-mcp" in service
+    assert "ReadOnlyPaths=/var/lib/chatgpt-session-ops/accounts" in service
+    assert "TimeoutStopSec=45" in service
     assert "UMask=0077" in service
 
 
