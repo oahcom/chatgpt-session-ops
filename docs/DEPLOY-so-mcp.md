@@ -1431,13 +1431,25 @@ and sets the target owner/group and mode:
 ```bash
 sudo python tools/migrate_sender_runtime_state.py \
   --source /opt/so-sender/cli \
-  --state /var/lib/chatgpt-session-ops
+  --state /var/lib/chatgpt-session-ops/mcp-state
 ```
 
-The service sets `SO_MCP_LEGACY_SENDER_DB` as read-only migration input. On first startup, the
-MCP process imports only the legacy `session_owners` mapping rows into
-`chatgpt_session_owners` in `SO_MCP_DB`, guarded by a one-time migration marker.
-It does not import legacy jobs or outbox events: those are historical Gateway
-records, not part of the synchronous execution contract. Keep the old database
-as an archive until the deployment has passed verification. Drain any queued
-or running jobs before disabling `so-sender.service`.
+Before the first start of the updated MCP, drain the old sender and wait
+until its `jobs` table has no `running` rows. Then stop `so-sender.service` so
+the source database is quiescent. Temporarily add this line to
+`/etc/so-mcp/so-mcp.env`:
+
+```bash
+SO_MCP_LEGACY_SENDER_DB=/var/lib/chatgpt-session-ops/state/sender-gateway.sqlite3
+```
+
+On first startup, the MCP process opens that database read-only and imports
+only legacy `session_owners` rows into `chatgpt_session_owners` in
+`SO_MCP_DB`, guarded by a one-time migration marker. It does not import legacy
+jobs, worker leases, or outbox events. Verify the imported count against the
+source table and confirm the migration marker exists. Then remove
+`SO_MCP_LEGACY_SENDER_DB` from `/etc/so-mcp/so-mcp.env` and restart MCP once;
+the steady-state service must not depend on the retired Gateway database.
+
+Keep the old database as an archive until the deployment has passed
+verification. Only then disable `so-sender.service` permanently.
