@@ -650,6 +650,7 @@ class MCPContractTests(unittest.TestCase):
                 "work_item_id": WORK_ITEM_ID,
                 "target_principal_id": "",
                 "scope": "read",
+                "idempotency_key": "123e4567-e89b-42d3-a456-426614174000",
             },
             "string argument too short",
         )
@@ -677,6 +678,7 @@ class MCPContractTests(unittest.TestCase):
                 "session_id": SESSION_ID,
                 "work_item_id": WORK_ITEM_ID,
                 "attempt_id": "att_not-a-uuid",
+                "idempotency_key": "123e4567-e89b-42d3-a456-426614174000",
             },
             "string argument has invalid format",
         )
