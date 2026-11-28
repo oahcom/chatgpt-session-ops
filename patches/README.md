@@ -36,3 +36,15 @@ The deployed-runtime and Sender Gateway tests are preserved under `patches/tests
   validation when legacy connectors omit the key. Same-request replay is
   deduplicated; a new request id is a new intent. Test with
   `PYTHONPATH=/opt/so-mcp pytest patches/tests/test_mcp_request_id_idempotency.py`.
+
+## Sender account-directory contract (isolated source patch)
+
+`sender-account-directory-contract.patch` applies from a clean `so-sender` source root. It adds `sender_gateway/account_directory.py` and makes Gateway discovery, CLI identity discovery, and `ChatGPTAPI` use the same resolver. The deployed runtime must include this new module alongside `sender_gateway/account_router.py`, `sender_gateway/app.py`, and `cli/chatgpt_send.py`; omitting it makes the CLI import fail.
+
+Contract:
+- `SO_SENDER_ACCOUNTS_DIR` is the directory containing `acctN` entries; `CHATGPT_AUTH_DIR` is the credential root.
+- `acct1` and `default` resolve to the auth root when it contains the credential pair. An `accounts/acct1` symlink to that root is accepted as the legacy Gateway discovery marker.
+- If the auth root has no acct1 credentials, a real `accounts/acct1` directory is accepted as the legacy `BASE/accounts` layout. If both root and a distinct real `accounts/acct1` contain credentials, resolution fails closed as ambiguous.
+- `acct2+` always resolve to `SO_SENDER_ACCOUNTS_DIR/acctN` (defaulting to `<auth-root>/accounts/acctN`). If `CHATGPT_AUTH_DIR` is absent, a configured accounts path named `accounts` implies its parent as auth root; another configured path is itself the auth root; with neither configured, CLI `BASE/accounts` is used.
+
+**Release gate:** production env values, effective service-user path access, and acct1 symlink/real-directory targets were not verified because production env and process-environment reads are permission-blocked. Before release, an authorized deployment operator must confirm the effective `SO_SENDER_ACCOUNTS_DIR` and `CHATGPT_AUTH_DIR`, inspect only path metadata and symlink targets (not credential contents), confirm that Gateway discovery and CLI credential loading resolve the same physical directories for acct1 and at least one acct2+, and include the new `account_directory.py` module in the deployed runtime. Isolated tests do not satisfy this production gate.

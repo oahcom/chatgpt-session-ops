@@ -30,11 +30,8 @@ class SenderChildAccountRootsTests(unittest.TestCase):
         self.gateway_dir.mkdir(parents=True)
         shutil.copy2(SNAPSHOT / "cli/chatgpt_send.py", self.cli_dir / "chatgpt_send.py")
         shutil.copy2(SNAPSHOT / "cli/pow_solver.py", self.cli_dir / "pow_solver.py")
-        shutil.copy2(
-            SNAPSHOT / "sender_gateway/sender_adapter.py",
-            self.gateway_dir / "sender_adapter.py",
-        )
-        (self.gateway_dir / "__init__.py").write_text("")
+        for source in (SNAPSHOT / "sender_gateway").glob("*.py"):
+            shutil.copy2(source, self.gateway_dir / source.name)
         applied = subprocess.run(
             ["patch", "--dry-run", "-p1", "-i", str(PATCH)],
             cwd=self.root, text=True, capture_output=True, check=False,
@@ -42,6 +39,17 @@ class SenderChildAccountRootsTests(unittest.TestCase):
         self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
         applied = subprocess.run(
             ["patch", "-p1", "-i", str(PATCH)],
+            cwd=self.root, text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+        resolver_patch = ROOT / "patches/sender-account-directory-contract.patch"
+        applied = subprocess.run(
+            ["patch", "--dry-run", "-p1", "-i", str(resolver_patch)],
+            cwd=self.root, text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)
+        applied = subprocess.run(
+            ["patch", "-p1", "-i", str(resolver_patch)],
             cwd=self.root, text=True, capture_output=True, check=False,
         )
         self.assertEqual(applied.returncode, 0, applied.stdout + applied.stderr)

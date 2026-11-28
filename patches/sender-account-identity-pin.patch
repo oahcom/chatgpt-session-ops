@@ -1,6 +1,18 @@
 --- a/so-sender/cli/chatgpt_send.py
 +++ b/so-sender/cli/chatgpt_send.py
-@@ -9350,6 +9350,21 @@
+@@ -8216,6 +8216,11 @@
+     账号隔离靠 Adapter 回显（X-Adapter-Account）验证：回显缺失或与指定账号
+     不符一律按失败处理，绝不报告成功。
+     """
++    # Validate at the helper boundary before constructing ChatGPTAPI.
++    if not validate_account_identity(account):
++        _cli_print_json({"event": "create_result", "ok": False,
++                         "reason": "invalid_account_identity", "account": account})
++        return 2
+     api, detail = _cli_open_api(account)
+     if api is None:
+         _cli_print_json({"event": "create_result", "ok": False,
+@@ -9350,6 +9355,21 @@
              )
              return 2
          if explicit_account and account != "auto":
@@ -22,7 +34,7 @@
              api = build(account)
              if api is None:
                  return 2
-@@ -9387,16 +9402,6 @@
+@@ -9387,16 +9407,6 @@
              if status == 200 and conv:
                  record_conv(conv, account, args[1])
                  print("NEW_CONV %s account=%s" % (conv, account), flush=True)
