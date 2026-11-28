@@ -1396,12 +1396,20 @@ sudo install -d -o chatgpt-sender -g chatgpt-sender -m 0700 \
 
 # Traverse the private parent and read account credentials without write access.
 sudo setfacl -m u:ubuntu:--x /var/lib/chatgpt-session-ops
+# acct1 is stored at CHATGPT_AUTH_DIR; all other accounts live below accounts/.
+sudo setfacl -m u:ubuntu:r-- /var/lib/chatgpt-session-ops/cookies.json \
+  /var/lib/chatgpt-session-ops/access_token.txt
 sudo setfacl -m u:ubuntu:r-x /var/lib/chatgpt-session-ops/accounts
 sudo find /var/lib/chatgpt-session-ops/accounts -type d -exec setfacl -m u:ubuntu:r-x {} +
 sudo find /var/lib/chatgpt-session-ops/accounts -type f -exec setfacl -m u:ubuntu:r-- {} +
 
-# The CLI writes reply archives, but never needs to overwrite credentials.
-sudo find /var/lib/chatgpt-session-ops/accounts -type d -name replies \
+# Pre-create reply directories: account directories themselves stay read-only.
+sudo install -d -o chatgpt-sender -g chatgpt-sender -m 0700 /var/lib/chatgpt-session-ops/replies
+for account in /var/lib/chatgpt-session-ops/accounts/acct*; do
+  [ -d "$account" ] || continue
+  sudo install -d -o chatgpt-sender -g chatgpt-sender -m 0700 "$account/replies"
+done
+sudo find /var/lib/chatgpt-session-ops -type d -name replies \
   -exec setfacl -m u:ubuntu:rwx,d:u:ubuntu:rwx {} +
 
 # Runtime state is writable; the legacy Gateway database is read-only.
@@ -1415,7 +1423,7 @@ a new account. Do not grant write access to `cookies.json` or
 `access_token.txt`.
 
 `CHATGPT_STATE_DIR` is `/var/lib/chatgpt-session-ops/mcp-state`;
-`SO_SENDER_ACCOUNTS_DIR` is `/var/lib/chatgpt-session-ops/accounts`;
+`CHATGPT_AUTH_DIR` is `/var/lib/chatgpt-session-ops` (the acct1 credential root); `SO_SENDER_ACCOUNTS_DIR` is `/var/lib/chatgpt-session-ops/accounts`;
 `CHATGPT_PROXY_FILE` is
 `/var/lib/chatgpt-session-ops/mcp-state/proxy.json`; and
 `SO_SENDER_ACCOUNT_LOCK_DIR` is
