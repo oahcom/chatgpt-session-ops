@@ -5,8 +5,8 @@ from types import SimpleNamespace
 from src.session_ops.authority import Principal
 from src.session_ops.mcp_auth import AuthContext
 from src.session_ops.mcp_server import (
-    MCPToolService, _mcp_session_id, _request_scoped_idempotency_key,
-    _validate_arguments,
+    MCPToolService, TOOL_SCHEMAS, _mcp_session_id,
+    _request_scoped_idempotency_key,
 )
 
 
@@ -62,8 +62,8 @@ def test_dispatch_replay_reuses_key_and_explicit_key_is_preserved():
                       {"prompt": "same intent", "idempotency_key": explicit},
                       auth, request_id="req-3", request_session_id="session-A")
     assert gateway.calls[3]["idempotency_key"] == explicit
-    assert "idempotency_key" not in _validate_arguments(
-        "chatgpt.session.send", {"prompt": "same intent"})
+    assert "idempotency_key" in TOOL_SCHEMAS["chatgpt.session.create"]["required"]
+    assert "idempotency_key" in TOOL_SCHEMAS["chatgpt.session.send"]["required"]
 
 
 def test_session_header_extraction():

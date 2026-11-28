@@ -8,12 +8,34 @@
  import json
  import re
  import sqlite3
-@@ -357,14 +358,14 @@
+@@ -313,9 +314,11 @@
+     ),
+ 
+     # The caller owns the stable key and must reuse it when recovering a
+-    # lost enqueue acknowledgement. A fresh key per invocation is not a retry.
++    # lost enqueue acknowledgement. Legacy clients are normalized from their
++    # MCP request id before this schema is validated.
+     "chatgpt.session.create": _object_schema(
+         {"account": _ACCOUNT, "idempotency_key": _IDEMPOTENCY_KEY},
++        ("idempotency_key",),
+     ),
+     "chatgpt.session.list": _object_schema({
+         "page_size": _PAGE_SIZE,
+@@ -328,7 +331,7 @@
+             "account": _ACCOUNT,
+             "idempotency_key": _IDEMPOTENCY_KEY,
+         },
+-        ("prompt",),
++        ("prompt", "idempotency_key"),
+     ),
+     "chatgpt.job.get": _object_schema(
+         {"job_id": _JOB_ID},
+@@ -357,14 +360,14 @@
      "session.list": "List sessions linked to a visible WorkItem.",
      "session.context": "Retrieve memory only through the authorized active session link.",
      "chatgpt.session.create": (
 -        "Queue creation of a remote ChatGPT session. Supply and reuse a UUIDv4 idempotency_key to deduplicate retries; older callers may omit it and the server will generate one for that enqueue attempt."
-+        "Queue creation of a remote ChatGPT session. Supply and reuse a UUIDv4 idempotency_key when available. If omitted by a legacy connector, the server derives one from the MCP session and JSON-RPC request id, so replaying the same request is deduplicated."
++        "Queue creation of a remote ChatGPT session. idempotency_key is required; reuse the same UUIDv4 for retries. Legacy connectors that omit it are normalized from the MCP session and JSON-RPC request id before validation."
      ),
      "chatgpt.session.list": (
          "List remote ChatGPT sessions owned by the authenticated principal."
@@ -21,11 +43,11 @@
      "chatgpt.session.send": (
          "Queue a prompt for a remote ChatGPT session and return a job id. "
 -        "Success means the job was persisted, not that the remote answered. Supply and reuse a UUIDv4 idempotency_key to deduplicate retries; older callers may omit it and the server will generate one for that enqueue attempt."
-+        "Success means the job was persisted, not that the remote answered. Supply and reuse a UUIDv4 idempotency_key when available. If omitted by a legacy connector, the server derives one from the MCP session and JSON-RPC request id, so replaying the same request is deduplicated."
++        "Success means the job was persisted, not that the remote answered. idempotency_key is required; reuse the same UUIDv4 for retries. Legacy connectors that omit it are normalized from the MCP session and JSON-RPC request id before validation."
      ),
      "chatgpt.job.get": "Get the status and result summary of a queued ChatGPT job.",
      "chatgpt.session.read": (
-@@ -701,6 +702,47 @@
+@@ -701,6 +704,47 @@
      }
  
  
@@ -73,7 +95,7 @@
  def _validate_arguments(name: str, arguments: Any) -> Dict[str, Any]:
      if name not in TOOL_SCHEMAS:
          raise ValueError("unknown tool")
-@@ -747,13 +789,6 @@
+@@ -747,13 +791,6 @@
      if "account" in properties and "account" not in supplied:
          supplied["account"] = "auto"
  
@@ -87,7 +109,7 @@
      if name == "chatgpt.session.read" and "limit" not in supplied:
          supplied["limit"] = 20
  
-@@ -1249,6 +1284,7 @@
+@@ -1249,6 +1286,7 @@
          auth: AuthContext,
          *,
          request_id: Optional[str] = None,
@@ -95,21 +117,29 @@
      ) -> Dict[str, Any]:
          """Execute one tool and always return the v0.1 envelope."""
          request_id = request_id or str(uuid.uuid4())
-@@ -1266,6 +1302,13 @@
+@@ -1264,8 +1302,20 @@
+                 )
+ 
              auth.require(*required_scopes_for_tool(name))
-             args = _validate_arguments(name, arguments)
+-            args = _validate_arguments(name, arguments)
              principal = auth.principal
-+            if (
-+                name in ("chatgpt.session.create", "chatgpt.session.send")
-+                and "idempotency_key" not in args
-+            ):
-+                args["idempotency_key"] = _request_scoped_idempotency_key(
-+                    name, principal, request_id, request_session_id
-+                )
++            normalized_arguments = arguments
++            if name in ("chatgpt.session.create", "chatgpt.session.send"):
++                if arguments is None:
++                    normalized_arguments = {}
++                if isinstance(normalized_arguments, Mapping):
++                    normalized_arguments = dict(normalized_arguments)
++                    normalized_arguments.setdefault(
++                        "idempotency_key",
++                        _request_scoped_idempotency_key(
++                            name, principal, request_id, request_session_id
++                        ),
++                    )
++            args = _validate_arguments(name, normalized_arguments)
  
              if name == "work_item.create":
                  result = self._run_db(
-@@ -1668,11 +1711,14 @@
+@@ -1668,11 +1718,14 @@
  
              loop = asyncio.get_running_loop()
  

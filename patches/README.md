@@ -30,8 +30,9 @@ The deployed-runtime and Sender Gateway tests are preserved under `patches/tests
 - `mcp-request-id-idempotency.patch` applies from `/opt/so-mcp` to live
   `src/session_ops/mcp_server.py` base SHA-256
   `4aebe295b53bdc14d99765f61eb1d526329bbacdb604f7dd4eed739439d4a82c`.
-  It preserves caller-supplied keys and derives a deterministic UUIDv4 from
-  authenticated tenant/principal, MCP session id, tool, and JSON-RPC request id
-  when legacy connectors omit the key. Same-request replay is deduplicated;
-  a new request id is a new intent. Test with
+  It marks `idempotency_key` required in the live tool schemas, preserves
+  caller-supplied keys, and derives a deterministic UUIDv4 from authenticated
+  tenant/principal, MCP session id, tool, and JSON-RPC request id before
+  validation when legacy connectors omit the key. Same-request replay is
+  deduplicated; a new request id is a new intent. Test with
   `PYTHONPATH=/opt/so-mcp pytest patches/tests/test_mcp_request_id_idempotency.py`.
