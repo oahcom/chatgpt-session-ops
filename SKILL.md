@@ -383,7 +383,7 @@ s.pop("last", None)
 | L1 读路径 | `--account <acct> --list` | token 被服务端接受，会话列表可拉 | 401 → 认证失效；403/429 → 风控；超时 → 网络 |
 | L2 写路径 | `--account <acct> --new <probe.txt>` | **完整链路可用**：PoW、发送、流式响应、落盘 | 才叫「不可用」 |
 
-L2 的探针文件内容写成 `Reply with exactly: PROBE_OK`，回复正文（`replies/reply-*.md` 去掉首行注释）应恰好是 `PROBE_OK`——**收到非空且符合预期的正文**才算通过，`status:200` 本身不算。单账号 L2 约 5–8 秒，六账号串行约 45 秒；L1 单账号 30–45 秒，六账号约 90 秒。**探针要设足前台 timeout 一次跑完（契约 CB-B9）**：不要短超时后台发射再结束回合——回合结束会把后台进程掐死，日志 0 字节即"从未投递"。
+L2 的探针文件内容写成 `Reply with exactly: PROBE_OK`，回复正文（`replies/reply-*.md` 去掉首行注释）应恰好是 `PROBE_OK`——**收到非空且符合预期的正文**才算通过，`status:200` 本身不算。单账号 L2 约 5–8 秒，六账号串行约 45 秒；L1 单账号 30–45 秒，六账号约 90 秒。**探针要设足前台 timeout 一次跑完（契约 CB-B9）**：不要短超时后台发射再结束回合。日志 0 字节本身不能证明 POST 未发生、后台进程已终止或投递失败；不得仅凭 0 字节判定未投递。
 
 故意不带 conversation_id。用于：各工作会话自产"Owner 裁决提示词"（自包含：背景、精确基线、待裁决项、可选裁决、记录格式）→ **原样**收集（回复中最长代码块，一字不改）→ 投递给全新 ChatGPT 会话扮演 Owner → 收割裁决记录（ACCEPT / ACCEPT WITH AMENDMENTS / NEEDS REVISION / REJECT + 理由 + 执行边界）→ 原文引用回灌工作会话。
 
@@ -601,7 +601,7 @@ python scripts/chatgpt_send.py --work-item wi_<uuid> \
 | 构建脚本 git HEAD 报旧 SHA / 产物指向旧树 | 同工作区有双 repo：`workspace/repo`（可能滞留旧头）vs `workspace/state/repo`（真头） | 构建/取证脚本显式指对 repo 路径；每次开工先 `git log -1` 确认头与预期一致 |
 | 413 conversation_too_large | 会话满员 | 新任务按契约 CB-A2 直接 `--new`，不要在满员会话硬发重试；确需续接的链走 `continue_full.py` 摘要续接 |
 | `TIMEOUT_PARTIAL after Ns, M bytes buffered, saved to <path>` | 投递超过本次发送预算（tier：非思考 420s / 思考 1800s；显式 `--timeout` / `CHATGPT_SEND_TIMEOUT` 覆盖，`600` 只是保留常量），已收内容落到 `<auth>/timeouts/` | 按契约 CB-A3：该轮正文按不完整处理，用 A12 raw mapping 补采；确需长等待时显式 `--timeout 1800` |
-| 投递日志 0 字节，或只有一行 `timeout: <N>s (source=cli\|env)` | 0 字节是默认 `--new` 路径 POST **之前**的正常状态（该路径不打印 `timeout:` 行）；`timeout:` 行只在显式配置 timeout 时打印，`source` 只会是 `cli`/`env`，**没有 `source=default` 这种发送日志** | 0 字节不能当「进程被掐」或「未发送」的证据；mtime<5 分钟也不构成 `NOT_SENT`（契约 CB-B7/B8/B9），等 `SEND` 行，判死只认 `judge_send_log()` |
+| 投递日志 0 字节，或只有一行 `timeout: <N>s (source=cli\|env)` | 0 字节是默认 `--new` 路径 POST **之前**的正常状态（该路径不打印 `timeout:` 行）；`timeout:` 行只在显式配置 timeout 时打印，`source` 只会是 `cli`/`env`，**没有 `source=default` 这种发送日志** | 0 字节本身不能证明 POST 未发生、进程已终止或投递失败。`judge_send_log()` 的 `NOT_SENT` 必须同时满足：日志大小 `< 200` 字节、日志年龄 `> 300` 秒、未检测到存活发送进程、`window_open` 为假，且日志中没有 `SEND` 或 `SEND_TRUNCATED` 行。`window_open` 仅在日志年龄 `<= 3600` 秒 **且** 首行以 `timeout:` 开头时为真。没有 prompt file 时，`live_senders(None)` 返回空列表并跳过进程检查；这不等于确认没有存活进程。只有进程枚举能力完全不可用、返回 `None` 时才触发 fail-closed；逐进程异常被跳过后得到的不完整列表不受该保护。不得仅凭 0 字节或 `mtime<5 分钟` 判定 `NOT_SENT`；最终判定必须依据 `judge_send_log()` 的实际结果（契约 CB-B7/B8/B9）。 |
 | **投递的代码正文里 `#[derive]` / `#[test]` / `#[cfg]` / markdown 标题全部消失** | 投递器把 `#` 开头行当注释删（旧版 `[l for l in text.splitlines() if not l.strip().startswith("#")]`）；Rust 属性行恰好全部以 `#` 开头 | 该行已改为只做空正文判定、不删任何行（2026-11-21）。**症状识别**：会话反馈"正文里没有属性行"时先查投递器，别怀疑会话。回归自检：投递前后 `text.count("#[derive")` 必须相等 |
 | 流读取为空 | `with` 提前关连接 | 读到 EOF（chatgpt_send.py 已正确处理） |
 | 输入框填入失败 | 用了 innerHTML 或裸赋值 | 文本域用原生 setter + InputEvent，或 CDP `Input.insertText` |
