@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -10,6 +11,8 @@ from unittest.mock import patch
 from src.session_ops.authority import Principal
 from src.session_ops.mcp_auth import AuthContext
 from src.session_ops.mcp_events import MCPEventsStore
+from src.session_ops.mcp_event_collector import MCPEventCollector
+from src.session_ops.mcp_event_dispatcher import MCPEventDispatcher
 from src.session_ops.mcp_server import MCPToolService, build_mcp_server
 from scripts.run_mcp_server import DeploymentASGI, _load_events_encryption_key, create_application
 
@@ -29,7 +32,7 @@ class TokenProvider:
         )
 
 
-async def _asgi_rpc(app, payload, session_id=None):
+async def _asgi_rpc(app, payload, session_id=None, *, disconnect_after=0.05):
     body = json.dumps(payload).encode()
     headers = [
         (b"authorization", b"Bearer test-token"),
@@ -62,7 +65,7 @@ async def _asgi_rpc(app, payload, session_id=None):
     }
 
     async def disconnect_later():
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(disconnect_after)
         disconnected.set()
 
     stopper = asyncio.create_task(disconnect_later())
@@ -78,6 +81,67 @@ async def _asgi_rpc(app, payload, session_id=None):
 
 
 class DeployedMCPEventsTests(unittest.TestCase):
+    def test_collector_isolates_bad_rows_and_still_acks_good_rows(self):
+        good = {
+            "event_id": "event-good", "job_id": "job-good", "tenant_id": "tenant-a",
+            "principal_id": "user-a", "name": "chatgpt.job.completed", "lease_token": "lease-good",
+            "payload": {"job_id": "job-good", "status": "succeeded", "summary": "done", "completed_at": "2026-11-28T12:00:00Z"},
+        }
+
+        class Sender:
+            def __init__(self):
+                self.acked = []
+            def claim_events(self, **_kwargs):
+                return {"items": [{"event_id": "event-bad"}, good]}
+            def ack_event(self, *, event_id, lease_token):
+                self.acked.append((event_id, lease_token))
+                return {"acknowledged": True}
+
+        class Store:
+            def __init__(self):
+                self.events = []
+            def publish_job_completed(self, *args, **kwargs):
+                self.events.append((args, kwargs))
+
+        sender, store = Sender(), Store()
+        collector = MCPEventCollector(sender, store, worker_id="test-dispatcher")
+        with patch("src.session_ops.mcp_event_collector.logging.exception") as log:
+            self.assertEqual(collector.run_once(), 1)
+        log.assert_called_once()
+        self.assertEqual(sender.acked, [("event-good", "lease-good")])
+        self.assertEqual(len(store.events), 1)
+
+    def test_dispatcher_runs_collection_delivery_and_cleanup_then_stops(self):
+        import threading
+
+        stop = threading.Event()
+        class Collector:
+            def __init__(self):
+                self.calls = 0
+            def run_once(self):
+                self.calls += 1
+                if self.calls == 2:
+                    stop.set()
+                return 0
+        class Store:
+            def __init__(self):
+                self.cleaned = 0
+                self.deliveries = 0
+            def cleanup_expired(self):
+                self.cleaned += 1
+            def deliver_pending(self, **kwargs):
+                self.deliveries += 1
+                self.asserted_limit = kwargs["limit"]
+                return 0
+
+        collector, store = Collector(), Store()
+        dispatcher = MCPEventDispatcher(collector, store, poll_seconds=0.05)
+        dispatcher._run(stop)
+        self.assertEqual(collector.calls, 2)
+        self.assertEqual(store.cleaned, 1)
+        self.assertEqual(store.deliveries, 2)
+        self.assertEqual(store.asserted_limit, 1)
+
     def test_events_key_file_requires_private_service_owned_raw_key(self):
         with tempfile.TemporaryDirectory(dir="/dev/shm") as tmp:
             key_file = Path(tmp) / "events.key"
@@ -226,6 +290,12 @@ class DeployedMCPEventsTests(unittest.TestCase):
 
                 secret = "whsec_" + base64.b64encode(b"w" * 32).decode()
                 with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
+                    async def heartbeat_tick():
+                        await asyncio.sleep(0.01)
+                        return time.monotonic()
+
+                    heartbeat_started = time.monotonic()
+                    heartbeat = asyncio.create_task(heartbeat_tick())
                     status, _headers, subscribed = await _asgi_rpc(app, {
                         "jsonrpc": "2.0", "id": 3, "method": "events/subscribe",
                         "params": {
@@ -233,7 +303,9 @@ class DeployedMCPEventsTests(unittest.TestCase):
                             "delivery": {"mode": "webhook", "url": "https://events.example.test/callback", "secret": secret},
                             "ttlMs": None,
                         },
-                    }, session_id)
+                    }, session_id, disconnect_after=1.0)
+                    heartbeat_at = await heartbeat
+                    self.assertLess(heartbeat_at - heartbeat_started, 0.15)
                 self.assertEqual(status, 200)
                 self.assertTrue(subscribed["result"]["id"].startswith("sub_"))
                 self.assertIsNone(subscribed["result"]["refreshBefore"])
@@ -244,7 +316,7 @@ class DeployedMCPEventsTests(unittest.TestCase):
                         "name": "chatgpt.job.completed", "arguments": {"job_id": "job-not-owned"},
                         "delivery": {"mode": "webhook", "url": "https://events.example.test/callback", "secret": secret},
                     },
-                }, session_id)
+                }, session_id, disconnect_after=1.0)
                 self.assertEqual(status, 200)
                 self.assertEqual(denied["error"]["code"], -32602)
                 self.assertEqual(denied["error"]["data"]["reason"], "job_not_accessible")
@@ -260,12 +332,14 @@ class DeployedMCPEventsTests(unittest.TestCase):
                 self.assertEqual(unsubscribed["result"], {})
 
         with tempfile.TemporaryDirectory(dir="/dev/shm") as tmp:
+            def slow_post(_url, body, _headers):
+                time.sleep(0.2)
+                return 200, json.dumps({"challenge": json.loads(body)["challenge"]}).encode()
+
             store = MCPEventsStore(
                 str(Path(tmp) / "events.sqlite3"),
                 encryption_key=b"d" * 32,
-                post_json=lambda _url, body, _headers: (
-                    200, json.dumps({"challenge": json.loads(body)["challenge"]}).encode()
-                ),
+                post_json=slow_post,
             )
             class Sender:
                 def enqueue(self, **_kwargs):
@@ -275,6 +349,7 @@ class DeployedMCPEventsTests(unittest.TestCase):
                 def read_session(self, **_kwargs):
                     return {"messages": []}
                 def get_job(self, **kwargs):
+                    time.sleep(0.2)
                     if kwargs.get("job_id") == "job-not-owned":
                         class Denied(Exception):
                             code = "NOT_FOUND"

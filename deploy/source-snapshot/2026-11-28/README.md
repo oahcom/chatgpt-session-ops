@@ -4,8 +4,8 @@ This directory is a source-only reconstruction of the files read from the live
 `/opt/so-mcp` and `/opt/so-sender` trees on 2026-11-28 18:19–18:26 +08.
 The snapshot preserves the exact pre-change bytes of the deployed runtime files
 except for the three MCP Events modules and the Sender outbox/client/route
-changes described below. `BASE-SHA256SUMS` records the pre-feature production source hashes. `SHA256SUMS`
-records the current reconstructed tree after the Events changes.
+changes described below. `BASE-SHA256SUMS` records the pre-feature production source hashes.
+`SHA256SUMS` records the current reconstructed tree after the Events changes.
 
 ## Provenance
 
@@ -29,8 +29,8 @@ records the current reconstructed tree after the Events changes.
   `/internal/v1/events/{event_id}/ack` routes. The dispatcher identity is
   `session_ops:event-dispatcher` in tenant `session_ops`.
 - The MCP Sender client uses its existing mTLS + signed identity path for claim
-  and ack. MCP Events store, collector, single in-process event dispatcher, MCP protocol handlers,
-  and ASGI lifecycle wiring are included from the tested project implementation.
+  and ack. MCP Events store, collector, single in-process event dispatcher, MCP
+  protocol handlers, and ASGI lifecycle wiring are included from the tested project implementation.
 
 ## Validation
 

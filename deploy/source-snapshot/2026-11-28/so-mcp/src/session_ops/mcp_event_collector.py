@@ -1,6 +1,7 @@
 """MCP-side polling bridge from the Sender Gateway outbox into MCP Events."""
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 from typing import Any
 

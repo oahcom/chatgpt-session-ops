@@ -1739,32 +1739,34 @@ def build_mcp_server(
                 raise AuthenticationError("verified authentication context required")
             if "session_ops.chatgpt.session.write" not in auth.scopes:
                 raise ScopeError(("session_ops.chatgpt.session.write",))
-            arguments = params.arguments or {}
+            subscription_params = params.model_dump(by_alias=True, exclude_unset=True)
+            arguments = subscription_params.get("arguments") or {}
             job_id = arguments.get("job_id")
-            if job_id is not None:
-                if sender_gateway is None:
-                    from mcp.shared.exceptions import MCPError
-                    raise MCPError(code=-32003, message="Event authorization service unavailable")
-                try:
-                    sender_gateway.get_job(
-                        principal_id=auth.principal.principal_id,
-                        tenant_id=auth.principal.tenant_id,
-                        job_id=job_id,
-                    )
-                except Exception as exc:
-                    if getattr(exc, "code", None) in ("NOT_FOUND", "PERMISSION_DENIED"):
+
+            def create_subscription() -> Any:
+                if job_id is not None:
+                    if sender_gateway is None:
                         from mcp.shared.exceptions import MCPError
-                        raise MCPError(
-                            code=-32602,
-                            message="Invalid event subscription",
-                            data={"reason": "job_not_accessible"},
-                        ) from exc
-                    raise
+                        raise MCPError(code=-32003, message="Event authorization service unavailable")
+                    try:
+                        sender_gateway.get_job(
+                            principal_id=auth.principal.principal_id,
+                            tenant_id=auth.principal.tenant_id,
+                            job_id=job_id,
+                        )
+                    except Exception as exc:
+                        if getattr(exc, "code", None) in ("NOT_FOUND", "PERMISSION_DENIED"):
+                            from mcp.shared.exceptions import MCPError
+                            raise MCPError(
+                                code=-32602,
+                                message="Invalid event subscription",
+                                data={"reason": "job_not_accessible"},
+                            ) from exc
+                        raise
+                return events_store.subscribe(auth, subscription_params)
+
             try:
-                return events_store.subscribe(
-                    auth,
-                    params.model_dump(by_alias=True, exclude_unset=True),
-                )
+                return await asyncio.to_thread(create_subscription)
             except CallbackEndpointError as exc:
                 from mcp.shared.exceptions import MCPError
                 raise MCPError(
