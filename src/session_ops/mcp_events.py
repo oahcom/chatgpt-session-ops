@@ -19,6 +19,7 @@ import urllib.error
 import urllib.request
 import uuid
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.exceptions import InvalidTag
 from src.session_ops.authority import UnconfirmedSession, validate_conversation_id
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -36,6 +37,7 @@ DEFAULT_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_TTL_SECONDS = 90 * 24 * 60 * 60
 MAX_DELIVERY_ATTEMPTS = 5
 DELIVERY_LEASE_SECONDS = 30
+_KEY_CHECK_CONTEXT = b"chatgpt-session-ops:mcp-events:encryption-key-check:v1"
 
 
 class CallbackEndpointError(Exception):
@@ -128,6 +130,7 @@ class MCPEventsStore:
         if encryption_key is None or not isinstance(encryption_key, bytes) or len(encryption_key) != 32:
             raise ValueError("a 32-byte encryption_key is required for subscription secret storage")
         self._cipher = AESGCM(encryption_key)
+        self._key_check = hmac.digest(encryption_key, _KEY_CHECK_CONTEXT, "sha256")
         if database != ":memory:":
             path = Path(database)
             path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -140,6 +143,10 @@ class MCPEventsStore:
                 """
                 PRAGMA journal_mode=WAL;
                 PRAGMA synchronous=FULL;
+                CREATE TABLE IF NOT EXISTS event_key_metadata (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                    key_check BLOB NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS event_subscriptions (
                     id TEXT PRIMARY KEY,
                     tenant_id TEXT NOT NULL,
@@ -193,6 +200,38 @@ class MCPEventsStore:
             delivery_columns = {row["name"] for row in db.execute("PRAGMA table_info(event_deliveries)")}
             if "generation" not in delivery_columns:
                 db.execute("ALTER TABLE event_deliveries ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+            key_metadata = db.execute(
+                "SELECT key_check FROM event_key_metadata WHERE singleton=1"
+            ).fetchone()
+            if key_metadata is None:
+                # Upgrade older event databases only after proving that the
+                # supplied key can decrypt every existing subscription secret.
+                encrypted_rows = db.execute(
+                    "SELECT id, secret_enc, secret_prev_enc FROM event_subscriptions"
+                ).fetchall()
+                try:
+                    for encrypted_row in encrypted_rows:
+                        self._decrypt_secret(encrypted_row["id"], encrypted_row["secret_enc"])
+                        if encrypted_row["secret_prev_enc"] is not None:
+                            self._decrypt_secret(encrypted_row["id"], encrypted_row["secret_prev_enc"])
+                except (InvalidTag, ValueError, UnicodeDecodeError) as exc:
+                    raise RuntimeError(
+                        "MCP Events encryption key does not decrypt existing subscriptions; "
+                        "restore the matching key or require re-subscription"
+                    ) from exc
+                db.execute(
+                    "INSERT INTO event_key_metadata(singleton, key_check) VALUES (1, ?)",
+                    (self._key_check,),
+                )
+            elif (
+                not isinstance(key_metadata["key_check"], bytes)
+                or len(key_metadata["key_check"]) != 32
+                or not hmac.compare_digest(key_metadata["key_check"], self._key_check)
+            ):
+                raise RuntimeError(
+                    "MCP Events encryption key does not match the database; "
+                    "restore the matching key or require re-subscription"
+                )
             # Legacy unscoped subscriptions have no explicit destination.
             # Disable them and cancel only their pending deliveries; never
             # reinterpret historical outbox rows or fan them out broadly.

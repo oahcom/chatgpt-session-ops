@@ -1,6 +1,8 @@
 """Protocol and storage tests for the isolated ChatGPT MCP Events PoC."""
 import base64
 import json
+import os
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -90,6 +92,101 @@ class MCPEventsStoreTests(unittest.TestCase):
         with self.store._db() as db:
             stored = db.execute("SELECT secret_enc FROM event_subscriptions").fetchone()[0]
         self.assertNotIn(self.delivery["secret"].encode(), bytes(stored))
+
+    def test_database_rejects_a_replacement_encryption_key(self):
+        with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
+            subscription = self.subscribe()
+        self.assertTrue(subscription["id"].startswith("sub_"))
+        with self.store._db() as db:
+            before = db.execute(
+                "SELECT active, secret_enc FROM event_subscriptions WHERE id=?",
+                (subscription["id"],),
+            ).fetchone()
+            key_check_before = db.execute(
+                "SELECT key_check FROM event_key_metadata WHERE singleton=1"
+            ).fetchone()[0]
+        with self.assertRaisesRegex(RuntimeError, "encryption key does not match the database"):
+            MCPEventsStore(self.db, post_json=self.callback.post, encryption_key=b"x" * 32)
+        with self.store._db() as db:
+            after = db.execute(
+                "SELECT active, secret_enc FROM event_subscriptions WHERE id=?",
+                (subscription["id"],),
+            ).fetchone()
+            key_check_after = db.execute(
+                "SELECT key_check FROM event_key_metadata WHERE singleton=1"
+            ).fetchone()[0]
+        self.assertEqual(tuple(after), tuple(before))
+        self.assertEqual(key_check_after, key_check_before)
+
+    def test_legacy_database_checks_existing_secrets_before_recording_key(self):
+        with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
+            self.subscribe()
+        with self.store._db() as db:
+            db.execute("DROP TABLE event_key_metadata")
+
+        with self.assertRaisesRegex(RuntimeError, "does not decrypt existing subscriptions"):
+            MCPEventsStore(self.db, post_json=self.callback.post, encryption_key=b"x" * 32)
+
+        restored = MCPEventsStore(self.db, post_json=self.callback.post, encryption_key=b"k" * 32)
+        with restored._db() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM event_key_metadata").fetchone()[0], 1)
+
+    def test_sqlite_backup_restores_subscriptions_and_callback_secrets_with_same_key(self):
+        with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
+            self.subscribe()
+        self.store.publish_job_completed(
+            "tenant-a", "issuer:user-a", "job-backup", "Finished",
+            event_id="evt_backup_restore",
+        )
+
+        backup_path = str(Path(self.tmp.name) / "restored" / "events.sqlite3")
+        Path(backup_path).parent.mkdir(mode=0o700)
+        source = sqlite3.connect(self.db)
+        destination = sqlite3.connect(backup_path)
+        try:
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+        os.chmod(backup_path, 0o600)
+
+        restored_callback = FakeCallback()
+        restored = MCPEventsStore(
+            backup_path,
+            post_json=restored_callback.post,
+            encryption_key=b"k" * 32,
+        )
+        self.assertEqual(restored.deliver_pending(), 1)
+        event_requests = [
+            (body, headers)
+            for _url, body, headers in restored_callback.requests
+            if json.loads(body).get("type") != "verification"
+        ]
+        self.assertEqual(len(event_requests), 1)
+        body, headers = event_requests[0]
+        self.assertEqual(json.loads(body)["data"]["job_id"], "job-backup")
+        self.assertTrue(headers["webhook-signature"].startswith("v1,"))
+
+    def test_lost_key_recovery_discards_subscriptions_but_preserves_workitem_events(self):
+        with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
+            self.subscribe()
+        self.store.publish_job_completed(
+            "tenant-a", "issuer:user-a", "job-key-loss", "Finished",
+            event_id="evt_key_loss",
+        )
+        with self.store._db() as db:
+            db.execute("DELETE FROM event_deliveries")
+            db.execute("DELETE FROM event_subscriptions")
+            db.execute("DELETE FROM callback_verifications")
+            db.execute("DELETE FROM event_key_metadata")
+
+        recovered = MCPEventsStore(self.db, post_json=self.callback.post, encryption_key=b"n" * 32)
+        with recovered._db() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM event_subscriptions").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT count(*) FROM event_deliveries").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT count(*) FROM callback_verifications").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT count(*) FROM event_key_metadata").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT count(*) FROM event_outbox WHERE event_id='evt_key_loss'").fetchone()[0], 1)
 
     def test_callback_challenge_mismatch_rejects_subscription(self):
         self.store.post_json = lambda url, body, headers: (200, b'{"challenge":"wrong"}')
