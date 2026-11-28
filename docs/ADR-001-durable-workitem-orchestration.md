@@ -85,7 +85,7 @@ A proven `NOT_SUBMITTED` Attempt may be requeued only through an explicit safe t
 ### Current remote operation shapes
 
 - `session.create` is one consequential remote POST to `/backend-api/conversation` containing both conversation creation and the fixed bootstrap prompt (`ping`). SSE parsing, optional GET verification, harvest/archive, and SO landing follow that POST. One provisioning Attempt may cause at most one remote POST for its entire lifetime.
-- HTTP 200 without one unique verified conversation ID is `remote_accepted_id_unresolved` / `UNKNOWN` with certainty `SUBMITTED`; it is never a safe retry or account-rotation signal. If account echo is missing/mismatched but a candidate ID exists, preserve the ID and quarantine the orphan.
+- HTTP 200 without one unique verified conversation ID is `remote_accepted_id_unresolved`: Attempt side-effect certainty is `SUBMITTED` (the remote POST was accepted), while Session identity resolution remains `UNKNOWN`; it is never a safe retry or account-rotation signal. If account echo is missing/mismatched but a candidate ID exists, preserve the ID and quarantine the orphan.
 - `session.send` is one prompt submission against an existing confirmed Assignment Session. WorkItem v2 rejects a missing conversation ID. The legacy v0.1 compound create+bootstrap+task-send path is not a WorkItem Attempt.
 - `session.read` is read-only and does not create an Attempt. Its result is reconciliation evidence only when tied to a verifiable Sender receipt or authoritative upstream snapshot/high-water/digest; one page or absence from one page does not prove no side effect.
 
