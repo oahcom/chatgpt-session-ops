@@ -167,6 +167,29 @@ class MCPChatGPTToolTests(unittest.TestCase):
         self.assertEqual(second["error"]["code"], "INVALID_ARGUMENT")
         send.assert_called_once()
 
+
+    def test_success_without_conversation_id_is_outcome_unknown(self):
+        service = MCPToolService(FakeStore())
+
+        def create(_prompt_path, *, work_item_context, account):
+            work_item_context.update({
+                "status": 200,
+                "account": "acct3",
+                "conversation_id": None,
+                "link": None,
+                "link_error": None,
+            })
+            return 0
+
+        with mock.patch("scripts.chatgpt_send.create_chat_rotating", side_effect=create):
+            result = service.dispatch(
+                "chatgpt.session.send",
+                {"work_item_id": WORK_ITEM_ID, "prompt": "start", "attempt_id": ATTEMPT_ID},
+                make_auth("session_ops.session.write", "session_ops.work_item.write"),
+            )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["status"], "outcome_unknown")
+
     def test_send_existing_conversation_requires_active_work_item_link(self):
         service = MCPToolService(FakeStore())
         with mock.patch("scripts.chatgpt_send.send_prompt") as send:

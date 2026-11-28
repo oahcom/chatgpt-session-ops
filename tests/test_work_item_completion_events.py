@@ -381,3 +381,51 @@ class WorkItemCompletionEventTests(unittest.TestCase):
                 "att_62345678-1234-4234-8234-123456789abc",
                 request_hash="e" * 64,
             )
+
+    def test_sent_unlinked_attempt_is_resolved_by_trusted_session_link(self):
+        from src.session_ops.authority import InvalidTransition
+
+        item = self.store.create_work_item(self.principal)
+        attempt_id = "att_72345678-1234-4234-8234-123456789abc"
+        session_id = "32345678-1234-4234-8234-123456789abc"
+        self.store.reserve_send_attempt(
+            self.principal, item.work_item_id, attempt_id, request_hash="f" * 64
+        )
+        self.store.complete_send_attempt(
+            self.principal,
+            item.work_item_id,
+            attempt_id,
+            status="sent_unlinked",
+            conversation_id=session_id,
+            account="acct2",
+            http_status=200,
+        )
+        with self.assertRaises(InvalidTransition):
+            self.store.reserve_send_attempt(
+                self.principal,
+                item.work_item_id,
+                "att_82345678-1234-4234-8234-123456789abc",
+                request_hash="0" * 64,
+            )
+
+        self.store._record_trusted_landing(
+            session_id,
+            match="confirmed",
+            evidence_complete=True,
+            work_item_id=item.work_item_id,
+            attempt_id=attempt_id,
+        )
+        self.store.link_session(self.principal, session_id, item.work_item_id, attempt_id)
+        with self.events._db() as db:
+            row = db.execute(
+                "SELECT status FROM work_item_send_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        self.assertEqual(row["status"], "sent")
+        created, _next = self.store.reserve_send_attempt(
+            self.principal,
+            item.work_item_id,
+            "att_92345678-1234-4234-8234-123456789abc",
+            request_hash="1" * 64,
+        )
+        self.assertTrue(created)
