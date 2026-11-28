@@ -33,8 +33,7 @@ MAX_CALLBACK_RESPONSE_BYTES = 4096
 DEFAULT_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_TTL_SECONDS = 90 * 24 * 60 * 60
 MAX_DELIVERY_ATTEMPTS = 5
-# Bound subscribe-time recovery so a new subscription cannot replay an unbounded history.
-SUBSCRIPTION_BACKFILL_SECONDS = 24 * 60 * 60
+DELIVERY_LEASE_SECONDS = 30
 
 
 class CallbackEndpointError(Exception):
@@ -149,6 +148,7 @@ class MCPEventsStore:
                     secret_prev_until INTEGER,
                     expires_at INTEGER,
                     active INTEGER NOT NULL DEFAULT 1,
+                    generation INTEGER NOT NULL DEFAULT 1,
                     created_at INTEGER NOT NULL,
                     UNIQUE(tenant_id, principal_id, name, arguments_json, callback_url)
                 );
@@ -165,7 +165,7 @@ class MCPEventsStore:
                     principal_id TEXT NOT NULL,
                     name TEXT NOT NULL,
                     data_json TEXT NOT NULL,
-                    created_at INTEGER NOT NULL
+                    created_at REAL NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS event_deliveries (
                     event_id TEXT NOT NULL,
@@ -176,12 +176,19 @@ class MCPEventsStore:
                     last_status INTEGER,
                     lease_until INTEGER,
                     lease_token TEXT,
+                    generation INTEGER NOT NULL DEFAULT 1,
                     PRIMARY KEY(event_id, subscription_id),
                     FOREIGN KEY(event_id) REFERENCES event_outbox(event_id),
                     FOREIGN KEY(subscription_id) REFERENCES event_subscriptions(id) ON DELETE CASCADE
                 );
                 """
             )
+            subscription_columns = {row["name"] for row in db.execute("PRAGMA table_info(event_subscriptions)")}
+            if "generation" not in subscription_columns:
+                db.execute("ALTER TABLE event_subscriptions ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
+            delivery_columns = {row["name"] for row in db.execute("PRAGMA table_info(event_deliveries)")}
+            if "generation" not in delivery_columns:
+                db.execute("ALTER TABLE event_deliveries ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
         if database != ":memory:":
             os.chmod(database, 0o600)
 
@@ -286,6 +293,7 @@ class MCPEventsStore:
             )
 
     def subscribe(self, auth: Any, params: Mapping[str, Any]) -> dict[str, Any]:
+        request_started_at = float(self.clock())
         tenant_id, principal_id = self._identity(auth)
         name = params.get("name")
         arguments = params.get("arguments") or {}
@@ -322,12 +330,22 @@ class MCPEventsStore:
         now = int(self.clock())
         previous_secret_enc = None
         previous_secret_until = None
+        generation = 1
         with self._db() as db:
             existing = db.execute(
-                "SELECT secret_enc, secret_prev_enc, secret_prev_until FROM event_subscriptions WHERE id=?",
+                "SELECT secret_enc, secret_prev_enc, secret_prev_until, active, generation FROM event_subscriptions WHERE id=?",
                 (subscription_id,),
             ).fetchone()
             if existing is not None:
+                generation = int(existing["generation"])
+                if existing["active"] == 0:
+                    # Unsubscribe already advanced the generation.
+                    db.execute(
+                        """UPDATE event_deliveries SET status='failed', last_status=410,
+                           next_attempt_at=0, lease_until=NULL, lease_token=NULL
+                           WHERE subscription_id=? AND status IN ('pending','sending')""",
+                        (subscription_id,),
+                    )
                 existing_secret = self._decrypt_secret(subscription_id, existing["secret_enc"])
                 if not hmac.compare_digest(existing_secret, secret):
                     previous_secret_enc = existing["secret_enc"]
@@ -338,35 +356,32 @@ class MCPEventsStore:
             db.execute(
                 """INSERT INTO event_subscriptions
                 (id, tenant_id, principal_id, name, arguments_json, callback_url, secret_enc,
-                 secret_prev_enc, secret_prev_until, expires_at, active, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                 secret_prev_enc, secret_prev_until, expires_at, active, generation, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
                 ON CONFLICT(tenant_id, principal_id, name, arguments_json, callback_url)
                 DO UPDATE SET secret_enc=excluded.secret_enc,
                               secret_prev_enc=excluded.secret_prev_enc,
                               secret_prev_until=excluded.secret_prev_until,
-                              expires_at=excluded.expires_at, active=1""",
+                              expires_at=excluded.expires_at, active=1,
+                              generation=excluded.generation""",
                 (subscription_id, tenant_id, principal_id, name, canonical_arguments, callback_url,
-                 encrypted_secret, previous_secret_enc, previous_secret_until, expires_at, now),
+                 encrypted_secret, previous_secret_enc, previous_secret_until, expires_at, generation, now),
             )
-            # Close the completion-vs-subscribe race: a fast job may complete
-            # after ChatGPT receives its job_id but before events/subscribe
-            # finishes callback verification and persistence. Backfill recent
-            # durable events for this exact owner and filter. The delivery PK
-            # makes repeated subscribe/refresh calls idempotent.
+            # Recover only completions racing with this subscribe request.
             recent_events = db.execute(
                 """SELECT event_id, data_json FROM event_outbox
                    WHERE tenant_id=? AND principal_id=? AND name=? AND created_at>=?
                    ORDER BY created_at""",
-                (tenant_id, principal_id, name, now - SUBSCRIPTION_BACKFILL_SECONDS),
+                (tenant_id, principal_id, name, request_started_at),
             ).fetchall()
             for event in recent_events:
                 event_data = json.loads(event["data_json"])
                 if arguments.get("job_id") not in (None, event_data.get("job_id")):
                     continue
                 db.execute(
-                    """INSERT OR IGNORE INTO event_deliveries(event_id, subscription_id, status)
-                       VALUES (?, ?, 'pending')""",
-                    (event["event_id"], subscription_id),
+                    """INSERT OR IGNORE INTO event_deliveries(event_id, subscription_id, status, generation)
+                       VALUES (?, ?, 'pending', ?)""",
+                    (event["event_id"], subscription_id, generation),
                 )
         return {"id": subscription_id, "refreshBefore": (datetime.fromtimestamp(expires_at, timezone.utc).isoformat().replace("+00:00", "Z") if expires_at is not None else None), "cursor": None, "truncated": False}
 
@@ -375,10 +390,19 @@ class MCPEventsStore:
         delivery = params.get("delivery") or {}
         arguments = _canonical_json(params.get("arguments") or {})
         with self._db() as db:
-            db.execute(
-                "UPDATE event_subscriptions SET active=0 WHERE tenant_id=? AND principal_id=? AND name=? AND arguments_json=? AND callback_url=?",
+            row = db.execute(
+                """SELECT id FROM event_subscriptions
+                   WHERE tenant_id=? AND principal_id=? AND name=? AND arguments_json=? AND callback_url=?""",
                 (tenant_id, principal_id, params.get("name"), arguments, delivery.get("url")),
-            )
+            ).fetchone()
+            if row is not None:
+                db.execute("UPDATE event_subscriptions SET active=0, generation=generation+1 WHERE id=?", (row["id"],))
+                db.execute(
+                    """UPDATE event_deliveries SET status='failed', last_status=410,
+                       next_attempt_at=0, lease_until=NULL, lease_token=NULL
+                       WHERE subscription_id=? AND status IN ('pending','sending')""",
+                    (row["id"],),
+                )
         return {}
 
     def publish_job_completed(
@@ -405,7 +429,7 @@ class MCPEventsStore:
             raise ValueError("error_code must be nonempty text")
         if outcome_unknown is not None and not isinstance(outcome_unknown, bool):
             raise ValueError("outcome_unknown must be boolean")
-        now = int(self.clock())
+        now = float(self.clock())
         event_id = event_id or "evt_" + uuid.uuid4().hex
         if not isinstance(event_id, str) or not event_id.startswith("evt_") or len(event_id) > 128:
             raise ValueError("event_id is malformed")
@@ -417,7 +441,7 @@ class MCPEventsStore:
             parsed_completed_at = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
             if parsed_completed_at.tzinfo is None:
                 raise ValueError("completed_at must include a timezone")
-            event_created_at = int(parsed_completed_at.timestamp())
+            event_created_at = parsed_completed_at.timestamp()
         except ValueError as exc:
             raise ValueError("completed_at must be a valid timezone-aware ISO timestamp") from exc
         data = {
@@ -448,14 +472,17 @@ class MCPEventsStore:
                 (event_id, tenant_id, principal_id, "chatgpt.job.completed", canonical_data, event_created_at),
             )
             subscriptions = db.execute(
-                "SELECT id, arguments_json FROM event_subscriptions WHERE tenant_id=? AND principal_id=? AND name='chatgpt.job.completed' AND active=1 AND (expires_at IS NULL OR expires_at>?)",
+                "SELECT id, arguments_json, generation FROM event_subscriptions WHERE tenant_id=? AND principal_id=? AND name='chatgpt.job.completed' AND active=1 AND (expires_at IS NULL OR expires_at>?)",
                 (tenant_id, principal_id, now),
             ).fetchall()
             for sub in subscriptions:
                 filters = json.loads(sub["arguments_json"])
                 if filters.get("job_id") not in (None, job_id):
                     continue
-                db.execute("INSERT INTO event_deliveries(event_id, subscription_id, status) VALUES (?, ?, 'pending')", (event_id, sub["id"]))
+                db.execute(
+                    "INSERT INTO event_deliveries(event_id, subscription_id, status, generation) VALUES (?, ?, 'pending', ?)",
+                    (event_id, sub["id"], sub["generation"]),
+                )
         return event_id
 
     def cleanup_expired(self, *, retention_seconds: int = 30 * 24 * 60 * 60) -> dict[str, int]:
@@ -473,7 +500,7 @@ class MCPEventsStore:
             if expired_ids:
                 placeholders = ",".join("?" for _ in expired_ids)
                 db.execute(
-                    f"UPDATE event_subscriptions SET active=0 WHERE id IN ({placeholders})",
+                    f"UPDATE event_subscriptions SET active=0, generation=generation+1 WHERE id IN ({placeholders})",
                     expired_ids,
                 )
                 db.execute(
@@ -513,134 +540,155 @@ class MCPEventsStore:
         }
 
     def deliver_pending(self, *, limit: int = 100, authorize: Any = None) -> int:
-        """Claim due deliveries transactionally, then perform bounded I/O outside SQLite."""
+        """Deliver bounded work with generation-fenced leases."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        # Bound the sequential batch to the 30s lease / 10s callback budget.
         now = int(self.clock())
         claimed: list[dict[str, Any]] = []
         with self._db() as db:
             db.execute("BEGIN IMMEDIATE")
-            # Recover work abandoned by a process that died while holding a lease.
             db.execute(
-                "UPDATE event_deliveries SET status='pending', lease_until=NULL, lease_token=NULL "
-                "WHERE status='sending' AND lease_until<=?",
-                (now,),
+                """UPDATE event_deliveries
+                   SET status=CASE WHEN attempts>=? THEN 'failed' ELSE 'pending' END,
+                       last_status=CASE WHEN attempts>=? THEN 599 ELSE last_status END,
+                       next_attempt_at=0, lease_until=NULL, lease_token=NULL
+                   WHERE status='sending' AND lease_until<=?""",
+                (MAX_DELIVERY_ATTEMPTS, MAX_DELIVERY_ATTEMPTS, now),
             )
-            # An expired or revoked subscription must not leave a permanent pending row.
             db.execute(
-                """UPDATE event_deliveries SET status='failed', last_status=410
+                """UPDATE event_deliveries SET status='failed', last_status=410,
+                       next_attempt_at=0, lease_until=NULL, lease_token=NULL
                    WHERE status='pending' AND EXISTS (
-                       SELECT 1 FROM event_subscriptions s
-                       WHERE s.id=event_deliveries.subscription_id
-                         AND (s.active=0 OR (s.expires_at IS NOT NULL AND s.expires_at<=?))
-                   )""",
+                       SELECT 1 FROM event_subscriptions s WHERE s.id=event_deliveries.subscription_id
+                         AND (s.active=0 OR s.generation!=event_deliveries.generation
+                              OR (s.expires_at IS NOT NULL AND s.expires_at<=?)))""",
                 (now,),
             )
             rows = db.execute(
-                """SELECT d.event_id, d.subscription_id, d.attempts, s.callback_url, s.secret_enc,
-                          s.secret_prev_enc, s.secret_prev_until, e.name, e.data_json, e.created_at,
-                          e.tenant_id, e.principal_id
+                """SELECT d.event_id, d.subscription_id, d.attempts, d.generation,
+                          s.callback_url, s.secret_enc, s.secret_prev_enc, s.secret_prev_until,
+                          e.name, e.data_json, e.created_at, e.tenant_id, e.principal_id
                    FROM event_deliveries d JOIN event_subscriptions s ON s.id=d.subscription_id
                    JOIN event_outbox e ON e.event_id=d.event_id
                    WHERE d.status='pending' AND d.next_attempt_at<=? AND s.active=1
+                     AND d.generation=s.generation AND d.attempts<?
                      AND (s.expires_at IS NULL OR s.expires_at>?)
                    ORDER BY e.created_at LIMIT ?""",
-                (now, now, limit),
+                (now, MAX_DELIVERY_ATTEMPTS, now, min(limit, 2)),
             ).fetchall()
             for row in rows:
-                lease_token = uuid.uuid4().hex
+                token = uuid.uuid4().hex
                 attempts = int(row["attempts"]) + 1
-                cursor = db.execute(
-                    """UPDATE event_deliveries
-                       SET status='sending', attempts=?, lease_until=?, lease_token=?
-                       WHERE event_id=? AND subscription_id=? AND status='pending'""",
-                    (attempts, now + 30, lease_token, row["event_id"], row["subscription_id"]),
+                cur = db.execute(
+                    """UPDATE event_deliveries SET status='sending', attempts=?, lease_until=?, lease_token=?
+                       WHERE event_id=? AND subscription_id=? AND generation=? AND status='pending'""",
+                    (attempts, now + DELIVERY_LEASE_SECONDS, token, row["event_id"], row["subscription_id"], row["generation"]),
                 )
-                if cursor.rowcount == 1:
+                if cur.rowcount == 1:
                     item = dict(row)
                     item["attempts"] = attempts
-                    item["lease_token"] = lease_token
+                    item["lease_token"] = token
                     claimed.append(item)
 
         delivered = 0
         for row in claimed:
+            status = 599
             event = {
-                "eventId": row["event_id"],
-                "name": row["name"],
+                "eventId": row["event_id"], "name": row["name"],
                 "timestamp": datetime.fromtimestamp(row["created_at"], timezone.utc).isoformat().replace("+00:00", "Z"),
-                "data": json.loads(row["data_json"]),
-                "cursor": None,
+                "data": json.loads(row["data_json"]), "cursor": None,
             }
             body = _canonical_json(event).encode("utf-8")
             if len(body) > MAX_EVENT_BYTES:
                 status = 413
             else:
                 try:
-                    if authorize is not None:
-                        allowed = authorize(
-                            tenant_id=row["tenant_id"],
-                            principal_id=row["principal_id"],
-                            job_id=event["data"].get("job_id"),
-                        )
-                        if allowed is not True:
-                            raise PermissionError("event resource is no longer accessible")
-                    # Recheck subscription state after the potentially slow
-                    # authorization round-trip and immediately before network I/O.
-                    # This prevents a lease claimed before expiry/unsubscribe from
-                    # sending a callback after that state transition.
-                    with self._db() as db:
-                        active_row = db.execute(
-                            "SELECT active, expires_at FROM event_subscriptions WHERE id=?",
-                            (row["subscription_id"],),
-                        ).fetchone()
+                    if authorize is not None and authorize(
+                        tenant_id=row["tenant_id"], principal_id=row["principal_id"],
+                        job_id=event["data"].get("job_id"),
+                    ) is not True:
+                        raise PermissionError("event resource is no longer accessible")
                     current_time = int(self.clock())
-                    if (
-                        active_row is None
-                        or active_row["active"] != 1
-                        or (active_row["expires_at"] is not None and active_row["expires_at"] <= current_time)
-                    ):
-                        status = 410
-                    else:
-                        secret = self._decrypt_secret(row["subscription_id"], row["secret_enc"])
-                        previous_secret = None
-                        if row["secret_prev_enc"] is not None and row["secret_prev_until"] is not None and row["secret_prev_until"] > current_time:
-                            previous_secret = self._decrypt_secret(row["subscription_id"], row["secret_prev_enc"])
-                        headers = _signed_headers(
-                            row["subscription_id"], secret, row["event_id"], body,
-                            previous_secret=previous_secret,
+                    with self._db() as db:
+                        lease = db.execute(
+                            """SELECT s.active, s.expires_at, s.generation, d.generation AS delivery_generation,
+                                      d.lease_until, d.lease_token
+                               FROM event_subscriptions s JOIN event_deliveries d ON d.subscription_id=s.id
+                               WHERE s.id=? AND d.event_id=?""",
+                            (row["subscription_id"], row["event_id"]),
+                        ).fetchone()
+                        valid = (
+                            lease is not None and lease["active"] == 1
+                            and lease["generation"] == row["generation"]
+                            and lease["delivery_generation"] == row["generation"]
+                            and lease["lease_token"] == row["lease_token"]
+                            and lease["lease_until"] is not None and lease["lease_until"] > current_time
+                            and (lease["expires_at"] is None or lease["expires_at"] > current_time)
                         )
-                        status, _ = self.post_json(row["callback_url"], body, headers)
+                        if valid:
+                            db.execute(
+                                """UPDATE event_deliveries SET lease_until=?
+                                   WHERE event_id=? AND subscription_id=? AND generation=?
+                                     AND status='sending' AND lease_token=?""",
+                                (current_time + DELIVERY_LEASE_SECONDS, row["event_id"], row["subscription_id"], row["generation"], row["lease_token"]),
+                            )
+                    if not valid:
+                        # If this exact lease is still ours but the subscription
+                        # expired during authorization, terminalize it. A lease
+                        # stolen or invalidated by another lifecycle is untouched.
+                        with self._db() as db:
+                            db.execute(
+                                """UPDATE event_deliveries SET status='failed', last_status=410,
+                                          lease_until=NULL, lease_token=NULL
+                                   WHERE event_id=? AND subscription_id=? AND generation=?
+                                     AND status='sending' AND lease_token=?
+                                     AND EXISTS (SELECT 1 FROM event_subscriptions s
+                                                 WHERE s.id=? AND s.active=1
+                                                   AND s.generation=? AND s.expires_at<=?)""",
+                                (row["event_id"], row["subscription_id"], row["generation"],
+                                 row["lease_token"], row["subscription_id"], row["generation"], current_time),
+                            )
+                        continue
+                    secret = self._decrypt_secret(row["subscription_id"], row["secret_enc"])
+                    previous = None
+                    if row["secret_prev_enc"] is not None and row["secret_prev_until"] is not None and row["secret_prev_until"] > current_time:
+                        previous = self._decrypt_secret(row["subscription_id"], row["secret_prev_enc"])
+                    headers = _signed_headers(row["subscription_id"], secret, row["event_id"], body, previous_secret=previous)
+                    status, _ = self.post_json(row["callback_url"], body, headers)
                 except PermissionError:
-                    # A definitive authorization denial is terminal and must
-                    # never be sent to the callback or retried.
                     status = 403
                 except Exception:
                     status = 599
-            retryable = status not in (403, 410, 413) and (
-                status == 599 or status in (408, 429) or status >= 500
-            )
+
+            retryable = status not in (403, 410, 413) and (status == 599 or status in (408, 429) or status >= 500)
             attempts = int(row["attempts"])
             state = "delivered" if 200 <= status < 300 else (
                 "pending" if retryable and attempts < MAX_DELIVERY_ATTEMPTS else "failed"
             )
-            next_attempt = now + min(3600, 2 ** attempts) if state == "pending" else 0
+            failure_time = int(self.clock())
+            next_attempt = failure_time + min(3600, 2 ** attempts) if state == "pending" else 0
             with self._db() as db:
-                db.execute(
-                    """UPDATE event_deliveries
-                       SET status=?, next_attempt_at=?, last_status=?, lease_until=NULL, lease_token=NULL
-                       WHERE event_id=? AND subscription_id=? AND status='sending' AND lease_token=?""",
-                    (state, next_attempt, status, row["event_id"], row["subscription_id"], row["lease_token"]),
+                updated = db.execute(
+                    """UPDATE event_deliveries SET status=?, next_attempt_at=?, last_status=?,
+                              lease_until=NULL, lease_token=NULL
+                       WHERE event_id=? AND subscription_id=? AND generation=?
+                         AND status='sending' AND lease_token=?""",
+                    (state, next_attempt, status, row["event_id"], row["subscription_id"], row["generation"], row["lease_token"]),
                 )
-                if status == 410:
-                    db.execute("UPDATE event_subscriptions SET active=0 WHERE id=?", (row["subscription_id"],))
-                    # A gone callback invalidates the entire subscription,
-                    # not only this one event. Cancel every already-claimed or
-                    # pending fan-out row so none are stranded forever.
-                    db.execute(
-                        """UPDATE event_deliveries
-                           SET status='failed', next_attempt_at=0, last_status=410,
-                               lease_until=NULL, lease_token=NULL
-                           WHERE subscription_id=? AND status IN ('pending','sending')""",
-                        (row["subscription_id"],),
+                if status == 410 and updated.rowcount == 1:
+                    invalidated = db.execute(
+                        """UPDATE event_subscriptions SET active=0, generation=generation+1
+                           WHERE id=? AND active=1 AND generation=?""",
+                        (row["subscription_id"], row["generation"]),
                     )
+                    if invalidated.rowcount == 1:
+                        db.execute(
+                            """UPDATE event_deliveries SET status='failed', next_attempt_at=0, last_status=410,
+                                      lease_until=NULL, lease_token=NULL
+                               WHERE subscription_id=? AND generation=? AND status IN ('pending','sending')""",
+                            (row["subscription_id"], row["generation"]),
+                        )
             if state == "delivered":
                 delivered += 1
         return delivered

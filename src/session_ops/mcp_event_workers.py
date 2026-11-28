@@ -61,7 +61,7 @@ class MCPEventWorkers:
     def __init__(self, collector: Any, delivery_worker: MCPEventDeliveryWorker) -> None:
         self.collector = collector
         self.delivery_worker = delivery_worker
-        self._stop = threading.Event()
+        self._stop_event: threading.Event | None = None
         self._threads: list[threading.Thread] = []
         self._lock = threading.Lock()
 
@@ -69,18 +69,19 @@ class MCPEventWorkers:
         with self._lock:
             if any(thread.is_alive() for thread in self._threads):
                 return
-            self._stop.clear()
+            stop_event = threading.Event()
+            self._stop_event = stop_event
             self._threads = [
                 threading.Thread(
                     target=self.collector.run_forever,
-                    args=(self._stop,),
+                    args=(stop_event,),
                     kwargs={"poll_seconds": 1.0},
                     name="mcp-event-collector",
                     daemon=True,
                 ),
                 threading.Thread(
                     target=self.delivery_worker.run_forever,
-                    args=(self._stop,),
+                    args=(stop_event,),
                     name="mcp-event-delivery",
                     daemon=True,
                 ),
@@ -89,8 +90,17 @@ class MCPEventWorkers:
                 thread.start()
 
     def stop(self) -> None:
-        self._stop.set()
-        for thread in self._threads:
+        with self._lock:
+            stop_event = self._stop_event
+            threads = list(self._threads)
+            if stop_event is not None:
+                stop_event.set()
+        for thread in threads:
             if thread.is_alive():
                 thread.join(timeout=10)
-        self._threads = []
+        with self._lock:
+            # Keep references to timed-out workers. A later start must not
+            # clear their stop signal or create a second live generation.
+            self._threads = [thread for thread in threads if thread.is_alive()]
+            if not self._threads:
+                self._stop_event = None

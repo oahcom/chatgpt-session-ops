@@ -42,43 +42,46 @@ class MCPEventCollector:
 
         acknowledged = 0
         for item in response["items"]:
-            if not isinstance(item, Mapping):
-                raise ValueError("Sender Gateway returned a malformed event")
-            event_id = item.get("event_id")
-            job_id = item.get("job_id")
-            tenant_id = item.get("tenant_id")
-            principal_id = item.get("principal_id")
-            lease_token = item.get("lease_token")
-            payload = item.get("payload")
-            if item.get("name") != "chatgpt.job.completed" or not isinstance(payload, Mapping):
-                raise ValueError("Sender Gateway returned an unsupported event")
-            if payload.get("job_id") != job_id or payload.get("status") not in ("succeeded", "failed"):
-                raise ValueError("Sender Gateway event owner or terminal state does not match its payload")
-            summary = payload.get("summary")
-            completed_at = payload.get("completed_at")
-            if not all(isinstance(value, str) and value for value in (event_id, job_id, tenant_id, principal_id, lease_token, summary, completed_at)):
-                raise ValueError("Sender Gateway event is missing required fields")
+            event_id = item.get("event_id") if isinstance(item, Mapping) else None
+            try:
+                if not isinstance(item, Mapping):
+                    raise ValueError("Sender Gateway returned a malformed event")
+                event_id = item.get("event_id")
+                job_id = item.get("job_id")
+                tenant_id = item.get("tenant_id")
+                principal_id = item.get("principal_id")
+                lease_token = item.get("lease_token")
+                payload = item.get("payload")
+                if item.get("name") != "chatgpt.job.completed" or not isinstance(payload, Mapping):
+                    raise ValueError("Sender Gateway returned an unsupported event")
+                if payload.get("job_id") != job_id or payload.get("status") not in ("succeeded", "failed"):
+                    raise ValueError("Sender Gateway event owner or terminal state does not match its payload")
+                summary = payload.get("summary")
+                completed_at = payload.get("completed_at")
+                if not all(isinstance(value, str) and value for value in (event_id, job_id, tenant_id, principal_id, lease_token, summary, completed_at)):
+                    raise ValueError("Sender Gateway event is missing required fields")
 
-            # The event ID is the cross-service idempotency key. If this write
-            # succeeds but ack fails, a later lease redelivery is harmless.
-            self.events_store.publish_job_completed(
-                tenant_id,
-                principal_id,
-                job_id,
-                summary,
-                event_id=event_id,
-                completed_at=completed_at,
-                status=payload["status"],
-                error_code=payload.get("error_code"),
-                outcome_unknown=payload.get("outcome_unknown"),
-            )
-            result = self.sender_client.ack_event(
-                event_id=event_id,
-                lease_token=lease_token,
-            )
-            if not isinstance(result, Mapping) or result.get("acknowledged") is not True:
-                raise RuntimeError("Sender Gateway did not acknowledge the event lease")
-            acknowledged += 1
+                # Persist before ack. A lost ack is safe because event_id is stable.
+                self.events_store.publish_job_completed(
+                    tenant_id,
+                    principal_id,
+                    job_id,
+                    summary,
+                    event_id=event_id,
+                    completed_at=completed_at,
+                    status=payload["status"],
+                    error_code=payload.get("error_code"),
+                    outcome_unknown=payload.get("outcome_unknown"),
+                )
+                result = self.sender_client.ack_event(event_id=event_id, lease_token=lease_token)
+                if not isinstance(result, Mapping) or result.get("acknowledged") is not True:
+                    raise RuntimeError("Sender Gateway did not acknowledge the event lease")
+                acknowledged += 1
+            except Exception:
+                # Isolate poison/failed rows. Never ack an event that was not
+                # durably ingested, but do not starve unrelated events in batch.
+                logging.exception("MCP Sender event ingestion failed (event_id=%s)", event_id)
+                continue
         return acknowledged
 
     def run_forever(

@@ -83,9 +83,8 @@ class MCPEventCollectorTests(unittest.TestCase):
         client = FakeSenderClient([self.item])
         client.fail_ack_once = True
         collector = MCPEventCollector(client, self.store, worker_id="mcp-1")
-        with self.assertRaises(TimeoutError):
-            collector.run_once()
-        # The sender will redeliver the same event ID after its lease expires.
+        # Ack loss is isolated to this row; a later claim/redelivery is safe.
+        self.assertEqual(collector.run_once(), 0)
         self.assertEqual(collector.run_once(), 1)
         with self.store._db() as db:
             self.assertEqual(db.execute("SELECT count(*) FROM event_outbox WHERE event_id=?", (self.item["event_id"],)).fetchone()[0], 1)
@@ -123,9 +122,21 @@ class MCPEventCollectorTests(unittest.TestCase):
         bad = {**self.item, "payload": {**self.item["payload"], "job_id": "another-job"}}
         client = FakeSenderClient([bad])
         collector = MCPEventCollector(client, self.store, worker_id="mcp-1")
-        with self.assertRaises(ValueError):
-            collector.run_once()
+        self.assertEqual(collector.run_once(), 0)
         self.assertEqual(client.acks, [])
+
+
+    def test_poison_event_does_not_block_later_valid_event(self):
+        bad = {**self.item, "payload": {**self.item["payload"], "job_id": "wrong-job"}}
+        good = {**self.item, "event_id": "evt_valid_after_poison"}
+        client = FakeSenderClient([bad, good])
+        collector = MCPEventCollector(client, self.store, worker_id="mcp-isolated")
+        self.assertEqual(collector.run_once(), 1)
+        self.assertEqual(client.acks, [(good["event_id"], good["lease_token"])])
+        with self.store._db() as db:
+            self.assertIsNone(db.execute("SELECT event_id FROM event_outbox WHERE event_id=?", (bad["event_id"],)).fetchone())
+            self.assertIsNotNone(db.execute("SELECT event_id FROM event_outbox WHERE event_id=?", (good["event_id"],)).fetchone())
+
 
 
 if __name__ == "__main__":

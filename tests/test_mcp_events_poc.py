@@ -223,12 +223,18 @@ class MCPEventsStoreTests(unittest.TestCase):
     def test_subscribe_backfills_completion_that_arrived_before_subscription(self):
         # Simulate the fast-job race: Sender event has already reached the MCP
         # event store before ChatGPT's events/subscribe request is persisted.
-        event_id = self.store.publish_job_completed(
-            "tenant-a", "issuer:user-a", "task-fast", "Finished",
-            event_id="evt_fast_job_before_subscribe",
-        )
+        event_ids = []
+        original_verify = self.store._verify_callback
+        def complete_during_subscribe(*args):
+            original_verify(*args)
+            event_ids.append(self.store.publish_job_completed(
+                "tenant-a", "issuer:user-a", "task-fast", "Finished",
+                event_id="evt_fast_job_before_subscribe",
+            ))
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
-            self.subscribe(job_id="task-fast")
+            with patch.object(self.store, "_verify_callback", side_effect=complete_during_subscribe):
+                self.subscribe(job_id="task-fast")
+        event_id = event_ids[0]
         with self.store._db() as db:
             row = db.execute(
                 "SELECT status FROM event_deliveries WHERE event_id=?",
@@ -238,29 +244,30 @@ class MCPEventsStoreTests(unittest.TestCase):
         self.assertEqual(self.store.deliver_pending(), 1)
 
     def test_subscribe_backfill_is_owner_and_job_filter_scoped(self):
-        own_match = self.store.publish_job_completed(
-            "tenant-a", "issuer:user-a", "task-match", "Finished",
-            event_id="evt_own_match",
-        )
-        self.store.publish_job_completed(
-            "tenant-a", "issuer:user-a", "task-other", "Finished",
-            event_id="evt_own_other",
-        )
-        self.store.publish_job_completed(
-            "tenant-b", "issuer:user-a", "task-match", "Finished",
-            event_id="evt_other_tenant",
-        )
-        self.store.publish_job_completed(
-            "tenant-a", "issuer:other-user", "task-match", "Finished",
-            event_id="evt_other_principal",
-        )
+        event_ids = []
+        original_verify = self.store._verify_callback
+        def publish_racing_events(*args):
+            original_verify(*args)
+            event_ids.append(self.store.publish_job_completed(
+                "tenant-a", "issuer:user-a", "task-match", "Finished", event_id="evt_own_match"
+            ))
+            self.store.publish_job_completed(
+                "tenant-a", "issuer:user-a", "task-other", "Finished", event_id="evt_own_other"
+            )
+            self.store.publish_job_completed(
+                "tenant-b", "issuer:user-a", "task-match", "Finished", event_id="evt_other_tenant"
+            )
+            self.store.publish_job_completed(
+                "tenant-a", "issuer:other-user", "task-match", "Finished", event_id="evt_other_principal"
+            )
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
-            self.subscribe(job_id="task-match")
+            with patch.object(self.store, "_verify_callback", side_effect=publish_racing_events):
+                self.subscribe(job_id="task-match")
         with self.store._db() as db:
             ids = [row[0] for row in db.execute("SELECT event_id FROM event_deliveries ORDER BY event_id")]
-        self.assertEqual(ids, [own_match])
+        self.assertEqual(ids, event_ids)
 
-    def test_subscribe_backfill_does_not_replay_events_older_than_24_hours(self):
+    def test_subscribe_backfill_does_not_replay_events_completed_before_request(self):
         now = int(self.store.clock())
         old_event = self.store.publish_job_completed(
             "tenant-a", "issuer:user-a", "task-old", "Finished",
@@ -469,6 +476,122 @@ class MCPEventsStoreTests(unittest.TestCase):
         self.store.unsubscribe(self.auth, {"name": "chatgpt.job.completed", "arguments": {}, "delivery": {"url": self.delivery["url"]}})
         with self.store._db() as db:
             self.assertEqual(db.execute("SELECT count(*) FROM event_subscriptions WHERE active=1").fetchone()[0], 0)
+
+
+    def test_unsubscribe_then_resubscribe_does_not_revive_old_generation(self):
+        with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
+            first = self.subscribe(job_id="job-generation")
+        old_event = self.store.publish_job_completed(
+            "tenant-a", "issuer:user-a", "job-generation", "old",
+            event_id="evt_old_generation",
+        )
+        self.store.unsubscribe(self.auth, {
+            "name": "chatgpt.job.completed",
+            "arguments": {"job_id": "job-generation"},
+            "delivery": {"url": self.delivery["url"]},
+        })
+        with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
+            second = self.subscribe(job_id="job-generation")
+        self.assertEqual(first["id"], second["id"])
+        new_event = self.store.publish_job_completed(
+            "tenant-a", "issuer:user-a", "job-generation", "new",
+            event_id="evt_new_generation",
+        )
+        self.assertEqual(self.store.deliver_pending(limit=10), 1)
+        with self.store._db() as db:
+            old = db.execute("SELECT status, generation FROM event_deliveries WHERE event_id=?", (old_event,)).fetchone()
+            new = db.execute("SELECT status, generation FROM event_deliveries WHERE event_id=?", (new_event,)).fetchone()
+            sub = db.execute("SELECT generation FROM event_subscriptions WHERE id=?", (second["id"],)).fetchone()
+        self.assertEqual(old["status"], "failed")
+        self.assertEqual(new["status"], "delivered")
+        self.assertEqual(old["generation"] + 1, new["generation"])
+        self.assertEqual(new["generation"], sub["generation"])
+
+    def test_stale_410_response_cannot_cancel_other_deliveries(self):
+        now = [1_800_000_000]
+        self.store.clock = lambda: now[0]
+        with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
+            self.subscribe()
+        first_event = self.store.publish_job_completed("tenant-a", "issuer:user-a", "job-stale-410-a", "A")
+        second_event = self.store.publish_job_completed("tenant-a", "issuer:user-a", "job-stale-410-b", "B")
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+        def callback(_url, body, _headers):
+            if b'"eventId"' in body:
+                calls.append(json.loads(body)["eventId"])
+                if len(calls) == 1:
+                    entered.set()
+                    release.wait(timeout=2)
+                    return 410, b""
+                return 204, b""
+            payload = json.loads(body)
+            return 200, json.dumps({"challenge": payload["challenge"]}).encode()
+        self.store.post_json = callback
+        first_result = []
+        worker = threading.Thread(target=lambda: first_result.append(self.store.deliver_pending(limit=1)))
+        worker.start()
+        self.assertTrue(entered.wait(timeout=1))
+        now[0] += 31
+        self.assertEqual(self.store.deliver_pending(limit=1), 1)
+        release.set()
+        worker.join(timeout=2)
+        self.assertFalse(worker.is_alive())
+        with self.store._db() as db:
+            sub = db.execute("SELECT active FROM event_subscriptions").fetchone()
+            stale = db.execute("SELECT status FROM event_deliveries WHERE event_id=?", (first_event,)).fetchone()
+            untouched = db.execute("SELECT status FROM event_deliveries WHERE event_id=?", (second_event,)).fetchone()
+        self.assertEqual(sub["active"], 1)
+        self.assertEqual(stale["status"], "delivered")
+        self.assertEqual(untouched["status"], "pending")
+
+    def test_retry_backoff_starts_at_callback_failure_time(self):
+        now = [1_800_000_000]
+        self.store.clock = lambda: now[0]
+        with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
+            self.subscribe(job_id="job-backoff-time")
+        event_id = self.store.publish_job_completed("tenant-a", "issuer:user-a", "job-backoff-time", "Finished")
+        def slow_failure(_url, _body, _headers):
+            now[0] += 10
+            return 503, b""
+        self.store.post_json = slow_failure
+        self.assertEqual(self.store.deliver_pending(), 0)
+        with self.store._db() as db:
+            row = db.execute("SELECT next_attempt_at, attempts FROM event_deliveries WHERE event_id=?", (event_id,)).fetchone()
+        self.assertEqual(row["attempts"], 1)
+        self.assertEqual(row["next_attempt_at"], now[0] + 2)
+
+    def test_expired_crash_lease_at_attempt_ceiling_is_terminal(self):
+        with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
+            self.subscribe(job_id="job-crash-ceiling")
+        event_id = self.store.publish_job_completed("tenant-a", "issuer:user-a", "job-crash-ceiling", "Finished")
+        now = int(self.store.clock())
+        with self.store._db() as db:
+            db.execute(
+                """UPDATE event_deliveries SET status='sending', attempts=5,
+                   lease_until=?, lease_token='abandoned' WHERE event_id=?""",
+                (now - 1, event_id),
+            )
+        self.assertEqual(self.store.deliver_pending(), 0)
+        with self.store._db() as db:
+            row = db.execute("SELECT status, attempts, last_status FROM event_deliveries WHERE event_id=?", (event_id,)).fetchone()
+        self.assertEqual((row["status"], row["attempts"], row["last_status"]), ("failed", 5, 599))
+
+    def test_recent_event_completed_before_subscribe_request_is_not_backfilled(self):
+        now = [1_800_000_000.5]
+        self.store.clock = lambda: now[0]
+        old_event = self.store.publish_job_completed(
+            "tenant-a", "issuer:user-a", "job-before-request", "Finished",
+            event_id="evt_before_request",
+            completed_at="2027-01-15T07:59:30Z",
+        )
+        now[0] = float(__import__("datetime").datetime.fromisoformat("2027-01-15T08:00:00+00:00").timestamp()) + 0.5
+        with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
+            self.subscribe(job_id="job-before-request")
+        with self.store._db() as db:
+            count = db.execute("SELECT count(*) FROM event_deliveries WHERE event_id=?", (old_event,)).fetchone()[0]
+        self.assertEqual(count, 0)
+
 
 
 if __name__ == "__main__":
