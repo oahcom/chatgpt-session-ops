@@ -23,6 +23,7 @@ ExecStart=/opt/so-mcp/.venv/bin/python -m scripts.run_mcp_server
 
 Restart=on-failure
 RestartSec=5s
+LimitNOFILE=8192:524288
 
 TimeoutStartSec=30
 TimeoutStopSec=1900

@@ -32,6 +32,7 @@ def test_service_uses_the_immutable_runtime_artifact():
     assert "ReadWritePaths=/var/lib/so-mcp" in service
     assert "ReadOnlyPaths=/var/lib/chatgpt-session-ops/accounts" in service
     assert "TimeoutStopSec=1900" in service
+    assert "LimitNOFILE=8192:524288" in service
     assert "UMask=0077" in service
     assert "Group=chatgpt-sender" in service
     assert "ReadOnlyPaths=/var/lib/chatgpt-session-ops/accounts" in service

@@ -54,8 +54,13 @@ class ChatGPTDirectClient:
         self.prompt_dir = self.runtime_dir / "prompts"
         # One in-process queue consumer only. Do not fan out CLI children
         # before durable account reservations and signed receipts exist.
-        if max_workers != 1 or max_queue_size < 1:
-            raise ValueError("the direct ChatGPT queue currently requires exactly one consumer")
+        if (
+            type(max_workers) is not int
+            or max_workers != 1
+            or type(max_queue_size) is not int
+            or not 1 <= max_queue_size <= 9
+        ):
+            raise ValueError("the direct ChatGPT queue requires one consumer and at most nine outstanding jobs")
         self.max_workers = max_workers
         self.max_queue_size = max_queue_size
         self._db_lock = threading.RLock()

@@ -1218,9 +1218,7 @@ class SecureWorkItemStore:
                 ).hex
                 source_conversations = [link["session_id"] for link in active_links]
                 event_conversation = (
-                    {"conversation_id": source_conversations[0]}
-                    if len(source_conversations) == 1
-                    else {"conversation_ids": source_conversations}
+                    {"source_conversation_ids": source_conversations}
                     if source_conversations else {}
                 )
                 self._completion_event_publisher(

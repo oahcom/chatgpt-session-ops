@@ -50,7 +50,6 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         self,
         callback_url: str = "https://events.example.test/work-item-completed",
         principal: Principal | None = None,
-        conversation_id: str = "12345678-1234-4234-8234-123456789abc",
         job_id: str | None = None,
     ) -> None:
         principal = principal or self.principal
@@ -66,7 +65,7 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.events.subscribe(auth, {
                 "name": "chatgpt.job.completed",
-                "arguments": {"conversation_id": conversation_id, **({"job_id": job_id} if job_id else {})},
+                "arguments": ({"job_id": job_id} if job_id else {}),
                 "delivery": delivery,
             })
 
@@ -86,17 +85,13 @@ class WorkItemCompletionEventTests(unittest.TestCase):
 
     def test_terminal_transition_atomically_enqueues_one_event_for_work_item(self):
         self._subscribe()
-        item, _session_id = self._create_linked_item()
-
+        item, source_session = self._create_linked_item()
         result = self.store.finish_work_item(self.principal, item.work_item_id, "completed")
         self.assertEqual(result.status, "completed")
-        historical_links = self.store.list_sessions(
-            self.principal, item.work_item_id, include_unlinked=True
-        )
+        historical_links = self.store.list_sessions(self.principal, item.work_item_id, include_unlinked=True)
         self.assertEqual(len(historical_links), 1)
         self.assertIsNotNone(historical_links[0].unlinked_at)
-        self.assertIsNone(self.store.get_active_link(self.principal, _session_id))
-
+        self.assertIsNone(self.store.get_active_link(self.principal, source_session))
         with self.events._db() as db:
             event = db.execute("SELECT * FROM event_outbox").fetchone()
             delivery = db.execute("SELECT status FROM event_deliveries").fetchone()
@@ -105,25 +100,22 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         self.assertEqual(event["principal_id"], self.principal.principal_id)
         self.assertEqual(payload["job_id"], item.work_item_id)
         self.assertEqual(payload["status"], "succeeded")
-        self.assertEqual(payload["conversation_id"], _session_id)
-        self.assertNotIn("conversation_ids", payload)
+        self.assertEqual(payload["source_conversation_ids"], [source_session])
+        self.assertNotIn("conversation_id", payload)
         self.assertEqual(delivery["status"], "pending")
-
         self.assertEqual(self.events.deliver_pending(), 1)
         with self.events._db() as db:
             delivered = db.execute("SELECT status FROM event_deliveries").fetchone()["status"]
         self.assertEqual(delivered, "delivered")
         callback_event = json.loads(self.callback.requests[-1][1])
         self.assertEqual(callback_event["data"]["job_id"], item.work_item_id)
-
-
-    def test_multiple_linked_sessions_fan_out_one_event_per_subscription(self):
+        self.assertEqual(self.callback.requests[-1][0], "https://events.example.test/work-item-completed")
+    def test_multiple_linked_sessions_are_payload_context_not_delivery_routes(self):
         first_session = "12345678-1234-4234-8234-123456789abc"
         second_session = "22345678-1234-4234-8234-123456789abc"
-        self._subscribe("https://events.example.test/conversation-one", conversation_id=first_session)
-        self._subscribe("https://events.example.test/conversation-two", conversation_id=second_session)
-        item, _first_session = self._create_linked_item()
-        second_session = "22345678-1234-4234-8234-123456789abc"
+        self._subscribe("https://events.example.test/chat-one")
+        self._subscribe("https://events.example.test/chat-two")
+        item, _ = self._create_linked_item()
         second_attempt = "att_22345678-1234-4234-8234-123456789abc"
         self.store._record_trusted_landing(
             second_session,
@@ -132,119 +124,88 @@ class WorkItemCompletionEventTests(unittest.TestCase):
             work_item_id=item.work_item_id,
             attempt_id=second_attempt,
         )
-        self.store.link_session(
-            self.principal, second_session, item.work_item_id, second_attempt
-        )
-
+        self.store.link_session(self.principal, second_session, item.work_item_id, second_attempt)
         self.store.finish_work_item(self.principal, item.work_item_id, "completed")
         with self.events._db() as db:
             event_count = db.execute("SELECT count(*) FROM event_outbox").fetchone()[0]
             delivery_count = db.execute("SELECT count(*) FROM event_deliveries").fetchone()[0]
+            payload = json.loads(db.execute("SELECT data_json FROM event_outbox").fetchone()[0])
         self.assertEqual(event_count, 1)
         self.assertEqual(delivery_count, 2)
-        with self.events._db() as db:
-            payload = json.loads(db.execute("SELECT data_json FROM event_outbox").fetchone()[0])
-        self.assertEqual(set(payload["conversation_ids"]), {first_session, second_session})
+        self.assertEqual(set(payload["source_conversation_ids"]), {first_session, second_session})
         self.assertEqual(self.events.deliver_pending(), 2)
-        delivered_payloads = [json.loads(body)["data"] for _url, body, _headers in self.callback.requests if json.loads(body).get("type") != "verification"]
-        self.assertEqual({payload["conversation_id"] for payload in delivered_payloads}, {first_session, second_session})
-        self.assertTrue(all("conversation_ids" not in payload for payload in delivered_payloads))
-
-
-    def test_owner_subscriptions_receive_all_workitem_events_in_their_destination_conversations(self):
-        first_session = "12345678-1234-4234-8234-123456789abc"
-        other_session = "32345678-1234-4234-8234-123456789abc"
-        self._subscribe("https://events.example.test/first", conversation_id=first_session)
-        self._subscribe("https://events.example.test/other", conversation_id=other_session)
+        delivered = [(url, json.loads(body)["data"]) for url, body, _headers in self.callback.requests
+                     if json.loads(body).get("type") != "verification"]
+        self.assertEqual({url for url, _data in delivered}, {
+            "https://events.example.test/chat-one", "https://events.example.test/chat-two"})
+        self.assertTrue(all(set(data["source_conversation_ids"]) == {first_session, second_session}
+                            for _url, data in delivered))
+    def test_each_subscribed_work_chat_receives_owner_events_via_its_callback(self):
+        self._subscribe("https://events.example.test/first")
+        self._subscribe("https://events.example.test/other")
         item, _ = self._create_linked_item()
         self.store.finish_work_item(self.principal, item.work_item_id, "completed")
         self.assertEqual(self.events.deliver_pending(), 2)
-        payloads = [json.loads(body) for _url, body, _headers in self.callback.requests if json.loads(body).get("type") != "verification"]
-        self.assertEqual(len(payloads), 2)
-        self.assertEqual({payload["data"]["conversation_id"] for payload in payloads}, {first_session, other_session})
-        self.assertTrue(all("conversation_ids" not in payload["data"] for payload in payloads))
-
-    def test_replay_backfill_targets_all_owner_destinations_not_source_sessions(self):
+        delivered = [(url, json.loads(body)["data"]) for url, body, _headers in self.callback.requests
+                     if json.loads(body).get("type") != "verification"]
+        self.assertEqual({url for url, _data in delivered}, {
+            "https://events.example.test/first", "https://events.example.test/other"})
+        self.assertTrue(all(data["job_id"] == item.work_item_id for _url, data in delivered))
+        self.assertTrue(all("conversation_id" not in data for _url, data in delivered))
+    def test_replay_backfill_targets_subscribed_work_chats_not_source_sessions(self):
         first_session = "12345678-1234-4234-8234-123456789abc"
-        other_session = "32345678-1234-4234-8234-123456789abc"
         self.events.clock = lambda: 1000.0
-        self.events.publish_job_completed(
-            self.principal.tenant_id,
-            self.principal.principal_id,
-            "wi_replay",
-            "replay event",
-            event_id="evt_replay_scoped",
-            completed_at="1970-01-01T00:16:41Z",
-            conversation_ids=[first_session],
-        )
-        self._subscribe("https://events.example.test/replay-first", conversation_id=first_session)
-        self._subscribe("https://events.example.test/replay-other", conversation_id=other_session)
+        self.events.publish_job_completed(self.principal.tenant_id, self.principal.principal_id,
+            "wi_replay", "replay event", event_id="evt_replay_scoped",
+            completed_at="1970-01-01T00:16:41Z", source_conversation_ids=[first_session])
+        self._subscribe("https://events.example.test/replay-first")
+        self._subscribe("https://events.example.test/replay-other")
         with self.events._db() as db:
-            rows = db.execute(
-                "SELECT s.callback_url FROM event_deliveries d JOIN event_subscriptions s ON s.id=d.subscription_id WHERE d.event_id='evt_replay_scoped'"
-            ).fetchall()
-        self.assertEqual(
-            {row["callback_url"] for row in rows},
-            {"https://events.example.test/replay-first", "https://events.example.test/replay-other"},
-        )
-
-    def test_unscoped_subscription_is_rejected(self):
-        auth = SimpleNamespace(principal=SimpleNamespace(
-            tenant_id=self.principal.tenant_id, principal_id=self.principal.principal_id
-        ))
-        delivery = {
-            "mode": "webhook",
-            "url": "https://events.example.test/unscoped",
-            "secret": "whsec_" + base64.b64encode(b"u" * 32).decode(),
-        }
-        with self.assertRaisesRegex(ValueError, "destination conversation_id"):
-            self.events.subscribe(auth, {
-                "name": "chatgpt.job.completed", "arguments": {}, "delivery": delivery
-            })
-
-    def test_one_owner_conversation_aggregates_multiple_distinct_workitems(self):
-        destination = "92345678-1234-4234-8234-123456789abc"
-        self._subscribe(conversation_id=destination)
+            rows = db.execute("SELECT s.callback_url FROM event_deliveries d JOIN event_subscriptions s "
+                "ON s.id=d.subscription_id WHERE d.event_id='evt_replay_scoped'").fetchall()
+        self.assertEqual({row["callback_url"] for row in rows}, {
+            "https://events.example.test/replay-first", "https://events.example.test/replay-other"})
+    def test_empty_filter_subscription_uses_callback_as_destination(self):
+        self._subscribe("https://events.example.test/subscribed-chat")
+        item = self.store.create_work_item(self.principal)
+        self.store.finish_work_item(self.principal, item.work_item_id, "completed")
+        self.assertEqual(self.events.deliver_pending(), 1)
+        delivered = [(url, json.loads(body)) for url, body, _headers in self.callback.requests
+                     if json.loads(body).get("type") != "verification"]
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(delivered[0][0], "https://events.example.test/subscribed-chat")
+        self.assertNotIn("conversation_id", delivered[0][1]["data"])
+    def test_one_owner_callback_subscription_aggregates_multiple_distinct_workitems(self):
+        self._subscribe()
         first, _ = self._create_linked_item()
         second = self.store.create_work_item(self.principal)
         self.store.finish_work_item(self.principal, first.work_item_id, "completed")
         self.store.finish_work_item(self.principal, second.work_item_id, "completed")
         self.assertEqual(self.events.deliver_pending(), 2)
-        payloads = [json.loads(body)["data"] for _url, body, _headers in self.callback.requests if json.loads(body).get("type") != "verification"]
+        payloads = [json.loads(body)["data"] for _url, body, _headers in self.callback.requests
+                    if json.loads(body).get("type") != "verification"]
         self.assertEqual({payload["job_id"] for payload in payloads}, {first.work_item_id, second.work_item_id})
-        self.assertEqual({payload["conversation_id"] for payload in payloads}, {destination})
-
-    def test_owner_destination_does_not_receive_another_principals_workitems(self):
-        destination = "92345678-1234-4234-8234-123456789abc"
-        self._subscribe(conversation_id=destination)
+    def test_owner_callback_does_not_receive_another_principals_workitems(self):
+        self._subscribe()
         other = Principal("tenant-a", "another-owner")
         foreign = self.store.create_work_item(other)
         self.store.finish_work_item(other, foreign.work_item_id, "completed")
         self.assertEqual(self.events.deliver_pending(), 0)
-
-    def test_multiple_owners_can_route_their_workitems_to_one_destination_conversation(self):
-        destination = "92345678-1234-4234-8234-123456789abc"
+    def test_multiple_owners_receive_only_their_events_at_their_callback_urls(self):
         other = Principal("tenant-a", "another-owner")
-        self._subscribe("https://events.example.test/shared-destination", principal=self.principal, conversation_id=destination)
-        self._subscribe("https://events.example.test/shared-destination", principal=other, conversation_id=destination)
-
+        self._subscribe("https://events.example.test/owner-a", principal=self.principal)
+        self._subscribe("https://events.example.test/owner-b", principal=other)
         first = self.store.create_work_item(self.principal)
         second = self.store.create_work_item(other)
         self.store.finish_work_item(self.principal, first.work_item_id, "completed")
         self.store.finish_work_item(other, second.work_item_id, "completed")
-
-        # Each owner's authenticated subscription is isolated, but both
-        # callbacks target the same ChatGPT Work destination conversation.
         self.assertEqual(self.events.deliver_pending(), 2)
-        payloads = [
-            json.loads(body)["data"]
-            for _url, body, _headers in self.callback.requests
-            if json.loads(body).get("type") != "verification"
-        ]
-        self.assertEqual({payload["job_id"] for payload in payloads}, {first.work_item_id, second.work_item_id})
-        self.assertEqual({payload["conversation_id"] for payload in payloads}, {destination})
-
-    def test_owner_destination_receives_completion_even_without_workitem_session_link(self):
+        delivered = [(url, json.loads(body)["data"]["job_id"]) for url, body, _headers in self.callback.requests
+                     if json.loads(body).get("type") != "verification"]
+        self.assertEqual(dict(delivered), {
+            "https://events.example.test/owner-a": first.work_item_id,
+            "https://events.example.test/owner-b": second.work_item_id})
+    def test_subscribed_chat_receives_completion_without_source_session_link(self):
         self._subscribe()
         item = self.store.create_work_item(self.principal)
         self.store.finish_work_item(self.principal, item.work_item_id, "completed")
@@ -252,21 +213,23 @@ class WorkItemCompletionEventTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT count(*) FROM event_outbox").fetchone()[0], 1)
             self.assertEqual(db.execute("SELECT count(*) FROM event_deliveries").fetchone()[0], 1)
         self.assertEqual(self.events.deliver_pending(), 1)
-        delivered = [json.loads(body)["data"] for _url, body, _headers in self.callback.requests if json.loads(body).get("type") != "verification"]
-        self.assertEqual(delivered[0]["conversation_id"], "12345678-1234-4234-8234-123456789abc")
-
-    def test_unscoped_legacy_subscription_is_disabled_on_startup(self):
-        # Create an old-format subscription row directly to model an upgrade.
+        delivered = [json.loads(body)["data"] for _url, body, _headers in self.callback.requests
+                     if json.loads(body).get("type") != "verification"]
+        self.assertEqual(len(delivered), 1)
+        self.assertNotIn("source_conversation_ids", delivered[0])
+    def test_legacy_destination_subscriptions_are_disabled_on_schema_upgrade(self):
         self._subscribe()
+        item = self.store.create_work_item(self.principal)
+        self.store.finish_work_item(self.principal, item.work_item_id, "completed")
         with self.events._db() as db:
-            db.execute("UPDATE event_subscriptions SET arguments_json='{}', active=1")
-        reopened = MCPEventsStore(
-            str(self.database), encryption_key=b"k" * 32, post_json=self.callback.post
-        )
+            db.execute("DROP TABLE event_schema_metadata")
+        reopened = MCPEventsStore(str(self.database), encryption_key=b"k" * 32,
+                                  post_json=self.callback.post)
         with reopened._db() as db:
             row = db.execute("SELECT active FROM event_subscriptions").fetchone()
+            delivery = db.execute("SELECT status FROM event_deliveries").fetchone()
         self.assertEqual(row["active"], 0)
-
+        self.assertEqual(delivery["status"], "failed")
     def test_delegated_completion_notifies_work_item_owner(self):
         self._subscribe(principal=self.principal)
         self._subscribe(
@@ -358,7 +321,7 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         ):
             self.events.subscribe(owner_auth, {
                 "name": "chatgpt.job.completed",
-                "arguments": {"job_id": item.work_item_id, "conversation_id": "12345678-1234-4234-8234-123456789abc"},
+                "arguments": {"job_id": item.work_item_id},
                 "delivery": owner_delivery,
             })
         owner_verify.assert_called_once()
@@ -376,7 +339,7 @@ class WorkItemCompletionEventTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "owned by the subscriber"):
                 self.events.subscribe(delegate_auth, {
                     "name": "chatgpt.job.completed",
-                    "arguments": {"job_id": item.work_item_id, "conversation_id": "12345678-1234-4234-8234-123456789abc"},
+                    "arguments": {"job_id": item.work_item_id},
                     "delivery": delivery,
                 })
         verify.assert_not_called()
@@ -432,7 +395,7 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.events.subscribe(writer_auth, {
                 "name": "chatgpt.job.completed",
-                "arguments": {"conversation_id": session_id},
+                "arguments": {},
                 "delivery": writer_delivery,
             })
 
@@ -462,7 +425,7 @@ class WorkItemCompletionEventTests(unittest.TestCase):
             if "eventId" in json.loads(body)
         ]
         self.assertEqual(len(event_posts), 1)
-        self.assertEqual(event_posts[0]["data"]["conversation_id"], session_id)
+        self.assertEqual(event_posts[0]["data"]["source_conversation_ids"], [session_id])
         with self.events._db() as db:
             rows = db.execute(
                 """SELECT d.status, s.principal_id FROM event_deliveries d

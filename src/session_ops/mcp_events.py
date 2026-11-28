@@ -37,6 +37,7 @@ MAX_CALLBACK_RESPONSE_BYTES = 4096
 DEFAULT_TTL_SECONDS = 7 * 24 * 60 * 60
 MAX_TTL_SECONDS = 90 * 24 * 60 * 60
 MAX_DELIVERY_ATTEMPTS = 5
+EVENT_SCHEMA_VERSION = 2
 DELIVERY_LEASE_SECONDS = 30
 _KEY_CHECK_CONTEXT = b"chatgpt-session-ops:mcp-events:encryption-key-check:v1"
 
@@ -162,6 +163,10 @@ class MCPEventsStore:
                     singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                     key_check BLOB NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS event_schema_metadata (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+                    version INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS event_subscriptions (
                     id TEXT PRIMARY KEY,
                     tenant_id TEXT NOT NULL,
@@ -247,18 +252,19 @@ class MCPEventsStore:
                     "MCP Events encryption key does not match the database; "
                     "restore the matching key or require re-subscription"
                 )
-            # Legacy unscoped subscriptions have no explicit destination.
-            # Disable them and cancel only their pending deliveries; never
-            # reinterpret historical outbox rows or fan them out broadly.
-            legacy_rows = db.execute(
-                "SELECT id, arguments_json FROM event_subscriptions WHERE active=1"
-            ).fetchall()
-            for legacy in legacy_rows:
-                try:
-                    filters = json.loads(legacy["arguments_json"])
-                except (TypeError, ValueError):
-                    filters = {}
-                if not isinstance(filters, dict) or not isinstance(filters.get("conversation_id"), str) or not filters["conversation_id"]:
+            schema_metadata = db.execute(
+                "SELECT version FROM event_schema_metadata WHERE singleton=1"
+            ).fetchone()
+            if schema_metadata is None or int(schema_metadata["version"]) < EVENT_SCHEMA_VERSION:
+                # Version 2 removes the application-defined destination
+                # conversation_id filter. ChatGPT's callback URL is the
+                # destination bound to the subscribed Work chat. Old
+                # subscriptions used the former, misleading filter semantics;
+                # deactivate them and require ChatGPT to subscribe again.
+                legacy_ids = db.execute(
+                    "SELECT id FROM event_subscriptions WHERE active=1"
+                ).fetchall()
+                for legacy in legacy_ids:
                     db.execute(
                         "UPDATE event_subscriptions SET active=0, generation=generation+1 WHERE id=?",
                         (legacy["id"],),
@@ -267,6 +273,13 @@ class MCPEventsStore:
                         "UPDATE event_deliveries SET status='failed', last_status=410, next_attempt_at=0, lease_until=NULL, lease_token=NULL WHERE subscription_id=? AND status IN ('pending','sending')",
                         (legacy["id"],),
                     )
+                db.execute(
+                    "INSERT INTO event_schema_metadata(singleton, version) VALUES (1, ?) "
+                    "ON CONFLICT(singleton) DO UPDATE SET version=excluded.version",
+                    (EVENT_SCHEMA_VERSION,),
+                )
+            elif int(schema_metadata["version"]) > EVENT_SCHEMA_VERSION:
+                raise RuntimeError("MCP Events database schema is newer than this server")
         if database != ":memory:":
             os.chmod(database, 0o600)
 
@@ -425,29 +438,27 @@ class MCPEventsStore:
     def event_catalog() -> list[dict[str, Any]]:
         return [{
             "name": "chatgpt.job.completed",
-            "description": "A WorkItem owned by the connected account has reached a terminal state; the subscribed conversation is the owner-level notification destination.",
+            "description": "A WorkItem owned by the connected account has reached a terminal state. ChatGPT delivers the webhook to the Work chat that created the subscription.",
             "delivery": ["webhook"],
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "conversation_id": {"type": "string", "minLength": 36, "maxLength": 36, "description": "The canonical ChatGPT Work conversation UUID that receives this owner’s WorkItem completion events."},
-                    "job_id": {"type": "string", "description": "Optional WorkItem ID filter. Omit it to receive all WorkItem completion events owned by this authenticated principal in the destination conversation."}
+                    "job_id": {"type": "string", "description": "Optional WorkItem ID filter. Omit it to receive all WorkItem completion events owned by this authenticated principal in the subscribed Work chat."}
                 },
-                "required": ["conversation_id"],
                 "additionalProperties": False,
             },
             "payloadSchema": {
                 "type": "object",
                 "properties": {
                     "job_id": {"type": "string"},
-                    "conversation_id": {"type": "string"},
+                    "source_conversation_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": True},
                     "status": {"type": "string", "enum": ["succeeded", "failed"]},
                     "summary": {"type": "string"},
                     "completed_at": {"type": "string", "format": "date-time"},
                     "error_code": {"type": "string"},
                     "outcome_unknown": {"type": "boolean"},
                 },
-                "required": ["job_id", "conversation_id", "status", "summary", "completed_at"],
+                "required": ["job_id", "status", "summary", "completed_at"],
                 "additionalProperties": False,
             },
         }]
@@ -494,18 +505,11 @@ class MCPEventsStore:
         delivery = params.get("delivery")
         if name != "chatgpt.job.completed" or not isinstance(arguments, dict):
             raise ValueError("unsupported event or invalid arguments")
-        if (
-            set(arguments) - {"job_id", "conversation_id"}
-            or not isinstance(arguments.get("conversation_id"), str)
-            or not arguments["conversation_id"]
-            or ("job_id" in arguments and (not isinstance(arguments["job_id"], str) or not arguments["job_id"]))
+        if set(arguments) - {"job_id"} or (
+            "job_id" in arguments
+            and (not isinstance(arguments["job_id"], str) or not arguments["job_id"])
         ):
-            raise ValueError("an explicit destination conversation_id is required for chatgpt.job.completed")
-        conversation_id = arguments["conversation_id"]
-        try:
-            validate_conversation_id(conversation_id)
-        except UnconfirmedSession as exc:
-            raise ValueError("conversation_id must be a canonical lowercase UUID") from exc
+            raise ValueError("only an optional job_id filter is supported for chatgpt.job.completed")
         job_id = arguments.get("job_id")
         if job_id is not None:
             # Completion events are owned and published by the WorkItem
@@ -603,10 +607,10 @@ class MCPEventsStore:
             ).fetchall()
             for event in recent_events:
                 event_data = json.loads(event["data_json"])
-                # conversation_id is the notification destination, not a
-                # requirement that this WorkItem originated in that chat.
-                # With no job_id filter, one owner-level subscription receives
-                # every completion event for this verified principal.
+                # ChatGPT's callback URL is bound to the subscribed Work chat;
+                # event arguments are filters only, never routing instructions.
+                # With no job_id filter, this subscription receives every
+                # completion event for the authenticated principal.
                 if arguments.get("job_id") not in (None, event_data.get("job_id")):
                     continue
                 db.execute(
@@ -645,8 +649,7 @@ class MCPEventsStore:
         *,
         event_id: str | None = None,
         completed_at: str | None = None,
-        conversation_id: str | None = None,
-        conversation_ids: list[str] | None = None,
+        source_conversation_ids: list[str] | None = None,
         status: str = "succeeded",
         error_code: str | None = None,
         outcome_unknown: bool | None = None,
@@ -662,8 +665,7 @@ class MCPEventsStore:
                 summary,
                 event_id=event_id,
                 completed_at=completed_at,
-                conversation_id=conversation_id,
-                conversation_ids=conversation_ids,
+                source_conversation_ids=source_conversation_ids,
                 status=status,
                 error_code=error_code,
                 outcome_unknown=outcome_unknown,
@@ -679,8 +681,7 @@ class MCPEventsStore:
         *,
         event_id: str,
         completed_at: str,
-        conversation_id: str | None = None,
-        conversation_ids: list[str] | None = None,
+        source_conversation_ids: list[str] | None = None,
         status: str = "succeeded",
         error_code: str | None = None,
         outcome_unknown: bool | None = None,
@@ -698,16 +699,17 @@ class MCPEventsStore:
             raise ValueError("completion event and WorkItem must share the same SQLite database")
         if not isinstance(summary, str):
             raise ValueError("job summary must be text")
-        if conversation_id is not None and (not isinstance(conversation_id, str) or not conversation_id):
-            raise ValueError("conversation_id must be nonempty text or null")
-        if conversation_ids is not None and (
-            not isinstance(conversation_ids, list)
-            or any(not isinstance(value, str) or not value for value in conversation_ids)
-            or len(set(conversation_ids)) != len(conversation_ids)
-        ):
-            raise ValueError("conversation_ids must be a list of unique nonempty strings")
-        if conversation_id is not None and conversation_ids is not None:
-            raise ValueError("use conversation_id or conversation_ids, not both")
+        if source_conversation_ids is not None:
+            if (
+                not isinstance(source_conversation_ids, list)
+                or any(not isinstance(value, str) or not value for value in source_conversation_ids)
+                or len(set(source_conversation_ids)) != len(source_conversation_ids)
+            ):
+                raise ValueError("source_conversation_ids must be a list of unique nonempty strings")
+            try:
+                source_conversation_ids = [validate_conversation_id(value) for value in source_conversation_ids]
+            except UnconfirmedSession as exc:
+                raise ValueError("source_conversation_ids must contain canonical lowercase UUIDs") from exc
         if status not in ("succeeded", "failed"):
             raise ValueError("job status must be succeeded or failed")
         if error_code is not None and (not isinstance(error_code, str) or not error_code):
@@ -735,10 +737,8 @@ class MCPEventsStore:
             "summary": summary[:4000],
             "completed_at": completed_at,
         }
-        if conversation_id is not None:
-            data["conversation_id"] = conversation_id
-        if conversation_ids is not None:
-            data["conversation_ids"] = conversation_ids
+        if source_conversation_ids is not None:
+            data["source_conversation_ids"] = source_conversation_ids
         if error_code is not None:
             data["error_code"] = error_code
         if outcome_unknown is not None:
@@ -758,21 +758,16 @@ class MCPEventsStore:
             "INSERT INTO event_outbox VALUES (?, ?, ?, ?, ?, ?)",
             (event_id, tenant_id, principal_id, "chatgpt.job.completed", canonical_data, event_created_at),
         )
-        # Subscriptions are explicit owner-scoped notification destinations.
-        # The destination conversation need not be linked to each WorkItem;
-        # omitting job_id intentionally aggregates all of this principal's
-        # WorkItem completions into one stable ChatGPT Work conversation.
+        # The callback URL is the ChatGPT-supplied destination bound to the
+        # subscribed Work chat. Subscriptions are owner-scoped; job_id is the
+        # only application filter and may be omitted for owner-wide events.
         subscriptions = db.execute(
             "SELECT id, arguments_json, generation FROM event_subscriptions WHERE tenant_id=? AND principal_id=? AND name='chatgpt.job.completed' AND active=1 AND (expires_at IS NULL OR expires_at>?)",
             (tenant_id, principal_id, now),
         ).fetchall()
         for sub in subscriptions:
             filters = json.loads(sub["arguments_json"])
-            scoped_conversation = filters.get("conversation_id")
-            if (
-                not isinstance(scoped_conversation, str)
-                or filters.get("job_id") not in (None, job_id)
-            ):
+            if filters.get("job_id") not in (None, job_id):
                 continue
             db.execute(
                 "INSERT INTO event_deliveries(event_id, subscription_id, status, generation) VALUES (?, ?, 'pending', ?)",
@@ -863,7 +858,7 @@ class MCPEventsStore:
             rows = db.execute(
                 """SELECT d.event_id, d.subscription_id, d.attempts, d.generation,
                           s.callback_url, s.secret_enc, s.secret_prev_enc, s.secret_prev_until,
-                          s.arguments_json, e.name, e.data_json, e.created_at, e.tenant_id, e.principal_id
+                          e.name, e.data_json, e.created_at, e.tenant_id, e.principal_id
                    FROM event_deliveries d JOIN event_subscriptions s ON s.id=d.subscription_id
                    JOIN event_outbox e ON e.event_id=d.event_id
                    WHERE d.status='pending' AND d.next_attempt_at<=? AND s.active=1
@@ -890,29 +885,15 @@ class MCPEventsStore:
         for row in claimed:
             status = 599
             event_data = json.loads(row["data_json"])
-            filters = json.loads(row["arguments_json"])
-            scoped_conversation = filters.get("conversation_id")
-            if not isinstance(scoped_conversation, str):
-                # Old or corrupt deliveries without an explicit destination
-                # must fail closed. Source WorkItem sessions are independent.
-                status = 403
-                event = None
-                body = b""
-            else:
-                # Always route the callback to the explicitly subscribed
-                # destination conversation, regardless of the WorkItem's
-                # source session links (which may be absent or different).
-                event_data.pop("conversation_ids", None)
-                event_data["conversation_id"] = scoped_conversation
-                event = {
-                    "eventId": row["event_id"], "name": row["name"],
-                    "timestamp": datetime.fromtimestamp(row["created_at"], timezone.utc).isoformat().replace("+00:00", "Z"),
-                    "data": event_data, "cursor": None,
-                }
-                body = _canonical_json(event).encode("utf-8")
-            if status == 403:
-                pass
-            elif len(body) > MAX_EVENT_BYTES:
+            # The ChatGPT-provided callback URL routes this event to the
+            # subscribed Work chat. Payload fields are data, never routing.
+            event = {
+                "eventId": row["event_id"], "name": row["name"],
+                "timestamp": datetime.fromtimestamp(row["created_at"], timezone.utc).isoformat().replace("+00:00", "Z"),
+                "data": event_data, "cursor": None,
+            }
+            body = _canonical_json(event).encode("utf-8")
+            if len(body) > MAX_EVENT_BYTES:
                 status = 413
             else:
                 try:
