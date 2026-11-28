@@ -4991,7 +4991,10 @@ class ChatGPTAPI:
             pass
         return data
 
-    def req(self, method, url, body=None, extra_headers=None, timeout=120):
+    def req(
+        self, method, url, body=None, extra_headers=None, timeout=120,
+        total_timeout=None,
+    ):
         if self.is_anon:
             if not self.cookie:
                 self.ensure_device_cookie()
@@ -5017,6 +5020,16 @@ class ChatGPTAPI:
         for k, v in (extra_headers or {}).items():
             rq.add_header(k, v)
         t0 = time.time()
+        total_deadline = (
+            time.monotonic() + max(0.0, float(total_timeout))
+            if total_timeout is not None
+            else None
+        )
+        timeout_budget = (
+            min(float(timeout), float(total_timeout))
+            if total_timeout is not None
+            else timeout
+        )
         # 已收到的原始字节：超时/断流时这是唯一副本，必须边读边留（旧版 resp.read() 一次读完，
         # 中途超时异常里没有已读字节 → 已收内容全丢，19 次卡死全部零留存）。
         sink = []
@@ -5024,7 +5037,7 @@ class ChatGPTAPI:
         self.last_partial_bytes = 0
         try:
             with self._opener.open(rq, timeout=timeout) as resp:
-                self._read_stream(resp, sink)   # 读到 EOF，勿提前 close
+                self._read_stream(resp, sink, deadline=total_deadline)   # 读到 EOF，勿提前 close
                 data = self._decompress(b"".join(sink), resp.headers.get("Content-Encoding"))
                 self.last_headers = {k.lower(): v for k, v in resp.headers.items()}
                 self.quota = self._quota_from_headers(self.last_headers)
@@ -5033,7 +5046,13 @@ class ChatGPTAPI:
                 self.last_status = resp.status
                 return resp.status, text
         except urllib.error.HTTPError as e:
-            rraw = e.read()
+            if total_deadline is not None:
+                # Read-only callers need the status, not an unbounded error body.
+                # Closing the response also releases the socket immediately.
+                e.close()
+                rraw = b""
+            else:
+                rraw = e.read()
             rraw = self._decompress(rraw, (e.headers or {}).get("Content-Encoding"))
             self.last_headers = {k.lower(): v for k, v in (e.headers or {}).items()}
             self.quota = self._quota_from_headers(self.last_headers)
@@ -5051,11 +5070,11 @@ class ChatGPTAPI:
             return self._partial_result(
                 b"".join(sink), t0, "IncompleteRead: %s" % (e,), marker="PARTIAL")
         except (socket.timeout, TimeoutError) as e:
-            return self._timeout_result(sink, t0, timeout, str(e) or type(e).__name__)
+            return self._timeout_result(sink, t0, timeout_budget, str(e) or type(e).__name__)
         except urllib.error.URLError as e:
             reason = getattr(e, "reason", None)
             if isinstance(reason, (socket.timeout, TimeoutError)) or "timed out" in str(reason):
-                return self._timeout_result(sink, t0, timeout, "urlopen: %s" % (reason,))
+                return self._timeout_result(sink, t0, timeout_budget, "urlopen: %s" % (reason,))
             self.last_headers = {}
             self.quota = {}
             self.last_body = ""
@@ -5069,7 +5088,7 @@ class ChatGPTAPI:
             return 0, "EXC " + str(e)
 
     @staticmethod
-    def _read_stream(resp, sink):
+    def _read_stream(resp, sink, deadline=None):
         """分块读到 EOF，边读边把字节追加进 sink。
 
         为什么不用 `resp.read()`：一次性读到底，中途 socket 超时抛出时异常对象里没有
@@ -5085,14 +5104,27 @@ class ChatGPTAPI:
         都在 `read()` 内抛出，因此该分支现实不可达，无需额外处理。
         """
         while True:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise socket.timeout("total response deadline exceeded")
+                fp = getattr(resp, "fp", None)
+                raw = getattr(fp, "raw", None)
+                sock = getattr(raw, "_sock", None)
+                if sock is not None:
+                    sock.settimeout(remaining)
             try:
-                chunk = resp.read(16384)
+                reader = getattr(resp, "read1", None) if deadline is not None else None
+                chunk = (reader or resp.read)(16384)
             except http.client.IncompleteRead as e:
                 part = getattr(e, "partial", b"") or b""
                 if part:
                     sink.append(part)
                 raise
             if not chunk:
+                remaining_length = getattr(resp, "length", None)
+                if deadline is not None and remaining_length:
+                    raise http.client.IncompleteRead(b"", remaining_length)
                 return
             sink.append(chunk)
 
@@ -5207,6 +5239,19 @@ class ChatGPTAPI:
                 return self.tail_from_mapping(f.read())
         except Exception:
             return None
+
+    def live_tail_once(self, conv_id, timeout=90):
+        """Fetch one conversation snapshot without retry or backoff."""
+        status, body = self.req(
+            "GET",
+            API_BASE + "/backend-api/conversation/" + conv_id,
+            timeout=_cap_timeout(timeout),
+            total_timeout=_cap_timeout(timeout),
+        )
+        if status == 200:
+            # The MCP adapter scans the raw mapping once; do not parse it twice.
+            return None, body, status, None
+        return None, None, status, body
 
     def live_tail(self, conv_id, tries=2):
         for attempt in range(tries):

@@ -27,6 +27,9 @@ class SessionOpsError(RuntimeError):
         super().__init__(detail or code)
 
 
+CHATGPT_READ_HTTP_TIMEOUT_SECONDS = 15.0
+
+
 _DEFAULT_ACCOUNT_HEALTH = (
     ("acct4", "auth_unavailable", "upstream HTTP 401; awaiting authorized reauthentication and read-only probe"),
     ("acct5", "operator_disabled", "operator disabled; do not reauthenticate"),
@@ -554,7 +557,24 @@ class ChatGPTDirectClient:
         if owner["account"] not in self._active_accounts():
             raise SessionOpsError("RESOURCE_EXHAUSTED", "recorded session account is currently unavailable")
         api = self._cli.ChatGPTAPI(account=owner["account"])
-        tail, raw = api.live_tail(conversation_id, tries=2)
+        _tail, raw, status, upstream_error = api.live_tail_once(
+            conversation_id,
+            timeout=CHATGPT_READ_HTTP_TIMEOUT_SECONDS,
+        )
+        if status != 200:
+            detail = f"upstream conversation read returned HTTP {status}"
+            if status == 401:
+                raise SessionOpsError("UNAUTHENTICATED", detail)
+            if status == 429:
+                raise SessionOpsError("RESOURCE_EXHAUSTED", detail)
+            if status == 404:
+                raise SessionOpsError("NOT_FOUND", detail)
+            if status in (408, 504) or (
+                status == 0
+                and any(token in str(upstream_error).lower() for token in ("timeout", "timed out"))
+            ):
+                raise SessionOpsError("TIMEOUT", "upstream conversation read timed out")
+            raise SessionOpsError("DEPENDENCY_UNAVAILABLE", detail)
         if not raw:
             raise SessionOpsError("DEPENDENCY_UNAVAILABLE", "conversation read returned no mapping")
         rows, complete = self._cli._scan_mapping(raw)

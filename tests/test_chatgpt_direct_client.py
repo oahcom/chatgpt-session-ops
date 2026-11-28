@@ -3,11 +3,17 @@ import os
 import threading
 import time
 
+import pytest
+
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from src.session_ops.chatgpt_direct_client import ChatGPTDirectClient, SessionOpsError
+from src.session_ops.chatgpt_direct_client import (
+    CHATGPT_READ_HTTP_TIMEOUT_SECONDS,
+    ChatGPTDirectClient,
+    SessionOpsError,
+)
 
 
 def make_client(tmp_path):
@@ -292,8 +298,11 @@ def test_read_session_after_message_id_and_response_contract(tmp_path):
     client._store_owner("conv-1", "tenant-a", "principal-a", "acct1")
 
     class FakeAPI:
-        def live_tail(self, conversation_id, tries=2):
-            return "tail", "mapping"
+        calls = []
+
+        def live_tail_once(self, conversation_id, timeout):
+            self.calls.append((conversation_id, timeout))
+            return None, "mapping", 200, None
 
     with patch.object(client._cli, "ChatGPTAPI", lambda account: FakeAPI()), patch.object(
         client._cli, "_scan_mapping",
@@ -309,6 +318,86 @@ def test_read_session_after_message_id_and_response_contract(tmp_path):
     }]
     assert result["complete"] is True
     assert result["next_after_message_id"] is None
+    assert FakeAPI.calls == [("conv-1", CHATGPT_READ_HTTP_TIMEOUT_SECONDS)]
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "expected_code"),
+    [
+        (401, "unauthorized", "UNAUTHENTICATED"),
+        (429, "rate limited", "RESOURCE_EXHAUSTED"),
+        (404, "missing", "NOT_FOUND"),
+        (0, "TIMEOUT: total response deadline exceeded", "TIMEOUT"),
+        (503, "unavailable", "DEPENDENCY_UNAVAILABLE"),
+    ],
+)
+def test_read_session_preserves_upstream_failure_categories(
+    tmp_path, status, body, expected_code
+):
+    client = make_client(tmp_path)
+    client._store_owner("conv-1", "tenant-a", "principal-a", "acct1")
+
+    class FakeAPI:
+        def live_tail_once(self, conversation_id, timeout):
+            return None, None, status, body
+
+    with patch.object(client._cli, "ChatGPTAPI", lambda account: FakeAPI()):
+        with pytest.raises(SessionOpsError) as caught:
+            client.read_session(
+                principal_id="principal-a", tenant_id="tenant-a",
+                conversation_id="conv-1", limit=10,
+            )
+    assert caught.value.code == expected_code
+
+
+def test_live_tail_once_uses_one_request_and_total_timeout(tmp_path, monkeypatch):
+    client = make_client(tmp_path)
+    cli = client._load_cli()
+    api_class = cli.ChatGPTAPI
+    api = api_class.__new__(api_class)
+    calls = []
+
+    def fake_req(method, url, timeout, total_timeout):
+        calls.append((method, url, timeout, total_timeout))
+        return 200, "mapping"
+
+    api.req = fake_req
+    monkeypatch.setattr(cli, "SEND_TIMEOUT", None)
+    result = api.live_tail_once("conv-1", timeout=7)
+    assert result == (None, "mapping", 200, None)
+    assert len(calls) == 1
+    assert calls[0][0] == "GET"
+    assert calls[0][2:] == (7, 7)
+
+
+def test_read_stream_enforces_total_deadline_between_chunks(tmp_path, monkeypatch):
+    client = make_client(tmp_path)
+    cli = client._load_cli()
+    api_class = cli.ChatGPTAPI
+
+    class FakeSocket:
+        def __init__(self):
+            self.timeouts = []
+
+        def settimeout(self, value):
+            self.timeouts.append(value)
+
+    class FakeResponse:
+        def __init__(self):
+            self.sock = FakeSocket()
+            self.fp = SimpleNamespace(raw=SimpleNamespace(_sock=self.sock))
+            self.chunks = iter((b"one", b"two", b""))
+
+        def read1(self, size):
+            return next(self.chunks)
+
+    response = FakeResponse()
+    sink = []
+    ticks = iter((10.0, 10.25, 10.5))
+    monkeypatch.setattr(cli, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+    api_class._read_stream(response, sink, deadline=11.0)
+    assert sink == [b"one", b"two"]
+    assert response.sock.timeouts == [1.0, 0.75, 0.5]
 
 
 def test_adapter_respects_persistent_cli_operator_disable(tmp_path):

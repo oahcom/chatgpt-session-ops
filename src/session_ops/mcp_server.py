@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 import sqlite3
 import threading
@@ -63,6 +64,7 @@ ADAPTER_DEADLINE_SECONDS = 8.0
 REQUEST_DEADLINE_SECONDS = 10.0
 CHATGPT_READ_REQUEST_DEADLINE_SECONDS = 20.0
 AUTH_VERIFY_DEADLINE_SECONDS = 3.5
+logger = logging.getLogger(__name__)
 
 MCP_SERVER_NAME = "chatgpt-session-ops"
 MCP_SERVER_VERSION = "0.1.0"
@@ -93,6 +95,8 @@ _CHATGPT_READ_EXECUTOR = ThreadPoolExecutor(
     thread_name_prefix="session-ops-chatgpt-read",
 )
 _CHATGPT_READ_SLOTS = threading.BoundedSemaphore(_CHATGPT_READ_WORKERS)
+_CHATGPT_READ_INFLIGHT_LOCK = threading.Lock()
+_CHATGPT_READ_INFLIGHT_KEYS = set()
 
 
 class _DeadlineExceeded(Exception):
@@ -107,24 +111,71 @@ class _ResourceExhausted(Exception):
     """Bounded execution capacity is full."""
 
 
-def _submit_chatgpt_read(function: Any):
-    """Submit one bounded read; admission is immediate and fail-fast."""
-    if not _CHATGPT_READ_SLOTS.acquire(blocking=False):
-        raise _ResourceExhausted("ChatGPT read capacity is occupied")
+def _submit_chatgpt_read(function: Any, *, key: Any):
+    """Submit one bounded single-flight read; admission is immediate."""
+    with _CHATGPT_READ_INFLIGHT_LOCK:
+        if key in _CHATGPT_READ_INFLIGHT_KEYS:
+            raise _ResourceExhausted("the same ChatGPT read is already in flight")
+        if not _CHATGPT_READ_SLOTS.acquire(blocking=False):
+            raise _ResourceExhausted("ChatGPT read capacity is occupied")
+        _CHATGPT_READ_INFLIGHT_KEYS.add(key)
     try:
         future = _CHATGPT_READ_EXECUTOR.submit(function)
     except BaseException:
+        with _CHATGPT_READ_INFLIGHT_LOCK:
+            _CHATGPT_READ_INFLIGHT_KEYS.discard(key)
         _CHATGPT_READ_SLOTS.release()
         raise
-    # This callback belongs to the concurrent Future, so timeout/cancellation
-    # of the asyncio waiter cannot release capacity while the thread is alive.
-    future.add_done_callback(lambda _future: _CHATGPT_READ_SLOTS.release())
+
+    # The real concurrent Future owns both releases. A timed-out/cancelled MCP
+    # waiter cannot free the key or capacity while the upstream request lives.
+    def release(_future):
+        with _CHATGPT_READ_INFLIGHT_LOCK:
+            _CHATGPT_READ_INFLIGHT_KEYS.discard(key)
+        _CHATGPT_READ_SLOTS.release()
+
+    future.add_done_callback(release)
     return future
 
 
-async def _run_chatgpt_read(function: Any, *, timeout: float):
-    """Await a read without cancelling its underlying bounded worker thread."""
-    concurrent_future = _submit_chatgpt_read(function)
+def _chatgpt_read_key(
+    tool_name: str, auth: AuthContext, arguments: Any, request_id: str
+):
+    principal = auth.principal
+    identity = (
+        auth.issuer,
+        auth.realm_namespace,
+        auth.subject,
+        principal.tenant_id,
+        principal.principal_id,
+    )
+    if tool_name == "chatgpt.session.read":
+        conversation_id = (
+            arguments.get("conversation_id")
+            if isinstance(arguments, Mapping)
+            else None
+        )
+        if not isinstance(conversation_id, str) or not conversation_id:
+            return (tool_name, *identity, "invalid", request_id)
+        return (tool_name, *identity, conversation_id)
+    raise ValueError("tool is not a ChatGPT read")
+
+
+def _chatgpt_read_log_hashes(auth: AuthContext, request_id: str, read_key: Any):
+    identity_hash = hashlib.sha256(
+        "|".join((
+            auth.issuer, auth.realm_namespace, auth.subject,
+            auth.principal.tenant_id, auth.principal.principal_id,
+        )).encode("utf-8")
+    ).hexdigest()[:16]
+    request_hash = hashlib.sha256(str(request_id).encode("utf-8")).hexdigest()[:16]
+    resource_hash = hashlib.sha256(repr(read_key).encode("utf-8")).hexdigest()[:16]
+    return identity_hash, request_hash, resource_hash
+
+
+async def _run_chatgpt_read(function: Any, *, timeout: float, key: Any):
+    """Await a read without cancelling its tracked worker thread."""
+    concurrent_future = _submit_chatgpt_read(function, key=key)
     async_future = asyncio.wrap_future(concurrent_future)
     return await asyncio.wait_for(asyncio.shield(async_future), timeout=timeout)
 
@@ -1728,9 +1779,14 @@ def build_mcp_server(
             )
 
             try:
-                if params.name in ("chatgpt.session.read", "chatgpt.session.list"):
+                if params.name == "chatgpt.session.read":
+                    read_key = _chatgpt_read_key(
+                        params.name, auth, arguments, request_id
+                    )
                     envelope = await _run_chatgpt_read(
-                        dispatch, timeout=CHATGPT_READ_REQUEST_DEADLINE_SECONDS
+                        dispatch,
+                        timeout=CHATGPT_READ_REQUEST_DEADLINE_SECONDS,
+                        key=read_key,
                     )
                 else:
                     future = loop.run_in_executor(None, dispatch)
@@ -1738,9 +1794,35 @@ def build_mcp_server(
                         future, timeout=REQUEST_DEADLINE_SECONDS
                     )
 
-            except _ResourceExhausted:
+            except asyncio.CancelledError:
+                if params.name == "chatgpt.session.read":
+                    identity_hash, request_hash, resource_hash = _chatgpt_read_log_hashes(
+                        auth, request_id, read_key
+                    )
+                    logger.warning(
+                        "chatgpt_read_waiter_cancelled tool=%s request_hash=%s principal_hash=%s resource_hash=%s worker_remains_tracked=true",
+                        params.name, request_hash, identity_hash, resource_hash,
+                    )
+                raise
+            except _ResourceExhausted as exc:
+                if params.name == "chatgpt.session.read":
+                    _identity_hash, request_hash, resource_hash = _chatgpt_read_log_hashes(
+                        auth, request_id, read_key
+                    )
+                    logger.warning(
+                        "chatgpt_read_admission_rejected tool=%s request_hash=%s resource_hash=%s reason=%s",
+                        params.name, request_hash, resource_hash, str(exc),
+                    )
                 envelope = _error("RESOURCE_EXHAUSTED", request_id)
             except asyncio.TimeoutError:
+                if params.name == "chatgpt.session.read":
+                    identity_hash, request_hash, resource_hash = _chatgpt_read_log_hashes(
+                        auth, request_id, read_key
+                    )
+                    logger.warning(
+                        "chatgpt_read_waiter_timeout tool=%s request_hash=%s principal_hash=%s resource_hash=%s worker_remains_tracked=true",
+                        params.name, request_hash, identity_hash, resource_hash,
+                    )
                 envelope = _error("TIMEOUT", request_id)
 
         return types.CallToolResult(
