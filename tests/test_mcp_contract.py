@@ -38,6 +38,7 @@ from src.session_ops.mcp_server import (
     _error,
     _exception_code,
     _validate_arguments,
+    TOOL_SCHEMAS,
 )
 from src.session_ops.chatgpt_direct_client import SessionOpsError
 
@@ -631,6 +632,14 @@ class MCPContractTests(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             _validate_arguments(tool, arguments)
         self.assertIn(fragment, str(caught.exception))
+
+    def test_all_database_mutations_advertise_required_idempotency_key(self):
+        for name in (
+            "work_item.create", "work_item.update", "work_item.finish",
+            "work_item.grant", "work_item.revoke", "session.link", "session.unlink",
+        ):
+            with self.subTest(tool=name):
+                self.assertIn("idempotency_key", TOOL_SCHEMAS[name]["required"])
 
     def test_required_argument_missing_is_rejected(self):
         self.assert_argument_rejected(

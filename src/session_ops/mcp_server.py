@@ -243,6 +243,7 @@ _IDEMPOTENCY_KEY = {
 TOOL_SCHEMAS = {
     "work_item.create": _object_schema(
         {"idempotency_key": _IDEMPOTENCY_KEY},
+        ("idempotency_key",),
     ),
     "work_item.get": _object_schema(
         {"work_item_id": _WORK_ITEM_ID},
@@ -260,7 +261,7 @@ TOOL_SCHEMAS = {
             "expected_updated_at": _ID,
             "idempotency_key": _IDEMPOTENCY_KEY,
         },
-        ("work_item_id", "status"),
+        ("work_item_id", "status", "idempotency_key"),
     ),
     "work_item.finish": _object_schema(
         {
@@ -268,7 +269,7 @@ TOOL_SCHEMAS = {
             "status": {"type": "string", "enum": ["completed", "cancelled"]},
             "idempotency_key": _IDEMPOTENCY_KEY,
         },
-        ("work_item_id", "status"),
+        ("work_item_id", "status", "idempotency_key"),
     ),
     "work_item.grant": _object_schema(
         {
@@ -277,7 +278,7 @@ TOOL_SCHEMAS = {
             "scope": _GRANT_SCOPE,
             "idempotency_key": _IDEMPOTENCY_KEY,
         },
-        ("work_item_id", "target_principal_id", "scope"),
+        ("work_item_id", "target_principal_id", "scope", "idempotency_key"),
     ),
     "work_item.revoke": _object_schema(
         {
@@ -286,7 +287,7 @@ TOOL_SCHEMAS = {
             "scope": _GRANT_SCOPE,
             "idempotency_key": _IDEMPOTENCY_KEY,
         },
-        ("work_item_id", "target_principal_id", "scope"),
+        ("work_item_id", "target_principal_id", "scope", "idempotency_key"),
     ),
     "session.link": _object_schema(
         {
@@ -295,7 +296,7 @@ TOOL_SCHEMAS = {
             "attempt_id": _ATTEMPT_ID,
             "idempotency_key": _IDEMPOTENCY_KEY,
         },
-        ("session_id", "work_item_id", "attempt_id"),
+        ("session_id", "work_item_id", "attempt_id", "idempotency_key"),
     ),
     "session.unlink": _object_schema(
         {
@@ -303,7 +304,7 @@ TOOL_SCHEMAS = {
             "expected_link_id": _LINK_ID,
             "idempotency_key": _IDEMPOTENCY_KEY,
         },
-        ("session_id",),
+        ("session_id", "idempotency_key"),
     ),
     "session.list": _object_schema(
         {
