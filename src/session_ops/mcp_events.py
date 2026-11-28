@@ -304,6 +304,29 @@ class MCPEventsStore:
             raise ValueError("unsupported event or invalid arguments")
         if set(arguments) - {"job_id"} or ("job_id" in arguments and (not isinstance(arguments["job_id"], str) or not arguments["job_id"])):
             raise ValueError("invalid chatgpt.job.completed subscription filter")
+        job_id = arguments.get("job_id")
+        if job_id is not None:
+            # Completion events are owned and published by the WorkItem
+            # owner. A delegate may subscribe to its own events, but a
+            # job-specific filter for someone else's WorkItem would never
+            # receive a delivery and must be rejected before callback I/O.
+            with self._db() as db:
+                authority_schema = db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='work_item_owners'"
+                ).fetchone()
+                owner = (
+                    db.execute(
+                        "SELECT tenant_id, owner_principal_id FROM work_item_owners WHERE work_item_id=?",
+                        (job_id,),
+                    ).fetchone()
+                    if authority_schema is not None else None
+                )
+            if authority_schema is not None and (
+                owner is None
+                or owner["tenant_id"] != tenant_id
+                or owner["owner_principal_id"] != principal_id
+            ):
+                raise ValueError("job_id filter must reference a WorkItem owned by the subscriber")
         if not isinstance(delivery, dict) or delivery.get("mode") != "webhook":
             raise ValueError("webhook delivery is required")
         callback_url, secret = delivery.get("url"), delivery.get("secret")

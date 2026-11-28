@@ -205,6 +205,57 @@ class WorkItemCompletionEventTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT count(*) FROM event_outbox").fetchone()[0], 0)
             self.assertEqual(db.execute("SELECT count(*) FROM event_deliveries").fetchone()[0], 0)
 
+
+    def test_delegate_cannot_subscribe_to_owner_work_item_filter(self):
+        item = self.store.create_work_item(self.principal)
+        delegate = Principal("tenant-a", "delegate-a")
+        conn = self.store._connect()
+        try:
+            conn.execute(
+                "INSERT INTO work_item_grants(work_item_id, principal_id, scope, granted_at) VALUES (?, ?, 'read', ?)",
+                (item.work_item_id, delegate.principal_id, "2026-11-28T12:00:00Z"),
+            )
+        finally:
+            conn.close()
+        # The owner can target its own WorkItem explicitly.
+        owner_delivery = {
+            "mode": "webhook",
+            "url": "https://events.example.test/owner-job",
+            "secret": "whsec_" + base64.b64encode(b"o" * 32).decode(),
+        }
+        owner_auth = SimpleNamespace(principal=SimpleNamespace(
+            tenant_id=self.principal.tenant_id,
+            principal_id=self.principal.principal_id,
+        ))
+        with (
+            patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"),
+            patch.object(self.events, "_verify_callback") as owner_verify,
+        ):
+            self.events.subscribe(owner_auth, {
+                "name": "chatgpt.job.completed",
+                "arguments": {"job_id": item.work_item_id},
+                "delivery": owner_delivery,
+            })
+        owner_verify.assert_called_once()
+
+        delegate_auth = SimpleNamespace(principal=SimpleNamespace(
+            tenant_id=delegate.tenant_id,
+            principal_id=delegate.principal_id,
+        ))
+        delivery = {
+            "mode": "webhook",
+            "url": "https://events.example.test/delegate-job",
+            "secret": "whsec_" + base64.b64encode(b"s" * 32).decode(),
+        }
+        with patch.object(self.events, "_verify_callback") as verify:
+            with self.assertRaisesRegex(ValueError, "owned by the subscriber"):
+                self.events.subscribe(delegate_auth, {
+                    "name": "chatgpt.job.completed",
+                    "arguments": {"job_id": item.work_item_id},
+                    "delivery": delivery,
+                })
+        verify.assert_not_called()
+
     def test_completion_event_belongs_to_owner_not_delegated_writer(self):
         from src.session_ops.authority import NotAuthorized
 
