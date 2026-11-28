@@ -3,7 +3,6 @@ import os
 import threading
 import time
 
-import pytest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -181,7 +180,7 @@ def test_default_send_queue_is_one_active_plus_eight_waiting(tmp_path):
 
 
 def test_direct_send_queue_rejects_capacity_above_nine(tmp_path):
-    with pytest.raises(ValueError, match="at most nine outstanding jobs"):
+    try:
         ChatGPTDirectClient(
             tmp_path / "mcp.sqlite3",
             repository_root=Path(__file__).resolve().parents[1],
@@ -189,11 +188,15 @@ def test_direct_send_queue_rejects_capacity_above_nine(tmp_path):
             runtime_dir=tmp_path / "runtime",
             max_queue_size=10,
         )
+    except ValueError as exc:
+        assert "at most nine outstanding jobs" in str(exc)
+    else:
+        raise AssertionError("direct send queue accepted capacity above nine")
 
 
 def test_direct_send_queue_rejects_non_integer_capacity_and_worker_values(tmp_path):
     for kwargs in ({"max_queue_size": 1.5}, {"max_queue_size": True}, {"max_workers": 1.0}, {"max_workers": True}):
-        with pytest.raises(ValueError):
+        try:
             ChatGPTDirectClient(
                 tmp_path / "mcp.sqlite3",
                 repository_root=Path(__file__).resolve().parents[1],
@@ -201,6 +204,9 @@ def test_direct_send_queue_rejects_non_integer_capacity_and_worker_values(tmp_pa
                 runtime_dir=tmp_path / "runtime",
                 **kwargs,
             )
+        except ValueError:
+            continue
+        raise AssertionError(f"direct send queue accepted invalid configuration: {kwargs!r}")
 
 
 def test_enqueue_is_idempotent_and_job_state_is_persistent(tmp_path):
