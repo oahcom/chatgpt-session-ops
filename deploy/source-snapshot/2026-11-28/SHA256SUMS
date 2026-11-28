@@ -5,7 +5,7 @@
 d8c32a83c9b1f4b9ae12a03d2edd5f3d228eef646e7a570cf9c2466edc3ab95a  deploy/source-snapshot/2026-11-28/so-mcp/src/session_ops/mcp_auth.py
 306017cd89dacaed57e0266de8e2dab59a84e3950c9377f36ec3d5361e4798d9  deploy/source-snapshot/2026-11-28/so-mcp/src/session_ops/mcp_event_collector.py
 ba12e9136c1fcfcbb9fa4c9acd33d8ee574547d4dc793b07df99195ad07dd415  deploy/source-snapshot/2026-11-28/so-mcp/src/session_ops/mcp_events.py
-b99d7cdca05794393158dd66ec02018fc6bb231bde6bde2c2d609dfd7df28f13  deploy/source-snapshot/2026-11-28/so-mcp/src/session_ops/mcp_event_workers.py
+4dc5ca6b5d188720b546a9d88eca02b9f76f53763653f99e17bce08d27133cb7  deploy/source-snapshot/2026-11-28/so-mcp/src/session_ops/mcp_event_workers.py
 0ae3da5d66963016dbd80f0d1a1d64064d6aa4a3fed7b022cd31cffb9e81f47e  deploy/source-snapshot/2026-11-28/so-mcp/src/session_ops/mcp_server.py
 6d402ae7f8bdb6265469e0d49619459199bcef575672dbe1b42c54e0dd218362  deploy/source-snapshot/2026-11-28/so-mcp/src/session_ops/memory_adapter_client.py
 6bae1ebabd8bb1923aaca6b1483bebf06bf62455b308b71e14034e5bd6f46a92  deploy/source-snapshot/2026-11-28/so-mcp/src/session_ops/sender_gateway_client.py

@@ -30,7 +30,7 @@ class MCPEventDeliveryWorker:
         self.cleanup_interval_seconds = float(cleanup_interval_seconds)
 
     def run_forever(self, stop_event: threading.Event) -> None:
-        last_cleanup = 0.0
+        last_cleanup = float("-inf")
         while not stop_event.is_set():
             now = time.monotonic()
             if now - last_cleanup >= self.cleanup_interval_seconds:

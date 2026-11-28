@@ -44,7 +44,8 @@ class MCPEventDeliveryWorkerTests(unittest.TestCase):
             cleanup_interval_seconds=60,
         )
         stop = StopAfterWait()
-        worker.run_forever(stop)
+        with patch("src.session_ops.mcp_event_workers.time.monotonic", return_value=1.0):
+            worker.run_forever(stop)
         self.assertEqual(store.cleanup_calls, 1)
         self.assertEqual(store.delivery_calls, [(2, authorize)])
         self.assertEqual(stop.waits, 1)
