@@ -127,6 +127,10 @@ TOOL_REQUIRED_SCOPES = {
         "session_ops.session.read",
         "session_ops.work_item.read",
     ),
+    "chatgpt.session.create": ("session_ops.chatgpt.session.write",),
+    "chatgpt.session.send": ("session_ops.chatgpt.session.write",),
+    "chatgpt.session.read": ("session_ops.chatgpt.session.read",),
+    "chatgpt.session.list": ("session_ops.chatgpt.session.read",),
 }
 
 
