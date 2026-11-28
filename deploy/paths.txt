@@ -1,7 +1,10 @@
 # Runtime entry point
 scripts/run_mcp_server.py
+
+# ChatGPT CLI and proof-of-work helper
 scripts/chatgpt_send.py
 scripts/pow_solver.py
+scripts/migrate_sender_owners.py
 
 # Application package
 src/session_ops/__init__.py
@@ -10,14 +13,8 @@ src/session_ops/chatgpt_cli.py
 src/session_ops/chatgpt_sessions.py
 src/session_ops/mcp_auth.py
 src/session_ops/mcp_server.py
-src/session_ops/chatgpt_cli.py
-src/session_ops/chatgpt_sessions.py
 src/session_ops/memory_adapter_client.py
 src/session_ops/work_items.py
-
-scripts/chatgpt_send.py
-scripts/pow_solver.py
-scripts/migrate_sender_owners.py
 
 # Runtime dependency declaration
 requirements-mcp.txt
