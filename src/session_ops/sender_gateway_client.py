@@ -32,6 +32,7 @@ CLIENT_KEY_ENV = "SO_MCP_SENDER_CLIENT_KEY"
 CA_ENV = "SO_MCP_SENDER_CA"
 TIMEOUT_ENV = "SO_MCP_SENDER_TIMEOUT"
 TOKEN_FILE_ENV = "SO_MCP_SENDER_TOKEN_FILE"
+IDENTITY_KEY_FILE_ENV = "SO_MCP_SENDER_IDENTITY_KEY_FILE"
 
 IDENTITY_KEY_FILE = "/etc/so-mcp/sender-identity.key"
 
@@ -477,13 +478,19 @@ class SenderGatewayClient:
         cls,
         environ: Optional[Mapping[str, str]] = None,
     ) -> "SenderGatewayClient":
-        config = load_sender_gateway_config(environ)
+        source = os.environ if environ is None else environ
+        config = load_sender_gateway_config(source)
 
         if not config["token_file"]:
             raise SenderGatewayConfigError(
                 TOKEN_FILE_ENV + " is required"
             )
 
+        # Keep the legacy path as a migration default; the consolidated
+        # chatgpt-session-ops service can place this key under its own /etc tree.
+        config["identity_key"] = _read_identity_key(
+            source.get(IDENTITY_KEY_FILE_ENV, IDENTITY_KEY_FILE)
+        )
         return cls(**config)
 
     def _connect(self) -> http.client.HTTPSConnection:
