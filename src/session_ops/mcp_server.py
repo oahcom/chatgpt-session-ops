@@ -255,7 +255,7 @@ TOOL_SCHEMAS = {
         "prompt": _PROMPT,
         "account": _ACCOUNT,
         "idempotency_key": _IDEMPOTENCY_KEY,
-    }, ("prompt",)),
+    }, ("conversation_id", "prompt")),
     "chatgpt.session.read": _object_schema({
         "conversation_id": _SESSION_ID,
         "after_message_id": _MESSAGE_ID,
