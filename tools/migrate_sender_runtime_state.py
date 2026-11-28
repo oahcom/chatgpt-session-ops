@@ -95,7 +95,7 @@ def migrate_state(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", default="/opt/so-sender/cli")
-    parser.add_argument("--state", default="/var/lib/chatgpt-session-ops")
+    parser.add_argument("--state", default="/var/lib/chatgpt-session-ops/mcp-state")
     parser.add_argument("--owner", default="chatgpt-sender")
     parser.add_argument("--group", default="chatgpt-sender")
     args = parser.parse_args()
