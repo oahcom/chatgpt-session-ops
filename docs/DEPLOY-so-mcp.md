@@ -1385,12 +1385,16 @@ its own process. `chatgpt.session.create` and `chatgpt.session.send` are
 synchronous: the tool call returns the completed CLI result. There is no
 separate Sender HTTP service, sender job queue, JobStore, or sender Worker.
 
-The MCP process remains `User=ubuntu`. Do not add it to the
-`chatgpt-sender` group and do not make credential files group-writable.
-Grant narrowly scoped ACLs instead:
+The MCP process remains `User=ubuntu`. Keep account credentials owned by
+`chatgpt-sender`; do not add MCP to that group and do not make credential
+files group-writable. Create a dedicated writable runtime directory and grant
+narrow ACLs:
 
 ```bash
-# Traverse the private parent, then read account credentials without write access.
+sudo install -d -o chatgpt-sender -g chatgpt-sender -m 0700 \
+  /var/lib/chatgpt-session-ops/mcp-state
+
+# Traverse the private parent and read account credentials without write access.
 sudo setfacl -m u:ubuntu:--x /var/lib/chatgpt-session-ops
 sudo setfacl -m u:ubuntu:r-x /var/lib/chatgpt-session-ops/accounts
 sudo find /var/lib/chatgpt-session-ops/accounts -type d -exec setfacl -m u:ubuntu:r-x {} +
@@ -1400,11 +1404,10 @@ sudo find /var/lib/chatgpt-session-ops/accounts -type f -exec setfacl -m u:ubunt
 sudo find /var/lib/chatgpt-session-ops/accounts -type d -name replies \
   -exec setfacl -m u:ubuntu:rwx,d:u:ubuntu:rwx {} +
 
-# Runtime state and account locks are writable by the MCP service.
-sudo setfacl -m u:ubuntu:rwx /var/lib/chatgpt-session-ops
-sudo setfacl -m u:ubuntu:rwx /var/lib/chatgpt-session-ops/state
-sudo find /var/lib/chatgpt-session-ops -maxdepth 1 -type f \
-  -exec setfacl -m u:ubuntu:rw- {} +
+# Runtime state is writable; the legacy Gateway database is read-only.
+sudo setfacl -m u:ubuntu:rwx /var/lib/chatgpt-session-ops/mcp-state
+sudo setfacl -m u:ubuntu:rw- /var/lib/chatgpt-session-ops/mcp-state/*
+sudo setfacl -m u:ubuntu:--x /var/lib/chatgpt-session-ops/state
 sudo setfacl -m u:ubuntu:r-- /var/lib/chatgpt-session-ops/state/sender-gateway.sqlite3
 ```
 
@@ -1412,13 +1415,15 @@ Apply the same read-only credential and writable-replies ACLs when provisioning
 a new account. Do not grant write access to `cookies.json` or
 `access_token.txt`.
 
-`CHATGPT_STATE_DIR` is `/var/lib/chatgpt-session-ops`;
+`CHATGPT_STATE_DIR` is `/var/lib/chatgpt-session-ops/mcp-state`;
 `SO_SENDER_ACCOUNTS_DIR` is `/var/lib/chatgpt-session-ops/accounts`;
-`CHATGPT_PROXY_FILE` is `/var/lib/chatgpt-session-ops/proxy.json`; and
+`CHATGPT_PROXY_FILE` is
+`/var/lib/chatgpt-session-ops/mcp-state/proxy.json`; and
 `SO_SENDER_ACCOUNT_LOCK_DIR` is
-`/var/lib/chatgpt-session-ops/state/account-locks`. The existing CLI runtime
-state is copied into this directory before cutover, so the CLI no longer needs
-to read code or configuration from `/opt/so-sender`.
+`/var/lib/chatgpt-session-ops/mcp-state/account-locks`. The existing CLI
+runtime state is copied into this directory before cutover, so the CLI no
+longer needs to read code or configuration from `/opt/so-sender`.
+
 
 Before switching the service, copy the existing runtime state files once. The
 script verifies each SHA-256, refuses to overwrite a different destination,
@@ -1430,7 +1435,7 @@ sudo python tools/migrate_sender_runtime_state.py \
   --state /var/lib/chatgpt-session-ops
 ```
 
-The service sets `SO_MCP_LEGACY_SENDER_DB` as read-only migration input. On first startup, The
+The service sets `SO_MCP_LEGACY_SENDER_DB` as read-only migration input. On first startup, the
 MCP process imports only the legacy `session_owners` mapping rows into
 `chatgpt_session_owners` in `SO_MCP_DB`, guarded by a one-time migration marker.
 It does not import legacy jobs or outbox events: those are historical Gateway
