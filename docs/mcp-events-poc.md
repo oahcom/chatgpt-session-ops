@@ -12,7 +12,28 @@ The event path is owned by `chatgpt-session-ops`; it has no Sender Gateway, Send
 6. Legacy unscoped subscriptions are disabled during store initialization and their pending deliveries are failed closed; historical outbox rows are retained.
 7. One in-process dispatcher delivers pending callbacks with bounded retries and Standard Webhooks signatures. Failed delivery remains durable for retry; duplicate delivery is idempotently identified by the stable event ID.
 
-The event store key is separate from the database file. `SO_MCP_EVENTS_DB`, if configured, must resolve to the same file as the WorkItem database; a second database is rejected because it would break atomicity. `SO_MCP_EVENTS_KEY_FILE` must contain a raw 32-byte key with service-user-only read access.
+The event store key is separate from the database file. `SO_MCP_EVENTS_DB`, if configured, must resolve to the same file as the WorkItem database; a second database is rejected because it would break atomicity. `SO_MCP_EVENTS_KEY_FILE` must contain a raw 32-byte key in a regular, non-symlink file owned by the service user with exact mode `0400` or `0600`.
+
+### Encryption-key lifecycle and recovery
+
+The Events encryption key is **immutable for the lifetime of this database**. In-place key rotation is deliberately unsupported: replacing the key without re-encrypting every current and previous subscription secret makes those rows undecryptable. Startup stores a keyed SHA-256 check value in `event_key_metadata`; a later startup with a different key fails before the dispatcher starts. When upgrading a database created before this check existed, startup first verifies that the supplied key decrypts every stored subscription secret before recording the check value. The check value is not the encryption key and cannot be used to decrypt subscription secrets.
+
+Back up the WorkItem/Events SQLite database with SQLite's online backup API (or another SQLite-consistent backup method). Do not copy only the main `.sqlite3` file while WAL mode is active: committed rows may still be in `-wal`. Back up the exact 32-byte key separately in an encrypted secret manager or equivalent access-controlled secret backup. The database backup and its matching key form one recovery set; never place the raw key in the database backup, repository, logs, or ticket.
+
+Restore the SQLite database to the new host using the SQLite backup API, restore the matching key file with owner-only mode `0400` or `0600`, then start MCP. Startup verifies the key/database pairing before enabling delivery. A database restored without its matching key must remain stopped; do not generate a replacement key and leave old subscriptions active. If the matching key is irrecoverably lost, stop MCP and take a fresh consistent database backup first. Then run this transaction against the WorkItem database:
+
+```sql
+BEGIN IMMEDIATE;
+DELETE FROM event_deliveries;
+DELETE FROM event_subscriptions;
+DELETE FROM callback_verifications;
+DELETE FROM event_key_metadata WHERE singleton=1;
+COMMIT;
+```
+
+Keep `event_outbox` and all WorkItem data. Provision a new key and restart; all former subscriptions are gone and their ChatGPT Work conversations must explicitly subscribe again. Historical outbox rows are retained but are not automatically replayed as part of this recovery procedure.
+
+There is no re-encryption migration, so interrupted rotation and rotation rollback are not supported operations. A wrong-key startup is fail-closed and does not modify the existing key metadata or subscription rows. Recovery is either restore the matching database/key pair or deliberately discard all subscriptions and re-establish them with a new key.
 
 ## Direct ChatGPT execution
 
