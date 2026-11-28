@@ -159,6 +159,9 @@ test -f "$TMP/scripts/run_mcp_server.py"
 test -f "$TMP/src/session_ops/authority.py"
 test -f "$TMP/src/session_ops/mcp_auth.py"
 test -f "$TMP/src/session_ops/mcp_server.py"
+test -f "$TMP/src/session_ops/chatgpt_direct_client.py"
+test -f "$TMP/src/session_ops/mcp_events.py"
+test -f "$TMP/src/session_ops/mcp_event_dispatcher.py"
 test -f "$TMP/src/session_ops/memory_adapter_client.py"
 test -f "$TMP/src/session_ops/work_items.py"
 test -f "$TMP/src/session_ops/__init__.py"
@@ -192,32 +195,30 @@ The active tree is `/opt/so-mcp`.
 
 The application tree is immutable at runtime. The service unit sets:
 
-- `CHATGPT_STATE_DIR=/var/lib/so-mcp/runtime` for account rotation, conversation
-  ownership, proxy configuration, anonymous-session state, slots, and logs.
-- `CHATGPT_AUTH_DIR=/var/lib/so-mcp` for credentials under
-  `accounts/acct1/` through `accounts/acct6/` and anonymous device state.
+- `CHATGPT_SESSION_OPS_ACCOUNTS_DIR=/var/lib/chatgpt-session-ops/accounts` for the credential vault. Credentials remain in the existing account directories and are not copied into the application tree.
+- `CHATGPT_SESSION_OPS_RUNTIME_DIR=/var/lib/so-mcp/chatgpt-session-ops` for mutable CLI state, prompt files, logs, and per-account runtime state.
 
 Prepare these directories before installing credentials or starting the
-service. They must be writable by `ubuntu`; credential files remain mode `0600`.
+service. They must be accessible to the `ubuntu` service account; credential
+files remain mode `0600`.
 
 ```bash
 sudo install -d -o ubuntu -g ubuntu -m 0700 \
-  /var/lib/so-mcp/runtime \
-  /var/lib/so-mcp/accounts \
-  /var/lib/so-mcp/accounts/acct1 \
-  /var/lib/so-mcp/accounts/acct2 \
-  /var/lib/so-mcp/accounts/acct3 \
-  /var/lib/so-mcp/accounts/acct4 \
-  /var/lib/so-mcp/accounts/acct5 \
-  /var/lib/so-mcp/accounts/acct6 \
-  /var/lib/so-mcp/accounts/nologin
+  /var/lib/so-mcp/chatgpt-session-ops \
+  /var/lib/chatgpt-session-ops/accounts \
+  /var/lib/chatgpt-session-ops/accounts/acct1 \
+  /var/lib/chatgpt-session-ops/accounts/acct2 \
+  /var/lib/chatgpt-session-ops/accounts/acct3 \
+  /var/lib/chatgpt-session-ops/accounts/acct4 \
+  /var/lib/chatgpt-session-ops/accounts/acct5 \
+  /var/lib/chatgpt-session-ops/accounts/acct6
 ```
 
 Do not put mutable rotation/ownership/proxy files or live credentials under
-`/opt/so-mcp`. The CLI keeps its historical `scripts/` defaults for local use,
-but the systemd unit redirects state and credentials into `/var/lib/so-mcp`.
-If proxy configuration is file-based rather than `CHATGPT_PROXY`, place
-`proxy.json` in `/var/lib/so-mcp/runtime/`.
+`/opt/so-mcp`. `ChatGPTDirectClient` redirects the CLI's mutable state into
+`/var/lib/so-mcp/chatgpt-session-ops`; account credentials remain in the
+separate `/var/lib/chatgpt-session-ops/accounts` vault. File-based proxy
+configuration, when used, is stored as `proxy.json` under the runtime path.
 
 The immediately previous tree is retained as:
 
@@ -447,17 +448,9 @@ only the message and the traceback frame differ.
 
 `SO_MCP_DB` is only checked against the literal `:memory:`, not for being
 absolute; a relative path resolves against `WorkingDirectory=/opt/so-mcp`. The
-unit is `ProtectSystem=strict` with `ReadWritePaths=/var/lib/so-mcp`, so the
-database must live under `/var/lib/so-mcp` or SQLite fails to create its WAL
-files at runtime. Use the path shown above. The same file is also what
-`scripts/chatgpt_send.py` opens for trusted WorkItem delivery (`--db`, or the
-`SO_MCP_DB` environment variable in that process), so both must name one path.
+unit is `ProtectSystem=strict` with `ReadWritePaths=/var/lib/so-mcp /var/lib/chatgpt-session-ops/accounts`, so the database must live under `/var/lib/so-mcp` or SQLite fails to create its WAL files at runtime. The WorkItem database is also the Events outbox database; a separate Events database is rejected to preserve atomic terminal-state publication.
 
-The unit also sets `CHATGPT_STATE_DIR` and `CHATGPT_AUTH_DIR` to the writable
-locations documented in section 2. Do not override them to point into
-`/opt/so-mcp`: `ProtectSystem=strict` intentionally makes the application tree
-read-only, and the CLI must persist account rotation and conversation ownership
-outside it.
+`CHATGPT_SESSION_OPS_ACCOUNTS_DIR` and `CHATGPT_SESSION_OPS_RUNTIME_DIR` are the only runtime path settings for the in-process direct client. Do not override them to point into `/opt/so-mcp`: the application tree is intentionally read-only.
 
 `scripts/run_mcp_server.py` also reads `LOG_LEVEL` for the Python logger
 (`logging.basicConfig`). It is not validated, has no failure mode, and is not
@@ -496,9 +489,11 @@ SO_MCP_EVENTS_KEY_FILE=/var/lib/so-mcp/events.key
 
 Leave `SO_MCP_EVENTS_DB` unset unless there is a specific operational reason
 to set it; if set, it must resolve to exactly the `SO_MCP_DB` file. The
-service validates the key file owner, restrictive mode, regular-file type,
-and exact 32-byte length at startup. The systemd unit already grants the
-service read/write access to `/var/lib/so-mcp`.
+service accepts only a regular, non-symlink key file owned by the service
+user, with exact mode `0400` or `0600` and exactly 32 raw bytes. It opens the
+file without following a final-component symlink and reads no more than 33
+bytes. The systemd unit already grants the service read/write access to
+`/var/lib/so-mcp`.
 
 ### OAuth scope issuance is a separate gate
 
@@ -506,7 +501,9 @@ The MCP resource metadata advertises the existing scopes
 `session_ops.chatgpt.session.read` and `session_ops.chatgpt.session.write`.
 Events do not introduce a separate OAuth scope: `events/list` requires the
 read scope, while `events/subscribe` and `events/unsubscribe` require the
-write scope. This is only the resource-server contract; it does not prove that
+write scope. `work_item.finish` requires `session_ops.work_item.write` and
+is additionally restricted to the immutable WorkItem owner. This is only the
+resource-server contract; it does not prove that
 the configured authorization server/client actually issues those scopes.
 
 Before enabling Events, obtain a token through the real ChatGPT OAuth flow
@@ -519,10 +516,13 @@ do not weaken the MCP checks or infer a grant from this repository's code.
 
 After provisioning, restart only in the approved deployment window and
 verify startup, the configured database identity, and callback HTTPS egress.
-Keep `SO_MCP_CHATGPT_MAINTENANCE=1` until the real ChatGPT Work subscription,
-idle-conversation callback/resumption, and unsubscribe acceptance test has
-passed. Provisioning the key alone is not authorization to enable production
-delivery.
+Do not provision the key or enable production delivery until the real ChatGPT Work acceptance test has passed in a controlled deployment window.
+That test must subscribe one destination conversation without `job_id`,
+complete multiple owner WorkItems (including one without a source session
+link), verify callbacks arrive in that same conversation, verify a different
+principal receives none, and verify unsubscribe. The service has no
+`SO_MCP_CHATGPT_MAINTENANCE` environment switch; production enablement is
+controlled solely by whether `SO_MCP_EVENTS_KEY_FILE` is configured.
 
 ### Deriving the realm namespace
 

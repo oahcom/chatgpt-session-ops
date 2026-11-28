@@ -14,14 +14,22 @@ import shutil
 import stat
 import sys
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Optional
 from urllib.parse import urlsplit
 
 import uvicorn
 
-from src.session_ops.authority import NotAuthorized, Principal, SecureWorkItemStore
+from src.session_ops.authority import (
+    PRINCIPAL_ID_RE,
+    NotAuthorized,
+    Principal,
+    PrincipalRecord,
+    SecureWorkItemStore,
+    StaticPrincipalDirectory,
+)
 from src.session_ops.mcp_auth import JWTVerifier
 from src.session_ops.mcp_server import MCPToolService, build_mcp_server
+from src.session_ops.chatgpt_direct_client import ChatGPTDirectClient
 from src.session_ops.mcp_events import MCPEventsStore
 from src.session_ops.mcp_event_dispatcher import MCPEventDispatcher
 
@@ -38,8 +46,12 @@ SUPPORTED_SCOPES = [
 ]
 
 MEMORY_STDIO_ENV = "SO_MCP_MEMORY_STDIO"
+PRINCIPAL_DIRECTORY_ENV = "SO_MCP_PRINCIPAL_DIRECTORY"
 EVENTS_KEY_FILE_ENV = "SO_MCP_EVENTS_KEY_FILE"
 EVENTS_DB_ENV = "SO_MCP_EVENTS_DB"
+
+#: The only keys a principal-directory entry may carry.
+PRINCIPAL_DIRECTORY_FIELDS = frozenset({"principal_id", "tenant_id", "enabled"})
 
 _SECRET_ARGUMENT_RE = re.compile(
     r"(token|password|passwd|secret|credential|"
@@ -156,6 +168,9 @@ def load_memory_adapter_command() -> Any:
     try:
         command = json.loads(raw)
     except (TypeError, ValueError) as exc:
+        # JSONDecodeError only carries line/column in its own message, so the
+        # position would otherwise be buried in a traceback. The raw value is
+        # deliberately not echoed: it may contain a path or a credential.
         raise RuntimeError(
             MEMORY_STDIO_ENV + " must contain a valid JSON array of strings"
         ) from exc
@@ -210,6 +225,101 @@ def _redact_memory_command(command: Any) -> str:
             redact_next = True
 
     return json.dumps(redacted, ensure_ascii=False)
+
+
+def load_principal_directory() -> Optional[StaticPrincipalDirectory]:
+    """Load the optional principal directory that grant targets resolve against.
+
+    Unset or empty:
+        Return None so ``SecureWorkItemStore`` keeps ``DenyAllPrincipalDirectory``
+        and every grant is rejected. Behaviour is unchanged.
+
+    Set:
+        It must contain a JSON array of
+        ``{"principal_id": str, "tenant_id": str, "enabled": bool}``.
+        Anything malformed is a startup error: silently degrading to deny-all
+        would surface as a mysterious "grant failed" at call time instead.
+    """
+    raw = os.environ.get(PRINCIPAL_DIRECTORY_ENV, "").strip()
+
+    if not raw:
+        return None
+
+    try:
+        entries = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            PRINCIPAL_DIRECTORY_ENV
+            + " must contain a valid JSON array: %s" % exc
+        ) from exc
+
+    if not isinstance(entries, list):
+        raise RuntimeError(PRINCIPAL_DIRECTORY_ENV + " must be a JSON array")
+
+    if not entries:
+        # An empty array denies every grant, which is indistinguishable from a
+        # typo; refusing to start beats a silent fail-closed surprise.
+        raise RuntimeError(
+            PRINCIPAL_DIRECTORY_ENV
+            + " must not be an empty array: empty array is indistinguishable"
+            " from unconfigured; remove the variable instead"
+        )
+
+    records = []
+
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise RuntimeError(
+                PRINCIPAL_DIRECTORY_ENV
+                + " entry %d must be a JSON object" % index
+            )
+
+        unknown = sorted(set(entry) - PRINCIPAL_DIRECTORY_FIELDS)
+        if unknown:
+            # A misspelled "disabled" would silently default to enabled=true.
+            raise RuntimeError(
+                PRINCIPAL_DIRECTORY_ENV
+                + " entry %d has an unknown field: %s"
+                % (index, ", ".join(unknown))
+            )
+
+        for field in ("principal_id", "tenant_id"):
+            value = entry.get(field)
+            if not isinstance(value, str) or not value:
+                raise RuntimeError(
+                    PRINCIPAL_DIRECTORY_ENV
+                    + " entry %d is missing a non-empty string %s"
+                    % (index, field)
+                )
+
+        principal_id = entry["principal_id"]
+        if not PRINCIPAL_ID_RE.fullmatch(principal_id):
+            raise RuntimeError(
+                PRINCIPAL_DIRECTORY_ENV
+                + " entry %d has an invalid principal_id: %r"
+                % (index, principal_id)
+            )
+
+        enabled = entry.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise RuntimeError(
+                PRINCIPAL_DIRECTORY_ENV
+                + " entry %d has a non-boolean enabled: %r"
+                % (index, enabled)
+            )
+
+        records.append(
+            PrincipalRecord(
+                principal_id=principal_id,
+                tenant_id=entry["tenant_id"],
+                enabled=enabled,
+            )
+        )
+
+    logging.getLogger("so-mcp").info(
+        "Principal directory: %d entries", len(records)
+    )
+    return StaticPrincipalDirectory(records)
 
 
 def _validate_https_url(name: str, value: str, *, require_path: bool) -> str:
@@ -279,15 +389,13 @@ def load_config() -> dict[str, Any]:
         realm_namespace = _realm_namespace_from_issuer(issuer)
 
     host = os.environ.get("SO_MCP_HOST", "127.0.0.1").strip()
-    # Loopback-only is a security contract (docs/DEPLOY-so-mcp.md section 2a):
-    # this process is a private service behind a TLS-terminating reverse proxy
-    # and must never be reachable from another host. Reject everything except
-    # the two loopback spellings before the value can reach uvicorn.run().
+    if not host:
+        raise RuntimeError("SO_MCP_HOST must not be empty; loopback-only binding is required (127.0.0.1 or ::1)")
+    # MCP is private behind the TLS-terminating reverse proxy. Never expose
+    # the application listener on a non-loopback interface.
     if host not in {"127.0.0.1", "::1"}:
         raise RuntimeError(
-            "SO_MCP_HOST must not be empty and must be loopback-only; "
-            "only 127.0.0.1 or ::1 are allowed by the deployment security "
-            f"contract (got {host!r})"
+            "SO_MCP_HOST must be loopback-only (127.0.0.1 or ::1)"
         )
 
     try:
@@ -313,7 +421,7 @@ def load_config() -> dict[str, Any]:
 
     memory_adapter_command = load_memory_adapter_command()
 
-    return {
+    config = {
         "issuer": issuer,
         "audience": audience,
         "database_path": database_path,
@@ -325,6 +433,64 @@ def load_config() -> dict[str, Any]:
         "discovery_url": discovery_url,
         "memory_adapter_command": memory_adapter_command,
     }
+
+    # Only present when SO_MCP_PRINCIPAL_DIRECTORY is set, so the unset case
+    # stays byte-identical to the deny-all default.
+    principal_directory = load_principal_directory()
+    if principal_directory is not None:
+        config["principal_directory"] = principal_directory
+
+    return config
+
+
+def _load_events_encryption_key(path_value: str) -> bytes:
+    """Read a private raw 32-byte Events key without following symlinks."""
+    path = Path(path_value)
+    if not path.is_absolute():
+        raise RuntimeError(EVENTS_KEY_FILE_ENV + " must be an absolute path")
+    try:
+        path_metadata = path.lstat()
+        if not stat.S_ISREG(path_metadata.st_mode):
+            raise RuntimeError(EVENTS_KEY_FILE_ENV + " must reference a regular non-symlink file")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(str(path), flags)
+    except OSError as exc:
+        raise RuntimeError(EVENTS_KEY_FILE_ENV + " is unavailable") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_dev != path_metadata.st_dev
+            or metadata.st_ino != path_metadata.st_ino
+        ):
+            raise RuntimeError(EVENTS_KEY_FILE_ENV + " must reference a regular non-symlink file")
+        if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) not in (0o400, 0o600):
+            raise RuntimeError(EVENTS_KEY_FILE_ENV + " must be owned by the MCP service user and mode 0400/0600")
+        content = bytearray()
+        while len(content) < 33:
+            chunk = os.read(descriptor, 33 - len(content))
+            if not chunk:
+                break
+            content.extend(chunk)
+        key = bytes(content)
+    except OSError as exc:
+        raise RuntimeError(EVENTS_KEY_FILE_ENV + " is unavailable") from exc
+    finally:
+        os.close(descriptor)
+    if len(key) != 32:
+        raise RuntimeError(EVENTS_KEY_FILE_ENV + " must contain exactly 32 raw bytes")
+    return key
+
+
+def _authorize_event_resource(
+    store: SecureWorkItemStore, *, tenant_id: str, principal_id: str, job_id: str
+) -> bool:
+    """Re-check owner read access immediately before callback I/O."""
+    try:
+        store.get_work_item(Principal(tenant_id, principal_id), job_id)
+        return True
+    except NotAuthorized:
+        return False
 
 
 def _without_non_bearer_authorization(scope: dict[str, Any]) -> dict[str, Any]:
@@ -390,78 +556,6 @@ def _add_access_manage_to_challenge(value: bytes) -> bytes:
     return value[:match.start(1)] + replacement + value[match.end(1):]
 
 
-def _authorize_event_resource(
-    store: SecureWorkItemStore,
-    *,
-    tenant_id: str,
-    principal_id: str,
-    job_id: str,
-) -> bool:
-    """Re-check current read or write access immediately before callback I/O."""
-    principal = Principal(tenant_id, principal_id)
-    for scope in ("read", "write"):
-        try:
-            store.require_access(principal, job_id, scope)
-            return True
-        except NotAuthorized:
-            continue
-    return False
-
-
-def _load_events_encryption_key(path_value: str) -> bytes:
-    """Read the private raw 32-byte key used to encrypt webhook secrets."""
-    path = Path(path_value)
-    if not path.is_absolute():
-        raise RuntimeError(EVENTS_KEY_FILE_ENV + " must be an absolute path")
-    try:
-        # O_NOFOLLOW closes the lstat/open symlink race on supported systems.
-        # Keep the explicit lstat check for a clear fail-closed fallback on
-        # platforms that do not expose O_NOFOLLOW.
-        path_metadata = path.lstat()
-        if not stat.S_ISREG(path_metadata.st_mode):
-            raise RuntimeError(EVENTS_KEY_FILE_ENV + " must reference a regular non-symlink file")
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_NONBLOCK", 0)
-            | getattr(os, "O_NOCTTY", 0)
-        )
-        descriptor = os.open(str(path), flags)
-    except OSError as exc:
-        raise RuntimeError(EVENTS_KEY_FILE_ENV + " is unavailable") from exc
-
-    try:
-        metadata = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_dev != path_metadata.st_dev
-            or metadata.st_ino != path_metadata.st_ino
-        ):
-            raise RuntimeError(EVENTS_KEY_FILE_ENV + " must reference a regular non-symlink file")
-        if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) not in (0o400, 0o600):
-            raise RuntimeError(
-                EVENTS_KEY_FILE_ENV
-                + " must be owned by the MCP service user and mode 0400/0600"
-            )
-        # Read at most 33 bytes: enough to distinguish the required 32-byte
-        # key from an oversized file without loading arbitrary file contents.
-        chunks = bytearray()
-        while len(chunks) < 33:
-            chunk = os.read(descriptor, 33 - len(chunks))
-            if not chunk:
-                break
-            chunks.extend(chunk)
-        key = bytes(chunks)
-    except OSError as exc:
-        raise RuntimeError(EVENTS_KEY_FILE_ENV + " is unavailable") from exc
-    finally:
-        os.close(descriptor)
-    if len(key) != 32:
-        raise RuntimeError(EVENTS_KEY_FILE_ENV + " must contain exactly 32 raw bytes")
-    return key
-
-
 class DeploymentASGI:
     """Add health and RFC 9728 metadata endpoints around the MCP ASGI app."""
 
@@ -471,12 +565,12 @@ class DeploymentASGI:
         *,
         issuer: str,
         audience: str,
-        background_tasks: Optional[Sequence[Any]] = None,
+        background_tasks: Optional[list[Any]] = None,
     ) -> None:
         self.inner = inner
         self.issuer = issuer
         self.audience = audience
-        self.background_tasks = tuple(background_tasks or ())
+        self.background_tasks = list(background_tasks or [])
 
         resource = urlsplit(audience)
         self.endpoint_path = resource.path
@@ -545,8 +639,6 @@ class DeploymentASGI:
                         task_id = id(task)
                         if task_id in stop_attempted_tasks:
                             continue
-                        # Record before calling stop(): if it raises, finally
-                        # must not repeat the same bounded wait a second time.
                         stop_attempted_tasks.add(task_id)
                         task.stop()
                 return message
@@ -612,8 +704,12 @@ class DeploymentASGI:
         )
 
 
-def create_application(config: dict[str, Any]) -> Any:
-    """Initialize persistent storage and construct the authenticated app."""
+def create_application(
+    config: dict[str, Any],
+    *,
+    session_ops: Any = None,
+) -> Any:
+    """Initialize the canonical DB, direct ChatGPT client, and optional Events."""
     database_value = str(config["database_path"])
     events_key_file = os.environ.get(EVENTS_KEY_FILE_ENV, "").strip()
     events_db_path = os.environ.get(EVENTS_DB_ENV, "").strip()
@@ -630,19 +726,13 @@ def create_application(config: dict[str, Any]) -> Any:
         encryption_key = _load_events_encryption_key(events_key_file)
         if events_db_path and Path(events_db_path).resolve() != database_path:
             raise RuntimeError(EVENTS_DB_ENV + " must use the WorkItem database for atomic completion events")
-        # The completion event and terminal WorkItem transition share one
-        # SQLite commit. A separate outbox database would reintroduce a loss
-        # window between the business transaction and event publication.
-        events_store = MCPEventsStore(
-            str(database_path),
-            encryption_key=encryption_key,
-        )
+        events_store = MCPEventsStore(str(database_path), encryption_key=encryption_key)
 
     store = SecureWorkItemStore(
         database_path,
+        principal_directory=config.get("principal_directory"),
         completion_event_publisher=(
-            events_store.publish_job_completed_in_transaction
-            if events_store is not None else None
+            events_store.publish_job_completed_in_transaction if events_store is not None else None
         ),
     )
     store.initialize()
@@ -655,31 +745,25 @@ def create_application(config: dict[str, Any]) -> Any:
         discovery_url=config["discovery_url"],
     )
 
+    if session_ops is None:
+        session_ops = ChatGPTDirectClient.from_env(store.database_path)
+    logging.getLogger("so-mcp").info("ChatGPT session engine: in-process repository adapter")
+
     service = MCPToolService(
         store,
         memory_adapter=config.get("memory_adapter_command"),
+        session_ops=session_ops,
     )
 
     background_tasks: list[Any] = []
     if events_store is not None:
         def authorize_event(*, tenant_id: str, principal_id: str, job_id: str) -> bool:
             return _authorize_event_resource(
-                store,
-                tenant_id=tenant_id,
-                principal_id=principal_id,
-                job_id=job_id,
+                store, tenant_id=tenant_id, principal_id=principal_id, job_id=job_id
             )
+        background_tasks.append(MCPEventDispatcher(events_store, authorize=authorize_event))
 
-        background_tasks.append(
-            MCPEventDispatcher(events_store, authorize=authorize_event)
-        )
-
-    mcp_app = build_mcp_server(
-        service,
-        verifier,
-        events_store=events_store,
-    )
-
+    mcp_app = build_mcp_server(service, verifier, events_store=events_store)
     return DeploymentASGI(
         mcp_app,
         issuer=config["issuer"],

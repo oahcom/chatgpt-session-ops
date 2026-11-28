@@ -13,6 +13,7 @@ def test_deploy_manifest_contains_only_live_mcp_event_modules():
         "scripts/chatgpt_send.py",
         "scripts/pow_solver.py",
         "src/session_ops/mcp_events.py",
+        "src/session_ops/chatgpt_direct_client.py",
         "src/session_ops/mcp_event_dispatcher.py",
     } <= paths
     assert "src/session_ops/mcp_event_collector.py" not in paths
@@ -25,9 +26,11 @@ def test_service_uses_the_immutable_runtime_artifact():
     assert "WorkingDirectory=/opt/so-mcp" in service
     assert "ExecStart=/opt/so-mcp/.venv/bin/python -m scripts.run_mcp_server" in service
     assert "SenderGatewayClient" not in service
-    assert "Environment=CHATGPT_STATE_DIR=/var/lib/so-mcp/runtime" in service
-    assert "Environment=CHATGPT_AUTH_DIR=/var/lib/so-mcp" in service
-    assert "ReadWritePaths=/var/lib/so-mcp" in service
+    assert "Environment=CHATGPT_SESSION_OPS_ACCOUNTS_DIR=/var/lib/chatgpt-session-ops/accounts" in service
+    assert "Environment=CHATGPT_SESSION_OPS_RUNTIME_DIR=/var/lib/so-mcp/chatgpt-session-ops" in service
+    assert "ReadWritePaths=/var/lib/so-mcp /var/lib/chatgpt-session-ops/accounts" in service
+    assert "TimeoutStopSec=600" in service
+    assert "UMask=0077" in service
 
 
 def test_deploy_runbook_documents_events_opt_in_and_oauth_scope_gate():

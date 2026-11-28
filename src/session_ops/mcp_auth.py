@@ -105,6 +105,7 @@ TOOL_REQUIRED_SCOPES = {
     "work_item.get": ("session_ops.work_item.read",),
     "work_item.list": ("session_ops.work_item.read",),
     "work_item.update": ("session_ops.work_item.write",),
+    "work_item.finish": ("session_ops.work_item.write",),
     "work_item.grant": (
         "session_ops.work_item.write",
         "session_ops.access.manage",

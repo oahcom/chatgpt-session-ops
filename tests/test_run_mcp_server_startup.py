@@ -779,6 +779,7 @@ class TestMCPEventsRuntimeWiring(unittest.TestCase):
                 mock.patch("scripts.run_mcp_server.SecureWorkItemStore") as store_type,
                 mock.patch("scripts.run_mcp_server.JWTVerifier"),
                 mock.patch("scripts.run_mcp_server.MCPEventsStore", return_value=events_store) as events_type,
+                mock.patch("scripts.run_mcp_server.ChatGPTDirectClient.from_env", return_value=mock.Mock()),
                 mock.patch("scripts.run_mcp_server.MCPEventDispatcher", return_value=dispatcher) as dispatcher_type,
                 mock.patch("scripts.run_mcp_server.build_mcp_server", return_value=mcp_app) as build_server,
             ):
@@ -788,6 +789,7 @@ class TestMCPEventsRuntimeWiring(unittest.TestCase):
         events_type.assert_called_once_with(str(Path(events_db).resolve()), encryption_key=b"e" * 32)
         store_type.assert_called_once_with(
             Path(events_db).resolve(),
+            principal_directory=None,
             completion_event_publisher=events_store.publish_job_completed_in_transaction,
         )
         dispatcher_type.assert_called_once()
@@ -796,7 +798,7 @@ class TestMCPEventsRuntimeWiring(unittest.TestCase):
         build_server.assert_called_once()
         self.assertIs(build_server.call_args.kwargs["events_store"], events_store)
         self.assertIs(app.inner, mcp_app)
-        self.assertEqual(app.background_tasks, (dispatcher,))
+        self.assertEqual(app.background_tasks, [dispatcher])
 
     def test_events_reject_memory_database_and_relative_events_path(self):
         base_config = {

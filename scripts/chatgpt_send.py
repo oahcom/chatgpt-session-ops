@@ -157,16 +157,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pow_solver import solve  # noqa: E402
 
-CODE_BASE = os.path.dirname(os.path.abspath(__file__))
-# Mutable state must not live under the immutable application tree in the MCP
-# systemd unit (ProtectSystem=strict). Local CLI use keeps the historical
-# scripts/ default; the deployed MCP sets CHATGPT_STATE_DIR under /var/lib.
-BASE = os.path.abspath(os.environ.get("CHATGPT_STATE_DIR") or CODE_BASE)
-
-
-def _auth_base():
-    """Credential root, separate from mutable runtime state when configured."""
-    return os.path.abspath(os.environ.get("CHATGPT_AUTH_DIR") or BASE)
+BASE = os.path.abspath(os.environ.get("CHATGPT_RUNTIME_DIR") or os.path.dirname(os.path.abspath(__file__)))
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36 Edg/157.0.4341.60")
 CTX = ssl.create_default_context()
@@ -2883,13 +2874,23 @@ def purge_expired(st):
     return changed
 
 
+def _effective_rotation_primary():
+    """Return the explicitly allowed logged-in accounts, or the legacy pool."""
+    raw = os.environ.get("CHATGPT_ALLOWED_ACCOUNTS")
+    if raw is None:
+        return ROTATION_PRIMARY
+    allowed = {item.strip() for item in raw.split(",") if item.strip()}
+    return tuple(account for account in ROTATION_PRIMARY if account in allowed)
+
+
 def rotation_plan(st):
-    """登录态身份（acct1/acct2/acct3/acct4/acct5/acct6）从游标起顺次尝试；不可用的排到末尾（避免死锁）。
-    匿名态不进入该计划——它只在**全部登录态**都 429 时由 anon_fallback_ready() 决定是否兜底。"""
+    """Rotate only through allowed logged-in accounts; anonymous stays separate."""
     st = _as_dict(st)
-    cur = _as_int(st.get("cursor"), 0)                          # F-34
-    n = len(ROTATION_PRIMARY)
-    seq = [ROTATION_PRIMARY[(cur + i) % n] for i in range(n)]
+    pool = _effective_rotation_primary()
+    if not pool:
+        return []
+    cur = _as_int(st.get("cursor"), 0) % len(pool)
+    seq = [pool[(cur + i) % len(pool)] for i in range(len(pool))]
     return [a for a in seq if not is_unavailable(st, a)] + [a for a in seq if is_unavailable(st, a)]
 
 
@@ -3855,7 +3856,7 @@ DEVICE_TRY_MAX = 8          # 一次读取最多试几个设备快照：别把 4
 
 
 def anon_device_dir():
-    return os.path.join(_auth_base(), "accounts", "nologin", "devices")
+    return os.path.join(BASE, "accounts", "nologin", "devices")
 
 
 def _read_text(path, default=""):
@@ -4457,7 +4458,7 @@ def save_device_cookie(cookie):
         return ""
     try:
         os.makedirs(anon_device_dir(), exist_ok=True)
-        _atomic_write(os.path.join(_auth_base(), "accounts", "nologin", "device-cookie.txt"), header)
+        _atomic_write(os.path.join(BASE, "accounts", "nologin", "device-cookie.txt"), header)
         if jar:
             _atomic_write(_device_jar(did), json.dumps(jar, ensure_ascii=False, indent=2))
         _atomic_write(_device_txt(did), header)
@@ -4520,7 +4521,7 @@ def device_summary():
         if d:
             counts[d] = counts.get(d, 0) + 1
     current = device_id_from_cookie(
-        _read_text(os.path.join(_auth_base(), "accounts", "nologin", "device-cookie.txt")))
+        _read_text(os.path.join(BASE, "accounts", "nologin", "device-cookie.txt")))
     rows = []
     for did in list_device_ids(limit=200):
         jar = load_device_jar(did)
@@ -4609,6 +4610,10 @@ class ThinkingModelUnavailable(RuntimeError):
         )
 
 
+class RemoteSendOutcomeUnknown(RuntimeError):
+    """The conversation POST may have been accepted; never rotate or replay."""
+
+
 def _cookie_domain_allowed(domain):
     """Cookie 持久化边界（DECISION-156）：只允许 OpenAI 自有域。
 
@@ -4634,19 +4639,22 @@ def _filter_openai_cookies(cookies):
 class ChatGPTAPI:
     def __init__(self, base_dir=None, account="default"):
         # CHATGPT_AUTH_DIR selects credential/cache root; account data stays isolated.
-        root = os.path.abspath(base_dir or _auth_base())
+        root = base_dir or os.environ.get("CHATGPT_AUTH_DIR") or BASE
         if account not in _VALID_ACCOUNT_IDENTITIES:
             raise ValueError(
                 "account must be one of %s"
                 % ", ".join(sorted(_VALID_ACCOUNT_IDENTITIES))
             )
-        if account == "default":
-            b = root
-        elif account == "acct1":
-            # Prefer the explicit per-account layout used by deployed vaults;
-            # retain the historical root-level acct1 layout for local users.
-            acct1_dir = os.path.join(root, "accounts", "acct1")
-            b = acct1_dir if os.path.isdir(acct1_dir) else root
+        if account in ("default", "acct1"):
+            # Support both the standalone layout (acct1 at root) and the
+            # shared production layout (/var/lib/chatgpt-session-ops/accounts/acctN).
+            acct1_root = os.path.join(root, "accounts", "acct1")
+            b = (
+                acct1_root
+                if not os.path.isfile(os.path.join(root, "cookies.json"))
+                and os.path.isfile(os.path.join(acct1_root, "cookies.json"))
+                else root
+            )
         else:
             b = os.path.join(root, "accounts", account)
         self.account = account
@@ -4685,7 +4693,7 @@ class ChatGPTAPI:
 
     # ---------- 匿名态设备身份 ----------
     def device_cookie_path(self):
-        return os.path.join(_auth_base(), "accounts", "nologin", "device-cookie.txt")
+        return os.path.join(BASE, "accounts", "nologin", "device-cookie.txt")
 
     def ensure_device_cookie(self, refresh=False):
         """匿名态的 cookie 来源：优先当前浏览器，其次上次落盘的 device-cookie.txt。"""
@@ -5217,10 +5225,18 @@ class ChatGPTAPI:
             body["conversation_id"] = conv_id
         if parent_message_id:  # 可选：GET 限速时省略，落点仍由 SSE 首事件唯一 id 校验
             body["parent_message_id"] = parent_message_id
-        return self.req("POST", API_BASE + "/backend-api/conversation", body, {
+        # Default to UNKNOWN before touching the network. A socket exception
+        # after the request write cannot prove that ChatGPT did not accept it.
+        self.last_send_certainty = "UNKNOWN"
+        status, response = self.req("POST", API_BASE + "/backend-api/conversation", body, {
             "OpenAI-Sentinel-Chat-Requirements-Token": req_token,
             "OpenAI-Sentinel-Proof-Token": proof,
         }, timeout=timeout)
+        if 200 <= status < 300:
+            self.last_send_certainty = "SUBMITTED"
+        elif status in (400, 401, 403, 404, 413, 422, 429):
+            self.last_send_certainty = "NOT_SUBMITTED"
+        return status, response
 
     # ---------- 思考模式 ----------
     @staticmethod
@@ -7034,9 +7050,6 @@ def _send_prompt_impl(
     """
     if conv_id:
         conv_id = safe_id(conv_id, "conv_id")
-    # Distinguish failures before POST (safe to rotate) from ambiguous
-    # transport failures after a POST may have reached ChatGPT.
-    api.last_send_started = False
     if text is None:
         text = load_prompt_text(prompt_file)
     # ponytail: 只做空正文判定，不再删行。旧版 `[l for l in ... if not
@@ -7120,9 +7133,20 @@ def _send_prompt_impl(
             send_timeout = override
             print("timeout: %ss (source=%s)"
                   % (send_timeout, SEND_TIMEOUT_SOURCE or "env"), flush=True)
-        api.last_send_started = True
         st, resp = api.send(conv_id, text, tail, req_token, proof, model=model,
                             timeout=send_timeout)
+        send_certainty = getattr(api, "last_send_certainty", None)
+        if send_certainty is None:
+            send_certainty = (
+                "NOT_SUBMITTED"
+                if st in (400, 401, 403, 404, 413, 422, 429)
+                else "UNKNOWN"
+            )
+        if st != 200 and send_certainty in ("UNKNOWN", "SUBMITTED"):
+            raise RemoteSendOutcomeUnknown(
+                "ChatGPT conversation POST did not return an authoritative response "
+                "(status=%s); do not retry or rotate accounts" % st
+            )
         # 截断/超时被 _partial_result 折成 200 交回既有解析链路（不丢字节），但
         # `SEND ... -> 200` 是唯一送达凭证——截断响应绝不能打它，否则一次超时
         # 在日志、退出码、会话登记三个门禁上同时是绿的（DEF-ops-01）。
@@ -7393,7 +7417,6 @@ def send_prompt_for_work_item(
     prompt_file,
     new_chat=False,
     thinking=None,
-    attempt_id=None,
 ):
     """Send one WorkItem attempt, record its landing, then link it.
 
@@ -7420,16 +7443,7 @@ def send_prompt_for_work_item(
             "anonymous sends cannot establish trusted landing evidence"
         )
 
-    if attempt_id is None:
-        attempt_id = "att_" + str(uuid.uuid4())
-    elif (
-        not isinstance(attempt_id, str)
-        or re.fullmatch(
-            r"att_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
-            attempt_id,
-        ) is None
-    ):
-        raise ValueError("attempt_id must be a valid att_UUIDv4")
+    attempt_id = "att_" + str(uuid.uuid4())
 
     # Match main's R373-07 flow: read and validate once, before logging or sending.
     text = load_prompt_text(prompt_file)
@@ -7556,9 +7570,7 @@ def send_prompt(api, conv_id, prompt_file, new_chat=False, thinking=None):
     return result
 
 
-def _attempt_create(
-    st, name, prompt_file, attempts, thinking=None, work_item_context=None
-):
+def _attempt_create(st, name, prompt_file, attempts, thinking=None):
     """用指定身份建会话并记录结果；返回 (status, conv_id)。
 
     HTTP 413 是本次发送的终止信号，不是账号级故障，
@@ -7581,119 +7593,13 @@ def _attempt_create(
         return "INIT_FAIL", None
 
     try:
-        if work_item_context is None:
-            status, _path, conv = send_prompt(
-                api,
-                None,
-                prompt_file,
-                new_chat=True,
-                thinking=thinking,
-            )
-        else:
-            result, link, link_error = send_prompt_for_work_item(
-                api,
-                work_item_context["store"],
-                work_item_context["principal"],
-                work_item_context["work_item_id"],
-                None,
-                prompt_file,
-                new_chat=True,
-                thinking=thinking,
-                attempt_id=work_item_context["attempt_id"],
-            )
-            status, _path, conv = (tuple(result) + (None, None, None))[:3]
-            ambiguous_transport = (
-                status in (408, 425)
-                or (isinstance(status, int) and status >= 500)
-                or (status == 0 and bool(getattr(api, "last_send_started", False)))
-            )
-            if ambiguous_transport:
-                detail = "send outcome unknown after POST attempt (status=%s)" % status
-                if work_item_context is not None:
-                    work_item_context.update({
-                        "status": status,
-                        "api": api,
-                        "link": None,
-                        "link_error": detail,
-                        "conversation_id": None,
-                        "account": name,
-                        "outcome_unknown": True,
-                    })
-                attempts.append({"account": name, "status": "OUTCOME_UNKNOWN", "reason": detail})
-                return "OUTCOME_UNKNOWN", None
-            if isinstance(conv, ConvRef) and conv.mismatch:
-                # HTTP 200 was accepted but the returned conversation identity
-                # is not trustworthy. Never rotate and resend this prompt.
-                actual = getattr(conv, "actual_conv_id", "") or ""
-                reason = getattr(conv, "reason", "") or "conversation identity mismatch"
-                detail = "conversation outcome unknown: %s; actual=%s" % (reason, actual or "unknown")
-                work_item_context.update({
-                    "status": 200,
-                    "api": api,
-                    "link": None,
-                    "link_error": detail,
-                    "conversation_id": (getattr(conv, "target_conv_id", "") or str(conv) or None),
-                    "account": name,
-                    "outcome_unknown": True,
-                })
-                attempts.append({
-                    "account": name,
-                    "status": "OUTCOME_UNKNOWN",
-                    "reason": reason,
-                    "actual_conv_id": actual or None,
-                })
-                return "OUTCOME_UNKNOWN", conv
-            work_item_context["status"] = status
-            work_item_context["api"] = api
-            work_item_context["link"] = link
-            work_item_context["link_error"] = link_error
-            if status is None or (
-                isinstance(status, int)
-                and (status in (408, 425) or status >= 500)
-            ):
-                # A server error or transport timeout does not prove the
-                # remote side rejected the prompt. Stop account rotation here;
-                # trying another account could deliver the same prompt twice.
-                detail = "send outcome unknown after HTTP %s" % (
-                    status if status is not None else "no response"
-                )
-                work_item_context.update({
-                    "link": None,
-                    "link_error": detail,
-                    "account": name,
-                    "outcome_unknown": True,
-                })
-                attempts.append({
-                    "account": name,
-                    "status": "OUTCOME_UNKNOWN",
-                    "reason": detail,
-                })
-                return "OUTCOME_UNKNOWN", conv
-
-        if work_item_context is None:
-            if isinstance(conv, ConvRef) and conv.mismatch:
-                actual = getattr(conv, "actual_conv_id", "") or "unknown"
-                reason = getattr(conv, "reason", "") or "conversation identity mismatch"
-                attempts.append({
-                    "account": name,
-                    "status": "OUTCOME_UNKNOWN",
-                    "reason": reason,
-                    "actual_conv_id": actual,
-                })
-                return "OUTCOME_UNKNOWN", conv
-            ambiguous_transport = (
-                status in (408, 425)
-                or (isinstance(status, int) and status >= 500)
-                or (status in (None, 0) and bool(getattr(api, "last_send_started", False)))
-            )
-            if ambiguous_transport:
-                detail = "send outcome unknown after POST attempt (status=%s)" % status
-                attempts.append({
-                    "account": name,
-                    "status": "OUTCOME_UNKNOWN",
-                    "reason": detail,
-                })
-                return "OUTCOME_UNKNOWN", conv
+        status, _path, conv = send_prompt(
+            api,
+            None,
+            prompt_file,
+            new_chat=True,
+            thinking=thinking,
+        )
 
     except ThinkingModelUnavailable as e:
         # 思考模型不可用是账号级失败，不是整个进程的退出信号。
@@ -7729,32 +7635,31 @@ def _attempt_create(
         return status, None
 
     except Exception as e:
-        status, conv = 0, None
-        if bool(getattr(api, "last_send_started", False)):
-            detail = "send outcome unknown after POST exception: %s: %s" % (type(e).__name__, e)
-            if work_item_context is not None:
-                work_item_context.update({
-                    "status": 0,
-                    "api": api,
-                    "link": None,
-                    "link_error": detail,
-                    "conversation_id": None,
-                    "account": name,
-                    "outcome_unknown": True,
-                })
-            attempts.append({"account": name, "status": "OUTCOME_UNKNOWN", "reason": detail})
-            return "OUTCOME_UNKNOWN", None
-
+        # An exception after entering send_prompt does not prove that the
+        # remote POST was never accepted. Stop account rotation: another
+        # account could create a duplicate remote session for this intent.
+        attempts.append({
+            "account": name,
+            "status": "OUTCOME_UNKNOWN",
+            "detail": "%s: %s" % (type(e).__name__, e),
+        })
         print(
-            "rotate: %s 通道异常（%s）" % (name, e),
+            "rotate: %s 通道异常，远端副作用未知；停止轮转（%s）" % (name, e),
             flush=True,
         )
+        return "OUTCOME_UNKNOWN", None
 
     attempts.append({
         "account": name,
         "status": status,
         "conv_id": conv,
     })
+
+    if isinstance(conv, ConvRef) and conv.mismatch:
+        # HTTP 200 with no unique verified conversation ID is already a
+        # possible remote create. Preserve the candidate but stop rotation.
+        attempts[-1]["status"] = "OUTCOME_UNKNOWN"
+        return "OUTCOME_UNKNOWN", None
 
     if status == 200:
         return status, conv
@@ -7796,8 +7701,9 @@ def _attempt_create(
 def _mark_success(st, name, conv, prompt_file, attempts):
     def mutate(s):
         s["created"][name] = s.get("created", {}).get(name, 0) + 1
-        if name in ROTATION_PRIMARY:
-            s["cursor"] = (ROTATION_PRIMARY.index(name) + 1) % len(ROTATION_PRIMARY)
+        pool = _effective_rotation_primary()
+        if name in pool:
+            s["cursor"] = (pool.index(name) + 1) % len(pool)
         else:
             # 兜底不推进游标：登录态恢复后仍按原均分顺序轮转，否则会白跳过一个账号的轮次
             s["fallback_uses"] = s.get("fallback_uses", 0) + 1
@@ -7811,9 +7717,7 @@ def _mark_success(st, name, conv, prompt_file, attempts):
                       "attempts": attempts}, ensure_ascii=False), flush=True)
 
 
-def create_chat_rotating(
-    prompt_file, thinking=None, *, work_item_context=None, account=None
-):
+def create_chat_rotating(prompt_file, thinking=None):
     """登录态优先建会话：acct1/acct2/acct3/acct4/acct5/acct6 均分轮转；
     仅当全部都 429 才用匿名兜底。
 
@@ -7843,12 +7747,7 @@ def create_chat_rotating(
             skipped[name] = reason
             outcomes[name] = "SKIP:" + reason
 
-    if account not in (None, "auto"):
-        if account not in ROTATION_PRIMARY:
-            raise ValueError("account is not a configured authenticated account")
-        plan = [account] if not is_unavailable(st, account) else []
-    else:
-        plan = [a for a in rotation_plan(st) if a not in skipped]
+    plan = [a for a in rotation_plan(st) if a not in skipped]
 
     print(
         "rotation plan: %s (cursor=%s)%s" % (
@@ -7861,27 +7760,15 @@ def create_chat_rotating(
     )
 
     for name in plan:
-        if work_item_context is None:
-            status, conv = _attempt_create(
-                st,
-                name,
-                prompt_file,
-                attempts,
-                thinking_requested,
-            )
-        else:
-            status, conv = _attempt_create(
-                st,
-                name,
-                prompt_file,
-                attempts,
-                thinking_requested,
-                work_item_context=work_item_context,
-            )
+        status, conv = _attempt_create(
+            st,
+            name,
+            prompt_file,
+            attempts,
+            thinking_requested,
+        )
         outcomes[name] = status
 
-        # An HTTP 200 with an untrusted conversation identity is ambiguous:
-        # stop here, preserve outcome_unknown, and never rotate/re-send.
         if status == "OUTCOME_UNKNOWN":
             print(
                 json.dumps(
@@ -7896,7 +7783,7 @@ def create_chat_rotating(
                 ),
                 flush=True,
             )
-            return 1
+            return 2
 
         # Terminal failure: stop immediately.
         # Never attempt another account or anonymous fallback.
@@ -7919,9 +7806,6 @@ def create_chat_rotating(
 
         if conv:
             _mark_success(st, name, conv, prompt_file, attempts)
-            if work_item_context is not None:
-                work_item_context["account"] = name
-                work_item_context["conversation_id"] = str(conv)
             return _send_exit_code(status, conv)
 
         if status == 200:
@@ -7977,11 +7861,7 @@ def create_chat_rotating(
         )
         return 1
 
-    block = (
-        "trusted WorkItem sends cannot use anonymous sessions"
-        if work_item_context is not None
-        else anon_fallback_block_reason(st, outcomes)
-    )
+    block = anon_fallback_block_reason(st, outcomes)
 
     if block is None:
         print(

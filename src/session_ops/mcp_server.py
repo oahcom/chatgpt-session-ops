@@ -12,9 +12,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
+import re
 import sqlite3
-import tempfile
 import threading
 import time
 import uuid
@@ -41,11 +40,8 @@ from src.session_ops.mcp_auth import (
     ScopeError,
     required_scopes_for_tool,
 )
+from src.session_ops.chatgpt_direct_client import SessionOpsError
 
-
-# ---------------------------------------------------------------------------
-# Frozen limits
-# ---------------------------------------------------------------------------
 
 DEFAULT_PAGE_SIZE = 25
 MIN_PAGE_SIZE = 1
@@ -56,49 +52,27 @@ MAX_CONTEXT_ENTRIES = 6
 MAX_CONTEXT_CONTENT_CHARS = 2048
 MAX_CONTEXT_CONTENT_BYTES = 8192
 MAX_QUERY_CHARS = 2048
-# Kept for parity with authority.py, but unused here: 4 * MAX_QUERY_CHARS ==
-# MAX_QUERY_BYTES, so a UTF-8 byte check could never fire on a query that the
-# schema maxLength already accepted. _validate_arguments bounds query length
-# with the schema alone.
 MAX_QUERY_BYTES = 8192
 
 MAX_HTTP_BODY_BYTES = 65536
 MAX_MCP_RESPONSE_BYTES = 65536
-# Leave room for the JSON-RPC and CallToolResult envelopes.
 MAX_STRUCTURED_CONTENT_BYTES = MAX_MCP_RESPONSE_BYTES - 2048
 
 DB_DEADLINE_SECONDS = 3.0
 ADAPTER_DEADLINE_SECONDS = 8.0
 REQUEST_DEADLINE_SECONDS = 10.0
+CHATGPT_READ_REQUEST_DEADLINE_SECONDS = 20.0
 AUTH_VERIFY_DEADLINE_SECONDS = 3.5
-
-# Remote ChatGPT reads may outlive the MCP caller deadline. Keep them out of
-# asyncio's shared executor and retain admission until the real thread exits.
-_READ_WORKERS = 2
-_READ_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_READ_WORKERS,
-    thread_name_prefix="session-ops-read",
-)
-_READ_SLOTS = threading.BoundedSemaphore(_READ_WORKERS)
-_READ_INFLIGHT_LOCK = threading.Lock()
-_READ_INFLIGHT_KEYS: set[tuple[str, str]] = set()
 
 MCP_SERVER_NAME = "chatgpt-session-ops"
 MCP_SERVER_VERSION = "0.1.0"
 
-# A bounded shared pool. A timed-out SQLite call is still bounded by the
-# authority store's own SQLite timeout/busy_timeout configuration.
-_DB_WORKERS = 8
 _DB_EXECUTOR = ThreadPoolExecutor(
-    max_workers=_DB_WORKERS,
+    max_workers=8,
     thread_name_prefix="session-ops-db",
 )
-# ThreadPoolExecutor has an unbounded internal queue. Match admission to the
-# worker count so timed-out calls cannot accumulate behind the pool.
-_DB_SLOTS = threading.BoundedSemaphore(_DB_WORKERS)
+_DB_SLOTS = threading.BoundedSemaphore(16)
 
-# Unauthenticated requests must not consume the event loop's shared default
-# executor. Bound both active and queued verification work independently.
 _AUTH_VERIFY_WORKERS = 4
 _AUTH_VERIFY_MAX_INFLIGHT = 8
 _AUTH_EXECUTOR = ThreadPoolExecutor(
@@ -109,11 +83,16 @@ _AUTH_VERIFY_SLOTS = threading.BoundedSemaphore(
     _AUTH_VERIFY_MAX_INFLIGHT
 )
 
-# ChatGPT sends are side-effecting and account rotation is process-local.
-# Keep one in-process consumer and a small bounded admission window; do not
-# fan a burst of MCP calls out into concurrent CLI children or another service.
-_SEND_WORKERS = 1
-_SEND_MAX_INFLIGHT = 9  # one executing plus at most eight waiting
+# ChatGPT read/list calls can outlive the MCP request when the HTTP client
+# times out. Keep them off asyncio's shared default executor and bound both
+# active and submitted work. Slots are released only when the real worker
+# thread exits, not when its awaiting MCP coroutine is cancelled.
+_CHATGPT_READ_WORKERS = 2
+_CHATGPT_READ_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_CHATGPT_READ_WORKERS,
+    thread_name_prefix="session-ops-chatgpt-read",
+)
+_CHATGPT_READ_SLOTS = threading.BoundedSemaphore(_CHATGPT_READ_WORKERS)
 
 
 class _DeadlineExceeded(Exception):
@@ -121,53 +100,38 @@ class _DeadlineExceeded(Exception):
 
 
 class _IndeterminateOperation(Exception):
-    """A mutation started but did not finish before the caller deadline."""
-
+    """A DB mutation is still running after its caller deadline."""
 
 
 class _ResourceExhausted(Exception):
-    """A bounded service resource or payload limit was exceeded."""
+    """Bounded execution capacity is full."""
 
 
-class _BoundedExecutor:
-    """ThreadPoolExecutor with bounded active + queued submissions."""
-
-    def __init__(self, *, max_workers: int, max_inflight: int, thread_name_prefix: str):
-        if max_workers < 1 or max_inflight < max_workers:
-            raise ValueError("max_inflight must be >= max_workers >= 1")
-        self._executor = ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix=thread_name_prefix,
-        )
-        self._slots = threading.BoundedSemaphore(max_inflight)
-
-    def submit(self, function: Any, *args: Any, **kwargs: Any) -> Any:
-        if not self._slots.acquire(blocking=False):
-            raise _ResourceExhausted("ChatGPT send queue is full")
-        try:
-            future = self._executor.submit(function, *args, **kwargs)
-        except BaseException:
-            self._slots.release()
-            raise
-        # Release only when the real task finishes, not when the MCP caller
-        # times out or disconnects. The queued/running send remains admitted.
-        future.add_done_callback(lambda _future: self._slots.release())
-        return future
-
-    def shutdown(self, wait: bool = True) -> None:
-        self._executor.shutdown(wait=wait)
+def _submit_chatgpt_read(function: Any):
+    """Submit one bounded read; admission is immediate and fail-fast."""
+    if not _CHATGPT_READ_SLOTS.acquire(blocking=False):
+        raise _ResourceExhausted("ChatGPT read capacity is occupied")
+    try:
+        future = _CHATGPT_READ_EXECUTOR.submit(function)
+    except BaseException:
+        _CHATGPT_READ_SLOTS.release()
+        raise
+    # This callback belongs to the concurrent Future, so timeout/cancellation
+    # of the asyncio waiter cannot release capacity while the thread is alive.
+    future.add_done_callback(lambda _future: _CHATGPT_READ_SLOTS.release())
+    return future
 
 
-_SEND_EXECUTOR = _BoundedExecutor(
-    max_workers=_SEND_WORKERS,
-    max_inflight=_SEND_MAX_INFLIGHT,
-    thread_name_prefix="session-ops-send",
-)
+async def _run_chatgpt_read(function: Any, *, timeout: float):
+    """Await a read without cancelling its underlying bounded worker thread."""
+    concurrent_future = _submit_chatgpt_read(function)
+    async_future = asyncio.wrap_future(concurrent_future)
+    return await asyncio.wait_for(asyncio.shield(async_future), timeout=timeout)
 
 
-# ---------------------------------------------------------------------------
-# Tool schemas: frozen v0.1 surface
-# ---------------------------------------------------------------------------
+class _ProtocolError(Exception):
+    pass
+
 
 def _object_schema(
     properties: Dict[str, Dict[str, Any]],
@@ -183,37 +147,98 @@ def _object_schema(
 
 
 _ID = {"type": "string", "minLength": 1}
+
 _WORK_ITEM_ID = {
     "type": "string",
     "pattern": r"^wi_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
 }
+
 _ATTEMPT_ID = {
     "type": "string",
     "pattern": r"^att_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
 }
-_PROMPT = {"type": "string", "minLength": 1, "maxLength": 40000}
-_ACCOUNT = {"type": "string", "minLength": 1, "maxLength": 32}
+
 _SESSION_ID = {
     "type": "string",
     "pattern": r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
 }
+
 _LINK_ID = {
     "type": "string",
     "pattern": r"^sl_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
 }
+
 _PAGE_SIZE = {
     "type": "integer",
     "minimum": MIN_PAGE_SIZE,
     "maximum": MAX_PAGE_SIZE,
     "default": DEFAULT_PAGE_SIZE,
 }
-# maxLength is the single source of the cursor length limit.
+
 _CURSOR = {"type": "string", "maxLength": MAX_CURSOR_CHARS}
+
 _STATUS = {
     "type": "string",
     "enum": ["active", "paused", "completed", "cancelled"],
 }
+_MUTABLE_WORK_ITEM_STATUS = {
+    "type": "string",
+    "enum": ["active", "paused"],
+}
+
 _GRANT_SCOPE = {"type": "string", "enum": ["read", "write"]}
+
+CHATGPT_ACCOUNTS = (
+    "auto",
+    "acct1",
+    "acct2",
+    "acct3",
+    "acct4",
+    "acct5",
+    "acct6",
+)
+
+_ACCOUNT = {
+    "type": "string",
+    "enum": list(CHATGPT_ACCOUNTS),
+    "default": "auto",
+}
+
+_JOB_ID = {
+    "type": "string",
+    "pattern": (
+        r"^cgj_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}"
+        r"-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    ),
+}
+
+_PROMPT = {
+    "type": "string",
+    "minLength": 1,
+    "maxLength": 32768,
+}
+
+_MESSAGE_ID = {
+    "type": "string",
+    "minLength": 1,
+    "maxLength": 256,
+}
+
+_READ_LIMIT = {
+    "type": "integer",
+    "minimum": 1,
+    "maximum": 50,
+    "default": 20,
+}
+
+_IDEMPOTENCY_KEY = {
+    "type": "string",
+    "pattern": (
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}"
+        r"-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    ),
+}
+
 
 TOOL_SCHEMAS = {
     "work_item.create": _object_schema({}),
@@ -221,18 +246,23 @@ TOOL_SCHEMAS = {
         {"work_item_id": _WORK_ITEM_ID},
         ("work_item_id",),
     ),
-    "work_item.list": _object_schema(
-        {
-            "status": _STATUS,
-            "page_size": _PAGE_SIZE,
-            "cursor": _CURSOR,
-        }
-    ),
+    "work_item.list": _object_schema({
+        "status": _STATUS,
+        "page_size": _PAGE_SIZE,
+        "cursor": _CURSOR,
+    }),
     "work_item.update": _object_schema(
         {
             "work_item_id": _WORK_ITEM_ID,
-            "status": _STATUS,
+            "status": _MUTABLE_WORK_ITEM_STATUS,
             "expected_updated_at": _ID,
+        },
+        ("work_item_id", "status"),
+    ),
+    "work_item.finish": _object_schema(
+        {
+            "work_item_id": _WORK_ITEM_ID,
+            "status": {"type": "string", "enum": ["completed", "cancelled"]},
         },
         ("work_item_id", "status"),
     ),
@@ -282,9 +312,6 @@ TOOL_SCHEMAS = {
             "query": {
                 "type": "string",
                 "minLength": 1,
-                # Single source of the query length limit: the validator's
-                # string branch enforces this maxLength, so no separate
-                # char/byte guard exists in _validate_arguments.
                 "maxLength": MAX_QUERY_CHARS,
             },
             "limit": {
@@ -296,46 +323,71 @@ TOOL_SCHEMAS = {
         },
         ("session_id", "query"),
     ),
+
+    # The caller owns the stable key and must reuse it when recovering a
+    # lost enqueue acknowledgement. Legacy clients are normalized from their
+    # MCP request id before this schema is validated.
+    "chatgpt.session.create": _object_schema(
+        {"account": _ACCOUNT, "idempotency_key": _IDEMPOTENCY_KEY},
+        ("idempotency_key",),
+    ),
+    "chatgpt.session.list": _object_schema({
+        "page_size": _PAGE_SIZE,
+        "cursor": _CURSOR,
+    }),
     "chatgpt.session.send": _object_schema(
         {
-            "work_item_id": _WORK_ITEM_ID,
             "conversation_id": _SESSION_ID,
             "prompt": _PROMPT,
             "account": _ACCOUNT,
-            "attempt_id": _ATTEMPT_ID,
+            "idempotency_key": _IDEMPOTENCY_KEY,
         },
-        ("work_item_id", "prompt", "attempt_id"),
+        ("conversation_id", "prompt", "idempotency_key"),
+    ),
+    "chatgpt.job.get": _object_schema(
+        {"job_id": _JOB_ID},
+        ("job_id",),
     ),
     "chatgpt.session.read": _object_schema(
         {
-            "work_item_id": _WORK_ITEM_ID,
             "conversation_id": _SESSION_ID,
-            "account": _ACCOUNT,
-            "max_chars": {"type": "integer", "minimum": 256, "maximum": 32768, "default": 12000},
+            "after_message_id": _MESSAGE_ID,
+            "limit": _READ_LIMIT,
         },
-        ("work_item_id", "conversation_id"),
+        ("conversation_id",),
     ),
 }
+
 
 TOOL_DESCRIPTIONS = {
     "work_item.create": "Create a WorkItem owned by the authenticated principal.",
     "work_item.get": "Get a WorkItem visible to the authenticated principal.",
     "work_item.list": "List visible WorkItems using keyset pagination.",
-    "work_item.update": "Update a WorkItem status with optional optimistic concurrency.",
+    "work_item.update": "Update a non-terminal WorkItem status with optional optimistic concurrency.",
+    "work_item.finish": "Complete or cancel a WorkItem as its immutable owner; terminal state, session unlink, and completion event are atomic.",
     "work_item.grant": "Grant a same-tenant principal read or write access.",
     "work_item.revoke": "Revoke a same-tenant principal read or write access.",
     "session.link": "Link a confirmed session to a visible WorkItem.",
     "session.unlink": "Unlink the active session link if it is visible.",
     "session.list": "List sessions linked to a visible WorkItem.",
     "session.context": "Retrieve memory only through the authorized active session link.",
-    "chatgpt.session.send": "Send through the in-repository ChatGPT runtime. Requires a stable attempt_id; reuse the exact ID and request parameters to safely inspect or retry a timed-out call. Uncertain attempts are never automatically resent.",
-    "chatgpt.session.read": "Read the current transcript from a ChatGPT session linked to the specified WorkItem.",
+    "chatgpt.session.create": (
+        "Queue creation of a remote ChatGPT session. idempotency_key is required; reuse the same UUIDv4 for retries. Legacy connectors that omit it are normalized from the MCP session and JSON-RPC request id before validation."
+    ),
+    "chatgpt.session.list": (
+        "List remote ChatGPT sessions owned by the authenticated principal."
+    ),
+    "chatgpt.session.send": (
+        "Queue a prompt for a remote ChatGPT session and return a job id. "
+        "Success means the job was persisted, not that the remote answered. idempotency_key is required; reuse the same UUIDv4 for retries. Legacy connectors that omit it are normalized from the MCP session and JSON-RPC request id before validation."
+    ),
+    "chatgpt.job.get": "Get the status and result summary of a queued ChatGPT job.",
+    "chatgpt.session.read": (
+        "Read harvested messages from a remote ChatGPT session owned by the "
+        "authenticated principal."
+    ),
 }
 
-
-# ---------------------------------------------------------------------------
-# Common validation, serialization, and envelopes
-# ---------------------------------------------------------------------------
 
 _ERROR_MESSAGES = {
     "INVALID_ARGUMENT": "invalid arguments",
@@ -343,12 +395,14 @@ _ERROR_MESSAGES = {
     "PERMISSION_DENIED": "insufficient permission",
     "NOT_FOUND": "resource is not available",
     "CONFLICT": "operation conflicts with the current state",
+    "OUTCOME_UNKNOWN": "remote side effect may have occurred; reconcile before retrying",
+    "INDETERMINATE": "database mutation may still commit; inspect the same operation before retrying",
     "QUARANTINED_SESSION": "session is not confirmed or is quarantined",
     "RESOURCE_EXHAUSTED": "resource limit exceeded",
     "DEPENDENCY_UNAVAILABLE": "required dependency is unavailable",
     "TIMEOUT": "operation timed out",
-    "INDETERMINATE": "operation outcome is indeterminate; do not retry automatically",
     "INTERNAL": "internal error",
+    "OWNERSHIP_PERSIST_FAILED": "session owner could not be persisted",
 }
 
 _RETRYABLE = {
@@ -357,13 +411,168 @@ _RETRYABLE = {
     "PERMISSION_DENIED": False,
     "NOT_FOUND": False,
     "CONFLICT": False,
+    "OUTCOME_UNKNOWN": False,
+    "INDETERMINATE": False,
     "QUARANTINED_SESSION": False,
     "RESOURCE_EXHAUSTED": True,
     "DEPENDENCY_UNAVAILABLE": True,
     "TIMEOUT": True,
-    "INDETERMINATE": False,
     "INTERNAL": False,
+    "OWNERSHIP_PERSIST_FAILED": False,
 }
+
+
+#: Secret shapes that must never reach ``error.details``.
+#:
+#: Order matters: URL userinfo and query first (they hide ``?token=`` before
+#: the key-value rule can trip over the URL), then the auth schemes, then
+#: ``key<sep>value`` in both quoted (JSON) and bare (header/query) forms.
+#:
+#: Every quantifier is bounded on purpose. The first version used
+#: ``(?:[a-z0-9]+[-_])*`` and ``(?:(?!\2).)*``, which are O(n^2) per start
+#: offset: a 64 KiB body took 18.6 s. The bounds are the real fix; the prefix
+#: slice in ``_redact`` is only the belt to that suspenders.
+_KEY_NAME = (
+    r"(?:[a-z0-9]{1,16}[-_]){0,4}"
+    r"(?:token|password|passwd|secret|api[-_]?key|apikey|hmac|signature"
+    r"|authorization|cookie|key)"
+)
+
+#: ``=``, ``=>`` and ``:`` / ``::`` / ``::=`` are the same delimiter in the wild.
+_SEPARATOR = r"\s*(?::+=?|=>|=)\s*"
+
+_KV_QUOTED = re.compile(
+    r"(?i)([\"']?" + _KEY_NAME + r"[\"']?" + _SEPARATOR + r")"
+    r"([\"'])(?:(?!\2).){0,2048}\2"
+)
+
+_KV_BARE = re.compile(
+    r"(?i)\b(" + _KEY_NAME + r")" + _SEPARATOR
+    + r"(?!bearer\b|basic\b|digest\b)[^\s,;&\"'}\]\[]+"
+)
+
+#: Three dot-separated segments: a JWT, whose ``.`` the char class excludes.
+#: The lookbehind keeps the engine from restarting inside one long run (that
+#: alone was O(n^2): 44 ms of the 65 KiB budget), and the segment caps bound
+#: the backtracking that remains.
+_JWT = re.compile(
+    r"(?<![A-Za-z0-9_-])"
+    r"[A-Za-z0-9_-]{8,1024}\.[A-Za-z0-9_-]{8,1024}\.[A-Za-z0-9_-]{1,1024}"
+)
+
+#: Module paths, host names and identifiers share the dotted shape, so a shape
+#: match alone is not evidence. A real JWT is either long (header 36 + payload
+#: + signature 43 > 64 chars) or starts with ``eyJ`` -- base64url of ``{"``,
+#: which is how every JWT header begins. Trade-off: a short, non-``eyJ`` token
+#: is left readable; among the dotted strings we do see, that is always a
+#: path or a host, never a credential.
+JWT_MIN_TOTAL_CHARS = 64
+
+
+def _mask_jwt(match: "re.Match[str]") -> str:
+    value = match.group(0)
+
+    if len(value) >= JWT_MIN_TOTAL_CHARS or value.startswith("eyJ"):
+        return "[redacted]"
+
+    return value
+
+_ENTROPY = re.compile(r"[A-Za-z0-9+/=_~-]{32,}")
+
+_ENTROPY_CLASSES = (
+    re.compile(r"[A-Z]"),
+    re.compile(r"[a-z]"),
+    re.compile(r"[0-9]"),
+)
+
+#: A run counts as a credential only if it carries a base64 symbol, or both an
+#: uppercase letter and a digit. CamelCase exception names (32+ chars, no
+#: digit) and ordinary lowercase prose are therefore left readable. Trade-off:
+#: a pure lowercase hex token is no longer caught here, but it always arrives
+#: as ``token=<hex>``, which _KV_BARE already covers.
+_HAS_BASE64_SYMBOL = re.compile(r"[+/=~]")
+_HAS_UPPER = re.compile(r"[A-Z]")
+_HAS_DIGIT = re.compile(r"[0-9]")
+
+
+def _mask_entropy(match: "re.Match[str]") -> str:
+    """Mask a long opaque token, keeping long identifiers readable."""
+    value = match.group(0)
+    classes = sum(1 for pattern in _ENTROPY_CLASSES if pattern.search(value))
+
+    if classes < 2:
+        return value
+
+    if _HAS_BASE64_SYMBOL.search(value):
+        return "[redacted]"
+
+    if _HAS_UPPER.search(value) and _HAS_DIGIT.search(value):
+        return "[redacted]"
+
+    return value
+
+
+_REDACTIONS = (
+    (
+        # Any scheme, including scheme-relative ``//user:pw@host``. No
+        # lookbehind: it was defeated by a preceding word character
+        # (``x//user:pw@``), and the scheme prefix is bounded to keep this
+        # linear. Accepted collateral: ``path=/a//b@c`` becomes
+        # ``/a//[redacted]@c`` -- a bare ``//x@`` in prose is rare enough to
+        # trade for zero missed userinfo.
+        re.compile(r"(?i)((?:[a-z][a-z0-9+.\-]{0,15}:)?//)([^/@\s]*)@"),
+        r"\1[redacted]@",
+    ),
+    (
+        # Drop the query string of any URL: it is where tokens travel.
+        re.compile(r"(?i)\b(https?://[^\s?#]+)\?[^\s#\"']*"),
+        r"\1?[redacted]",
+    ),
+    (
+        re.compile(r"(?i)\b(bearer|basic|digest)\s+[^\s,;\"']+"),
+        r"\1 [redacted]",
+    ),
+    (
+        _JWT,
+        _mask_jwt,
+    ),
+    (
+        _KV_QUOTED,
+        lambda match: match.group(1) + match.group(2) + "[redacted]" + match.group(2),
+    ),
+    (
+        _KV_BARE,
+        r"\1=[redacted]",
+    ),
+    (
+        _ENTROPY,
+        _mask_entropy,
+    ),
+)
+
+#: Owner cap on ``error.details.detail``.
+MAX_DETAIL_CHARS = 512
+
+#: A rejected call reports at most this many argument errors.
+MAX_ARGUMENT_ERRORS = 10
+
+#: Regex work is capped before the 512-char trim. A secret straddling this
+#: boundary can be cut in half, which is why the quantifier bounds above are
+#: the primary defence and this slice is only the fallback.
+MAX_REDACT_INPUT_CHARS = 8192
+
+
+def _redact(text: str) -> str:
+    """Strip credentials, URL query strings and excess length from text."""
+    if not isinstance(text, str) or not text:
+        return ""
+
+    text = text[:MAX_REDACT_INPUT_CHARS]
+
+    for pattern, replacement in _REDACTIONS:
+        text = pattern.sub(replacement, text)
+
+    return text[:MAX_DETAIL_CHARS]
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -393,6 +602,7 @@ def _error(
 ) -> Dict[str, Any]:
     if code not in _ERROR_MESSAGES:
         code = "INTERNAL"
+
     return {
         "ok": False,
         "error": {
@@ -408,6 +618,149 @@ def _error(
     }
 
 
+class _ArgumentError(ValueError):
+    """A schema rejection that names the fields, never the supplied values."""
+
+    def __init__(self, errors: Sequence[Mapping[str, str]]) -> None:
+        self.errors = [dict(error) for error in list(errors)[:MAX_ARGUMENT_ERRORS]]
+        super().__init__(
+            "; ".join(
+                "%s: %s" % (error["field"], error["reason"])
+                for error in self.errors
+            )
+        )
+
+
+def _field_path(prefix: str, name: str) -> str:
+    """Dotted path for nested arguments; flat schemas pass an empty prefix."""
+    return name if not prefix else prefix + "." + name
+
+
+def _check_value(
+    path: str,
+    value: Any,
+    rule: Mapping[str, Any],
+    errors: list,
+) -> None:
+    """Record every constraint ``value`` breaks, without quoting ``value``."""
+    expected = rule.get("type")
+
+    if expected == "string":
+        if not isinstance(value, str):
+            errors.append({
+                "field": path,
+                "reason": "type mismatch: expected string",
+            })
+            return
+
+        minimum = rule.get("minLength", 0)
+        if len(value) < minimum:
+            errors.append({
+                "field": path,
+                "reason": "too short: minLength %d" % minimum,
+            })
+
+        maximum = rule.get("maxLength")
+        if maximum is not None and len(value) > maximum:
+            errors.append({
+                "field": path,
+                "reason": "too long: maxLength %d" % maximum,
+            })
+
+        if "enum" in rule and value not in rule["enum"]:
+            errors.append({"field": path, "reason": "not in enum"})
+
+        if "pattern" in rule and re.fullmatch(rule["pattern"], value) is None:
+            errors.append({
+                "field": path,
+                "reason": "does not match pattern %s" % rule["pattern"],
+            })
+
+    elif expected == "integer":
+        if isinstance(value, bool) or not isinstance(value, int):
+            errors.append({
+                "field": path,
+                "reason": "type mismatch: expected integer",
+            })
+            return
+
+        if "minimum" in rule and value < rule["minimum"]:
+            errors.append({
+                "field": path,
+                "reason": "below minimum %d" % rule["minimum"],
+            })
+
+        if "maximum" in rule and value > rule["maximum"]:
+            errors.append({
+                "field": path,
+                "reason": "above maximum %d" % rule["maximum"],
+            })
+
+    elif expected == "boolean":
+        if not isinstance(value, bool):
+            errors.append({
+                "field": path,
+                "reason": "type mismatch: expected boolean",
+            })
+
+
+def _argument_details(exc: _ArgumentError) -> Dict[str, Any]:
+    """Owner shape: ``detail`` (first error) plus the full ``errors`` list."""
+    errors = [
+        {"field": _redact(error["field"]), "reason": _redact(error["reason"])}
+        for error in exc.errors
+    ]
+
+    if not errors:
+        return {}
+
+    return {
+        "detail": "%s: %s" % (errors[0]["field"], errors[0]["reason"]),
+        "errors": errors,
+    }
+
+
+def _request_scoped_idempotency_key(
+    name: str,
+    principal: Any,
+    request_id: str,
+    session_id: Optional[str] = None,
+) -> str:
+    """Derive a stable UUIDv4 for replay of the same MCP JSON-RPC request.
+
+    Explicit caller keys remain preferred. Legacy connectors that omit the key
+    still get transport-level deduplication: the same principal, MCP session,
+    tool and JSON-RPC request id produce the same Sender idempotency key. A new
+    JSON-RPC request id is a new user intent.
+    """
+    material = "\0".join((
+        str(principal.tenant_id),
+        str(principal.principal_id),
+        str(session_id or ""),
+        str(name),
+        str(request_id),
+    )).encode("utf-8")
+    digest = hashlib.sha256(material).digest()[:16]
+    return str(uuid.UUID(bytes=digest, version=4))
+
+
+def _mcp_session_id(request: Any) -> Optional[str]:
+    """Return the Streamable HTTP session id, if this request has one."""
+    scope = getattr(request, "scope", None)
+    if not isinstance(scope, Mapping):
+        return None
+    for header_name, header_value in scope.get("headers", ()):
+        if isinstance(header_name, str):
+            normalized_name = header_name.lower()
+        else:
+            normalized_name = bytes(header_name).lower().decode("ascii", "ignore")
+        if normalized_name == "mcp-session-id":
+            if isinstance(header_value, str):
+                return header_value
+            return bytes(header_value).decode("utf-8", "replace")
+    return None
+
+
 def _validate_arguments(name: str, arguments: Any) -> Dict[str, Any]:
     if name not in TOOL_SCHEMAS:
         raise ValueError("unknown tool")
@@ -420,7 +773,6 @@ def _validate_arguments(name: str, arguments: Any) -> Dict[str, Any]:
     properties = schema["properties"]
     supplied = dict(arguments)
 
-    # This rejects identity fields as well as every other undeclared field.
     if any(key not in properties for key in supplied):
         raise ValueError("unknown argument")
     for key in schema.get("required", ()):
@@ -430,7 +782,6 @@ def _validate_arguments(name: str, arguments: Any) -> Dict[str, Any]:
     for key, value in supplied.items():
         rule = properties[key]
         expected = rule.get("type")
-
         if expected == "string":
             if not isinstance(value, str):
                 raise ValueError("string argument required")
@@ -441,10 +792,8 @@ def _validate_arguments(name: str, arguments: Any) -> Dict[str, Any]:
             if "enum" in rule and value not in rule["enum"]:
                 raise ValueError("string argument is not an allowed value")
             if "pattern" in rule:
-                import re
                 if re.fullmatch(rule["pattern"], value) is None:
                     raise ValueError("string argument has invalid format")
-
         elif expected == "integer":
             if isinstance(value, bool) or not isinstance(value, int):
                 raise ValueError("integer argument required")
@@ -452,7 +801,6 @@ def _validate_arguments(name: str, arguments: Any) -> Dict[str, Any]:
                 raise ValueError("integer argument below minimum")
             if value > rule.get("maximum", value):
                 raise ValueError("integer argument above maximum")
-
         elif expected == "boolean":
             if not isinstance(value, bool):
                 raise ValueError("boolean argument required")
@@ -463,28 +811,34 @@ def _validate_arguments(name: str, arguments: Any) -> Dict[str, Any]:
         supplied["include_unlinked"] = False
     if name == "session.context" and "limit" not in supplied:
         supplied["limit"] = MAX_CONTEXT_ENTRIES
-
-    # cursor and query length are bounded by the schema maxLength enforced in
-    # the per-type string branch above, so there is no separate check here.
-    if name == "session.context":
-        query = supplied["query"]
-        if not query.strip():
-            raise ValueError("query must not be blank")
-
+    if "account" in properties and "account" not in supplied:
+        supplied["account"] = "auto"
+    if name == "chatgpt.session.read" and "limit" not in supplied:
+        supplied["limit"] = 20
+    if name == "session.context" and not supplied["query"].strip():
+        raise ValueError("query must not be blank")
     return supplied
 
 
 def _record_dict(value: Any) -> Any:
     if value is None:
         return None
+
     if is_dataclass(value):
         return asdict(value)
+
     if isinstance(value, (str, int, float, bool)):
         return value
+
     if isinstance(value, dict):
-        return {str(k): _record_dict(v) for k, v in value.items()}
+        return {
+            str(key): _record_dict(item)
+            for key, item in value.items()
+        }
+
     if isinstance(value, (list, tuple)):
         return [_record_dict(item) for item in value]
+
     return str(value)
 
 
@@ -495,10 +849,272 @@ def _page_dict(page: Any) -> Dict[str, Any]:
     }
 
 
+JOB_STATUSES = ("queued", "running", "succeeded", "failed")
+MESSAGE_ROLES = ("user", "assistant")
+
+
+def _require_object(payload: Any) -> Mapping[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise _ProtocolError("dependency response must be an object")
+    return payload
+
+
+def _require_text(
+    payload: Mapping[str, Any],
+    key: str,
+    *,
+    max_chars: int = 1024,
+) -> str:
+    value = payload.get(key)
+
+    if not isinstance(value, str) or not value or len(value) > max_chars:
+        raise _ProtocolError(
+            "dependency response field %s is invalid" % key
+        )
+
+    return value
+
+
+def _optional_text(
+    payload: Mapping[str, Any],
+    key: str,
+    *,
+    max_chars: int = 1024,
+) -> Optional[str]:
+    value = payload.get(key)
+
+    if value is None:
+        return None
+
+    if not isinstance(value, str) or len(value) > max_chars:
+        raise _ProtocolError(
+            "dependency response field %s is invalid" % key
+        )
+
+    return value
+
+
+def _optional_int(
+    payload: Mapping[str, Any],
+    key: str,
+) -> Optional[int]:
+    value = payload.get(key)
+
+    if value is None:
+        return None
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise _ProtocolError(
+            "dependency response field %s is invalid" % key
+        )
+
+    return value
+
+
+def _job_status(payload: Mapping[str, Any]) -> str:
+    status = payload.get("status")
+
+    if status not in JOB_STATUSES:
+        raise _ProtocolError("dependency response job status is invalid")
+
+    return status
+
+
+def _project_job_submission(
+    payload: Any,
+    operation: str,
+) -> Dict[str, Any]:
+    payload = _require_object(payload)
+
+    projected = {
+        "job_id": _require_text(payload, "job_id", max_chars=64),
+        "operation": operation,
+        "status": _job_status(payload),
+        "created_at": _require_text(payload, "created_at", max_chars=64),
+    }
+
+    if operation == "session.send":
+        projected["conversation_id"] = _optional_text(
+            payload,
+            "conversation_id",
+            max_chars=64,
+        )
+
+    return projected
+
+
+def _project_job(payload: Any) -> Dict[str, Any]:
+    payload = _require_object(payload)
+
+    result = payload.get("result")
+
+    if result is not None:
+        result = _require_object(result)
+        receipt_durable = result.get("receipt_durable", False)
+        if not isinstance(receipt_durable, bool):
+            raise _ProtocolError("dependency job receipt_durable is malformed")
+        reply_sha256 = _optional_text(result, "reply_sha256", max_chars=64)
+        if reply_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", reply_sha256):
+            raise _ProtocolError("dependency job reply_sha256 is malformed")
+        result = {
+            "message_id": _optional_text(result, "message_id", max_chars=256),
+            "assistant_message_count": _optional_int(
+                result, "assistant_message_count"
+            ),
+            "response_chars": _optional_int(result, "response_chars"),
+            "turn_id": _optional_text(result, "turn_id", max_chars=64),
+            "reply_state": _optional_text(result, "reply_state", max_chars=32),
+            "reply_source": _optional_text(result, "reply_source", max_chars=32),
+            "reply_chars": _optional_int(result, "reply_chars"),
+            "reply_sha256": reply_sha256,
+            "receipt_durable": receipt_durable,
+            "receipt_version": _optional_int(result, "receipt_version"),
+        }
+
+    error = payload.get("error")
+
+    if error is not None:
+        error = _require_object(error)
+        retryable = error.get("retryable")
+
+        if not isinstance(retryable, bool):
+            raise _ProtocolError("dependency job error is malformed")
+
+        error = {
+            "code": _require_text(error, "code", max_chars=64),
+            "retryable": retryable,
+        }
+
+    outcome_unknown = payload.get("outcome_unknown", False)
+    if not isinstance(outcome_unknown, bool):
+        raise _ProtocolError("dependency job outcome_unknown is malformed")
+    if outcome_unknown and error is not None:
+        error["retryable"] = False
+
+    return {
+        "job_id": _require_text(payload, "job_id", max_chars=64),
+        "operation": _require_text(payload, "operation", max_chars=32),
+        "status": _job_status(payload),
+        "conversation_id": _optional_text(
+            payload, "conversation_id", max_chars=64
+        ),
+        "created_at": _require_text(payload, "created_at", max_chars=64),
+        "started_at": _optional_text(payload, "started_at", max_chars=64),
+        "completed_at": _optional_text(payload, "completed_at", max_chars=64),
+        "result": result,
+        "error": error,
+        "outcome_unknown": outcome_unknown,
+    }
+
+
+def _project_sessions(payload: Any) -> Dict[str, Any]:
+    payload = _require_object(payload)
+    items = payload.get("items")
+
+    if not isinstance(items, list):
+        raise _ProtocolError("dependency session list has no items")
+
+    projected = []
+
+    for item in items:
+        item = _require_object(item)
+
+        projected.append({
+            "conversation_id": _require_text(
+                item, "conversation_id", max_chars=64
+            ),
+            "account": _optional_text(item, "account", max_chars=32),
+            "created_at": _optional_text(item, "created_at", max_chars=64),
+            "last_message_at": _optional_text(
+                item, "last_message_at", max_chars=64
+            ),
+            "message_count": _optional_int(item, "message_count"),
+        })
+
+    return {
+        "items": projected,
+        "next_cursor": _optional_text(
+            payload, "next_cursor", max_chars=MAX_CURSOR_CHARS
+        ),
+    }
+
+
+def _project_messages(payload: Any) -> Dict[str, Any]:
+    payload = _require_object(payload)
+    messages = payload.get("messages")
+
+    if not isinstance(messages, list):
+        raise _ProtocolError("dependency message list has no messages")
+
+    projected = []
+
+    for message in messages:
+        message = _require_object(message)
+        role = message.get("role")
+
+        if role not in MESSAGE_ROLES:
+            raise _ProtocolError("dependency message role is invalid")
+
+        content = message.get("content")
+
+        if not isinstance(content, str):
+            raise _ProtocolError("dependency message content is invalid")
+
+        projected.append({
+            "message_id": _require_text(
+                message, "message_id", max_chars=256
+            ),
+            "role": role,
+            "content": content,
+            "created_at": _optional_text(
+                message, "created_at", max_chars=64
+            ),
+        })
+
+    complete = payload.get("complete")
+
+    if not isinstance(complete, bool):
+        raise _ProtocolError(
+            "dependency did not report harvest completeness"
+        )
+
+    return {
+        "conversation_id": _require_text(
+            payload, "conversation_id", max_chars=64
+        ),
+        "messages": projected,
+        "next_after_message_id": _optional_text(
+            payload, "next_after_message_id", max_chars=256
+        ),
+        "complete": complete,
+    }
+
+
+def _detail(detail: str) -> Dict[str, Any]:
+    """Owner-frozen ``error.details`` shape for a real exception message."""
+    return {"detail": detail} if detail else {}
+
+
 def _exception_code(exc: BaseException) -> Tuple[str, Dict[str, Any]]:
+    if isinstance(exc, _ProtocolError):
+        return "INTERNAL", {}
+
+    if isinstance(exc, _ArgumentError):
+        # Argument rejection is the one place where naming the field is the
+        # whole diagnostic value; the value itself is never echoed.
+        return "INVALID_ARGUMENT", _argument_details(exc)
+
+    if isinstance(exc, SessionOpsError):
+        code = getattr(exc, "code", None)
+        detail = _detail(_redact(str(exc)))
+        if code in _ERROR_MESSAGES:
+            return code, detail
+        return "INTERNAL", detail
+
     if isinstance(exc, AuthenticationError):
         if getattr(exc, "category", "") == "dependency_unavailable":
             return "DEPENDENCY_UNAVAILABLE", {}
+
         return "UNAUTHENTICATED", {}
 
     if isinstance(exc, ScopeError):
@@ -518,30 +1134,35 @@ def _exception_code(exc: BaseException) -> Tuple[str, Dict[str, Any]]:
     if isinstance(exc, PrincipalDirectoryUnavailable):
         return "DEPENDENCY_UNAVAILABLE", {}
 
-    if isinstance(exc, (InvalidIdentifier, InvalidPrincipal, ValueError, TypeError)):
+    if isinstance(
+        exc,
+        (InvalidIdentifier, InvalidPrincipal, ValueError, TypeError),
+    ):
         return "INVALID_ARGUMENT", {}
 
     if isinstance(exc, _IndeterminateOperation):
         return "INDETERMINATE", {"outcome": "indeterminate", "safe_to_retry": False}
-
+    if isinstance(exc, _ResourceExhausted):
+        return "RESOURCE_EXHAUSTED", {}
     if isinstance(exc, _DeadlineExceeded):
         return "TIMEOUT", {}
 
-    if isinstance(exc, _ResourceExhausted):
-        return "RESOURCE_EXHAUSTED", {}
-
     if isinstance(exc, sqlite3.OperationalError):
         message = str(exc).lower()
+
         if "locked" in message or "busy" in message:
             return "RESOURCE_EXHAUSTED", {}
+
         return "INTERNAL", {}
 
-    # MemoryAdapterError is imported lazily with MemoryAdapterClient.
     adapter_code = getattr(exc, "code", None)
+
     if adapter_code == "ADAPTER_TIMEOUT":
         return "TIMEOUT", {}
+
     if adapter_code in ("ADAPTER_UNAVAILABLE", "ADAPTER_CRASHED"):
         return "DEPENDENCY_UNAVAILABLE", {}
+
     if adapter_code == "SCOPE_VIOLATION":
         return "INTERNAL", {}
 
@@ -550,43 +1171,77 @@ def _exception_code(exc: BaseException) -> Tuple[str, Dict[str, Any]]:
 
     if isinstance(exc, AuthorityError):
         message = str(exc).lower()
+
         if "changed" in message or "conflict" in message:
             return "CONFLICT", {}
+
         return "INVALID_ARGUMENT", {}
 
     return "INTERNAL", {}
 
 
-# ---------------------------------------------------------------------------
-# SDK-independent service
-# ---------------------------------------------------------------------------
-
 class MCPToolService:
-    """Dispatch MCP tools through WorkItem authority and the local ChatGPT runtime.
+    """Dispatch frozen MCP tools through the authorized service layer."""
 
-    ``memory_adapter`` is the command sequence used to start the Memory
-    Adapter, for example ``["python", "-m", "some_adapter_module"]``.
-    It is configuration, not a shared MemoryAdapterClient instance.
-    """
+    _CHATGPT_TOOLS = frozenset({
+        "chatgpt.session.create",
+        "chatgpt.session.list",
+        "chatgpt.session.send",
+        "chatgpt.job.get",
+        "chatgpt.session.read",
+    })
 
     def __init__(
         self,
         store: Any,
         *,
         memory_adapter: Optional[Sequence[str]] = None,
+        session_ops: Any = None,
     ):
         if store is None:
             raise ValueError("SecureWorkItemStore is required")
+
         self.store = store
+
         if memory_adapter is None:
             self.memory_adapter_command = None
         else:
             if isinstance(memory_adapter, (str, bytes)):
-                raise ValueError("memory_adapter must be a command sequence")
+                raise ValueError(
+                    "memory_adapter must be a command sequence"
+                )
+
             command = tuple(memory_adapter)
-            if not command or not all(isinstance(part, str) and part for part in command):
+
+            if not command or not all(
+                isinstance(part, str) and part
+                for part in command
+            ):
                 raise ValueError("memory_adapter command is invalid")
+
             self.memory_adapter_command = command
+
+        self.session_ops = session_ops
+
+        if self.session_ops is not None:
+            self._validate_session_ops(self.session_ops)
+
+    @staticmethod
+    def _validate_session_ops(session_ops: Any) -> None:
+        required_methods = (
+            "enqueue",
+            "get_job",
+            "list_sessions",
+            "read_session",
+        )
+
+        if not all(
+            callable(getattr(session_ops, method, None))
+            for method in required_methods
+        ):
+            raise ValueError(
+                "session_ops client must implement the local Session Ops interface"
+            )
 
     @staticmethod
     def _run_db(function: Any, *, mutation: bool = False) -> Any:
@@ -597,14 +1252,12 @@ class MCPToolService:
         except BaseException:
             _DB_SLOTS.release()
             raise
-        # Keep capacity occupied until the callable actually stops, including
-        # when the MCP caller times out or disconnects.
+        # Keep capacity occupied until the actual callable exits, even if the
+        # request times out. A running mutation may still commit.
         future.add_done_callback(lambda _future: _DB_SLOTS.release())
         try:
             return future.result(timeout=DB_DEADLINE_SECONDS)
         except FutureTimeout:
-            # A queued future can be cancelled safely. A running callable
-            # cannot: it may still commit after this request returns.
             if future.cancel():
                 raise _DeadlineExceeded("database operation cancelled before start")
             if future.done():
@@ -622,6 +1275,7 @@ class MCPToolService:
         auth: AuthContext,
         *,
         request_id: Optional[str] = None,
+        request_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Execute one tool and always return the v0.1 envelope."""
         request_id = request_id or str(uuid.uuid4())
@@ -630,22 +1284,41 @@ class MCPToolService:
         try:
             if name not in TOOL_SCHEMAS:
                 raise ValueError("unknown tool")
+
             if not isinstance(auth, AuthContext):
-                raise AuthenticationError("verified authentication context required")
+                raise AuthenticationError(
+                    "verified authentication context required"
+                )
 
             auth.require(*required_scopes_for_tool(name))
-            args = _validate_arguments(name, arguments)
             principal = auth.principal
+            normalized_arguments = arguments
+            if name in ("chatgpt.session.create", "chatgpt.session.send"):
+                if arguments is None:
+                    normalized_arguments = {}
+                if isinstance(normalized_arguments, Mapping):
+                    normalized_arguments = dict(normalized_arguments)
+                    normalized_arguments.setdefault(
+                        "idempotency_key",
+                        _request_scoped_idempotency_key(
+                            name, principal, request_id, request_session_id
+                        ),
+                    )
+            args = _validate_arguments(name, normalized_arguments)
 
             if name == "work_item.create":
                 result = self._run_db(
-                    lambda: self.store.create_work_item(principal), mutation=True
+                    lambda: self.store.create_work_item(principal, request_id=request_id),
+                    mutation=True,
                 )
                 data = _record_dict(result)
 
             elif name == "work_item.get":
                 result = self._run_db(
-                    lambda: self.store.get_work_item(principal, args["work_item_id"])
+                    lambda: self.store.get_work_item(
+                        principal,
+                        args["work_item_id"],
+                    )
                 )
                 data = _record_dict(result)
 
@@ -673,6 +1346,18 @@ class MCPToolService:
                 )
                 data = _record_dict(result)
 
+            elif name == "work_item.finish":
+                result = self._run_db(
+                    lambda: self.store.finish_work_item(
+                        principal,
+                        args["work_item_id"],
+                        args["status"],
+                        request_id=request_id,
+                    ),
+                    mutation=True,
+                )
+                data = _record_dict(result)
+
             elif name == "work_item.grant":
                 self._run_db(
                     lambda: self.store.grant(
@@ -684,6 +1369,7 @@ class MCPToolService:
                     ),
                     mutation=True,
                 )
+
                 data = {
                     "work_item_id": args["work_item_id"],
                     "target_principal_id": args["target_principal_id"],
@@ -702,6 +1388,7 @@ class MCPToolService:
                     ),
                     mutation=True,
                 )
+
                 data = {
                     "work_item_id": args["work_item_id"],
                     "target_principal_id": args["target_principal_id"],
@@ -733,6 +1420,7 @@ class MCPToolService:
                     ),
                     mutation=True,
                 )
+
                 data = {
                     "unlinked": result is not None,
                     "link": _record_dict(result),
@@ -759,352 +1447,91 @@ class MCPToolService:
                     started=started,
                 )
 
+            elif name == "chatgpt.session.create":
+                data = _project_job_submission(
+                    self._session_ops().enqueue(
+                        principal_id=principal.principal_id,
+                        tenant_id=principal.tenant_id,
+                        operation="session.create",
+                        arguments={
+                            "account": args["account"],
+                        },
+                        idempotency_key=args["idempotency_key"],
+                    ),
+                    "session.create",
+                )
+
+            elif name == "chatgpt.session.list":
+                data = _project_sessions(
+                    self._session_ops().list_sessions(
+                        principal_id=principal.principal_id,
+                        tenant_id=principal.tenant_id,
+                        page_size=args["page_size"],
+                        cursor=args.get("cursor"),
+                    )
+                )
+
             elif name == "chatgpt.session.send":
-                data = self._chatgpt_session_send(
-                    principal=principal,
-                    work_item_id=args["work_item_id"],
-                    conversation_id=args.get("conversation_id"),
-                    prompt=args["prompt"],
-                    account=args.get("account"),
-                    attempt_id=args.get("attempt_id"),
+                send_arguments = {
+                    "account": args["account"],
+                    "prompt": args["prompt"],
+                }
+
+                if args.get("conversation_id") is not None:
+                    send_arguments["conversation_id"] = (
+                        args["conversation_id"]
+                    )
+
+                data = _project_job_submission(
+                    self._session_ops().enqueue(
+                        principal_id=principal.principal_id,
+                        tenant_id=principal.tenant_id,
+                        operation="session.send",
+                        arguments=send_arguments,
+                        idempotency_key=args["idempotency_key"],
+                    ),
+                    "session.send",
+                )
+
+            elif name == "chatgpt.job.get":
+                data = _project_job(
+                    self._session_ops().get_job(
+                        principal_id=principal.principal_id,
+                        tenant_id=principal.tenant_id,
+                        job_id=args["job_id"],
+                    )
                 )
 
             elif name == "chatgpt.session.read":
-                data = self._chatgpt_session_read(
-                    principal=principal,
-                    work_item_id=args["work_item_id"],
-                    conversation_id=args["conversation_id"],
-                    account=args.get("account"),
-                    max_chars=args.get("max_chars", 12000),
+                data = _project_messages(
+                    self._session_ops().read_session(
+                        principal_id=principal.principal_id,
+                        tenant_id=principal.tenant_id,
+                        conversation_id=args["conversation_id"],
+                        after_message_id=args.get("after_message_id"),
+                        limit=args["limit"],
+                    )
                 )
 
             else:
                 raise ValueError("unknown tool")
 
             envelope = _success(data, request_id)
+
             if len(_json_bytes(envelope)) > MAX_STRUCTURED_CONTENT_BYTES:
                 return _error("RESOURCE_EXHAUSTED", request_id)
+
             return envelope
 
         except BaseException as exc:
             code, details = _exception_code(exc)
             return _error(code, request_id, details)
 
-    def _chatgpt_session_send(
-        self,
-        *,
-        principal: Any,
-        work_item_id: str,
-        conversation_id: Optional[str],
-        prompt: str,
-        account: Optional[str],
-        attempt_id: Optional[str],
-    ) -> Dict[str, Any]:
-        """Send through the in-repository runtime with durable retry protection."""
-        from scripts import chatgpt_send as runtime
-
-        if not attempt_id:
-            raise ValueError("attempt_id is required and must be reused for retries")
-
-        explicit_account = None if account in (None, "", "auto") else account
-        request_hash = hashlib.sha256(
-            json.dumps(
-                {
-                    "work_item_id": work_item_id,
-                    "conversation_id": conversation_id,
-                    "prompt": prompt,
-                    "account": explicit_account,
-                },
-                sort_keys=True,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
-
-        created, attempt = self._run_db(
-            lambda: self.store.reserve_send_attempt(
-                principal,
-                work_item_id,
-                attempt_id,
-                request_hash=request_hash,
-            ),
-            mutation=True,
-        )
-        if not created:
-            previous_status = attempt["status"]
-            response_status = (
-                "in_progress" if previous_status == "running" else previous_status
-            )
-            return {
-                "work_item_id": work_item_id,
-                "attempt_id": attempt_id,
-                "conversation_id": attempt.get("conversation_id"),
-                "account": attempt.get("account"),
-                "status": response_status,
-                "http_status": attempt.get("http_status"),
-                "error": attempt.get("error"),
-                "replayed": True,
-            }
-
-        prompt_path = None
-        api = None
-        resolved_account = None
-        outcome_unknown = False
-        attempt_error = None
-        context = None
-        try:
-            # All local authorization and account checks happen before the
-            # remote side effect. A failed preflight consumes this attempt ID
-            # as failed, so a retry cannot accidentally send under new inputs.
-            if conversation_id:
-                active_link = self._run_db(
-                    lambda: self.store.get_active_link(principal, conversation_id)
-                )
-                if active_link is None or active_link.work_item_id != work_item_id:
-                    raise NotAuthorized()
-                resolved = runtime.resolve_conversation_account(
-                    conversation_id,
-                    explicit_account=explicit_account,
-                )
-                if resolved.get("status") == "conflict":
-                    raise NotAuthorized()
-                if resolved.get("account") is None or (
-                    explicit_account is not None and resolved.get("account") != explicit_account
-                ):
-                    raise InvalidIdentifier("conversation account is unknown or does not match; specify the linked account")
-                resolved_account = resolved["account"]
-                api = runtime.ChatGPTAPI(account=resolved_account)
-
-            fd, prompt_path = tempfile.mkstemp(prefix="mcp-prompt-", suffix=".txt")
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                stream.write(prompt)
-        except BaseException as exc:
-            try:
-                self._run_db(
-                    lambda: self.store.complete_send_attempt(
-                        principal,
-                        work_item_id,
-                        attempt_id,
-                        status="failed",
-                        error=type(exc).__name__,
-                    ),
-                    mutation=True,
-                )
-            except _IndeterminateOperation as completion_exc:
-                raise completion_exc from exc
-            except BaseException:
-                pass
-            if prompt_path is not None:
-                try:
-                    os.unlink(prompt_path)
-                except FileNotFoundError:
-                    pass
-            raise
-
-        try:
-            if conversation_id:
-                # Existing active link is already trusted. Reuse it; do not
-                # create a second landing event or attempt to link the session again.
-                result = runtime.send_prompt(api, conversation_id, prompt_path)
-                values = tuple(result) if isinstance(result, (tuple, list)) else ()
-                http_status = values[0] if values else None
-                conv_ref = values[2] if len(values) > 2 else None
-                resolved_conversation_id = conversation_id
-                link = active_link
-                link_error = None
-                if bool(getattr(conv_ref, "mismatch", False)):
-                    outcome_unknown = True
-                    actual = getattr(conv_ref, "actual_conv_id", "") or "unknown"
-                    reason = getattr(conv_ref, "reason", "") or "conversation identity mismatch"
-                    link_error = "conversation outcome unknown: %s; actual=%s" % (reason, actual)
-                    attempt_error = "conversation_identity_mismatch actual=%s" % actual
-                    # ConvRef mismatch is produced only after the remote POST
-                    # returned HTTP 200; identity uncertainty is not a safe retry.
-                    http_status = 200
-                elif http_status == 0 and bool(getattr(api, "last_send_started", False)):
-                    outcome_unknown = True
-                    link_error = "send outcome unknown after POST transport failure"
-            else:
-                context = {
-                    "store": self.store,
-                    "principal": principal,
-                    "work_item_id": work_item_id,
-                    "attempt_id": attempt_id,
-                }
-                runtime.create_chat_rotating(
-                    prompt_path,
-                    work_item_context=context,
-                    account=explicit_account,
-                )
-                link = context.get("link")
-                link_error = context.get("link_error")
-                http_status = context.get("status")
-                resolved_conversation_id = context.get("conversation_id")
-                resolved_account = context.get("account")
-                outcome_unknown = bool(context.get("outcome_unknown"))
-                if outcome_unknown:
-                    actual = context.get("actual_conv_id")
-                    attempt_error = (
-                        "conversation_identity_mismatch actual=%s" % actual
-                        if actual else
-                        "outcome_unknown_http_%s" % http_status
-                        if http_status is not None else
-                        "outcome_unknown_no_response"
-                    )
-                elif link_error:
-                    attempt_error = "session_link_failed"
-
-            if outcome_unknown:
-                status = "outcome_unknown"
-            elif http_status == 200 and link is not None:
-                status = "sent"
-            elif http_status == 200 and resolved_conversation_id:
-                status = "sent_unlinked"
-            elif (
-                http_status is None and (conversation_id is not None or resolved_account is not None)
-            ) or http_status == 200 or (
-                isinstance(http_status, int) and http_status in (408, 425) or
-                isinstance(http_status, int) and http_status >= 500
-            ):
-                # A timeout, server error, or accepted response without a
-                # conversation ID does not prove non-delivery.
-                status = "outcome_unknown"
-            else:
-                status = "failed"
-
-            if isinstance(link_error, str) and link_error:
-                attempt_error = link_error[:1000]
-            elif status == "sent_unlinked":
-                attempt_error = "session_link_not_confirmed"
-            elif status == "outcome_unknown":
-                attempt_error = "remote_send_outcome_unknown (status=%s)" % http_status
-            elif status == "failed":
-                attempt_error = "send_failed (status=%s)" % http_status
-            else:
-                attempt_error = None
-            if status == "outcome_unknown" and attempt_error is None:
-                attempt_error = (
-                    "outcome_unknown_http_%s" % http_status
-                    if http_status is not None else
-                    "outcome_unknown_no_response"
-                )
-            elif status == "sent_unlinked" and attempt_error is None:
-                attempt_error = "session_link_failed"
-
-            record = self._run_db(
-                lambda: self.store.complete_send_attempt(
-                    principal,
-                    work_item_id,
-                    attempt_id,
-                    status=status,
-                    conversation_id=resolved_conversation_id,
-                    account=resolved_account,
-                    http_status=http_status,
-                    error=attempt_error,
-                ),
-                mutation=True,
-            )
-            return {
-                "work_item_id": work_item_id,
-                "attempt_id": attempt_id,
-                "conversation_id": record.get("conversation_id"),
-                "account": record.get("account"),
-                "status": record["status"],
-                "http_status": record.get("http_status"),
-                "error": record.get("error"),
-                "replayed": False,
-            }
-        except BaseException as exc:
-            # A timed-out completion write may still commit. Do not race it
-            # with a second status update that could overwrite a successful
-            # result; the caller must query/replay the same attempt ID.
-            if isinstance(exc, _IndeterminateOperation):
-                raise
-            # Only failures after a POST may have reached ChatGPT are unknown.
-            # Authorization/account/prompt preflight failures are definitely
-            # non-deliveries and must not poison the WorkItem send slot.
-            remote_send_started = bool(getattr(api, "last_send_started", False))
-            if context is not None:
-                context_api = context.get("api")
-                remote_send_started = remote_send_started or bool(
-                    getattr(context_api, "last_send_started", False)
-                ) or bool(context.get("outcome_unknown"))
-            attempt_status = "outcome_unknown" if remote_send_started else "failed"
-            try:
-                self._run_db(
-                    lambda: self.store.complete_send_attempt(
-                        principal,
-                        work_item_id,
-                        attempt_id,
-                        status=attempt_status,
-                        error=type(exc).__name__,
-                    ),
-                    mutation=True,
-                )
-            except _IndeterminateOperation as completion_exc:
-                raise completion_exc from exc
-            except BaseException:
-                pass
-            raise
-        finally:
-            if prompt_path is not None:
-                try:
-                    os.unlink(prompt_path)
-                except FileNotFoundError:
-                    pass
-
-    def _chatgpt_session_read(
-        self,
-        *,
-        principal: Any,
-        work_item_id: str,
-        conversation_id: str,
-        account: Optional[str],
-        max_chars: int,
-    ) -> Dict[str, Any]:
-        """Read the linked ChatGPT conversation directly through ChatGPTAPI."""
-        from scripts import chatgpt_send as runtime
-
-        link = self._run_db(
-            lambda: self.store.get_session_link_for_work_item(
-                principal, work_item_id, conversation_id
-            )
-        )
-        if link is None:
-            raise NotAuthorized()
-        explicit_account = None if account in (None, "", "auto") else account
-        resolved = runtime.resolve_conversation_account(
-            conversation_id,
-            explicit_account=explicit_account,
-        )
-        if resolved.get("status") == "conflict":
-            raise NotAuthorized()
-        if resolved.get("account") is None:
-            raise InvalidIdentifier("conversation account is unknown; specify account")
-        api = runtime.ChatGPTAPI(account=resolved["account"])
-        # A caller timeout cannot stop an already-running synchronous HTTP read.
-        # Never retry inside this operation: retries can overlap abandoned GETs.
-        tail, _body = api.live_tail(conversation_id, tries=1)
-        if tail is None:
-            return {
-                "work_item_id": work_item_id,
-                "conversation_id": conversation_id,
-                "account": resolved["account"],
-                "status": "unavailable",
-                "http_status": getattr(api, "last_status", None),
-                "text": "",
-                "truncated": False,
-            }
-        text = str(tail)
-        return {
-            "work_item_id": work_item_id,
-            "conversation_id": conversation_id,
-            "account": resolved["account"],
-            "status": "ok",
-            "http_status": getattr(api, "last_status", None),
-            "text": text[:max_chars],
-            "truncated": len(text) > max_chars,
-        }
+    def _session_ops(self) -> Any:
+        """Return the in-process ChatGPT session client; never open a network sidecar."""
+        if self.session_ops is not None:
+            return self.session_ops
+        raise SessionOpsError("DEPENDENCY_UNAVAILABLE", "local ChatGPT session client was not configured at startup")
 
     def _session_context(
         self,
@@ -1121,23 +1548,27 @@ class MCPToolService:
                 category="dependency_unavailable",
             )
 
-        # The work_item_id is derived only from the authority-checked active
-        # link. The caller cannot choose or override it.
         link = self._run_db(
             lambda: self.store.get_active_link(principal, session_id)
         )
+
         if link is None:
             raise QuarantineNotCleared(
                 "an authorized active session link is required"
             )
 
-        remaining = REQUEST_DEADLINE_SECONDS - (time.monotonic() - started)
-        adapter_timeout = min(ADAPTER_DEADLINE_SECONDS, remaining)
+        remaining = REQUEST_DEADLINE_SECONDS - (
+            time.monotonic() - started
+        )
+
+        adapter_timeout = min(
+            ADAPTER_DEADLINE_SECONDS,
+            remaining,
+        )
+
         if adapter_timeout <= 0:
             raise _DeadlineExceeded("request deadline exceeded")
 
-        # Construct a new client for every call. Never mutate a shared client's
-        # timeout_seconds; concurrent requests therefore cannot race on it.
         from src.session_ops.memory_adapter_client import (
             MemoryAdapterClient,
         )
@@ -1146,6 +1577,7 @@ class MCPToolService:
             self.memory_adapter_command,
             timeout_seconds=adapter_timeout,
         )
+
         retrieved = client.retrieve(
             work_item_id=link.work_item_id,
             session_id=session_id,
@@ -1154,27 +1586,28 @@ class MCPToolService:
         )
 
         entries = []
+
         for entry in retrieved.entries[:MAX_CONTEXT_ENTRIES]:
             content = entry.content
+
             if (
                 len(content) > MAX_CONTEXT_CONTENT_CHARS
-                or len(content.encode("utf-8")) > MAX_CONTEXT_CONTENT_BYTES
+                or len(content.encode("utf-8"))
+                > MAX_CONTEXT_CONTENT_BYTES
             ):
                 raise _ResourceExhausted(
                     "memory adapter returned oversized content"
                 )
 
-            entries.append(
-                {
-                    "memory_id": entry.memory_id,
-                    "session_id": entry.session_id,
-                    "content": content,
-                    "provenance": _record_dict(entry.provenance),
-                    "created_at": entry.created_at,
-                    "score": entry.score,
-                    "trust": "untrusted_historical_context",
-                }
-            )
+            entries.append({
+                "memory_id": entry.memory_id,
+                "session_id": entry.session_id,
+                "content": content,
+                "provenance": _record_dict(entry.provenance),
+                "created_at": entry.created_at,
+                "score": entry.score,
+                "trust": "untrusted_historical_context",
+            })
 
         return {
             "work_item_id": link.work_item_id,
@@ -1183,46 +1616,43 @@ class MCPToolService:
         }
 
 
-# ---------------------------------------------------------------------------
-# Streamable HTTP authentication and SDK binding
-# ---------------------------------------------------------------------------
-
 def build_mcp_server(
     service: MCPToolService,
     token_provider: JWTVerifier,
     *,
     events_store: Any = None,
 ) -> Any:
-    """Build and return the authenticated Streamable HTTP ASGI application.
-
-    ``token_provider`` is one shared JWTVerifier instance. It is not called
-    with zero arguments and has no ``.verifier`` attribute contract. The
-    bearer token is extracted independently from every HTTP request.
-
-    The verifier's JWKSProvider uses a lock-protected cache. Per-request
-    AuthContext objects are stored only in that request's ASGI scope state.
-    """
+    """Build and return the authenticated Streamable HTTP ASGI application."""
     if not isinstance(service, MCPToolService):
         raise TypeError("service must be MCPToolService")
+
     if not callable(getattr(token_provider, "verify", None)):
         raise TypeError("token_provider must be a JWTVerifier instance")
-    # The optional SDK is deliberately imported only here.
+
     from mcp import types
     from mcp.server import Server
     from mcp.server.transport_security import TransportSecuritySettings
 
     resource = urlsplit(token_provider.audience)
+
     if resource.scheme != "https" or not resource.netloc:
-        raise ValueError("JWTVerifier audience must be an HTTPS resource URI")
+        raise ValueError(
+            "JWTVerifier audience must be an HTTPS resource URI"
+        )
 
     endpoint_path = resource.path or "/mcp"
+
     if not endpoint_path.startswith("/"):
         endpoint_path = "/" + endpoint_path
 
-    metadata_path = "/.well-known/oauth-protected-resource" + endpoint_path
+    metadata_path = (
+        "/.well-known/oauth-protected-resource" + endpoint_path
+    )
+
     resource_metadata_url = (
         resource.scheme + "://" + resource.netloc + metadata_path
     )
+
     resource_origin = resource.scheme + "://" + resource.netloc
 
     all_scopes = (
@@ -1231,12 +1661,11 @@ def build_mcp_server(
         "session_ops.session.read",
         "session_ops.session.write",
         "session_ops.context.read",
-        # Events subscriptions have a separate lifecycle authority. Keep
-        # these scopes explicit in the OAuth challenge rather than silently
-        # aliasing them to generic session write access.
+        "session_ops.access.manage",
         "session_ops.chatgpt.session.read",
         "session_ops.chatgpt.session.write",
     )
+
     challenge_scope = " ".join(all_scopes)
 
     async def on_list_tools(ctx: Any, params: Any) -> Any:
@@ -1248,6 +1677,7 @@ def build_mcp_server(
             )
             for name in TOOL_SCHEMAS
         ]
+
         return types.ListToolsResult(tools=tools)
 
     async def on_call_tool(ctx: Any, params: Any) -> Any:
@@ -1257,108 +1687,48 @@ def build_mcp_server(
 
         if request is not None:
             state = request.scope.get("state", {})
+
             if isinstance(state, dict):
                 auth = state.get("session_ops_auth")
 
         if not isinstance(auth, AuthContext):
             envelope = _error("UNAUTHENTICATED", request_id)
+
         else:
-            arguments = params.arguments if params.arguments is not None else {}
+            arguments = (
+                params.arguments
+                if params.arguments is not None
+                else {}
+            )
+
             loop = asyncio.get_running_loop()
-            if params.name == "chatgpt.session.read":
-                conversation_id = str(arguments.get("conversation_id", ""))
-                read_key = (
-                    "%s|%s|%s" % (auth.issuer, auth.realm_namespace, auth.subject),
-                    conversation_id,
-                )
-                with _READ_INFLIGHT_LOCK:
-                    admitted = (
-                        read_key not in _READ_INFLIGHT_KEYS
-                        and _READ_SLOTS.acquire(blocking=False)
-                    )
-                    if admitted:
-                        _READ_INFLIGHT_KEYS.add(read_key)
-                if not admitted:
-                    envelope = _error("DEPENDENCY_UNAVAILABLE", request_id)
-                else:
-                    try:
-                        job = _READ_EXECUTOR.submit(
-                            service.dispatch,
-                            params.name,
-                            arguments,
-                            auth,
-                            request_id=request_id,
-                        )
-                    except BaseException:
-                        with _READ_INFLIGHT_LOCK:
-                            _READ_INFLIGHT_KEYS.discard(read_key)
-                        _READ_SLOTS.release()
-                        raise
 
-                    def release_read(_job: Any) -> None:
-                        with _READ_INFLIGHT_LOCK:
-                            _READ_INFLIGHT_KEYS.discard(read_key)
-                        _READ_SLOTS.release()
+            request_session_id = _mcp_session_id(request)
 
-                    # Register outside the lock: add_done_callback may execute
-                    # synchronously when the job already completed.
-                    job.add_done_callback(release_read)
-                    future = asyncio.wrap_future(job, loop=loop)
-                    try:
-                        # Shield prevents wait_for from cancelling the
-                        # wrapper; the underlying job remains tracked until
-                        # its completion callback releases admission.
-                        envelope = await asyncio.wait_for(
-                            asyncio.shield(future),
-                            timeout=REQUEST_DEADLINE_SECONDS,
-                        )
-                    except asyncio.TimeoutError:
-                        envelope = _error("TIMEOUT", request_id)
-            elif params.name == "chatgpt.session.send":
-                try:
-                    job = _SEND_EXECUTOR.submit(
-                        service.dispatch,
-                        params.name,
-                        arguments,
-                        auth,
-                        request_id=request_id,
+            dispatch = lambda: service.dispatch(
+                params.name,
+                arguments,
+                auth,
+                request_id=request_id,
+                request_session_id=request_session_id,
+            )
+
+            try:
+                if params.name in ("chatgpt.session.read", "chatgpt.session.list"):
+                    envelope = await _run_chatgpt_read(
+                        dispatch, timeout=CHATGPT_READ_REQUEST_DEADLINE_SECONDS
                     )
-                except _ResourceExhausted:
-                    envelope = _error("RESOURCE_EXHAUSTED", request_id)
                 else:
-                    future = asyncio.wrap_future(job, loop=loop)
-                    try:
-                        # A caller timeout must not cancel a queued/running
-                        # send. The worker reserves the durable attempt before
-                        # the POST; retrying the same attempt_id is observational
-                        # once execution starts. Work not yet started is safe to
-                        # resubmit after a process restart.
-                        envelope = await asyncio.wait_for(
-                            asyncio.shield(future),
-                            timeout=REQUEST_DEADLINE_SECONDS,
-                        )
-                    except asyncio.TimeoutError:
-                        envelope = _error("TIMEOUT", request_id)
-            else:
-                future = loop.run_in_executor(
-                    None,
-                    lambda: service.dispatch(
-                        params.name,
-                        arguments,
-                        auth,
-                        request_id=request_id,
-                    ),
-                )
-                try:
+                    future = loop.run_in_executor(None, dispatch)
                     envelope = await asyncio.wait_for(
-                        future,
-                        timeout=REQUEST_DEADLINE_SECONDS,
+                        future, timeout=REQUEST_DEADLINE_SECONDS
                     )
-                except asyncio.TimeoutError:
-                    envelope = _error("TIMEOUT", request_id)
 
-        # Keep the text fallback small; the complete contract envelope is in
-        # structured_content and is size-checked by MCPToolService.
+            except _ResourceExhausted:
+                envelope = _error("RESOURCE_EXHAUSTED", request_id)
+            except asyncio.TimeoutError:
+                envelope = _error("TIMEOUT", request_id)
+
         return types.CallToolResult(
             content=[
                 types.TextContent(
@@ -1382,15 +1752,9 @@ def build_mcp_server(
     )
 
     if events_store is not None:
-        # MCP SDK 2.3.0 supports custom request handlers and context middleware,
-        # but its ServerCapabilities model predates the ChatGPT MCP Events field.
-        # Advertise the field after SDK serialization, without monkey-patching
-        # the SDK's Pydantic models or changing non-event deployments.
         from src.session_ops.mcp_events import CallbackEndpointError, build_event_request_models
 
-        EventsListParams, EventsSubscribeParams, EventsUnsubscribeParams = (
-            build_event_request_models()
-        )
+        EventsListParams, EventsSubscribeParams, EventsUnsubscribeParams = build_event_request_models()
 
         def _event_auth(ctx: Any) -> Any:
             request = getattr(ctx, "request", None)
@@ -1403,29 +1767,23 @@ def build_mcp_server(
             auth = _event_auth(ctx)
             if not isinstance(auth, AuthContext):
                 raise AuthenticationError("verified authentication context required")
+            auth.require("session_ops.chatgpt.session.read")
             events_store._identity(auth)
-            if not ({"session_ops.chatgpt.session.read", "session_ops.chatgpt.session.write"} & set(auth.scopes)):
-                raise ScopeError(("session_ops.chatgpt.session.read",))
             return {"events": events_store.event_catalog()}
 
         async def on_events_subscribe(ctx: Any, params: Any) -> Any:
             auth = _event_auth(ctx)
             if not isinstance(auth, AuthContext):
                 raise AuthenticationError("verified authentication context required")
-            if "session_ops.chatgpt.session.write" not in auth.scopes:
-                raise ScopeError(("session_ops.chatgpt.session.write",))
+            auth.require("session_ops.chatgpt.session.write")
+
             def create_subscription() -> Any:
                 payload = params.model_dump(by_alias=True, exclude_unset=True)
                 arguments = payload.get("arguments") or {}
                 job_id = arguments.get("job_id")
                 if job_id is not None:
-                    # Completion events are attributed to the WorkItem owner.
-                    # A delegated writer cannot create an owner-filtered feed.
                     service.store.require_owner(auth.principal, job_id)
-                return events_store.subscribe(
-                    auth,
-                    payload,
-                )
+                return events_store.subscribe(auth, payload)
 
             try:
                 return await asyncio.to_thread(create_subscription)
@@ -1436,9 +1794,6 @@ def build_mcp_server(
                     message="Callback endpoint verification failed",
                     data={"reason": exc.reason},
                 ) from exc
-            except ValueError as exc:
-                from mcp.shared.exceptions import MCPError
-                raise MCPError(code=-32602, message="Invalid event subscription", data={"reason": "invalid_subscription"}) from exc
             except (NotAuthorized, InvalidIdentifier) as exc:
                 from mcp.shared.exceptions import MCPError
                 raise MCPError(
@@ -1446,20 +1801,24 @@ def build_mcp_server(
                     message="Invalid event subscription",
                     data={"reason": "job_not_owned"},
                 ) from exc
+            except ValueError as exc:
+                from mcp.shared.exceptions import MCPError
+                raise MCPError(
+                    code=-32602,
+                    message="Invalid event subscription",
+                    data={"reason": "invalid_subscription"},
+                ) from exc
 
         async def on_events_unsubscribe(ctx: Any, params: Any) -> Any:
             auth = _event_auth(ctx)
             if not isinstance(auth, AuthContext):
                 raise AuthenticationError("verified authentication context required")
-            if "session_ops.chatgpt.session.write" not in auth.scopes:
-                raise ScopeError(("session_ops.chatgpt.session.write",))
-            def remove_subscription() -> Any:
-                return events_store.unsubscribe(
-                    auth,
-                    params.model_dump(by_alias=True, exclude_unset=True),
-                )
-
-            return await asyncio.to_thread(remove_subscription)
+            auth.require("session_ops.chatgpt.session.write")
+            return await asyncio.to_thread(
+                events_store.unsubscribe,
+                auth,
+                params.model_dump(by_alias=True, exclude_unset=True),
+            )
 
         server.add_request_handler("events/list", EventsListParams, on_events_list)
         server.add_request_handler("events/subscribe", EventsSubscribeParams, on_events_subscribe)
@@ -1475,8 +1834,6 @@ def build_mcp_server(
 
         server.middleware.append(advertise_events_capability)
 
-    # The SDK enforces the request-body limit in its Streamable HTTP transport.
-    # Host/origin checks remain enabled for the public resource and local tests.
     allowed_hosts = [
         resource.netloc,
         resource.netloc + ":*",
@@ -1484,12 +1841,14 @@ def build_mcp_server(
         "localhost:*",
         "[::1]:*",
     ]
+
     allowed_origins = [
         resource_origin,
         "http://127.0.0.1:*",
         "http://localhost:*",
         "http://[::1]:*",
     ]
+
     transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=allowed_hosts,
@@ -1520,37 +1879,47 @@ def build_mcp_server(
                 (b"content-length", str(len(body)).encode("ascii")),
                 (b"cache-control", b"no-store"),
             ]
-            headers.extend(extra_headers)
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": status,
-                    "headers": headers,
-                }
-            )
-            await send(
-                {
-                    "type": "http.response.body",
-                    "body": body,
-                }
-            )
 
-        async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+            headers.extend(extra_headers)
+
+            await send({
+                "type": "http.response.start",
+                "status": status,
+                "headers": headers,
+            })
+
+            await send({
+                "type": "http.response.body",
+                "body": body,
+            })
+
+        async def __call__(
+            self,
+            scope: Any,
+            receive: Any,
+            send: Any,
+        ) -> None:
             path = scope.get("path", "")
             endpoint_prefix = endpoint_path.rstrip("/")
+
             is_endpoint_path = (
                 path == endpoint_path
                 or path.startswith(endpoint_prefix + "/")
             )
+
             if scope.get("type") != "http" or not is_endpoint_path:
                 await self.inner(scope, receive, send)
                 return
 
             headers = {}
+
             for key, value in scope.get("headers", ()):
-                headers[key.decode("latin-1").lower()] = value.decode("latin-1")
+                headers[key.decode("latin-1").lower()] = (
+                    value.decode("latin-1")
+                )
 
             authorization = headers.get("authorization")
+
             challenge = (
                 'Bearer realm="session-ops", resource_metadata="'
                 + resource_metadata_url
@@ -1564,96 +1933,162 @@ def build_mcp_server(
                     send,
                     401,
                     b"",
-                    ((b"www-authenticate", challenge.encode("latin-1")),),
+                    ((
+                        b"www-authenticate",
+                        challenge.encode("latin-1"),
+                    ),),
                 )
                 return
 
             parts = authorization.split(None, 1)
+
             if (
                 len(parts) != 2
                 or parts[0].lower() != "bearer"
                 or not parts[1].strip()
                 or any(ch.isspace() for ch in parts[1].strip())
             ):
-                invalid_challenge = challenge + ', error="invalid_token"'
+                invalid_challenge = (
+                    challenge + ', error="invalid_token"'
+                )
+
                 await self._respond(
                     send,
                     401,
                     b"",
-                    ((b"www-authenticate", invalid_challenge.encode("latin-1")),),
+                    ((
+                        b"www-authenticate",
+                        invalid_challenge.encode("latin-1"),
+                    ),),
                 )
                 return
 
             token = parts[1].strip()
             loop = asyncio.get_running_loop()
+
             if not _AUTH_VERIFY_SLOTS.acquire(blocking=False):
                 envelope = _error(
-                    "DEPENDENCY_UNAVAILABLE", str(uuid.uuid4())
+                    "DEPENDENCY_UNAVAILABLE",
+                    str(uuid.uuid4()),
                 )
-                await self._respond(send, 503, _json_bytes(envelope))
+
+                await self._respond(
+                    send,
+                    503,
+                    _json_bytes(envelope),
+                )
                 return
 
             try:
-                # Use the dedicated bounded pool. Attach the release callback
-                # to the concurrent Future, not the asyncio wrapper: a timeout
-                # must not free capacity while its worker is still running.
                 verify_job = _AUTH_EXECUTOR.submit(
                     token_provider.verify,
                     token,
                 )
+
                 verify_job.add_done_callback(
                     lambda _job: _AUTH_VERIFY_SLOTS.release()
                 )
+
                 verify_future = asyncio.wrap_future(
                     verify_job,
                     loop=loop,
                 )
+
             except Exception:
                 _AUTH_VERIFY_SLOTS.release()
-                envelope = _error("INTERNAL", str(uuid.uuid4()))
-                await self._respond(send, 500, _json_bytes(envelope))
+
+                envelope = _error(
+                    "INTERNAL",
+                    str(uuid.uuid4()),
+                )
+
+                await self._respond(
+                    send,
+                    500,
+                    _json_bytes(envelope),
+                )
                 return
+
             try:
                 auth = await asyncio.wait_for(
                     verify_future,
                     timeout=AUTH_VERIFY_DEADLINE_SECONDS,
                 )
+
             except asyncio.TimeoutError:
-                envelope = _error("DEPENDENCY_UNAVAILABLE", str(uuid.uuid4()))
-                await self._respond(send, 503, _json_bytes(envelope))
+                envelope = _error(
+                    "DEPENDENCY_UNAVAILABLE",
+                    str(uuid.uuid4()),
+                )
+
+                await self._respond(
+                    send,
+                    503,
+                    _json_bytes(envelope),
+                )
                 return
+
             except AuthenticationError as exc:
                 if getattr(exc, "category", "") == "dependency_unavailable":
-                    envelope = _error("DEPENDENCY_UNAVAILABLE", str(uuid.uuid4()))
-                    await self._respond(send, 503, _json_bytes(envelope))
+                    envelope = _error(
+                        "DEPENDENCY_UNAVAILABLE",
+                        str(uuid.uuid4()),
+                    )
+
+                    await self._respond(
+                        send,
+                        503,
+                        _json_bytes(envelope),
+                    )
                     return
-                invalid_challenge = challenge + ', error="invalid_token"'
+
+                invalid_challenge = (
+                    challenge + ', error="invalid_token"'
+                )
+
                 await self._respond(
                     send,
                     401,
                     b"",
-                    ((b"www-authenticate", invalid_challenge.encode("latin-1")),),
+                    ((
+                        b"www-authenticate",
+                        invalid_challenge.encode("latin-1"),
+                    ),),
                 )
                 return
+
             except Exception:
-                envelope = _error("INTERNAL", str(uuid.uuid4()))
-                await self._respond(send, 500, _json_bytes(envelope))
+                envelope = _error(
+                    "INTERNAL",
+                    str(uuid.uuid4()),
+                )
+
+                await self._respond(
+                    send,
+                    500,
+                    _json_bytes(envelope),
+                )
                 return
 
             if not isinstance(auth, AuthContext):
-                invalid_challenge = challenge + ', error="invalid_token"'
+                invalid_challenge = (
+                    challenge + ', error="invalid_token"'
+                )
+
                 await self._respond(
                     send,
                     401,
                     b"",
-                    ((b"www-authenticate", invalid_challenge.encode("latin-1")),),
+                    ((
+                        b"www-authenticate",
+                        invalid_challenge.encode("latin-1"),
+                    ),),
                 )
                 return
 
-            # ASGI scope is request-local. Never write identity to the shared
-            # verifier, service, Server, or middleware instance.
             state = scope.setdefault("state", {})
             state["session_ops_auth"] = auth
+
             await self.inner(scope, receive, send)
 
     return _BearerAuthASGIMiddleware(app)

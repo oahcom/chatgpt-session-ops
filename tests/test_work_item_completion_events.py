@@ -88,13 +88,13 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         self._subscribe()
         item, _session_id = self._create_linked_item()
 
-        result = self.store.set_status(self.principal, item.work_item_id, "completed")
+        result = self.store.finish_work_item(self.principal, item.work_item_id, "completed")
         self.assertEqual(result.status, "completed")
-        historical_link = self.store.get_session_link_for_work_item(
-            self.principal, item.work_item_id, _session_id
+        historical_links = self.store.list_sessions(
+            self.principal, item.work_item_id, include_unlinked=True
         )
-        self.assertIsNotNone(historical_link)
-        self.assertIsNotNone(historical_link.unlinked_at)
+        self.assertEqual(len(historical_links), 1)
+        self.assertIsNotNone(historical_links[0].unlinked_at)
         self.assertIsNone(self.store.get_active_link(self.principal, _session_id))
 
         with self.events._db() as db:
@@ -136,7 +136,7 @@ class WorkItemCompletionEventTests(unittest.TestCase):
             self.principal, second_session, item.work_item_id, second_attempt
         )
 
-        self.store.set_status(self.principal, item.work_item_id, "completed")
+        self.store.finish_work_item(self.principal, item.work_item_id, "completed")
         with self.events._db() as db:
             event_count = db.execute("SELECT count(*) FROM event_outbox").fetchone()[0]
             delivery_count = db.execute("SELECT count(*) FROM event_deliveries").fetchone()[0]
@@ -157,7 +157,7 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         self._subscribe("https://events.example.test/first", conversation_id=first_session)
         self._subscribe("https://events.example.test/other", conversation_id=other_session)
         item, _ = self._create_linked_item()
-        self.store.set_status(self.principal, item.work_item_id, "completed")
+        self.store.finish_work_item(self.principal, item.work_item_id, "completed")
         self.assertEqual(self.events.deliver_pending(), 2)
         payloads = [json.loads(body) for _url, body, _headers in self.callback.requests if json.loads(body).get("type") != "verification"]
         self.assertEqual(len(payloads), 2)
@@ -207,8 +207,8 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         self._subscribe(conversation_id=destination)
         first, _ = self._create_linked_item()
         second = self.store.create_work_item(self.principal)
-        self.store.set_status(self.principal, first.work_item_id, "completed")
-        self.store.set_status(self.principal, second.work_item_id, "completed")
+        self.store.finish_work_item(self.principal, first.work_item_id, "completed")
+        self.store.finish_work_item(self.principal, second.work_item_id, "completed")
         self.assertEqual(self.events.deliver_pending(), 2)
         payloads = [json.loads(body)["data"] for _url, body, _headers in self.callback.requests if json.loads(body).get("type") != "verification"]
         self.assertEqual({payload["job_id"] for payload in payloads}, {first.work_item_id, second.work_item_id})
@@ -219,13 +219,13 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         self._subscribe(conversation_id=destination)
         other = Principal("tenant-a", "another-owner")
         foreign = self.store.create_work_item(other)
-        self.store.set_status(other, foreign.work_item_id, "completed")
+        self.store.finish_work_item(other, foreign.work_item_id, "completed")
         self.assertEqual(self.events.deliver_pending(), 0)
 
     def test_owner_destination_receives_completion_even_without_workitem_session_link(self):
         self._subscribe()
         item = self.store.create_work_item(self.principal)
-        self.store.set_status(self.principal, item.work_item_id, "completed")
+        self.store.finish_work_item(self.principal, item.work_item_id, "completed")
         with self.events._db() as db:
             self.assertEqual(db.execute("SELECT count(*) FROM event_outbox").fetchone()[0], 1)
             self.assertEqual(db.execute("SELECT count(*) FROM event_deliveries").fetchone()[0], 1)
@@ -256,9 +256,9 @@ class WorkItemCompletionEventTests(unittest.TestCase):
 
         from src.session_ops.authority import NotAuthorized
         with self.assertRaises(NotAuthorized):
-            self.store.set_status(self.delegate, item.work_item_id, "completed")
+            self.store.finish_work_item(self.delegate, item.work_item_id, "completed")
         self.assertEqual(self.store.get_work_item(self.principal, item.work_item_id).status, "active")
-        self.store.set_status(self.principal, item.work_item_id, "completed")
+        self.store.finish_work_item(self.principal, item.work_item_id, "completed")
         with self.events._db() as db:
             event = db.execute("SELECT tenant_id, principal_id FROM event_outbox").fetchone()
             deliveries = db.execute(
@@ -273,7 +273,7 @@ class WorkItemCompletionEventTests(unittest.TestCase):
     def test_cancelled_work_item_emits_failed_completion_event(self):
         self._subscribe()
         item, _session_id = self._create_linked_item()
-        self.store.set_status(self.principal, item.work_item_id, "cancelled")
+        self.store.finish_work_item(self.principal, item.work_item_id, "cancelled")
         with self.events._db() as db:
             event = db.execute("SELECT data_json FROM event_outbox").fetchone()
         payload = json.loads(event["data_json"])
@@ -283,8 +283,8 @@ class WorkItemCompletionEventTests(unittest.TestCase):
 
     def test_repeated_terminal_status_does_not_duplicate_completion_event(self):
         item, _session_id = self._create_linked_item()
-        self.store.set_status(self.principal, item.work_item_id, "completed")
-        self.store.set_status(self.principal, item.work_item_id, "completed")
+        self.store.finish_work_item(self.principal, item.work_item_id, "completed", request_id="finish-once")
+        self.store.finish_work_item(self.principal, item.work_item_id, "completed", request_id="finish-once")
         with self.events._db() as db:
             self.assertEqual(db.execute("SELECT count(*) FROM event_outbox").fetchone()[0], 1)
 
@@ -300,7 +300,7 @@ class WorkItemCompletionEventTests(unittest.TestCase):
             completion_event_publisher=fail_after_insert,
         )
         with self.assertRaisesRegex(RuntimeError, "injected outbox failure"):
-            store.set_status(self.principal, item.work_item_id, "completed")
+            store.finish_work_item(self.principal, item.work_item_id, "completed")
 
         self.assertEqual(store.get_work_item(self.principal, item.work_item_id).status, "active")
         self.assertEqual(len(store.list_sessions(self.principal, item.work_item_id)), 1)
@@ -379,7 +379,7 @@ class WorkItemCompletionEventTests(unittest.TestCase):
             principal = Principal(tenant_id, principal_id)
             for scope in ("read", "write"):
                 try:
-                    self.store.require_access(principal, job_id, scope)
+                    self.store.get_work_item(principal, job_id)
                     return True
                 except NotAuthorized:
                     continue
@@ -414,7 +414,7 @@ class WorkItemCompletionEventTests(unittest.TestCase):
                 "delivery": writer_delivery,
             })
 
-        self.store.set_status(self.principal, item.work_item_id, "completed")
+        self.store.finish_work_item(self.principal, item.work_item_id, "completed")
 
         # Revoking the delegated write grant must not redirect the owner's
         # event to the delegate or leak it to the delegate's subscription.
@@ -469,130 +469,3 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         finally:
             conn.rollback()
             conn.close()
-
-    def test_send_attempt_is_durable_and_same_key_never_replays(self):
-        from src.session_ops.authority import InvalidIdentifier, InvalidTransition
-
-        item = self.store.create_work_item(self.principal)
-        attempt_id = "att_32345678-1234-4234-8234-123456789abc"
-        request_hash = "a" * 64
-        created, first = self.store.reserve_send_attempt(
-            self.principal, item.work_item_id, attempt_id, request_hash=request_hash
-        )
-        self.assertTrue(created)
-        self.assertEqual(first["status"], "running")
-
-        created, duplicate = self.store.reserve_send_attempt(
-            self.principal, item.work_item_id, attempt_id, request_hash=request_hash
-        )
-        self.assertFalse(created)
-        self.assertEqual(duplicate["status"], "running")
-        with self.assertRaises(InvalidTransition):
-            self.store.reserve_send_attempt(
-                self.principal,
-                item.work_item_id,
-                "att_42345678-1234-4234-8234-123456789abc",
-                request_hash="b" * 64,
-            )
-        with self.assertRaises(InvalidIdentifier):
-            self.store.reserve_send_attempt(
-                self.principal, item.work_item_id, attempt_id, request_hash="c" * 64
-            )
-
-        completed = self.store.complete_send_attempt(
-            self.principal,
-            item.work_item_id,
-            attempt_id,
-            status="sent",
-            conversation_id="12345678-1234-4234-8234-123456789abc",
-            account="acct2",
-            http_status=200,
-        )
-        self.assertEqual(completed["status"], "sent")
-        created, replay = self.store.reserve_send_attempt(
-            self.principal, item.work_item_id, attempt_id, request_hash=request_hash
-        )
-        self.assertFalse(created)
-        self.assertEqual(replay["status"], "sent")
-        self.assertEqual(replay["conversation_id"], completed["conversation_id"])
-
-    def test_expired_send_attempt_becomes_unknown_and_blocks_new_send(self):
-        import time
-        from src.session_ops.authority import InvalidTransition
-
-        item = self.store.create_work_item(self.principal)
-        attempt_id = "att_52345678-1234-4234-8234-123456789abc"
-        created, _record = self.store.reserve_send_attempt(
-            self.principal, item.work_item_id, attempt_id, request_hash="d" * 64
-        )
-        self.assertTrue(created)
-        conn = self.store._connect()
-        try:
-            conn.execute(
-                "UPDATE work_item_send_attempts SET lease_until = ? WHERE attempt_id = ?",
-                (time.time() - 1, attempt_id),
-            )
-            conn.commit()
-        finally:
-            conn.close()
-
-        created, unknown = self.store.reserve_send_attempt(
-            self.principal, item.work_item_id, attempt_id, request_hash="d" * 64
-        )
-        self.assertFalse(created)
-        self.assertEqual(unknown["status"], "outcome_unknown")
-        with self.assertRaises(InvalidTransition):
-            self.store.reserve_send_attempt(
-                self.principal,
-                item.work_item_id,
-                "att_62345678-1234-4234-8234-123456789abc",
-                request_hash="e" * 64,
-            )
-
-    def test_sent_unlinked_attempt_is_resolved_by_trusted_session_link(self):
-        from src.session_ops.authority import InvalidTransition
-
-        item = self.store.create_work_item(self.principal)
-        attempt_id = "att_72345678-1234-4234-8234-123456789abc"
-        session_id = "32345678-1234-4234-8234-123456789abc"
-        self.store.reserve_send_attempt(
-            self.principal, item.work_item_id, attempt_id, request_hash="f" * 64
-        )
-        self.store.complete_send_attempt(
-            self.principal,
-            item.work_item_id,
-            attempt_id,
-            status="sent_unlinked",
-            conversation_id=session_id,
-            account="acct2",
-            http_status=200,
-        )
-        with self.assertRaises(InvalidTransition):
-            self.store.reserve_send_attempt(
-                self.principal,
-                item.work_item_id,
-                "att_82345678-1234-4234-8234-123456789abc",
-                request_hash="0" * 64,
-            )
-
-        self.store._record_trusted_landing(
-            session_id,
-            match="confirmed",
-            evidence_complete=True,
-            work_item_id=item.work_item_id,
-            attempt_id=attempt_id,
-        )
-        self.store.link_session(self.principal, session_id, item.work_item_id, attempt_id)
-        with self.events._db() as db:
-            row = db.execute(
-                "SELECT status FROM work_item_send_attempts WHERE attempt_id = ?",
-                (attempt_id,),
-            ).fetchone()
-        self.assertEqual(row["status"], "sent")
-        created, _next = self.store.reserve_send_attempt(
-            self.principal,
-            item.work_item_id,
-            "att_92345678-1234-4234-8234-123456789abc",
-            request_hash="1" * 64,
-        )
-        self.assertTrue(created)

@@ -35,8 +35,11 @@ from src.session_ops.mcp_server import (
     MAX_QUERY_CHARS,
     MAX_STRUCTURED_CONTENT_BYTES,
     MCPToolService,
+    _error,
+    _exception_code,
     _validate_arguments,
 )
+from src.session_ops.chatgpt_direct_client import SessionOpsError
 
 
 TENANT = "tenant-a"
@@ -82,7 +85,7 @@ class FakeStore:
         self.calls = []
         self.created = []
 
-    def create_work_item(self, principal):
+    def create_work_item(self, principal, request_id=None):
         self.calls.append(("create", principal))
         item = {
             "work_item_id": WORK_ITEM_ID,
@@ -122,6 +125,10 @@ class FakeStore:
             "work_item_id": work_item_id,
             "status": status,
         }
+
+    def finish_work_item(self, principal, work_item_id, status, request_id=None):
+        self.calls.append(("finish", principal, work_item_id, status))
+        return {"work_item_id": work_item_id, "status": status}
 
     def grant(
         self, principal, work_item_id, target_principal_id,
@@ -246,7 +253,7 @@ class MCPContractTests(unittest.TestCase):
         self.assertIn("details", result["error"])
 
     # --------------------------------------------------------------
-    # Ten tools: one successful dispatch each
+    # WorkItem, Session, and ChatGPT tools: one successful dispatch each
     # --------------------------------------------------------------
 
     def test_work_item_create(self):
@@ -273,6 +280,26 @@ class MCPContractTests(unittest.TestCase):
         )
         self.assert_success(result)
         self.assertEqual(result["data"]["status"], "paused")
+
+    def test_work_item_finish_uses_explicit_terminal_owner_operation(self):
+        store = FakeStore()
+        service = MCPToolService(store)
+        result = service.dispatch(
+            "work_item.finish",
+            {"work_item_id": WORK_ITEM_ID, "status": "completed"},
+            make_auth(),
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["data"]["status"], "completed")
+        self.assertEqual(store.calls[-1][0], "finish")
+
+    def test_work_item_update_rejects_terminal_status(self):
+        result = self.dispatch(
+            "work_item.update",
+            {"work_item_id": WORK_ITEM_ID, "status": "completed"},
+        )
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["error"]["code"], "INVALID_ARGUMENT")
 
     def test_work_item_grant(self):
         result = self.dispatch(
@@ -684,12 +711,12 @@ class MCPContractTests(unittest.TestCase):
             store.initialize()
             original_create = store.create_work_item
 
-            def delayed_create(principal):
+            def delayed_create(principal, request_id=None):
                 started.set()
                 if not release.wait(2):
                     raise AssertionError("test did not release delayed mutation")
                 try:
-                    return original_create(principal)
+                    return original_create(principal, request_id=request_id)
                 finally:
                     finished.set()
 
@@ -900,9 +927,18 @@ class MCPContractTests(unittest.TestCase):
         result = self.dispatch_with_adapter_error("ADAPTER_CODE_UNSPECIFIED")
         self.assert_error(result, "INTERNAL")
 
+    def test_unknown_remote_side_effect_is_never_retryable(self):
+        code, details = _exception_code(
+            SessionOpsError("OUTCOME_UNKNOWN", "remote send may have been accepted")
+        )
+        self.assertEqual(code, "OUTCOME_UNKNOWN")
+        self.assertIn("detail", details)
+        envelope = _error(code, "test-request", details)
+        self.assertFalse(envelope["error"]["retryable"])
+
     def test_oversized_response_becomes_resource_exhausted(self):
         class OversizedStore(FakeStore):
-            def create_work_item(self, principal):
+            def create_work_item(self, principal, request_id=None):
                 return {"content": "x" * MAX_STRUCTURED_CONTENT_BYTES}
 
         service = MCPToolService(OversizedStore())
@@ -1080,3 +1116,38 @@ class ArgumentValidationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChatGPTSessionArgumentContractTests(unittest.TestCase):
+    def test_session_send_requires_conversation_id(self):
+        with self.assertRaisesRegex(ValueError, "required argument missing"):
+            _validate_arguments(
+                "chatgpt.session.send",
+                {
+                    "prompt": "probe",
+                    "idempotency_key": str(uuid.uuid4()),
+                },
+            )
+
+    def test_session_send_rejects_malformed_conversation_id(self):
+        with self.assertRaisesRegex(ValueError, "invalid format"):
+            _validate_arguments(
+                "chatgpt.session.send",
+                {
+                    "conversation_id": "not-a-conversation-id",
+                    "prompt": "probe",
+                    "idempotency_key": str(uuid.uuid4()),
+                },
+            )
+
+    def test_session_send_accepts_valid_conversation_id(self):
+        args = _validate_arguments(
+            "chatgpt.session.send",
+            {
+                "conversation_id": SESSION_ID,
+                "prompt": "probe",
+                "idempotency_key": str(uuid.uuid4()),
+            },
+        )
+        self.assertEqual(args["conversation_id"], SESSION_ID)
+        self.assertEqual(args["account"], "auto")
