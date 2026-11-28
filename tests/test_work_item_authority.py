@@ -493,7 +493,7 @@ class OperationReceiptTests(Base):
         self.assertEqual(
             reopened.link_session(
                 self.alice, sid, item.work_item_id, attempt_id,
-                request_id="link-receipt-1",
+                request_id="link-rpc-4", idempotency_key="stable-link-1",
             ),
             link,
         )
@@ -559,7 +559,7 @@ class OperationReceiptTests(Base):
                 conn.execute(
                     "SELECT count(*) FROM authority_operation_receipts "
                     "WHERE request_id = ? AND state = 'completed'",
-                    ("atomic-create-receipt",),
+                    ("atomic-create-key",),
                 ).fetchone()[0],
                 1,
             )

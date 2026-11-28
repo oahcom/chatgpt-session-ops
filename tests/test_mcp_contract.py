@@ -144,7 +144,7 @@ class FakeStore:
 
     def revoke(
         self, principal, work_item_id, target_principal_id,
-        scope, request_id=None,
+        scope, request_id=None, idempotency_key=None,
     ):
         self.calls.append(("revoke", principal, target_principal_id, scope))
         return {
@@ -753,7 +753,7 @@ class MCPContractTests(unittest.TestCase):
                     result["error"]["details"],
                     {
                         "outcome": "indeterminate",
-                        "retry_with_same_request_id": True,
+                        "retry_with_same_idempotency_key": True,
                     },
                 )
             finally:
@@ -785,7 +785,8 @@ class MCPContractTests(unittest.TestCase):
                 request_session_id="zero-id-session"
             )
             replay = service.dispatch(
-                "work_item.create", {}, self.auth, request_id=0
+                "work_item.create", {}, self.auth, request_id=0,
+                request_session_id="zero-id-session"
             )
             self.assertTrue(first["ok"], first)
             self.assertEqual(replay["data"], first["data"])

@@ -1258,7 +1258,7 @@ class SecureWorkItemStore:
                 "work_item_id": stored["work_item_id"], "status": stored["status"],
                 "created_at": stored["created_at"], "updated_at": stored["updated_at"],
             }
-            self._operation_complete(conn, principal, tool_name, request_id, result)
+            self._operation_complete(conn, principal, tool_name, operation_id, result)
             conn.execute("COMMIT")
             return _row_to_work_item(stored)
         except BaseException:

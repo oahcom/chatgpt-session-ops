@@ -241,7 +241,7 @@ _IDEMPOTENCY_KEY = {
 
 
 TOOL_SCHEMAS = {
-    "work_item.create": "Create a WorkItem. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
+    "work_item.create": _object_schema({"idempotency_key": _IDEMPOTENCY_KEY}),
     "work_item.get": _object_schema(
         {"work_item_id": _WORK_ITEM_ID},
         ("work_item_id",),
@@ -251,7 +251,7 @@ TOOL_SCHEMAS = {
         "page_size": _PAGE_SIZE,
         "cursor": _CURSOR,
     }),
-    "work_item.update": "Update a WorkItem. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
+    "work_item.update": _object_schema(
         {
             "work_item_id": _WORK_ITEM_ID,
             "status": _MUTABLE_WORK_ITEM_STATUS,
@@ -260,7 +260,7 @@ TOOL_SCHEMAS = {
         },
         ("work_item_id", "status"),
     ),
-    "work_item.finish": "Complete or cancel a WorkItem. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
+    "work_item.finish": _object_schema(
         {
             "work_item_id": _WORK_ITEM_ID,
             "status": {"type": "string", "enum": ["completed", "cancelled"]},
@@ -268,7 +268,7 @@ TOOL_SCHEMAS = {
         },
         ("work_item_id", "status"),
     ),
-    "work_item.grant": "Grant WorkItem access. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
+    "work_item.grant": _object_schema(
         {
             "work_item_id": _WORK_ITEM_ID,
             "target_principal_id": _ID,
@@ -277,7 +277,7 @@ TOOL_SCHEMAS = {
         },
         ("work_item_id", "target_principal_id", "scope"),
     ),
-    "work_item.revoke": "Revoke WorkItem access. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
+    "work_item.revoke": _object_schema(
         {
             "work_item_id": _WORK_ITEM_ID,
             "target_principal_id": _ID,
@@ -286,7 +286,7 @@ TOOL_SCHEMAS = {
         },
         ("work_item_id", "target_principal_id", "scope"),
     ),
-    "session.link": "Link a trusted Session. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
+    "session.link": _object_schema(
         {
             "session_id": _SESSION_ID,
             "work_item_id": _WORK_ITEM_ID,
@@ -295,7 +295,7 @@ TOOL_SCHEMAS = {
         },
         ("session_id", "work_item_id"),
     ),
-    "session.unlink": "Unlink a Session. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions.",
+    "session.unlink": _object_schema(
         {
             "session_id": _SESSION_ID,
             "expected_link_id": _LINK_ID,
@@ -303,7 +303,7 @@ TOOL_SCHEMAS = {
         },
         ("session_id",),
     ),
-    "session.list": _object_schema(
+    "session.list":    "session.list": _object_schema(
         {
             "work_item_id": _WORK_ITEM_ID,
             "include_unlinked": {"type": "boolean", "default": False},
@@ -371,15 +371,15 @@ _DB_MUTATION_TOOLS = frozenset({
 })
 
 TOOL_DESCRIPTIONS = {
-    "work_item.create": "Create a WorkItem owned by the authenticated principal.",
+    "work_item.create": "Create a WorkItem owned by the authenticated principal. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions."
     "work_item.get": "Get a WorkItem visible to the authenticated principal.",
     "work_item.list": "List visible WorkItems using keyset pagination.",
-    "work_item.update": "Update a non-terminal WorkItem status with optional optimistic concurrency.",
-    "work_item.finish": "Complete or cancel a WorkItem as its immutable owner; terminal state, session unlink, and completion event are atomic.",
-    "work_item.grant": "Grant a same-tenant principal read or write access.",
-    "work_item.revoke": "Revoke a same-tenant principal read or write access.",
-    "session.link": "Link a confirmed session to a visible WorkItem.",
-    "session.unlink": "Unlink the active session link if it is visible.",
+    "work_item.update": "Update a non-terminal WorkItem status with optional optimistic concurrency. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions."
+    "work_item.finish": "Complete or cancel a WorkItem as its immutable owner; terminal state, session unlink, and completion event are atomic. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions."
+    "work_item.grant": "Grant a same-tenant principal read or write access. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions."
+    "work_item.revoke": "Revoke a same-tenant principal read or write access. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions."
+    "session.link": "Link a confirmed session to a visible WorkItem. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions."
+    "session.unlink": "Unlink the active session link if it is visible. Pass a stable UUIDv4 idempotency_key and reuse it across retries and MCP sessions."
     "session.list": "List sessions linked to a visible WorkItem.",
     "session.context": "Retrieve memory only through the authorized active session link.",
     "chatgpt.session.create": (
@@ -1154,7 +1154,7 @@ def _exception_code(exc: BaseException) -> Tuple[str, Dict[str, Any]]:
     if isinstance(exc, _IndeterminateOperation):
         return "INDETERMINATE", {
             "outcome": "indeterminate",
-            "retry_with_same_request_id": True,
+            "retry_with_same_idempotency_key": True,
         }
     if isinstance(exc, _ResourceExhausted):
         return "RESOURCE_EXHAUSTED", {}
