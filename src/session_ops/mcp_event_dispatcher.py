@@ -72,20 +72,23 @@ class MCPEventDispatcher:
             thread.start()
 
     def stop(self) -> None:
+        # Serialize the complete stop/join/clear sequence with start(). If the
+        # lock were released before join, a concurrent start could replace the
+        # thread reference and then have that new reference cleared by this
+        # older stop call.
         with self._lock:
             stop_event, thread = self._stop_event, self._thread
-        if stop_event is not None:
-            stop_event.set()
-            # The current operation is bounded by SQLite's 5s busy timeout
-            # or the callback's 5s network timeout. Leave margin for cleanup.
-            if not self._operation_lock.acquire(timeout=30):
-                raise TimeoutError("MCP event dispatcher did not leave its in-flight operation")
-            self._operation_lock.release()
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=3)
-            if thread.is_alive():
-                raise RuntimeError("MCP event dispatcher thread did not terminate")
-        with self._lock:
-            if thread is None or not thread.is_alive():
+            if stop_event is not None:
+                stop_event.set()
+                # The current operation is bounded by SQLite's 5s busy timeout
+                # or the callback's 5s network timeout. Leave margin for cleanup.
+                if not self._operation_lock.acquire(timeout=30):
+                    raise TimeoutError("MCP event dispatcher did not leave its in-flight operation")
+                self._operation_lock.release()
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=3)
+                if thread.is_alive():
+                    raise RuntimeError("MCP event dispatcher thread did not terminate")
+            if self._thread is thread:
                 self._thread = None
                 self._stop_event = None

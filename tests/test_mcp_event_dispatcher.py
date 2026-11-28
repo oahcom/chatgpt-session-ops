@@ -53,6 +53,42 @@ class MCPEventDispatcherTests(unittest.TestCase):
         self.assertFalse(first_thread.is_alive())
         self.assertIsNone(dispatcher._thread)
 
+    def test_concurrent_start_cannot_be_orphaned_by_previous_stop(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        class BlockingStore(Store):
+            def deliver_pending(self, *, limit, authorize=None):
+                entered.set()
+                release.wait(timeout=2)
+                return 0
+
+        dispatcher = MCPEventDispatcher(BlockingStore(), poll_seconds=0.05)
+        dispatcher.start()
+        first_thread = dispatcher._thread
+        self.assertTrue(entered.wait(1))
+
+        stopper = threading.Thread(target=dispatcher.stop)
+        starter = threading.Thread(target=dispatcher.start)
+        stopper.start()
+        self.assertTrue(dispatcher._stop_event.wait(1))
+        starter.start()
+        self.assertTrue(starter.is_alive(), "start must wait for stop/join to finish")
+
+        release.set()
+        stopper.join(timeout=2)
+        starter.join(timeout=2)
+        self.assertFalse(stopper.is_alive())
+        self.assertFalse(starter.is_alive())
+        second_thread = dispatcher._thread
+        self.assertIsNotNone(second_thread)
+        self.assertIsNot(first_thread, second_thread)
+        self.assertTrue(second_thread.is_alive())
+
+        dispatcher.stop()
+        self.assertFalse(second_thread.is_alive())
+        self.assertIsNone(dispatcher._thread)
+
     def test_stop_fails_closed_when_inflight_operation_does_not_finish(self):
         class BusyLock:
             def acquire(self, timeout=None):
