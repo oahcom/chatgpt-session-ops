@@ -777,34 +777,14 @@ class MCPToolService:
 
             elif name == "chatgpt.session.list":
                 self._require_chatgpt_cli()
-                all_items = []
-                partial = False
-                list_errors = []
-                next_cursor = None
-                for _ in range(100):
-                    page = self.chatgpt_cli.list_sessions(100, next_cursor)
-                    all_items.extend(page["items"])
-                    partial = partial or page.get("partial", False)
-                    list_errors.extend(page.get("errors", []))
-                    next_cursor = page.get("next_cursor")
-                    if next_cursor is None:
-                        break
-                else:
-                    raise _ResourceExhausted("ChatGPT session listing exceeded its page bound")
                 owned = self.chatgpt_registry.list_owned(
                     principal.tenant_id, principal.principal_id
                 )
-                visible = [item for item in all_items if item["conversation_id"] in owned]
-                offset = int(args.get("cursor") or "0")
-                size = args["page_size"]
-                window = visible[offset:offset + size]
-                end = offset + size
-                data = {
-                    "items": window,
-                    "next_cursor": str(end) if end < len(visible) else None,
-                    "partial": partial,
-                    "errors": list_errors[:10],
-                }
+                data = self.chatgpt_cli.list_sessions(
+                    args["page_size"],
+                    args.get("cursor"),
+                    allowed_conversation_ids=owned,
+                )
 
             else:
                 raise ValueError("unknown tool")
