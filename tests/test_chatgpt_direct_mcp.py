@@ -144,9 +144,7 @@ class ChatGPTCLIAdapterTests(unittest.TestCase):
         result = chatgpt_cli._CliResult(
             0, "NEW_CONV %s account=acct2\n" % CONV_ID, "", (), "create"
         )
-        with patch.object(chatgpt_cli, "_LOGGED_IN_ACCOUNTS", frozenset({"acct2"})), patch.object(
-            chatgpt_cli, "_VALID_IDENTITIES", frozenset({"default", "nologin", "acct2"})
-        ):
+        with patch.object(chatgpt_cli, "_discover_logged_in_accounts", return_value=frozenset({"acct2"})):
             conv_id, account, _receipt = self.adapter._parse_create(result, "auto")
         self.assertEqual((conv_id, account), (CONV_ID, "acct2"))
 
