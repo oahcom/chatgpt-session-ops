@@ -319,12 +319,34 @@ class MemoryAdapterClient:
                     "memory adapter returned an entry outside the requested "
                     "work item scope",
                 )
+
+            # A supplied Session ID is an exact response boundary, not merely
+            # a best-effort Adapter filter. Validate every entry before any
+            # result can be returned to the caller.
+            if session_id is not None:
+                entry_session_id = raw.get("session_id")
+                if (
+                    not isinstance(entry_session_id, str)
+                    or not entry_session_id
+                    or entry_session_id.strip() != entry_session_id
+                    or entry_session_id != session_id
+                ):
+                    raise MemoryAdapterError(
+                        "SCOPE_VIOLATION",
+                        request_id,
+                        "memory adapter returned an entry outside the "
+                        "requested session scope",
+                    )
+            else:
+                # Preserve v0.1 unscoped-within-WorkItem retrieval behavior.
+                entry_session_id = raw["session_id"]
+
             try:
                 entries.append(
                     RetrievedMemory(
                         memory_id=str(raw["memory_id"]),
                         work_item_id=entry_work_item_id,
-                        session_id=str(raw["session_id"]),
+                        session_id=str(entry_session_id),
                         content=str(raw["content"]),
                         provenance=dict(raw.get("provenance") or {}),
                         created_at=str(raw["created_at"]),

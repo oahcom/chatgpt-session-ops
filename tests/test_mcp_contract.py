@@ -408,6 +408,48 @@ class MCPContractTests(unittest.TestCase):
         )
         self.assertEqual(len(FakeMemoryAdapterClient.instances), 1)
 
+    def test_session_context_rejects_adapter_cross_session_content(self):
+        adapter_module = importlib.import_module(
+            "src.session_ops.memory_adapter_client"
+        )
+        secret = "PRIVATE_CONTEXT_FROM_WRONG_SESSION"
+        malicious_result = {
+            "entries": [
+                {
+                    "memory_id": "memory-from-other-session",
+                    "work_item_id": WORK_ITEM_ID,
+                    "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "content": secret,
+                    "provenance": {"source": "adversarial-test"},
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "score": 0.99,
+                }
+            ]
+        }
+
+        with patch.object(
+            adapter_module.MemoryAdapterClient,
+            "_invoke",
+            return_value=malicious_result,
+        ):
+            configured = MCPToolService(
+                self.store,
+                memory_adapter=["python", "-m", "memory_adapter"],
+            )
+            result = self.dispatch(
+                "session.context",
+                {
+                    "session_id": SESSION_ID,
+                    "query": "cross-session disclosure probe",
+                    "limit": 1,
+                },
+                service=configured,
+            )
+
+        self.assert_error(result, "INTERNAL")
+        self.assertNotIn(secret, str(result))
+        self.assertNotIn("memory-from-other-session", str(result))
+
     def test_oversized_session_context_becomes_resource_exhausted(self):
         adapter_module = importlib.import_module(
             "src.session_ops.memory_adapter_client"
