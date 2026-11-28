@@ -1,14 +1,10 @@
-# Deployed-source integration patches (Sender outbox partially applied; MCP Events not enabled)
+# Historical deployed-source integration patch artifacts (not production-ready)
 
-These patches were generated from the live deployed Python source trees on 2026-11-27 and validated against pristine copies of those exact files. They are intentionally split by service root because MCP and Sender Gateway are deployed separately.
+These patches were generated from deployed Python source snapshots on 2026-11-27. **The Sender Gateway patch set is currently stale against `/opt/so-sender`:** its `job_store.py` / `app.py` hunks do not match the current deployed files (verified 2026-11-28), so do not apply it as-is. Rebase/regenerate it against the current deployed-source hashes before any deployment. The patches are intentionally split by service root because MCP and Sender Gateway are deployed separately.
 
 ## Apply roots
 
-- Sender Gateway patches apply from `/opt/so-sender`:
-  - `sender-gateway-event-outbox.patch`: add `job_event_outbox` in the same SQLite transaction as `JobStore.complete()`, leased claim/ack methods, dispatcher-only HTTP routes, and delivered-event retention.
-  - `sender-gateway-thread-connection-cleanup.patch`: close and unregister each request thread's JobStore SQLite connection in the HTTP handler `finish()` hook.
-  - `sender-gateway-failed-terminal-event.patch`: incremental addition of failure-terminal events, applied on disk but not yet loaded by the running service.
-  - `sender-gateway-outbox-retention.patch`: incremental retention index and 30-day pruning of terminal (`delivered`/`failed`) outbox rows only. Never deletes `pending` or `sending` rows. Based on the exact current deployed source SHA256 in `deployed-source-post-failure-event.sha256`. Validated against a pristine copy of that file; not deployed. This hotfix was applied to `/opt/so-sender` and the service restarted after a backup was saved at `/var/backups/so-sender-thread-cleanup-20261127`. The incident had accumulated 509 per-request connections and 1023/1024 FDs, causing SQLite `CANTOPEN` errors; after the fix, 20 parallel SO-MCP session-list probes succeeded with 14 FDs still open.
+- Sender Gateway patch artifacts (`sender-gateway-event-outbox.patch`, `sender-gateway-thread-connection-cleanup.patch`, `sender-gateway-failed-terminal-event.patch`, and `sender-gateway-outbox-retention.patch`) are historical. **None is approved for application to the current `/opt/so-sender` tree.** The current source already has a bounded SQLite connection pool, but does not contain the event outbox or event claim/ack routes. Reconstruct the desired changes against the live hashes and validate all patch hunks in a clean fixture before considering deployment.
 - MCP patches apply from `/opt/so-mcp`:
   - `mcp-sender-event-client.patch`: add `SenderGatewayClient.claim_events()` / `ack_event()` using the existing mTLS + service-token + HMAC identity assertion path.
   - `mcp-server-events.patch`: register MCP Events request handlers and advertise `capabilities.events`.
@@ -25,7 +21,7 @@ Without `SO_MCP_EVENTS_KEY_FILE`, the feature remains disabled and the MCP serve
 
 ## Safety
 
-The exact combined patch `sender-gateway-applied-combined.patch` (connection cleanup plus success outbox/claim/ack) has been applied to `/opt/so-sender`; the original two source files are backed up at `/var/backups/so-sender-thread-cleanup-20261127`. `so-sender.service` was restarted and is active. The incremental failure-event patch is on disk but is not yet loaded by the running process. The additional retention patch is isolated only and has not been applied to production. At the last read-only inspection, 18 jobs were queued, 1 was running, and 32 success events were pending in the Sender Gateway outbox; no rows were older than 30 days. No MCP Events patch has been applied to `/opt/so-mcp`; no MCP collector or webhook delivery worker is active. The current MCP implementation checks job ownership at subscribe time and before each delivery, and periodically prunes expired/terminal records. The local snapshots under `/dev/shm` contain no production credentials, tokens, private keys, account data, virtual environments, or production sender adapter. Recover/version the canonical source and review the remaining diffs before enabling event delivery.
+The live `/opt/so-sender/sender_gateway/job_store.py` and `app.py` inspected on 2026-11-28 do **not** contain `job_event_outbox` or the `/internal/v1/events/claim` and `/internal/v1/events/{event_id}/ack` routes. Their SHA256 values differ from the patch's expected base, and the event-outbox patch fails its first hunk in a read-only fixture. Treat all previous deployment-state notes in this file as historical, not current production evidence. No production files, database rows, credentials, or service state were changed during this verification. The local snapshots under `/dev/shm` must not be treated as production source or used to consume historical outbox records.
 
 ## Reproducing isolated deployed-source tests
 

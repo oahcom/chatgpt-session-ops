@@ -59,7 +59,7 @@ class MCPEventCollectorTests(unittest.TestCase):
 
     def test_persists_event_before_acknowledging_sender(self):
         client = FakeSenderClient([self.item])
-        collector = MCPEventCollector(client, self.store, worker_id="mcp-1", batch_size=10)
+        collector = MCPEventCollector(client, self.store, worker_id="mcp-1", batch_size=2)
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.store.subscribe(
                 type("Auth", (), {"principal": type("P", (), {"tenant_id": "tenant-a", "principal_id": "user-a"})()})(),
@@ -74,6 +74,7 @@ class MCPEventCollectorTests(unittest.TestCase):
                 },
             )
         self.assertEqual(collector.run_once(), 1)
+        self.assertEqual(client.claims, [("mcp-1", 2)])
         self.assertEqual(client.acks, [(self.item["event_id"], "lease-1")])
         with self.store._db() as db:
             self.assertEqual(db.execute("SELECT count(*) FROM event_outbox WHERE event_id=?", (self.item["event_id"],)).fetchone()[0], 1)
@@ -137,6 +138,16 @@ class MCPEventCollectorTests(unittest.TestCase):
             self.assertIsNone(db.execute("SELECT event_id FROM event_outbox WHERE event_id=?", (bad["event_id"],)).fetchone())
             self.assertIsNotNone(db.execute("SELECT event_id FROM event_outbox WHERE event_id=?", (good["event_id"],)).fetchone())
 
+
+    def test_default_claim_is_bounded_to_two_events(self):
+        client = FakeSenderClient([self.item])
+        collector = MCPEventCollector(client, self.store, worker_id="mcp-default")
+        self.assertEqual(collector.run_once(), 1)
+        self.assertEqual(client.claims, [("mcp-default", 2)])
+
+    def test_claim_batch_above_lease_budget_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "1..2"):
+            MCPEventCollector(FakeSenderClient([]), self.store, worker_id="mcp-large", batch_size=3)
 
 
 if __name__ == "__main__":

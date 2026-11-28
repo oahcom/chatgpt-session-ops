@@ -21,12 +21,14 @@ class MCPEventCollector:
         events_store: Any,
         *,
         worker_id: str,
-        batch_size: int = 25,
+        batch_size: int = 2,
     ) -> None:
         if not isinstance(worker_id, str) or not worker_id.strip():
             raise ValueError("worker_id is required")
-        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 100:
-            raise ValueError("batch_size must be in 1..100")
+        # Sender leases are deliberately short. Keep each claim small enough
+        # that later items cannot expire behind slow earlier ingestions.
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 2:
+            raise ValueError("batch_size must be in 1..2")
         self.sender_client = sender_client
         self.events_store = events_store
         self.worker_id = worker_id
