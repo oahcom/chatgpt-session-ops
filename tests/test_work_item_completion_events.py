@@ -94,7 +94,7 @@ class WorkItemCompletionEventTests(unittest.TestCase):
             )
 
         # Terminal unlinking does not erase the trusted ownership evidence.
-        self.store.set_status(self.principal, item.work_item_id, "completed")
+        self.store.finish_work_item(self.principal, item.work_item_id, "completed")
         self.store.require_conversation_owner(self.principal, session_id)
 
         # A historical reassignment to a different immutable owner makes the

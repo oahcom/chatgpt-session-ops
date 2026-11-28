@@ -1,6 +1,7 @@
 """Protocol and storage tests for the isolated ChatGPT MCP Events PoC."""
 import base64
 import json
+import multiprocessing
 import os
 import sqlite3
 import tempfile
@@ -12,6 +13,19 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from src.session_ops.mcp_events import CallbackEndpointError, MCPEventsStore, _secret_key
+
+
+def _deliver_in_separate_process(database, encryption_key, now, result_queue):
+    store = MCPEventsStore(
+        database,
+        post_json=lambda _url, _body, _headers: (204, b""),
+        encryption_key=encryption_key,
+        clock=lambda: now,
+    )
+    try:
+        result_queue.put(("ok", store.deliver_pending(limit=1)))
+    except Exception as exc:  # pragma: no cover - child-process diagnostic
+        result_queue.put(("error", repr(exc)))
 
 
 class FakeCallback:
@@ -658,7 +672,7 @@ class MCPEventsStoreTests(unittest.TestCase):
         with self.store._db() as db:
             self.assertEqual(db.execute("SELECT count(*) FROM event_deliveries").fetchone()[0], 1)
 
-    def test_unsubscribe_waits_for_inflight_callback_before_returning(self):
+    def test_unsubscribe_waits_for_inflight_callback_across_store_instances(self):
         self.subscribe(job_id="job-unsubscribe-race")
         self.publish_job_completed(
             "tenant-a", "issuer:user-a", "job-unsubscribe-race", "Finished"
@@ -676,12 +690,17 @@ class MCPEventsStoreTests(unittest.TestCase):
             return 204, b""
 
         self.store.post_json = blocked_callback
+        second_store = MCPEventsStore(
+            self.db,
+            post_json=lambda _url, _body, _headers: (204, b""),
+            encryption_key=b"k" * 32,
+        )
         delivery_thread = threading.Thread(target=self.store.deliver_pending)
         delivery_thread.start()
         self.assertTrue(entered.wait(1), "delivery did not reach callback I/O")
 
         def unsubscribe():
-            self.store.unsubscribe(self.auth, {
+            second_store.unsubscribe(self.auth, {
                 "name": "chatgpt.job.completed",
                 "arguments": {
                     "job_id": "job-unsubscribe-race",
@@ -765,20 +784,26 @@ class MCPEventsStoreTests(unittest.TestCase):
             payload = json.loads(body)
             return 200, json.dumps({"challenge": payload["challenge"]}).encode()
         self.store.post_json = callback
-        # A second store instance models another process: the per-instance
-        # lifecycle lock must not weaken SQLite lease fencing across workers.
-        second_store = MCPEventsStore(
-            self.db,
-            post_json=lambda _url, _body, _headers: (204, b""),
-            encryption_key=b"k" * 32,
-            clock=lambda: now[0],
-        )
         first_result = []
         worker = threading.Thread(target=lambda: first_result.append(self.store.deliver_pending(limit=1)))
         worker.start()
         self.assertTrue(entered.wait(timeout=1))
         now[0] += 31
-        self.assertEqual(second_store.deliver_pending(limit=1), 1)
+        # A spawned process has an independent lifecycle lock and exercises
+        # SQLite lease fencing across the unsupported multi-process boundary.
+        context = multiprocessing.get_context("spawn")
+        result_queue = context.Queue()
+        process = context.Process(
+            target=_deliver_in_separate_process,
+            args=(self.db, b"k" * 32, now[0], result_queue),
+        )
+        process.start()
+        process.join(timeout=3)
+        self.assertFalse(process.is_alive())
+        self.assertEqual(process.exitcode, 0)
+        result_kind, result_value = result_queue.get(timeout=1)
+        self.assertEqual(result_kind, "ok", result_value)
+        self.assertEqual(result_value, 1)
         release.set()
         worker.join(timeout=2)
         self.assertFalse(worker.is_alive())

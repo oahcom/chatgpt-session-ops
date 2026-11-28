@@ -664,11 +664,19 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self._deadline_timer = None
         self._deadline_lock = threading.Lock()
         self._deadline_expired = False
+        # http.client clears ``self.sock`` after getresponse() when the
+        # response is expected to close the connection. HTTPResponse then
+        # keeps reading through its own makefile/socket reference. Keep an
+        # independent reference so the absolute watchdog can still interrupt
+        # a slow-drip response body after that handoff.
+        self._watchdog_sock = None
 
     def _expire_deadline(self) -> None:
         with self._deadline_lock:
             self._deadline_expired = True
-            sock, self.sock = self.sock, None
+            sock = self._watchdog_sock or self.sock
+            self._watchdog_sock = None
+            self.sock = None
         if sock is not None:
             try:
                 sock.shutdown(socket.SHUT_RDWR)
@@ -680,10 +688,11 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
                 pass
 
     def cancel_deadline(self) -> None:
-        timer = self._deadline_timer
+        with self._deadline_lock:
+            timer, self._deadline_timer = self._deadline_timer, None
+            self._watchdog_sock = None
         if timer is not None:
             timer.cancel()
-            self._deadline_timer = None
 
     def connect(self) -> None:
         # A tunnel would hand the hostname to a proxy, which is exactly the
@@ -715,6 +724,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
                     sock.close()
                     raise TimeoutError("HTTPS request exceeded its total deadline")
                 self.sock = sock
+                self._watchdog_sock = sock
             if self._deadline is not None:
                 remaining = self._deadline - time.monotonic()
                 if remaining <= 0:
@@ -736,6 +746,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
                     self.sock = None
                     raise TimeoutError("HTTPS request exceeded its total deadline")
                 self.sock = wrapped
+                self._watchdog_sock = wrapped
                 if self._deadline is not None:
                     remaining = self._deadline - time.monotonic()
                     if remaining <= 0:

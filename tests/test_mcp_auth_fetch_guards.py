@@ -299,9 +299,22 @@ class TestPinnedHTTPSConnectionConnect(unittest.TestCase):
                 return_value=local,
             ):
                 connection.connect()
+            # http.client clears HTTPSConnection.sock after getresponse()
+            # hands a close-delimited body to HTTPResponse. The watchdog must
+            # retain its own socket reference through that response-body read.
+            body_reader = local.makefile("rb")
+            connection.sock = None
             peer.settimeout(0.2)
             sent = []
             stop = threading.Event()
+            reader_finished = threading.Event()
+
+            def read_response_body():
+                try:
+                    while body_reader.read(1):
+                        pass
+                finally:
+                    reader_finished.set()
 
             def slow_peer():
                 while not stop.is_set():
@@ -313,6 +326,8 @@ class TestPinnedHTTPSConnectionConnect(unittest.TestCase):
                     time.sleep(0.01)
 
             sender = threading.Thread(target=slow_peer, daemon=True)
+            reader = threading.Thread(target=read_response_body, daemon=True)
+            reader.start()
             sender.start()
             time.sleep(0.04)
             self.assertGreater(len(sent), 0)
@@ -320,11 +335,17 @@ class TestPinnedHTTPSConnectionConnect(unittest.TestCase):
                 self._wait_for_deadline(connection, 0.5),
                 "the absolute deadline did not close a continuously active socket",
             )
+            self.assertTrue(
+                reader_finished.wait(timeout=0.5),
+                "the absolute deadline did not interrupt the response-body reader",
+            )
             stop.set()
             sender.join(timeout=0.5)
+            reader.join(timeout=0.5)
+            body_reader.close()
             self.assertIsNone(connection.sock)
             self.assertTrue(connection._deadline_expired)
-            self.assertGreater(sent.__len__(), 0)
+            self.assertGreater(len(sent), 0)
         finally:
             connection.cancel_deadline()
             connection.close()

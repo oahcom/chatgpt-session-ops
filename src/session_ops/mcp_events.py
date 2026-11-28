@@ -39,6 +39,19 @@ MAX_TTL_SECONDS = 90 * 24 * 60 * 60
 MAX_DELIVERY_ATTEMPTS = 5
 DELIVERY_LEASE_SECONDS = 30
 _KEY_CHECK_CONTEXT = b"chatgpt-session-ops:mcp-events:encryption-key-check:v1"
+_DELIVERY_LOCKS_GUARD = threading.Lock()
+_DELIVERY_LOCKS: dict[str, Any] = {}
+
+
+def _delivery_lock_for_database(database: str) -> threading.RLock:
+    """Return one lifecycle lock shared by all store instances for this DB."""
+    key = os.path.realpath(os.path.abspath(database))
+    with _DELIVERY_LOCKS_GUARD:
+        lock = _DELIVERY_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _DELIVERY_LOCKS[key] = lock
+        return lock
 
 
 class CallbackEndpointError(Exception):
@@ -131,10 +144,10 @@ class MCPEventsStore:
         if database == ":memory:":
             raise ValueError("MCP Events requires a file-backed SQLite database")
         self.database = database
-        # Serialize delivery start/finish with unsubscribe in this process.
-        # Once unsubscribe returns, no callback that was merely between its
-        # final lease check and POST can still begin afterward.
-        self._delivery_lock = threading.RLock()
+        # Serialize delivery start/finish with unsubscribe across every store
+        # instance for this canonical database path in the current process.
+        # Multi-process deployment still requires a cross-process barrier.
+        self._delivery_lock = _delivery_lock_for_database(database)
         self.post_json = post_json or _post_public_https
         self.clock = clock
         self._metrics_lock = threading.Lock()
