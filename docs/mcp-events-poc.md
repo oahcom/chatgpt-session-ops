@@ -34,7 +34,7 @@ The event store key is separate from the database file. `SO_MCP_EVENTS_DB`, if c
 
 ## Verification
 
-Rebased branch verification: `python -m unittest discover -s tests -q` — **1,344 passed, 13 skipped**; full repository `python -m pytest -q` — **1,391 passed, 13 skipped, 1,577 subtests passed**. Python compilation and `git diff --check` passed.
+Rebased branch verification: with the MCP SDK installed, `/opt/so-mcp/.venv/bin/python -m unittest discover -s tests -q` — **1,344 passed, 7 skipped**; full repository `python -m pytest -q` — **1,391 passed, 13 skipped, 1,577 subtests passed**. Python compilation and `git diff --check` passed. The SDK-backed run exercises the real Streamable HTTP Events handshake and subscribe/unsubscribe lifecycle.
 
 Focused integration tests cover the full local path: authenticated WorkItem -> owner-authorized terminal transition -> same-transaction outbox insert -> webhook delivery. They verify delegated writers cannot complete/cancel a WorkItem, cannot create a filtered subscription for another owner's WorkItem, conversation-isolated fan-out and payload sanitization across multiple linked sessions, exact-conversation replay/backfill, rejection and migration shutdown of unscoped subscriptions, no fan-out without a linked conversation, and outbox rollback on terminal-transition failure. Additional regression tests cover bounded DNS resolution, dispatcher shutdown failure without duplicate stop waits, send-attempt idempotency, and ambiguous remote-send outcomes without account rotation/retry.
 

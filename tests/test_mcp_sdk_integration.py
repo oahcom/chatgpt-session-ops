@@ -258,7 +258,10 @@ class MCPSDKIntegrationTests(unittest.TestCase):
             # Filtered subscriptions must be owned by the authenticated principal.
             filtered_params = EventsSubscribeParams.model_validate({
                 "name": "chatgpt.job.completed",
-                "arguments": {"job_id": "wi_12345678-1234-4234-8234-123456789abc"},
+                "arguments": {
+                    "job_id": "wi_12345678-1234-4234-8234-123456789abc",
+                    "conversation_id": "12345678-1234-4234-8234-123456789abc",
+                },
                 "delivery": {
                     "mode": "webhook",
                     "url": "https://events.example.test/filtered-owner",
@@ -408,7 +411,7 @@ class MCPSDKIntegrationTests(unittest.TestCase):
                         "jsonrpc": "2.0", "id": 3, "method": "events/subscribe",
                         "params": {
                             "name": "chatgpt.job.completed",
-                            "arguments": {"job_id": "job-1", "conversation_id": "12345678-1234-4234-8234-123456789abc"},
+                            "arguments": {"conversation_id": "12345678-1234-4234-8234-123456789abc"},
                             "delivery": {"mode": "webhook", "url": "https://events.example.test/callback", "secret": secret},
                             "ttlMs": None,
                         },
@@ -421,7 +424,7 @@ class MCPSDKIntegrationTests(unittest.TestCase):
                     "jsonrpc": "2.0", "id": 4, "method": "events/unsubscribe",
                     "params": {
                         "name": "chatgpt.job.completed",
-                        "arguments": {"job_id": "job-1", "conversation_id": "12345678-1234-4234-8234-123456789abc"},
+                        "arguments": {"conversation_id": "12345678-1234-4234-8234-123456789abc"},
                         "delivery": {"mode": "webhook", "url": "https://events.example.test/callback"},
                     },
                 }, session_id)
