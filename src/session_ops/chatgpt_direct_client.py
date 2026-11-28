@@ -411,25 +411,37 @@ class ChatGPTDirectClient:
             active = self._validate_create_account(requested)
             with self._rotation_lock:
                 self._cli.ROTATION_PRIMARY = active
-                os.environ["CHATGPT_ANON_FALLBACK"] = "0"
-                os.environ.pop("CHATGPT_ALLOWED_ACCOUNTS", None)
-                if requested != "auto":
-                    api = self._cli.ChatGPTAPI(account=requested)
-                    status, path, conv = self._cli.send_prompt(api, None, prompt_path, new_chat=True)
-                    conversation_id = str(getattr(conv, "id", None) or conv or "")
-                    if status != 200 or not re.fullmatch(r"[0-9a-f-]{36}", conversation_id) or getattr(conv, "send_truncated", False):
-                        raise SessionOpsError("OUTCOME_UNKNOWN", "session create may have reached ChatGPT but was not fully verified; do not retry")
-                    self._cli.record_conv(conversation_id, api.account, prompt_path)
-                    account = api.account
-                else:
-                    previous = (self._cli.load_rotation().get("last") or {}).get("conv_id")
-                    exit_code = self._cli.create_chat_rotating(prompt_path)
-                    state = self._cli.load_rotation()
-                    last = state.get("last") or {}
-                    conversation_id = last.get("conv_id")
-                    account = last.get("account")
-                    if exit_code != 0 or not conversation_id or conversation_id == previous or account not in active:
-                        raise SessionOpsError("OUTCOME_UNKNOWN", "session create may have reached ChatGPT but did not produce a uniquely verified result; do not retry")
+                previous_anon_fallback = os.environ.get("CHATGPT_ANON_FALLBACK")
+                previous_allowed_accounts = os.environ.get("CHATGPT_ALLOWED_ACCOUNTS")
+                try:
+                    os.environ["CHATGPT_ANON_FALLBACK"] = "0"
+                    os.environ.pop("CHATGPT_ALLOWED_ACCOUNTS", None)
+                    if requested != "auto":
+                        api = self._cli.ChatGPTAPI(account=requested)
+                        status, path, conv = self._cli.send_prompt(api, None, prompt_path, new_chat=True)
+                        conversation_id = str(getattr(conv, "id", None) or conv or "")
+                        if status != 200 or not re.fullmatch(r"[0-9a-f-]{36}", conversation_id) or getattr(conv, "send_truncated", False):
+                            raise SessionOpsError("OUTCOME_UNKNOWN", "session create may have reached ChatGPT but was not fully verified; do not retry")
+                        self._cli.record_conv(conversation_id, api.account, prompt_path)
+                        account = api.account
+                    else:
+                        previous = (self._cli.load_rotation().get("last") or {}).get("conv_id")
+                        exit_code = self._cli.create_chat_rotating(prompt_path)
+                        state = self._cli.load_rotation()
+                        last = state.get("last") or {}
+                        conversation_id = last.get("conv_id")
+                        account = last.get("account")
+                        if exit_code != 0 or not conversation_id or conversation_id == previous or account not in active:
+                            raise SessionOpsError("OUTCOME_UNKNOWN", "session create may have reached ChatGPT but did not produce a uniquely verified result; do not retry")
+                finally:
+                    if previous_anon_fallback is None:
+                        os.environ.pop("CHATGPT_ANON_FALLBACK", None)
+                    else:
+                        os.environ["CHATGPT_ANON_FALLBACK"] = previous_anon_fallback
+                    if previous_allowed_accounts is None:
+                        os.environ.pop("CHATGPT_ALLOWED_ACCOUNTS", None)
+                    else:
+                        os.environ["CHATGPT_ALLOWED_ACCOUNTS"] = previous_allowed_accounts
             self._store_owner(conversation_id, tenant_id, principal_id, account)
             return {"conversation_id": conversation_id, "account": account, "reply_state": "unverified", "receipt_durable": False}
 

@@ -3,6 +3,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from src.session_ops.chatgpt_direct_client import ChatGPTDirectClient, SessionOpsError
@@ -45,6 +46,52 @@ def test_read_only_credential_vault_remains_eligible_for_account_preflight(tmp_p
 
     with patch("src.session_ops.chatgpt_direct_client.os.access", side_effect=read_only_access):
         assert client._active_accounts() == ("acct1", "acct2")
+    client.stop()
+
+
+def test_session_create_restores_process_environment_on_success_and_failure(tmp_path):
+    client = make_client(tmp_path)
+    api = SimpleNamespace(account="acct1")
+    conversation = SimpleNamespace(
+        id="12345678-1234-4234-8234-123456789abc",
+        send_truncated=False,
+    )
+    client._validate_create_account = lambda _requested: ("acct1",)
+    row = {
+        "tenant_id": "t1",
+        "principal_id": "p1",
+        "requested_account": "acct1",
+        "prompt_path": str(tmp_path / "prompt.txt"),
+        "operation": "session.create",
+    }
+
+    with patch.dict(os.environ, {
+        "CHATGPT_ANON_FALLBACK": "1",
+        "CHATGPT_ALLOWED_ACCOUNTS": "acct2",
+    }):
+        with patch.object(client._cli, "ChatGPTAPI", return_value=api), patch.object(
+            client._cli, "send_prompt", return_value=(200, "path", conversation)
+        ), patch.object(client._cli, "record_conv"):
+            result = client._run_operation(row)
+        assert result["conversation_id"] == conversation.id
+        assert os.environ["CHATGPT_ANON_FALLBACK"] == "1"
+        assert os.environ["CHATGPT_ALLOWED_ACCOUNTS"] == "acct2"
+
+    with patch.dict(os.environ, {
+        "CHATGPT_ANON_FALLBACK": "1",
+        "CHATGPT_ALLOWED_ACCOUNTS": "acct2",
+    }):
+        with patch.object(client._cli, "ChatGPTAPI", return_value=api), patch.object(
+            client._cli, "send_prompt", return_value=(500, "path", conversation)
+        ):
+            try:
+                client._run_operation(row)
+            except SessionOpsError as exc:
+                assert exc.code == "OUTCOME_UNKNOWN"
+            else:
+                raise AssertionError("unverified session create must fail closed")
+        assert os.environ["CHATGPT_ANON_FALLBACK"] == "1"
+        assert os.environ["CHATGPT_ALLOWED_ACCOUNTS"] == "acct2"
     client.stop()
 
 
@@ -97,7 +144,7 @@ def test_stop_cancels_waiting_futures_and_restart_recovers_durable_queue(tmp_pat
     else:
         raise AssertionError("closed executor accepted a new ChatGPT job")
 
-    def recovered_run(_self, _row):
+    def recovered_run(_client, _row):
         return {"conversation_id": "recovered", "account": "acct1", "receipt_durable": True}
 
     with patch.object(ChatGPTDirectClient, "_run_operation", recovered_run):
@@ -107,18 +154,18 @@ def test_stop_cancels_waiting_futures_and_restart_recovers_durable_queue(tmp_pat
             accounts_dir=client.accounts_dir,
             runtime_dir=client.runtime_dir,
         )
-    try:
-        deadline = time.time() + 2
-        while time.time() < deadline:
-            recovered = restarted.get_job(
-                principal_id="p1", tenant_id="t1", job_id=second["job_id"]
-            )
-            if recovered["status"] == "succeeded":
-                break
-            time.sleep(0.01)
-        assert recovered["status"] == "succeeded"
-    finally:
-        restarted.stop()
+        try:
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                recovered = restarted.get_job(
+                    principal_id="p1", tenant_id="t1", job_id=second["job_id"]
+                )
+                if recovered["status"] == "succeeded":
+                    break
+                time.sleep(0.01)
+            assert recovered["status"] == "succeeded"
+        finally:
+            restarted.stop()
 
 
 def test_default_send_queue_is_one_active_plus_eight_waiting(tmp_path):
