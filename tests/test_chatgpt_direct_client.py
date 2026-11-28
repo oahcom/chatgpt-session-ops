@@ -321,33 +321,31 @@ def test_read_session_after_message_id_and_response_contract(tmp_path):
     assert FakeAPI.calls == [("conv-1", CHATGPT_READ_HTTP_TIMEOUT_SECONDS)]
 
 
-@pytest.mark.parametrize(
-    ("status", "body", "expected_code"),
-    [
+def test_read_session_preserves_upstream_failure_categories(tmp_path):
+    cases = [
         (401, "unauthorized", "UNAUTHENTICATED"),
         (429, "rate limited", "RESOURCE_EXHAUSTED"),
         (404, "missing", "NOT_FOUND"),
         (0, "TIMEOUT: total response deadline exceeded", "TIMEOUT"),
         (503, "unavailable", "DEPENDENCY_UNAVAILABLE"),
-    ],
-)
-def test_read_session_preserves_upstream_failure_categories(
-    tmp_path, status, body, expected_code
-):
-    client = make_client(tmp_path)
-    client._store_owner("conv-1", "tenant-a", "principal-a", "acct1")
+    ]
+    for index, (status, body, expected_code) in enumerate(cases):
+        case_dir = tmp_path / str(index)
+        case_dir.mkdir()
+        client = make_client(case_dir)
+        client._store_owner("conv-1", "tenant-a", "principal-a", "acct1")
 
-    class FakeAPI:
-        def live_tail_once(self, conversation_id, timeout):
-            return None, None, status, body
+        class FakeAPI:
+            def live_tail_once(self, conversation_id, timeout):
+                return None, None, status, body
 
-    with patch.object(client._cli, "ChatGPTAPI", lambda account: FakeAPI()):
-        with pytest.raises(SessionOpsError) as caught:
-            client.read_session(
-                principal_id="principal-a", tenant_id="tenant-a",
-                conversation_id="conv-1", limit=10,
-            )
-    assert caught.value.code == expected_code
+        with patch.object(client._cli, "ChatGPTAPI", lambda account: FakeAPI()):
+            with pytest.raises(SessionOpsError) as caught:
+                client.read_session(
+                    principal_id="principal-a", tenant_id="tenant-a",
+                    conversation_id="conv-1", limit=10,
+                )
+        assert caught.value.code == expected_code
 
 
 def test_live_tail_once_uses_one_request_and_total_timeout(tmp_path, monkeypatch):
