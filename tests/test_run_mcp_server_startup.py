@@ -46,6 +46,7 @@ Run with:
     python -m unittest tests.test_run_mcp_server_startup
 """
 
+import asyncio
 import json
 import os
 import sys
@@ -66,6 +67,7 @@ from scripts.run_mcp_server import (  # noqa: E402
     _realm_namespace_from_issuer,
     _resolve_memory_executable,
     _validate_https_url,
+    create_application,
     load_config,
     load_memory_adapter_command,
     main,
@@ -592,6 +594,106 @@ class TestLoadConfig(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             self._run(UVICORN_LOG_LEVEL="verbose")
         self.assertEqual(str(ctx.exception), "UVICORN_LOG_LEVEL is invalid")
+
+
+class TestDeploymentASGILifespan(unittest.TestCase):
+    def test_background_dispatcher_starts_and_stops_with_asgi_lifespan(self):
+        calls = []
+
+        class Task:
+            def start(self):
+                calls.append("start")
+
+            def stop(self):
+                calls.append("stop")
+
+        class Inner:
+            async def __call__(self, scope, receive, send):
+                while True:
+                    message = await receive()
+                    if message["type"] == "lifespan.startup":
+                        await send({"type": "lifespan.startup.complete"})
+                    elif message["type"] == "lifespan.shutdown":
+                        await send({"type": "lifespan.shutdown.complete"})
+                        return
+
+        messages = iter((
+            {"type": "lifespan.startup"},
+            {"type": "lifespan.shutdown"},
+        ))
+        sent = []
+
+        async def receive():
+            return next(messages)
+
+        async def send(message):
+            sent.append(message)
+
+        app = DeploymentASGI(
+            Inner(),
+            issuer="https://issuer.example.test/realm",
+            audience="https://resource.example.test/mcp",
+            background_tasks=[Task()],
+        )
+        asyncio.run(app({"type": "lifespan"}, receive, send))
+
+        self.assertEqual(calls, ["start", "stop"])
+        self.assertEqual(
+            [message["type"] for message in sent],
+            ["lifespan.startup.complete", "lifespan.shutdown.complete"],
+        )
+
+
+class TestMCPEventsRuntimeWiring(unittest.TestCase):
+    def test_create_application_wires_sender_store_and_dispatcher(self):
+        config = {
+            "database_path": "/tmp/session-ops-runtime-test.sqlite3",
+            "issuer": "https://issuer.example.test/realm",
+            "audience": "https://resource.example.test/mcp",
+            "realm_namespace": "realm",
+            "tenant_claim": "tenant_id",
+            "discovery_url": None,
+            "memory_adapter_command": None,
+        }
+        sender = mock.Mock()
+        events_store = mock.Mock()
+        collector = mock.Mock()
+        dispatcher = mock.Mock()
+        mcp_app = object()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            key_path = Path(tmp) / "events.key"
+            key_path.write_bytes(b"e" * 32)
+            key_path.chmod(0o400)
+            events_db = str(Path(tmp) / "events.sqlite3")
+
+            with (
+                mock.patch.dict(os.environ, {
+                    "SO_MCP_SENDER_URL": "https://sender.example.test",
+                    "SO_MCP_EVENTS_KEY_FILE": str(key_path),
+                    "SO_MCP_EVENTS_DB": events_db,
+                }),
+                mock.patch("scripts.run_mcp_server.SecureWorkItemStore") as store_type,
+                mock.patch("scripts.run_mcp_server.JWTVerifier"),
+                mock.patch("scripts.run_mcp_server.SenderGatewayClient.from_env", return_value=sender),
+                mock.patch("scripts.run_mcp_server.MCPEventsStore", return_value=events_store) as events_type,
+                mock.patch("scripts.run_mcp_server.MCPEventCollector", return_value=collector) as collector_type,
+                mock.patch("scripts.run_mcp_server.MCPEventDispatcher", return_value=dispatcher) as dispatcher_type,
+                mock.patch("scripts.run_mcp_server.build_mcp_server", return_value=mcp_app) as build_server,
+            ):
+                app = create_application(config)
+
+        store_type.return_value.initialize.assert_called_once_with()
+        events_type.assert_called_once_with(events_db, encryption_key=b"e" * 32)
+        collector_type.assert_called_once_with(
+            sender,
+            events_store,
+            worker_id=mock.ANY,
+        )
+        dispatcher_type.assert_called_once()
+        build_server.assert_called_once()
+        self.assertIs(app.inner, mcp_app)
+        self.assertEqual(app.background_tasks, (dispatcher,))
 
 
 class TestMain(unittest.TestCase):

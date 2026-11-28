@@ -40,7 +40,7 @@ Original deployment markers (`8aa2597` for MCP, `dbdcf3c` for Sender) still do n
 
 ## Verification
 
-- Full repository suite: **1299 passed, 7 skipped, 1573 subtests passed**.
+- Full repository suite: **1302 passed, 7 skipped, 1573 subtests passed**.
 - Sender outbox and authenticated route tests: **14 passed**.
 - MCP Events ASGI and Sender-to-MCP pipeline tests: **11 passed**.
 - Python compilation, exact production-base patch checks, and `git diff --check` passed.
