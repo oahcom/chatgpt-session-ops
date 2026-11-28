@@ -188,19 +188,9 @@ _MUTABLE_WORK_ITEM_STATUS = {
 
 _GRANT_SCOPE = {"type": "string", "enum": ["read", "write"]}
 
-CHATGPT_ACCOUNTS = (
-    "auto",
-    "acct1",
-    "acct2",
-    "acct3",
-    "acct4",
-    "acct5",
-    "acct6",
-)
-
 _ACCOUNT = {
     "type": "string",
-    "enum": list(CHATGPT_ACCOUNTS),
+    "pattern": r"^(?:auto|acct[1-9][0-9]*)$",
     "default": "auto",
 }
 

@@ -1276,6 +1276,30 @@ class ChatGPTSessionArgumentContractTests(unittest.TestCase):
                 },
             )
 
+    def test_chatgpt_account_schema_accepts_dynamic_account_ids(self):
+        for account in ("acct7", "acct10", "acct123"):
+            with self.subTest(account=account):
+                args = _validate_arguments(
+                    "chatgpt.session.create",
+                    {"account": account, "idempotency_key": str(uuid.uuid4())},
+                )
+                self.assertEqual(args["account"], account)
+                send_args = _validate_arguments(
+                    "chatgpt.session.send",
+                    {"conversation_id": SESSION_ID, "prompt": "probe", "account": account,
+                     "idempotency_key": str(uuid.uuid4())},
+                )
+                self.assertEqual(send_args["account"], account)
+
+    def test_chatgpt_account_schema_rejects_noncanonical_ids(self):
+        for account in ("acct0", "acct01", "acctx", "nologin", "auto1"):
+            with self.subTest(account=account):
+                with self.assertRaisesRegex(ValueError, "invalid format"):
+                    _validate_arguments(
+                        "chatgpt.session.create",
+                        {"account": account, "idempotency_key": str(uuid.uuid4())},
+                    )
+
     def test_session_send_accepts_valid_conversation_id(self):
         args = _validate_arguments(
             "chatgpt.session.send",
