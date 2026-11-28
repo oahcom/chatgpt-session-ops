@@ -36,3 +36,38 @@ The deployed-runtime and Sender Gateway tests are preserved under `patches/tests
   validation when legacy connectors omit the key. Same-request replay is
   deduplicated; a new request id is a new intent. Test with
   `PYTHONPATH=/opt/so-mcp pytest patches/tests/test_mcp_request_id_idempotency.py`.
+
+## Sender snapshot patch registry (isolated tests; not deployment authorization)
+
+| Artifact | Target / purpose | Base and validation |
+|---|---|---|
+| `sender-account-identity-pin.patch` | Snapshot-only explicit-account identity preflight and explicit 429 no-cross-account behavior in `so-sender/cli/chatgpt_send.py`. | Snapshot SHA256 `de20a07cfe7667efc4ee79fe3231e6753a1dd09fa4cdbd55279fbcf239dcb3bd`; covered by `patches/tests/test_sender_account_identity_pin.py`. |
+| `sender-child-env-account-roots.patch` | Pass `SO_SENDER_ACCOUNTS_DIR` and `CHATGPT_AUTH_DIR` through the Adapter child environment allowlist. | Same 2026-11-28 Sender snapshot; covered by `patches/tests/test_sender_child_env_account_roots.py` together with the account-directory resolver patch. |
+| `sender-account-directory-contract.patch` | Shared Gateway/CLI account directory resolution, including dynamic acctN credential loading. | Same isolated Sender snapshot; tested with synthetic paths and credentials. |
+
+CI runs both Sender patch test modules together in the unit job. They are snapshot-fixture tests only and do not authorize applying any patch to production.
+
+## Sender account-directory contract (isolated source patch)
+
+`sender-account-directory-contract.patch` applies from a clean `so-sender` source root. It adds `sender_gateway/account_directory.py` and makes Gateway discovery, CLI identity discovery, and `ChatGPTAPI` use the same resolver. The deployed runtime must include this new module alongside `sender_gateway/account_router.py`, `sender_gateway/app.py`, and `cli/chatgpt_send.py`; omitting it makes the CLI import fail.
+
+Contract:
+- `SO_SENDER_ACCOUNTS_DIR` is the directory containing `acctN` entries; `CHATGPT_AUTH_DIR` is the credential root.
+- `acct1` and `default` resolve to the auth root when it contains the credential pair. A real `accounts/acct1` marker directory may coexist as a legacy Gateway marker; it is not followed or treated as the credential source when the auth root has credentials.
+- If the auth root has no acct1 credentials, a real `accounts/acct1` directory is accepted as the legacy `BASE/accounts` credential layout. If both root and a distinct real `accounts/acct1` contain credentials, resolution fails closed as ambiguous.
+- Symlink account directories and symlink credential marker files are rejected, preserving Gateway's no-symlink discovery boundary.
+- `acct2+` always resolve to `SO_SENDER_ACCOUNTS_DIR/acctN` (defaulting to `<auth-root>/accounts/acctN`). If `CHATGPT_AUTH_DIR` is absent, a configured accounts path named `accounts` implies its parent as auth root; another configured path is itself the auth root; with neither configured, CLI `BASE/accounts` is used.
+
+**Release gate:** production env values, effective service-user path access, and acct1 real-directory marker/legacy credential targets were not verified because production env and process-environment reads are permission-blocked. The isolated child-env fixture uses `SO_SENDER_ACCOUNTS_DIR = CHATGPT_AUTH_DIR/accounts` with a real `accounts/acct10` directory and synthetic credentials; a separate account-directory test covers acct1's legacy auth-root mapping. These fixtures prove the tested resolver behavior, but do **not** establish that the production directory layout matches it. Before release, an authorized deployment operator must confirm the effective `SO_SENDER_ACCOUNTS_DIR` and `CHATGPT_AUTH_DIR`, inspect only path metadata and confirm no symlink account directories or credential marker files are relied upon (not credential contents), explicitly confirm the real `accounts/acct1` marker/legacy credential layout without introducing symlink exceptions, confirm that Gateway discovery and CLI credential loading resolve the same physical directories for acct1 and at least one acct2+, and include the new `account_directory.py` module in the deployed runtime. Do not create or change production symlinks/layout based on this fixture. Isolated tests do not satisfy this production gate.
+
+## Sender explicit-account identity pin (snapshot-only patch)
+
+`sender-account-identity-pin.patch` is a **separate Sender CLI patch artifact**; it is not part of the historical Sender Gateway event-outbox patch set above. It modifies only `so-sender/cli/chatgpt_send.py` (patch headers: `a/so-sender/cli/chatgpt_send.py` and `b/so-sender/cli/chatgpt_send.py`).
+
+- Target file: `so-sender/cli/chatgpt_send.py`
+- Required base SHA256: `de20a07cfe7667efc4ee79fe3231e6753a1dd09fa4cdbd55279fbcf239dcb3bd` (2026-11-28 `deploy/source-snapshot/2026-11-28/SHA256SUMS`, entry `so-sender/cli/chatgpt_send.py`).
+- Patch application root: use `-p1` from `/opt` (the patch path resolves to `so-sender/cli/chatgpt_send.py`), or `-p2` from `/opt/so-sender` (the patch path resolves to `cli/chatgpt_send.py`). These are path-strip explanations only, **not deployment authorization**.
+- Before any consideration of application, verify that the exact target live file has the required SHA256. A matching hash is necessary but not sufficient: PR review and explicit deployment authorization are also required.
+- **Do not apply before PR review and authorized deployment.** The currently reported production baseline has a different SHA256 and already contains the explicit-account identity preflight; this snapshot patch is not applicable to that reported live baseline. See `sender-account-identity-pin-production.md` for the separate production-only patch assessment, currently BLOCKED.
+
+This artifact must remain distinct from the historical event-outbox patches. The historical Sender Gateway event-outbox patch set above remains stale/not approved for application; registering this CLI patch does not change that status or make any event-outbox patch applicable.

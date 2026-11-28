@@ -1,0 +1,180 @@
+--- /dev/null
++++ b/so-sender/sender_gateway/account_directory.py
+@@ -0,0 +1,76 @@
++"""Shared credential-directory contract for Sender Gateway and CLI."""
++from __future__ import annotations
++import os
++from pathlib import Path
++
++_CREDENTIAL_FILES = ("cookies.json", "access_token.txt")
++
++def has_credentials(path: Path) -> bool:
++    # Preserve Gateway's no-symlink trust boundary for both account dirs and
++    # credential markers; Path.is_dir()/is_file() alone follow symlinks.
++    if path.is_symlink() or not path.is_dir():
++        return False
++    return all(
++        not (path / name).is_symlink() and (path / name).is_file()
++        for name in _CREDENTIAL_FILES
++    )
++
++class AccountDirectoryResolver:
++    def __init__(self, auth_root, accounts_dir=None):
++        self.auth_root = Path(auth_root).expanduser()
++        self.accounts_dir = Path(accounts_dir).expanduser() if accounts_dir is not None else self.auth_root / "accounts"
++
++    @classmethod
++    def from_environment(cls, base_dir=None, accounts_dir=None, prefer_base=False):
++        configured = accounts_dir if accounts_dir is not None else os.environ.get("SO_SENDER_ACCOUNTS_DIR")
++        env_root = os.environ.get("CHATGPT_AUTH_DIR")
++        if prefer_base and base_dir:
++            auth_root = base_dir
++        elif env_root:
++            auth_root = env_root
++        elif configured:
++            configured_path = Path(configured).expanduser()
++            auth_root = configured_path.parent if configured_path.name == "accounts" else configured_path
++        else:
++            auth_root = base_dir
++        if not auth_root:
++            raise ValueError("an auth root is required")
++        return cls(auth_root, configured or (Path(auth_root) / "accounts"))
++
++    def account_dir(self, account):
++        if account in ("default", "acct1"):
++            root_has = has_credentials(self.auth_root)
++            legacy = self.accounts_dir / "acct1"
++            legacy_has = has_credentials(legacy)
++            if root_has and legacy_has and legacy.resolve() != self.auth_root.resolve():
++                raise ValueError("ambiguous acct1 credential directories")
++            if root_has:
++                return self.auth_root
++            if legacy_has:
++                return legacy
++            return self.auth_root
++        if account == "nologin":
++            return self.accounts_dir / "nologin"
++        if not isinstance(account, str) or not account.startswith("acct"):
++            raise ValueError("invalid account identity")
++        suffix = account[4:]
++        if not suffix.isdigit() or int(suffix) < 2:
++            raise ValueError("invalid account identity")
++        return self.accounts_dir / account
++
++    def discover_accounts(self):
++        found = set()
++        if has_credentials(self.account_dir("acct1")):
++            found.add("acct1")
++        if self.accounts_dir.is_dir():
++            for entry in self.accounts_dir.iterdir():
++                if entry.name.startswith("acct") and entry.name[4:].isdigit() and int(entry.name[4:]) >= 2 and has_credentials(self.account_dir(entry.name)):
++                    found.add(entry.name)
++        return tuple(sorted(found, key=lambda name: int(name[4:])))
++
++def discover_accounts(accounts_dir, auth_root=None):
++    if auth_root is None:
++        auth_root = os.environ.get("CHATGPT_AUTH_DIR") or (
++            Path(accounts_dir).parent if Path(accounts_dir).name == "accounts" else accounts_dir
++        )
++    return AccountDirectoryResolver(auth_root, accounts_dir).discover_accounts()
+--- a/so-sender/sender_gateway/account_router.py
++++ b/so-sender/sender_gateway/account_router.py
+@@ -80,22 +80,14 @@
+ AUTO = "auto"
+ 
+ 
+-def discover_accounts(accounts_dir: str | Path) -> tuple[str, ...]:
+-    """Return credential-backed acctN directories in numeric order."""
+-    root = Path(accounts_dir)
+-    if not root.is_dir():
+-        return ()
+-    return tuple(sorted(
+-        (
+-            entry.name for entry in root.iterdir()
+-            if entry.is_dir()
+-            and entry.name.startswith("acct")
+-            and entry.name[4:].isdigit()
+-            and (entry / "cookies.json").is_file()
+-            and (entry / "access_token.txt").is_file()
+-        ),
+-        key=lambda name: int(name[4:]),
+-    ))
++from .account_directory import discover_accounts as _discover_account_directories
++
++
++def discover_accounts(
++    accounts_dir: str | Path, auth_root: str | Path | None = None
++) -> tuple[str, ...]:
++    """Return accounts whose Gateway and CLI credential paths are identical."""
++    return _discover_account_directories(accounts_dir, auth_root=auth_root)
+ 
+ _ROUTER_SCHEMA: Sequence[str] = (
+     """
+--- a/so-sender/sender_gateway/app.py
++++ b/so-sender/sender_gateway/app.py
+@@ -314,7 +314,10 @@
+         self.store = JobStore(self.database, lease_seconds=lease_seconds)
+         # Account identities come from the credential directory, not a code whitelist.
+         # New acctN directories are picked up on the next service start.
+-        account_names = discover_accounts(accounts_dir)
++        auth_root = Path(os.environ.get("CHATGPT_AUTH_DIR") or (
++            accounts_dir.parent if accounts_dir.name == "accounts" else accounts_dir
++        ))
++        account_names = discover_accounts(accounts_dir, auth_root=auth_root)
+         if not account_names:
+             raise RuntimeError("no account directories with cookies.json and access_token.txt")
+         self.router = AccountRouter(self.store, accounts=tuple(account_names))
+--- a/so-sender/cli/chatgpt_send.py
++++ b/so-sender/cli/chatgpt_send.py
+@@ -132,6 +132,8 @@
+ from datetime import datetime
+ 
+ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "sender_gateway")))
++from account_directory import AccountDirectoryResolver  # noqa: E402
+ from pow_solver import solve  # noqa: E402
+ 
+ BASE = os.path.dirname(os.path.abspath(__file__))
+@@ -3315,20 +3317,9 @@
+ 
+ 
+ def _discover_account_identities():
+-    """Discover configured acctN identities; adding credentials needs no code edit."""
+-    from pathlib import Path
+-    names = {"acct1", "acct2", "acct3", "acct4", "acct5", "acct6"}
+-    roots = [Path(os.environ.get("SO_SENDER_ACCOUNTS_DIR", "")), Path(BASE) / "accounts"]
+-    for root in roots:
+-        if root.is_dir():
+-            names.update(
+-                entry.name for entry in root.iterdir()
+-                if entry.is_dir() and entry.name.startswith("acct")
+-                and entry.name[4:].isdigit()
+-                and (entry / "cookies.json").is_file()
+-                and (entry / "access_token.txt").is_file()
+-            )
+-    return frozenset({"default", "nologin", *names})
++    """Discover only identities resolvable by the shared credential path contract."""
++    resolver = AccountDirectoryResolver.from_environment(base_dir=BASE)
++    return frozenset({"default", "nologin", *resolver.discover_accounts()})
+ 
+ 
+ _VALID_ACCOUNT_IDENTITIES = _discover_account_identities()
+@@ -4344,14 +4335,15 @@
+ 
+ class ChatGPTAPI:
+     def __init__(self, base_dir=None, account="default"):
+-        # CHATGPT_AUTH_DIR selects credential/cache root; account data stays isolated.
+-        root = base_dir or os.environ.get("CHATGPT_AUTH_DIR") or BASE
+         if account not in _VALID_ACCOUNT_IDENTITIES:
+             raise ValueError(
+                 "account must be one of %s"
+                 % ", ".join(sorted(_VALID_ACCOUNT_IDENTITIES))
+             )
+-        b = root if account in ("default", "acct1") else os.path.join(root, "accounts", account)
++        resolver = AccountDirectoryResolver.from_environment(
++            base_dir=base_dir or BASE, prefer_base=base_dir is not None
++        )
++        b = str(resolver.account_dir(account))
+         self.account = account
+         self.base_dir = b
+         self.is_anon = account == "nologin"  # 匿名态：走 /backend-anon/，POST 需浏览器过 Turnstile

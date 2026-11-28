@@ -197,6 +197,51 @@ jobs:
               )
           PY
 
+      - name: Run isolated Sender patch integration tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v patch
+          patch --version | head -n 1
+          before_manifests=$(sha256sum \
+            deploy/source-snapshot/2026-11-28/SHA256SUMS \
+            deploy/source-snapshot/2026-11-28/BASE-SHA256SUMS)
+          verify_snapshot_checksums() {
+            python3 - <<'PY'
+          from hashlib import sha256
+          from pathlib import Path
+          import sys
+
+          repo = Path.cwd()
+          snapshot = repo / "deploy/source-snapshot/2026-11-28"
+          manifest = snapshot / "SHA256SUMS"
+          for line_number, line in enumerate(manifest.read_text().splitlines(), 1):
+              expected, relative = line.split("  ", 1)
+              candidates = (repo / relative, snapshot / relative)
+              source = next((path for path in candidates if path.is_file()), None)
+              if source is None:
+                  sys.exit(f"{manifest}:{line_number}: missing {relative}")
+              actual = sha256(source.read_bytes()).hexdigest()
+              if actual != expected:
+                  sys.exit(f"{manifest}:{line_number}: checksum mismatch: {relative}")
+          print("PASS: all deployed snapshot files match SHA256SUMS")
+          PY
+          }
+          verify_snapshot_checksums
+          python3 -m unittest -v \
+            patches.tests.test_sender_account_identity_pin \
+            patches.tests.test_sender_child_env_account_roots \
+            2>&1 | tee sender-patch-tests.log
+          verify_snapshot_checksums
+          after_manifests=$(sha256sum \
+            deploy/source-snapshot/2026-11-28/SHA256SUMS \
+            deploy/source-snapshot/2026-11-28/BASE-SHA256SUMS)
+          test "$before_manifests" = "$after_manifests" || {
+            echo "ERROR: snapshot checksum manifests changed during tests" >&2
+            exit 1
+          }
+          echo "PASS: snapshot checksum manifests unchanged before/after tests"
+
   # tools/gen_manifest.py and tools/verify_deploy.py had 58 tests in
   # tools/tests/ that no job ever ran: every other invocation here is scoped to
   # tests/, so a broken manifest generator or a verifier that "verified nothing"
