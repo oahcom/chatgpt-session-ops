@@ -268,7 +268,7 @@ SO MCP 和 ChatGPT CLI 在同一个仓库、同一个部署单元中运行。MCP
 - `chatgpt.session.send`：同步发送并返回结果，不创建后台 Job。
 - `chatgpt.session.read` / `chatgpt.session.list`：读取消息或列出当前主体拥有的会话。
 - 会话账户归属与幂等记录保存在 `SO_MCP_DB`，按 tenant/principal 隔离。
-- 旧 Gateway 的 148 条 `session_owners` 由一次性迁移脚本导入并逐条校验；旧 jobs/outbox 只归档，不再参与新执行链。
+- 旧 Gateway 的 `session_owners` 在 MCP 首次启动时只读导入并逐条校验；账户健康状态迁入 CLI 原生轮转状态；旧 jobs/outbox 不再参与新执行链。
 
 运行服务：
 
