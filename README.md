@@ -182,6 +182,8 @@ python scripts/chatgpt_send.py --anon-restore <device>     # 把留存身份回�
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `CHATGPT_AUTH_DIR` | 脚本目录 | acct1 凭据根 |
+| `SO_SENDER_ACCOUNTS_DIR` | 未设置时使用脚本目录下的 `accounts/` | 动态发现 `acctN` 凭据目录 |
+| `CHATGPT_STATE_DIR` | 脚本目录 | 轮转、会话映射、代理与日志等运行态文件根目录 |
 | `CHATGPT_BASE` | `https://chatgpt.com` | API 根（可指向本地闸口） |
 | `CHATGPT_PROXY` | 空 | 出口代理，最高优先级；`http/https/socks5/socks5h` |
 | `CHATGPT_ALLOW_DIRECT` | 空 | 设 `1` 才允许直连（默认 fail-closed，拒绝联网） |
