@@ -30,6 +30,8 @@ SUPPORTED_SCOPES = [
     "session_ops.session.write",
     "session_ops.context.read",
     "session_ops.access.manage",
+    "session_ops.chatgpt.session.read",
+    "session_ops.chatgpt.session.write",
 ]
 
 MEMORY_STDIO_ENV = "SO_MCP_MEMORY_STDIO"
@@ -306,6 +308,15 @@ def load_config() -> dict[str, Any]:
 
     memory_adapter_command = load_memory_adapter_command()
 
+    default_chatgpt_cli = Path(__file__).resolve().parents[1] / "scripts" / "chatgpt_send.py"
+    configured_chatgpt_cli = os.environ.get("SO_MCP_CHATGPT_CLI", "").strip()
+    chatgpt_cli_path = Path(configured_chatgpt_cli or default_chatgpt_cli).expanduser()
+    if not chatgpt_cli_path.is_absolute():
+        raise RuntimeError("SO_MCP_CHATGPT_CLI must be an absolute path")
+    if not chatgpt_cli_path.is_file() or not os.access(str(chatgpt_cli_path), os.R_OK):
+        raise RuntimeError("ChatGPT CLI script is unavailable")
+    chatgpt_cli_path = str(chatgpt_cli_path.resolve())
+
     return {
         "issuer": issuer,
         "audience": audience,
@@ -317,6 +328,7 @@ def load_config() -> dict[str, Any]:
         "log_level": log_level,
         "discovery_url": discovery_url,
         "memory_adapter_command": memory_adapter_command,
+        "chatgpt_cli_path": chatgpt_cli_path,
     }
 
 
@@ -518,6 +530,7 @@ def create_application(config: dict[str, Any]) -> Any:
     service = MCPToolService(
         store,
         memory_adapter=config.get("memory_adapter_command"),
+        chatgpt_cli_path=config.get("chatgpt_cli_path"),
     )
     mcp_app = build_mcp_server(service, verifier)
 
@@ -558,6 +571,7 @@ def main() -> None:
         "Memory adapter command: %s",
         _redact_memory_command(config["memory_adapter_command"]),
     )
+    logger.info("Direct ChatGPT CLI: %s", config["chatgpt_cli_path"])
 
     uvicorn.run(
         app,
