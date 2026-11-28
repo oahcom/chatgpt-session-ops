@@ -7581,10 +7581,54 @@ def _attempt_create(
                 attempt_id=work_item_context["attempt_id"],
             )
             status, _path, conv = (tuple(result) + (None, None, None))[:3]
+            if isinstance(conv, ConvRef) and conv.mismatch:
+                # HTTP 200 was accepted but the returned conversation identity
+                # is not trustworthy. Never rotate and resend this prompt.
+                actual = getattr(conv, "actual_conv_id", "") or ""
+                reason = getattr(conv, "reason", "") or "conversation identity mismatch"
+                detail = "conversation outcome unknown: %s; actual=%s" % (reason, actual or "unknown")
+                work_item_context.update({
+                    "status": 200,
+                    "api": api,
+                    "link": None,
+                    "link_error": detail,
+                    "conversation_id": (getattr(conv, "target_conv_id", "") or str(conv) or None),
+                    "account": name,
+                    "outcome_unknown": True,
+                })
+                attempts.append({
+                    "account": name,
+                    "status": "OUTCOME_UNKNOWN",
+                    "reason": reason,
+                    "actual_conv_id": actual or None,
+                })
+                return "OUTCOME_UNKNOWN", conv
             work_item_context["status"] = status
             work_item_context["api"] = api
             work_item_context["link"] = link
             work_item_context["link_error"] = link_error
+            if status is None or (
+                isinstance(status, int)
+                and (status in (408, 425) or status >= 500)
+            ):
+                # A server error or transport timeout does not prove the
+                # remote side rejected the prompt. Stop account rotation here;
+                # trying another account could deliver the same prompt twice.
+                detail = "send outcome unknown after HTTP %s" % (
+                    status if status is not None else "no response"
+                )
+                work_item_context.update({
+                    "link": None,
+                    "link_error": detail,
+                    "account": name,
+                    "outcome_unknown": True,
+                })
+                attempts.append({
+                    "account": name,
+                    "status": "OUTCOME_UNKNOWN",
+                    "reason": detail,
+                })
+                return "OUTCOME_UNKNOWN", conv
 
     except ThinkingModelUnavailable as e:
         # 思考模型不可用是账号级失败，不是整个进程的退出信号。
@@ -7756,6 +7800,24 @@ def create_chat_rotating(
                 work_item_context=work_item_context,
             )
         outcomes[name] = status
+
+        # An HTTP 200 with an untrusted conversation identity is ambiguous:
+        # stop here, preserve outcome_unknown, and never rotate/re-send.
+        if status == "OUTCOME_UNKNOWN":
+            print(
+                json.dumps(
+                    {
+                        "result": "outcome_unknown",
+                        "terminal": True,
+                        "account": name,
+                        "outcomes": outcomes,
+                        "attempts": attempts,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            return 1
 
         # Terminal failure: stop immediately.
         # Never attempt another account or anonymous fallback.

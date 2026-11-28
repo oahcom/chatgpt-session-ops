@@ -266,7 +266,7 @@ TOOL_DESCRIPTIONS = {
     "session.unlink": "Unlink the active session link if it is visible.",
     "session.list": "List sessions linked to a visible WorkItem.",
     "session.context": "Retrieve memory only through the authorized active session link.",
-    "chatgpt.session.send": "Send a prompt through the in-repository ChatGPT execution path and link the confirmed session to a WorkItem.",
+    "chatgpt.session.send": "Send through the in-repository ChatGPT runtime. Requires a stable attempt_id; reuse the exact ID and request parameters to safely inspect or retry a timed-out call. Uncertain attempts are never automatically resent.",
     "chatgpt.session.read": "Read the current transcript from a ChatGPT session linked to the specified WorkItem.",
 }
 
@@ -758,6 +758,7 @@ class MCPToolService:
         prompt_path = None
         api = None
         resolved_account = None
+        outcome_unknown = False
         try:
             # All local authorization and account checks happen before the
             # remote side effect. A failed preflight consumes this attempt ID
@@ -792,7 +793,7 @@ class MCPToolService:
                         work_item_id,
                         attempt_id,
                         status="failed",
-                        error="%s: %s" % (type(exc).__name__, exc),
+                        error=type(exc).__name__,
                     )
                 )
             except BaseException:
@@ -811,11 +812,18 @@ class MCPToolService:
                 result = runtime.send_prompt(api, conversation_id, prompt_path)
                 values = tuple(result) if isinstance(result, (tuple, list)) else ()
                 http_status = values[0] if values else None
-                resolved_conversation_id = (
-                    str(values[2]) if len(values) > 2 and values[2] else conversation_id
-                )
+                conv_ref = values[2] if len(values) > 2 else None
+                resolved_conversation_id = conversation_id
                 link = active_link
                 link_error = None
+                if bool(getattr(conv_ref, "mismatch", False)):
+                    outcome_unknown = True
+                    actual = getattr(conv_ref, "actual_conv_id", "") or "unknown"
+                    reason = getattr(conv_ref, "reason", "") or "conversation identity mismatch"
+                    link_error = "conversation outcome unknown: %s; actual=%s" % (reason, actual)
+                    # ConvRef mismatch is produced only after the remote POST
+                    # returned HTTP 200; identity uncertainty is not a safe retry.
+                    http_status = 200
             else:
                 context = {
                     "store": self.store,
@@ -833,8 +841,11 @@ class MCPToolService:
                 http_status = context.get("status")
                 resolved_conversation_id = context.get("conversation_id")
                 resolved_account = context.get("account")
+                outcome_unknown = bool(context.get("outcome_unknown"))
 
-            if http_status == 200 and link is not None:
+            if outcome_unknown:
+                status = "outcome_unknown"
+            elif http_status == 200 and link is not None:
                 status = "sent"
             elif http_status == 200 and resolved_conversation_id:
                 status = "sent_unlinked"
@@ -859,7 +870,7 @@ class MCPToolService:
                     conversation_id=resolved_conversation_id,
                     account=resolved_account,
                     http_status=http_status,
-                    error=str(link_error)[:1000] if link_error else None,
+                    error="session_link_failed" if link_error else None,
                 )
             )
             return {
@@ -882,7 +893,7 @@ class MCPToolService:
                         work_item_id,
                         attempt_id,
                         status="outcome_unknown",
-                        error="%s: %s" % (type(exc).__name__, exc),
+                        error=type(exc).__name__,
                     )
                 )
             except BaseException:

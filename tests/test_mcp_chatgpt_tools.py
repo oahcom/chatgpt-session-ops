@@ -140,6 +140,41 @@ class MCPChatGPTToolTests(unittest.TestCase):
         self.assertEqual(result["data"]["status"], "outcome_unknown")
         self.assertEqual(result["data"]["http_status"], 503)
 
+    def test_existing_conversation_identity_mismatch_is_outcome_unknown_and_not_replayed(self):
+        link = SimpleNamespace(link_id="link-mismatch", session_id=SESSION_ID,
+                               work_item_id=WORK_ITEM_ID, linked_at="now", unlinked_at=None)
+        store = FakeStore(link=link)
+        service = MCPToolService(store)
+        conv_ref = SimpleNamespace(
+            mismatch=True,
+            actual_conv_id="11111111-1111-4111-8111-111111111111",
+            reason="ambiguous conversation identity",
+        )
+        with (
+            mock.patch("scripts.chatgpt_send.resolve_conversation_account", return_value={"status": "known", "account": "acct2"}),
+            mock.patch("scripts.chatgpt_send.ChatGPTAPI", return_value=SimpleNamespace(account="acct2")),
+            mock.patch("scripts.chatgpt_send.send_prompt", return_value=(1, None, conv_ref)) as send,
+        ):
+            first = service.dispatch(
+                "chatgpt.session.send",
+                {"work_item_id": WORK_ITEM_ID, "conversation_id": SESSION_ID,
+                 "prompt": "send once", "attempt_id": ATTEMPT_ID},
+                make_auth("session_ops.session.write", "session_ops.work_item.write"),
+            )
+            replay = service.dispatch(
+                "chatgpt.session.send",
+                {"work_item_id": WORK_ITEM_ID, "conversation_id": SESSION_ID,
+                 "prompt": "send once", "attempt_id": ATTEMPT_ID},
+                make_auth("session_ops.session.write", "session_ops.work_item.write"),
+            )
+        self.assertTrue(first["ok"])
+        self.assertEqual(first["data"]["status"], "outcome_unknown")
+        self.assertEqual(first["data"]["http_status"], 200)
+        self.assertIn("11111111-1111-4111-8111-111111111111", first["data"]["error"])
+        self.assertTrue(replay["data"]["replayed"])
+        self.assertEqual(replay["data"]["status"], "outcome_unknown")
+        send.assert_called_once()
+
     def test_reusing_attempt_id_with_different_prompt_is_rejected(self):
         link = SimpleNamespace(link_id="link-existing", session_id=SESSION_ID,
                                work_item_id=WORK_ITEM_ID, linked_at="now", unlinked_at=None)
