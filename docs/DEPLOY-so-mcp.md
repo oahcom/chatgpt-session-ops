@@ -1400,21 +1400,14 @@ is `/var/lib/chatgpt-session-ops/accounts`. This preserves the existing CLI
 rotation, conversation map, proxy file, logs and account-lock directory without
 keeping the CLI code under `/opt/so-sender`.
 
-Before switching the service, copy the existing runtime state files once. Do
-not overwrite a destination that already exists with different content:
+Before switching the service, copy the existing runtime state files once. The
+script verifies each SHA-256, refuses to overwrite a different destination,
+and sets the target owner/group and mode:
 
 ```bash
-STATE=/var/lib/chatgpt-session-ops
-for name in account-rotation.json conv-accounts.json conv-accounts.json.highwater.json proxy.json; do
-  src="/opt/so-sender/cli/$name"
-  dst="$STATE/$name"
-  test -f "$src"
-  if test -e "$dst"; then
-    cmp -s "$src" "$dst" || { echo "state conflict: $dst" >&2; exit 1; }
-  else
-    sudo install -o chatgpt-sender -g chatgpt-sender -m 0600 "$src" "$dst"
-  fi
-done
+sudo python tools/migrate_sender_runtime_state.py \
+  --source /opt/so-sender/cli \
+  --state /var/lib/chatgpt-session-ops
 ```
 
 On first startup, `SO_MCP_LEGACY_SENDER_DB` is read-only migration input. The
