@@ -1927,6 +1927,44 @@ class SecureWorkItemStore:
             )
         return Page((_row_to_session_link(row) for row in visible), next_cursor)
 
+    def require_conversation_owner(
+        self, principal: Principal, session_id: str
+    ) -> None:
+        """Require an unambiguous historical link owned by this principal.
+
+        Destination conversations may be independent of the WorkItem whose
+        completion is being announced, but their ownership must still be
+        established by trusted Session Ops landing/link evidence. UUID shape
+        alone is never proof that a conversation belongs to the caller.
+        """
+        validate_conversation_id(session_id)
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT DISTINCT o.tenant_id, o.owner_principal_id
+                   FROM session_links AS s
+                   JOIN work_item_owners AS o ON o.work_item_id=s.work_item_id
+                   WHERE s.session_id=?
+                     AND EXISTS (
+                         SELECT 1 FROM authority_landing_events AS e
+                          WHERE e.session_id=s.session_id
+                            AND e.work_item_id=s.work_item_id
+                            AND e.match='confirmed'
+                            AND e.evidence_complete=1
+                            AND e.consumed_at IS NOT NULL
+                            AND e.rejected_at IS NULL
+                     )""",
+                (session_id,),
+            ).fetchall()
+            owners = {
+                (row["tenant_id"], row["owner_principal_id"])
+                for row in rows
+            }
+            if owners != {(principal.tenant_id, principal.principal_id)}:
+                raise NotAuthorized()
+        finally:
+            conn.close()
+
     def get_active_link(
         self, principal: Principal, session_id: str
     ) -> Optional[SessionLink]:

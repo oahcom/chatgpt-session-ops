@@ -80,11 +80,42 @@ class _FakeTLSContext:
         self.server_hostnames = []
         self._raise_on_wrap = raise_on_wrap
 
-    def wrap_socket(self, sock, *, server_hostname):
+    def wrap_socket(self, sock, *, server_hostname, do_handshake_on_connect=True):
         self.server_hostnames.append(server_hostname)
         if self._raise_on_wrap is not None:
             raise self._raise_on_wrap
         return sock
+
+
+class _BlockingTLSWrappedSocket:
+    """A controllable SSLSocket stand-in whose handshake blocks until closed."""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.closed = threading.Event()
+
+    def settimeout(self, timeout):
+        self.sock.settimeout(timeout)
+
+    def do_handshake(self):
+        if not self.closed.wait(1):
+            raise TimeoutError("test handshake was not interrupted")
+
+    def shutdown(self, how):
+        try:
+            self.sock.shutdown(how)
+        except OSError:
+            pass
+
+    def close(self):
+        self.closed.set()
+        self.sock.close()
+
+
+class _BlockingHandshakeTLSContext(_FakeTLSContext):
+    def wrap_socket(self, sock, *, server_hostname, do_handshake_on_connect=True):
+        self.server_hostnames.append(server_hostname)
+        return _BlockingTLSWrappedSocket(sock)
 
 
 class TestResolveValidatedAddress(unittest.TestCase):
@@ -251,6 +282,107 @@ class TestPinnedHTTPSConnectionConnect(unittest.TestCase):
 
         self.assertEqual(str(ctx.exception), "HTTPS proxy tunnels are not supported")
         self.assertEqual(dialled, [], "a tunnel must be refused before any dial")
+
+    def test_total_deadline_closes_socket_even_when_peer_keeps_sending(self):
+        local, peer = socket.socketpair()
+        connection = _PinnedHTTPSConnection(
+            "issuer.example.test",
+            pinned_ip="93.184.216.34",
+            port=443,
+            timeout=1.0,
+            total_timeout=0.15,
+            context=_FakeTLSContext(),
+        )
+        try:
+            with patch(
+                "src.session_ops.mcp_auth.socket.create_connection",
+                return_value=local,
+            ):
+                connection.connect()
+            # http.client clears HTTPSConnection.sock after getresponse()
+            # hands a close-delimited body to HTTPResponse. The watchdog must
+            # retain its own socket reference through that response-body read.
+            body_reader = local.makefile("rb")
+            connection.sock = None
+            peer.settimeout(0.2)
+            sent = []
+            stop = threading.Event()
+            reader_finished = threading.Event()
+
+            def read_response_body():
+                try:
+                    while body_reader.read(1):
+                        pass
+                finally:
+                    reader_finished.set()
+
+            def slow_peer():
+                while not stop.is_set():
+                    try:
+                        peer.send(b"x")
+                        sent.append(1)
+                    except OSError:
+                        return
+                    time.sleep(0.01)
+
+            sender = threading.Thread(target=slow_peer, daemon=True)
+            reader = threading.Thread(target=read_response_body, daemon=True)
+            reader.start()
+            sender.start()
+            time.sleep(0.04)
+            self.assertGreater(len(sent), 0)
+            self.assertTrue(
+                self._wait_for_deadline(connection, 0.5),
+                "the absolute deadline did not close a continuously active socket",
+            )
+            self.assertTrue(
+                reader_finished.wait(timeout=0.5),
+                "the absolute deadline did not interrupt the response-body reader",
+            )
+            stop.set()
+            sender.join(timeout=0.5)
+            reader.join(timeout=0.5)
+            body_reader.close()
+            self.assertIsNone(connection.sock)
+            self.assertTrue(connection._deadline_expired)
+            self.assertGreater(len(sent), 0)
+        finally:
+            connection.cancel_deadline()
+            connection.close()
+            peer.close()
+
+    def test_total_deadline_interrupts_tls_handshake(self):
+        local, peer = socket.socketpair()
+        connection = _PinnedHTTPSConnection(
+            "issuer.example.test",
+            pinned_ip="93.184.216.34",
+            port=443,
+            timeout=1.0,
+            total_timeout=0.1,
+            context=_BlockingHandshakeTLSContext(),
+        )
+        try:
+            with patch(
+                "src.session_ops.mcp_auth.socket.create_connection",
+                return_value=local,
+            ):
+                with self.assertRaises(TimeoutError):
+                    connection.connect()
+            self.assertTrue(connection._deadline_expired)
+            self.assertIsNone(connection.sock)
+        finally:
+            connection.cancel_deadline()
+            connection.close()
+            peer.close()
+
+    @staticmethod
+    def _wait_for_deadline(connection, timeout):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if connection._deadline_expired:
+                return True
+            time.sleep(0.005)
+        return connection._deadline_expired
 
     def test_wrap_failure_is_reraised_and_socket_closed(self):
         """The bare raise at L633: a TLS failure must escape, not be swallowed."""

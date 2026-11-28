@@ -62,7 +62,7 @@ class _FakeTLSContext:
     def __init__(self):
         self.server_hostnames = []
 
-    def wrap_socket(self, sock, *, server_hostname):
+    def wrap_socket(self, sock, *, server_hostname, do_handshake_on_connect=True):
         self.server_hostnames.append(server_hostname)
         return sock
 

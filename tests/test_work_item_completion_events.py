@@ -8,8 +8,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from src.session_ops.authority import Principal, PrincipalRecord, SecureWorkItemStore, StaticPrincipalDirectory
+from src.session_ops.authority import NotAuthorized, Principal, PrincipalRecord, SecureWorkItemStore, StaticPrincipalDirectory
 from src.session_ops.mcp_events import MCPEventsStore
+from src.session_ops.work_items import WorkItemStore
 
 
 class Callback:
@@ -83,6 +84,55 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         )
         self.store.link_session(self.principal, session_id, item.work_item_id, attempt_id)
         return item, session_id
+
+    def test_destination_conversation_requires_unambiguous_immutable_owner(self):
+        item, session_id = self._create_linked_item()
+        self.store.require_conversation_owner(self.principal, session_id)
+        with self.assertRaises(NotAuthorized):
+            self.store.require_conversation_owner(
+                Principal("tenant-a", "another-owner"), session_id
+            )
+
+        # Terminal unlinking does not erase the trusted ownership evidence.
+        self.store.finish_work_item(self.principal, item.work_item_id, "completed")
+        self.store.require_conversation_owner(self.principal, session_id)
+
+        # A historical reassignment to a different immutable owner makes the
+        # destination ambiguous and must fail closed for both principals.
+        other = Principal("tenant-a", "another-owner")
+        other_item = self.store.create_work_item(other)
+        other_attempt = "att_22345678-1234-4234-8234-123456789abc"
+        self.store._record_trusted_landing(
+            session_id,
+            match="confirmed",
+            evidence_complete=True,
+            work_item_id=other_item.work_item_id,
+            attempt_id=other_attempt,
+        )
+        self.store.link_session(
+            other, session_id, other_item.work_item_id, other_attempt
+        )
+        for principal in (self.principal, other):
+            with self.subTest(principal=principal.principal_id):
+                with self.assertRaises(NotAuthorized):
+                    self.store.require_conversation_owner(principal, session_id)
+
+        with self.assertRaises(NotAuthorized):
+            self.store.require_conversation_owner(
+                self.principal, "32345678-1234-4234-8234-123456789abc"
+            )
+
+    def test_destination_rejects_raw_session_link_without_consumed_landing(self):
+        item = self.store.create_work_item(self.principal)
+        session_id = "42345678-1234-4234-8234-123456789abc"
+
+        # The lower-level WorkItemStore API can persist a syntactically valid
+        # link, but it does not consume trusted landing evidence. Such a row
+        # must never be accepted as proof of destination conversation ownership.
+        WorkItemStore(self.database).link_session(session_id, item.work_item_id)
+
+        with self.assertRaises(NotAuthorized):
+            self.store.require_conversation_owner(self.principal, session_id)
 
     def test_terminal_transition_atomically_enqueues_one_event_for_work_item(self):
         self._subscribe()

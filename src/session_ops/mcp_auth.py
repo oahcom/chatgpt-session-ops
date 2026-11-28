@@ -649,9 +649,50 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
       hostname verification still work. Pinning the address must not weaken TLS.
     """
 
-    def __init__(self, host: str, *, pinned_ip: str, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        host: str,
+        *,
+        pinned_ip: str,
+        total_timeout: float | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(host, **kwargs)
         self._pinned_ip = pinned_ip
+        self._total_timeout = total_timeout
+        self._deadline = None
+        self._deadline_timer = None
+        self._deadline_lock = threading.Lock()
+        self._deadline_expired = False
+        # http.client clears ``self.sock`` after getresponse() when the
+        # response is expected to close the connection. HTTPResponse then
+        # keeps reading through its own makefile/socket reference. Keep an
+        # independent reference so the absolute watchdog can still interrupt
+        # a slow-drip response body after that handoff.
+        self._watchdog_sock = None
+
+    def _expire_deadline(self) -> None:
+        with self._deadline_lock:
+            self._deadline_expired = True
+            sock = self._watchdog_sock or self.sock
+            self._watchdog_sock = None
+            self.sock = None
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def cancel_deadline(self) -> None:
+        with self._deadline_lock:
+            timer, self._deadline_timer = self._deadline_timer, None
+            self._watchdog_sock = None
+        if timer is not None:
+            timer.cancel()
 
     def connect(self) -> None:
         # A tunnel would hand the hostname to a proxy, which is exactly the
@@ -660,34 +701,112 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         if self._tunnel_host:
             raise OSError("HTTPS proxy tunnels are not supported")
 
-        sock = socket.create_connection(
-            (self._pinned_ip, self.port),
-            self.timeout,
-            self.source_address,
+        if self._total_timeout is not None:
+            self._deadline = time.monotonic() + self._total_timeout
+            self._deadline_timer = threading.Timer(
+                self._total_timeout, self._expire_deadline
+            )
+            self._deadline_timer.daemon = True
+            self._deadline_timer.start()
+
+        remaining = (
+            max(0.001, self._deadline - time.monotonic())
+            if self._deadline is not None else self.timeout
         )
         try:
-            self.sock = self._context.wrap_socket(
+            sock = socket.create_connection(
+                (self._pinned_ip, self.port),
+                remaining,
+                self.source_address,
+            )
+            with self._deadline_lock:
+                if self._deadline_expired:
+                    sock.close()
+                    raise TimeoutError("HTTPS request exceeded its total deadline")
+                self.sock = sock
+                self._watchdog_sock = sock
+            if self._deadline is not None:
+                remaining = self._deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("HTTPS request exceeded its total deadline")
+                sock.settimeout(remaining)
+            # Defer the TLS handshake until the SSLSocket is installed as
+            # self.sock. SSLContext.wrap_socket() normally performs the
+            # handshake before returning; during that interval the raw socket
+            # may already have been detached, so the watchdog cannot reliably
+            # close the socket that is actually blocked in the handshake.
+            wrapped = self._context.wrap_socket(
                 sock,
                 server_hostname=self.host,
+                do_handshake_on_connect=False,
             )
+            with self._deadline_lock:
+                if self._deadline_expired:
+                    wrapped.close()
+                    self.sock = None
+                    raise TimeoutError("HTTPS request exceeded its total deadline")
+                self.sock = wrapped
+                self._watchdog_sock = wrapped
+                if self._deadline is not None:
+                    remaining = self._deadline - time.monotonic()
+                    if remaining <= 0:
+                        self.sock = None
+                        wrapped.close()
+                        raise TimeoutError("HTTPS request exceeded its total deadline")
+                    wrapped.settimeout(remaining)
+            # For the real SSLContext this is the blocking TLS handshake. The
+            # watchdog now owns the SSLSocket and can interrupt it at deadline.
+            handshake = getattr(wrapped, "do_handshake", None)
+            if callable(handshake):
+                handshake()
+            with self._deadline_lock:
+                if self._deadline_expired:
+                    self.sock = None
+                    wrapped.close()
+                    raise TimeoutError("HTTPS request exceeded its total deadline")
+                if self._deadline is not None:
+                    remaining = self._deadline - time.monotonic()
+                    if remaining <= 0:
+                        self.sock = None
+                        wrapped.close()
+                        raise TimeoutError("HTTPS request exceeded its total deadline")
+                    wrapped.settimeout(remaining)
         except BaseException:
-            sock.close()
+            self.cancel_deadline()
+            sock_to_close = self.sock
+            self.sock = None
+            if sock_to_close is not None:
+                sock_to_close.close()
             raise
 
 
 class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
     """Build HTTPS connections that use one request's validated IP."""
 
-    def __init__(self, pinned_ip: str) -> None:
+    def __init__(self, pinned_ip: str, *, total_timeout: float | None = None) -> None:
         self._pinned_ip = pinned_ip
+        self._total_timeout = total_timeout
+        self._connections: list[_PinnedHTTPSConnection] = []
         super().__init__()
+
+    def cancel_deadlines(self) -> None:
+        for connection in self._connections:
+            connection.cancel_deadline()
 
     def https_open(self, request: Any) -> Any:
         pinned_ip = self._pinned_ip
+        total_timeout = self._total_timeout
+        owner = self
 
         class PinnedConnection(_PinnedHTTPSConnection):
             def __init__(self, host: str, **kwargs: Any) -> None:
-                super().__init__(host, pinned_ip=pinned_ip, **kwargs)
+                super().__init__(
+                    host,
+                    pinned_ip=pinned_ip,
+                    total_timeout=total_timeout,
+                    **kwargs,
+                )
+                owner._connections.append(self)
 
         return self.do_open(
             PinnedConnection,
