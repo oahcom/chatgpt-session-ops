@@ -14,6 +14,7 @@ import re
 import shutil
 import stat
 import sys
+import time
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import urlsplit
@@ -680,12 +681,34 @@ class DeploymentASGI:
                 try:
                     event_snapshot = await asyncio.to_thread(self.readiness_snapshot)
                     dispatcher = event_snapshot.get("dispatcher", {})
+                    store = event_snapshot.get("store", {})
+                    outbox = store.get("outbox", {}) if isinstance(store, dict) else {}
                     running = isinstance(dispatcher, dict) and dispatcher.get("running") is True
+                    last_loop_at = dispatcher.get("last_loop_at") if isinstance(dispatcher, dict) else None
+                    loop_age = (
+                        max(0, time.time() - float(last_loop_at))
+                        if isinstance(last_loop_at, (int, float)) else None
+                    )
+                    reasons = []
+                    if not running:
+                        reasons.append("dispatcher_stopped")
+                    if int(dispatcher.get("consecutive_errors", 0) or 0) > 0:
+                        reasons.append("dispatcher_errors")
+                    if loop_age is not None and loop_age > 60:
+                        reasons.append("dispatcher_stale")
+                    if loop_age is None and int(outbox.get("pending", 0) or 0) > 0:
+                        reasons.append("dispatcher_not_progressing")
+                    if int(outbox.get("oldest_pending_age_seconds", 0) or 0) > 120:
+                        reasons.append("old_pending_deliveries")
+                    if int(outbox.get("retry_exhausted", 0) or 0) > 0:
+                        reasons.append("retry_exhausted")
+                    healthy = not reasons
                     readiness = {
-                        "status": "ready" if running else "degraded",
+                        "status": "ready" if healthy else "degraded",
+                        "reasons": reasons,
                         "events": {"enabled": True, **event_snapshot},
                     }
-                    status_code = 200 if running else 503
+                    status_code = 200 if healthy else 503
                 except Exception:
                     # Do not leak exception messages, DB paths, or payloads.
                     readiness = {
