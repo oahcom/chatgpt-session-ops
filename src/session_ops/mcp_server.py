@@ -1417,6 +1417,18 @@ def build_mcp_server(
             def create_subscription() -> Any:
                 payload = params.model_dump(by_alias=True, exclude_unset=True)
                 arguments = payload.get("arguments") or {}
+                destination = arguments.get("conversation_id")
+                try:
+                    # A destination may be independent of the source WorkItem,
+                    # but it must be a conversation previously linked through
+                    # trusted landing evidence to this immutable owner.
+                    service.store.require_conversation_owner(
+                        auth.principal, destination
+                    )
+                except (NotAuthorized, InvalidIdentifier, UnconfirmedSession) as exc:
+                    raise ValueError(
+                        "destination conversation ownership could not be verified"
+                    ) from exc
                 job_id = arguments.get("job_id")
                 if job_id is not None:
                     # Completion events are attributed to the WorkItem owner.

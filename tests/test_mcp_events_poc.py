@@ -47,11 +47,12 @@ class MCPEventsStoreTests(unittest.TestCase):
 
     def subscribe(self, **kwargs):
         kwargs.setdefault("conversation_id", "12345678-1234-4234-8234-123456789abc")
-        return self.store.subscribe(self.auth, {
-            "name": "chatgpt.job.completed",
-            "arguments": kwargs,
-            "delivery": self.delivery,
-        })
+        with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
+            return self.store.subscribe(self.auth, {
+                "name": "chatgpt.job.completed",
+                "arguments": kwargs,
+                "delivery": self.delivery,
+            })
 
     def publish_job_completed(self, *args, **kwargs):
         kwargs.setdefault("conversation_id", "12345678-1234-4234-8234-123456789abc")
@@ -65,6 +66,10 @@ class MCPEventsStoreTests(unittest.TestCase):
         input_property = definition["inputSchema"]["properties"]["conversation_id"]
         self.assertEqual(input_property["minLength"], 36)
         self.assertEqual(input_property["maxLength"], 36)
+        self.assertEqual(
+            input_property["pattern"],
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        )
         self.assertIn("conversation_id", required)
         input_required = definition["inputSchema"]["required"]
         self.assertNotIn("job_id", input_required)
@@ -533,6 +538,54 @@ class MCPEventsStoreTests(unittest.TestCase):
         with self.store._db() as db:
             self.assertEqual(db.execute("SELECT count(*) FROM event_deliveries").fetchone()[0], 1)
 
+    def test_unsubscribe_waits_for_inflight_callback_before_returning(self):
+        self.subscribe(job_id="job-unsubscribe-race")
+        self.publish_job_completed(
+            "tenant-a", "issuer:user-a", "job-unsubscribe-race", "Finished"
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        requests = []
+
+        def blocked_callback(url, body, headers):
+            requests.append((url, body, headers))
+            entered.set()
+            if not release.wait(2):
+                raise AssertionError("test did not release in-flight callback")
+            return 204, b""
+
+        self.store.post_json = blocked_callback
+        delivery_thread = threading.Thread(target=self.store.deliver_pending)
+        delivery_thread.start()
+        self.assertTrue(entered.wait(1), "delivery did not reach callback I/O")
+
+        def unsubscribe():
+            self.store.unsubscribe(self.auth, {
+                "name": "chatgpt.job.completed",
+                "arguments": {
+                    "job_id": "job-unsubscribe-race",
+                    "conversation_id": "12345678-1234-4234-8234-123456789abc",
+                },
+                "delivery": {"url": self.delivery["url"]},
+            })
+            finished.set()
+
+        unsubscribe_thread = threading.Thread(target=unsubscribe)
+        unsubscribe_thread.start()
+        self.assertFalse(
+            finished.wait(0.05),
+            "unsubscribe returned while callback was still in flight",
+        )
+        release.set()
+        delivery_thread.join(timeout=2)
+        unsubscribe_thread.join(timeout=2)
+        self.assertFalse(delivery_thread.is_alive())
+        self.assertFalse(unsubscribe_thread.is_alive())
+        self.assertTrue(finished.is_set())
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(self.store.deliver_pending(), 0)
+
     def test_unsubscribe_is_owner_scoped_and_idempotent(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.subscribe()
@@ -592,12 +645,20 @@ class MCPEventsStoreTests(unittest.TestCase):
             payload = json.loads(body)
             return 200, json.dumps({"challenge": payload["challenge"]}).encode()
         self.store.post_json = callback
+        # A second store instance models another process: the per-instance
+        # lifecycle lock must not weaken SQLite lease fencing across workers.
+        second_store = MCPEventsStore(
+            self.db,
+            post_json=lambda _url, _body, _headers: (204, b""),
+            encryption_key=b"k" * 32,
+            clock=lambda: now[0],
+        )
         first_result = []
         worker = threading.Thread(target=lambda: first_result.append(self.store.deliver_pending(limit=1)))
         worker.start()
         self.assertTrue(entered.wait(timeout=1))
         now[0] += 31
-        self.assertEqual(self.store.deliver_pending(limit=1), 1)
+        self.assertEqual(second_store.deliver_pending(limit=1), 1)
         release.set()
         worker.join(timeout=2)
         self.assertFalse(worker.is_alive())
