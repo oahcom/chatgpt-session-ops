@@ -1,18 +1,6 @@
 --- a/so-sender/cli/chatgpt_send.py
 +++ b/so-sender/cli/chatgpt_send.py
-@@ -8216,6 +8216,11 @@
-     账号隔离靠 Adapter 回显（X-Adapter-Account）验证：回显缺失或与指定账号
-     不符一律按失败处理，绝不报告成功。
-     """
-+    # Validate at the helper boundary before constructing ChatGPTAPI.
-+    if not validate_account_identity(account):
-+        _cli_print_json({"event": "create_result", "ok": False,
-+                         "reason": "invalid_account_identity", "account": account})
-+        return 2
-     api, detail = _cli_open_api(account)
-     if api is None:
-         _cli_print_json({"event": "create_result", "ok": False,
-@@ -9350,6 +9355,21 @@
+@@ -9350,6 +9350,21 @@
              )
              return 2
          if explicit_account and account != "auto":
@@ -34,7 +22,7 @@
              api = build(account)
              if api is None:
                  return 2
-@@ -9387,16 +9407,6 @@
+@@ -9387,16 +9407,15 @@
              if status == 200 and conv:
                  record_conv(conv, account, args[1])
                  print("NEW_CONV %s account=%s" % (conv, account), flush=True)
@@ -44,9 +32,15 @@
 -                # 重试不会重复建会话、不会多花配额。
 -                print("WARN: %s 返回 429 —— 换另一个登录态，都限速则走匿名通道" % account,
 -                      flush=True)
--                def mark(s):
--                    mark_unavailable(s, account, "HTTP 429 限速冷却", COOLDOWN_429)
--                mutate_rotation(mark)
++            if status == 429 and account in _effective_rotation_primary():
++                # Preserve local cooldown for subsequent direct CLI auto-create,
++                # but never cross the explicit account boundary or recurse.
+                 def mark(s):
++                    # Match _attempt_create's account-failure accounting while
++                    # retaining the explicit-account no-rotation boundary.
++                    s["failures"][account] = s.get("failures", {}).get(account, 0) + 1
+                     mark_unavailable(s, account, "HTTP 429 限速冷却", COOLDOWN_429)
+                 mutate_rotation(mark)
 -                return create_chat_rotating(args[1], thinking=True if thinking_flag else None)
              return 0 if status == 200 else 1
          # 默认：acct1/acct2/acct3/acct4/acct5/acct6 均分轮转，全部 429 才匿名兜底

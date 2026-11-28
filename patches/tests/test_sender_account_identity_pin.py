@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 ROOT = Path(__file__).resolve().parents[2]
+TEMP_ROOT = Path.home() / ".worktrees"
 SNAPSHOT = ROOT / "deploy/source-snapshot/2026-11-28/so-sender"
 PATCH = ROOT / "patches/sender-account-identity-pin.patch"
 
@@ -22,7 +23,8 @@ PATCH = ROOT / "patches/sender-account-identity-pin.patch"
 class SenderAccountIdentityPinTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.temp = tempfile.TemporaryDirectory(prefix="sender-account-pin-", dir=str(ROOT))
+        TEMP_ROOT.mkdir(parents=True, exist_ok=True)
+        cls.temp = tempfile.TemporaryDirectory(prefix="sender-account-pin-", dir=str(TEMP_ROOT))
         cls.root = Path(cls.temp.name)
         cls.cli_dir = cls.root / "so-sender/cli"
         cls.gateway_dir = cls.root / "so-sender/sender_gateway"
@@ -124,6 +126,7 @@ class SenderAccountIdentityPinTests(unittest.TestCase):
                 "ChatGPTAPI", "_cli_open_api", "send_prompt", "record_conv", "create_chat_rotating",
                 "load_rotation", "purge_expired", "is_unavailable", "rotation_plan",
                 "_effective_rotation_primary", "_attempt_create", "_mark_success",
+                "mutate_rotation",
             )
         }
 
@@ -155,6 +158,11 @@ class SenderAccountIdentityPinTests(unittest.TestCase):
         self.cli.send_prompt = fake_send
         self.cli.record_conv = Mock()
         self.cli.create_chat_rotating = rotate
+        self.last_rotation_state = {"cursor": 0, "unavailable": {}, "failures": {}}
+        def apply_rotation_mutation(mutator):
+            mutator(self.last_rotation_state)
+            return self.last_rotation_state
+        self.cli.mutate_rotation = Mock(side_effect=apply_rotation_mutation)
         sys.argv[:] = ["chatgpt_send.py", "--account", account, "--new", "prompt.txt"]
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
@@ -286,35 +294,6 @@ class SenderAccountIdentityPinTests(unittest.TestCase):
         self.assertEqual(Path(api2.base_dir), accounts_dir / "acct2")
         self.assertEqual(api2.token, "acct2-base-token")
 
-    def test_account_only_helper_rejects_acct5_before_open_api(self):
-        os.environ["CHATGPT_ALLOWED_ACCOUNTS"] = "acct1,acct2"
-        open_api = Mock()
-        self.cli._cli_open_api = open_api
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            result = self.cli._cli_account_only_create("acct5", "prompt.txt")
-        self.assertEqual(result, 2)
-        open_api.assert_not_called()
-        payload = __import__("json").loads(output.getvalue().strip().splitlines()[-1])
-        self.assertEqual(payload["event"], "create_result")
-        self.assertEqual(payload["reason"], "invalid_account_identity")
-
-    def test_account_only_helper_allows_discovered_acct10_after_allowlist(self):
-        os.environ["CHATGPT_ALLOWED_ACCOUNTS"] = "acct10"
-        api = SimpleNamespace(last_headers={"x-adapter-account": "acct10"})
-        self.cli._cli_open_api = Mock(return_value=(api, None))
-        self.cli.send_prompt = Mock(return_value=(200, None, str(uuid.uuid4())))
-        self.cli.record_conv = Mock()
-        output = io.StringIO()
-        with contextlib.redirect_stdout(output):
-            result = self.cli._cli_account_only_create("acct10", "prompt.txt")
-        self.assertEqual(result, 0, output.getvalue())
-        self.cli._cli_open_api.assert_called_once_with("acct10")
-        self.cli.send_prompt.assert_called_once()
-        payload = __import__("json").loads(output.getvalue().strip().splitlines()[-1])
-        self.assertTrue(payload["ok"])
-        self.assertEqual(payload["account"], "acct10")
-
     def test_disabled_acct5_is_rejected_before_api_construction_or_request(self):
         os.environ["CHATGPT_ALLOWED_ACCOUNTS"] = "acct1,acct2"
         api = Mock()
@@ -354,16 +333,28 @@ class SenderAccountIdentityPinTests(unittest.TestCase):
         self.assertEqual(api_calls, ["acct10"])
         self.assertEqual(requests, ["acct10"])
 
+    def test_explicit_acct1_401_fails_without_acct2_attempt(self):
+        result, api_calls, requests, rotate, output = self.run_cli_new("acct1", 401)
+        self.assertEqual(result, 1)
+        self.assertEqual(api_calls, ["acct1"])
+        self.assertEqual(requests, ["acct1"])
+        rotate.assert_not_called()
+        self.cli.mutate_rotation.assert_not_called()
+        self.assertNotIn("NEW_CONV", output)
+        self.assertNotIn("account=acct2", output)
+
     def test_explicit_acct1_403_fails_without_acct2_attempt(self):
         result, api_calls, requests, rotate, output = self.run_cli_new("acct1", 403)
         self.assertEqual(result, 1)
         self.assertEqual(api_calls, ["acct1"])
         self.assertEqual(requests, ["acct1"])
         rotate.assert_not_called()
+        self.cli.mutate_rotation.assert_not_called()
         self.assertNotIn("NEW_CONV", output)
         self.assertNotIn("account=acct2", output)
 
     def test_explicit_acct1_429_fails_without_acct2_attempt(self):
+        real_auto_rotate = self.cli.create_chat_rotating
         result, api_calls, requests, rotate, output = self.run_cli_new("acct1", 429)
         self.assertEqual(result, 1)
         self.assertEqual(api_calls, ["acct1"])
@@ -371,6 +362,39 @@ class SenderAccountIdentityPinTests(unittest.TestCase):
         rotate.assert_not_called()
         self.assertNotIn("NEW_CONV", output)
         self.assertNotIn("account=acct2", output)
+        self.cli.mutate_rotation.assert_called_once()
+        cooldown = self.last_rotation_state["unavailable"]["acct1"]
+        self.assertEqual(cooldown["reason"], "HTTP 429 限速冷却")
+        self.assertEqual(cooldown["ttl"], self.cli.COOLDOWN_429)
+        self.assertGreater(cooldown["epoch"], 0)
+        self.assertEqual(self.last_rotation_state["failures"]["acct1"], 1)
+
+        # Exercise the real automatic-rotation planner against the state written
+        # by the explicit 429 path: acct1 must be skipped and acct2 attempted.
+        original_effective = self.cli._effective_rotation_primary
+        original_attempt = self.cli._attempt_create
+        self.cli.create_chat_rotating = real_auto_rotate
+        self.cli._effective_rotation_primary = lambda: ("acct1", "acct2")
+        self.cli.load_rotation = Mock(return_value=self.last_rotation_state)
+        self.cli.purge_expired = Mock(return_value=False)
+        attempted = []
+        def attempt(_state, name, _prompt, _attempts, _thinking):
+            attempted.append(name)
+            return 200, "conv-acct2"
+        self.cli._attempt_create = attempt
+        self.cli._mark_success = Mock()
+        try:
+            rotation_output = io.StringIO()
+            with contextlib.redirect_stdout(rotation_output):
+                rotation_result = self.cli.create_chat_rotating("prompt.txt")
+            self.assertEqual(rotation_result, 0, rotation_output.getvalue())
+            self.assertEqual(attempted, ["acct2"], rotation_output.getvalue())
+            self.cli._mark_success.assert_called_once()
+            self.assertEqual(self.cli._mark_success.call_args.args[1], "acct2")
+        finally:
+            self.cli._effective_rotation_primary = original_effective
+            self.cli._attempt_create = original_attempt
+            self.cli.create_chat_rotating = real_auto_rotate
 
     def test_auto_create_retains_rotation_to_acct2_after_acct1_403_or_429(self):
         original_effective = self.cli._effective_rotation_primary
@@ -399,28 +423,51 @@ class SenderAccountIdentityPinTests(unittest.TestCase):
 
         self.cli._effective_rotation_primary = original_effective
 
-    def test_adapter_classifies_account_only_429_and_preserves_retry_after(self):
+    def test_rotation_state_write_keeps_owner_write_and_group_read_mode(self):
+        rotation_file = self.root / "rotation-permissions" / "account-rotation.json"
+        old_rotation_file = self.cli.ROTATION_FILE
+        try:
+            rotation_file.parent.mkdir(parents=True, exist_ok=True)
+            self.cli.ROTATION_FILE = str(rotation_file)
+            self.cli.mutate_rotation(
+                lambda state: self.cli.mark_unavailable(
+                    state, "acct1", "HTTP 429 限速冷却", self.cli.COOLDOWN_429
+                )
+            )
+            persisted = self.cli.load_rotation()["unavailable"]["acct1"]
+            self.assertEqual(persisted["reason"], "HTTP 429 限速冷却")
+            self.assertEqual(persisted["ttl"], self.cli.COOLDOWN_429)
+            mode = __import__("stat").S_IMODE(rotation_file.stat().st_mode)
+            self.assertEqual(mode, 0o640)
+            self.assertTrue(mode & 0o200, "owner must retain write permission")
+            self.assertTrue(mode & 0o040, "service operator group remains readable")
+        finally:
+            self.cli.ROTATION_FILE = old_rotation_file
+
+    def test_adapter_classifies_legacy_send_prompt_401_output_for_gateway_health(self):
         adapter = object.__new__(self.adapter_type)
-        payload = {
-            "event": "create_result",
-            "ok": False,
-            "reason": "rate_limited",
-            "account": "acct1",
-            "http_status": 429,
-            "retry_after_seconds": 37,
-        }
         result = SimpleNamespace(
-            stdout=__import__("json").dumps(payload) + "\n",
-            exit_code=1,
+            stdout="SEND prompt.txt -> 401 respLen=0 in 1s",
             stderr="",
+            exit_code=1,
             operation="create",
         )
-        with self.assertRaises(self.sender_error_type) as raised:
-            adapter._parse_create(result, expected_account="acct1")
-        error = raised.exception
+        error = adapter._classify_failure(result, "sender CLI exited non-zero")
+        self.assertEqual(error.code, "UNAUTHENTICATED")
+        self.assertEqual(error.upstream_status, 401)
+        self.assertEqual(error.operation, "create")
+
+    def test_adapter_classifies_legacy_send_prompt_429_output_for_gateway_cooldown(self):
+        adapter = object.__new__(self.adapter_type)
+        result = SimpleNamespace(
+            stdout="SEND prompt.txt -> 429 respLen=0 in 1s",
+            stderr="",
+            exit_code=1,
+            operation="create",
+        )
+        error = adapter._classify_failure(result, "sender CLI exited non-zero")
         self.assertEqual(error.code, "RESOURCE_EXHAUSTED")
         self.assertEqual(error.upstream_status, 429)
-        self.assertEqual(error.retry_after_seconds, 37)
         self.assertEqual(error.operation, "create")
 
     def test_adapter_rejects_mismatched_account_result(self):
