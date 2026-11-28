@@ -296,6 +296,18 @@ class AuthorizationTests(Base):
             self.store.get_work_item(self.alice, item.work_item_id), changed
         )
 
+    def test_delegated_writer_cannot_complete_or_cancel_work_item(self) -> None:
+        item = self.store.create_work_item(self.alice)
+        self.store.grant(self.alice, item.work_item_id, "bob", "write")
+        for terminal_status in ("completed", "cancelled"):
+            with self.subTest(status=terminal_status):
+                with self.assertRaises(NotAuthorized):
+                    self.store.set_status(self.bob, item.work_item_id, terminal_status)
+                self.assertEqual(
+                    self.store.get_work_item(self.alice, item.work_item_id).status,
+                    "active",
+                )
+
     def test_owner_can_make_terminal_transition_only_once(self) -> None:
         item = self.store.create_work_item(self.alice)
         changed = self.store.set_status(

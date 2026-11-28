@@ -1006,6 +1006,11 @@ class SecureWorkItemStore:
             ).fetchone()
             if row is None:
                 raise NotAuthorized()
+            if status in TERMINAL_STATUSES:
+                # A terminal transition is the event's source-of-truth edge.
+                # A delegated writer may update active work, but cannot
+                # complete/cancel the owner's WorkItem or trigger its event.
+                self._require_owner(conn, principal, work_item_id)
             if expected_updated_at is not None and row["updated_at"] != expected_updated_at:
                 raise AuthorityError("work item has changed; refresh and retry")
             current = row["status"]

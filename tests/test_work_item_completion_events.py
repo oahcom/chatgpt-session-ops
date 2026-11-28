@@ -155,7 +155,11 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         item, _session_id = self._create_linked_item()
         self.store.grant(self.principal, item.work_item_id, self.delegate.principal_id, "write")
 
-        self.store.set_status(self.delegate, item.work_item_id, "completed")
+        from src.session_ops.authority import NotAuthorized
+        with self.assertRaises(NotAuthorized):
+            self.store.set_status(self.delegate, item.work_item_id, "completed")
+        self.assertEqual(self.store.get_work_item(self.principal, item.work_item_id).status, "active")
+        self.store.set_status(self.principal, item.work_item_id, "completed")
         with self.events._db() as db:
             event = db.execute("SELECT tenant_id, principal_id FROM event_outbox").fetchone()
             deliveries = db.execute(
@@ -311,7 +315,7 @@ class WorkItemCompletionEventTests(unittest.TestCase):
                 "delivery": writer_delivery,
             })
 
-        self.store.set_status(grantee, item.work_item_id, "completed")
+        self.store.set_status(self.principal, item.work_item_id, "completed")
 
         # Revoking the delegated write grant must not redirect the owner's
         # event to the delegate or leak it to the delegate's subscription.
