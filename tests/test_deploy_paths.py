@@ -42,6 +42,9 @@ def test_deploy_runbook_documents_events_opt_in_and_oauth_scope_gate():
     assert "session_ops.chatgpt.session.write" in docs
     assert "does not prove" in docs
     assert "real ChatGPT Work" in docs
+    assert "/readyz" in docs
+    assert "oldest_pending_age_seconds" in docs
+    assert "never returns event IDs" in docs
     assert "immutable for the lifetime" in docs
     assert "SQLite's online backup API" in docs
     recovery = (root / "docs" / "mcp-events-poc.md").read_text()
