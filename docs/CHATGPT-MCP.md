@@ -29,6 +29,7 @@ The systemd service uses these values:
 
 - `SO_SENDER_ACCOUNTS_DIR=/var/lib/chatgpt-session-ops/accounts`
 - `CHATGPT_STATE_DIR=/var/lib/so-mcp/chatgpt-cli`
+- `SO_SENDER_ACCOUNT_LOCK_DIR=/var/lib/so-mcp/chatgpt-cli/account-locks`
 - `CHATGPT_PROXY_FILE=/var/lib/so-mcp/chatgpt-cli/proxy.json`
 
 The MCP process runs as `ubuntu`. Account credentials remain owned by
