@@ -1145,7 +1145,7 @@ class SecureWorkItemStore:
                 "updated_at": stored["updated_at"],
             }
             self._operation_complete(
-                conn, principal, "work_item.update", request_id, result
+                conn, principal, "work_item.update", operation_id, result
             )
             conn.execute("COMMIT")
             return _row_to_work_item(stored)
@@ -1728,7 +1728,7 @@ class SecureWorkItemStore:
                 "unlinked_at": None,
             }
             self._operation_complete(
-                conn, principal, "session.link", request_id, result
+                conn, principal, "session.link", operation_id, result
             )
             conn.execute("COMMIT")
 

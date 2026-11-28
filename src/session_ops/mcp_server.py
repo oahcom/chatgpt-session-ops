@@ -243,7 +243,6 @@ _IDEMPOTENCY_KEY = {
 TOOL_SCHEMAS = {
     "work_item.create": _object_schema(
         {"idempotency_key": _IDEMPOTENCY_KEY},
-        ("idempotency_key",),
     ),
     "work_item.get": _object_schema(
         {"work_item_id": _WORK_ITEM_ID},
@@ -261,7 +260,7 @@ TOOL_SCHEMAS = {
             "expected_updated_at": _ID,
             "idempotency_key": _IDEMPOTENCY_KEY,
         },
-        ("work_item_id", "status", "idempotency_key"),
+        ("work_item_id", "status"),
     ),
     "work_item.finish": _object_schema(
         {
@@ -269,7 +268,7 @@ TOOL_SCHEMAS = {
             "status": {"type": "string", "enum": ["completed", "cancelled"]},
             "idempotency_key": _IDEMPOTENCY_KEY,
         },
-        ("work_item_id", "status", "idempotency_key"),
+        ("work_item_id", "status"),
     ),
     "work_item.grant": _object_schema(
         {
@@ -278,7 +277,7 @@ TOOL_SCHEMAS = {
             "scope": _GRANT_SCOPE,
             "idempotency_key": _IDEMPOTENCY_KEY,
         },
-        ("work_item_id", "target_principal_id", "scope", "idempotency_key"),
+        ("work_item_id", "target_principal_id", "scope"),
     ),
     "work_item.revoke": _object_schema(
         {
@@ -287,7 +286,7 @@ TOOL_SCHEMAS = {
             "scope": _GRANT_SCOPE,
             "idempotency_key": _IDEMPOTENCY_KEY,
         },
-        ("work_item_id", "target_principal_id", "scope", "idempotency_key"),
+        ("work_item_id", "target_principal_id", "scope"),
     ),
     "session.link": _object_schema(
         {
@@ -296,7 +295,7 @@ TOOL_SCHEMAS = {
             "attempt_id": _ATTEMPT_ID,
             "idempotency_key": _IDEMPOTENCY_KEY,
         },
-        ("session_id", "work_item_id", "idempotency_key"),
+        ("session_id", "work_item_id"),
     ),
     "session.unlink": _object_schema(
         {
@@ -304,7 +303,7 @@ TOOL_SCHEMAS = {
             "expected_link_id": _LINK_ID,
             "idempotency_key": _IDEMPOTENCY_KEY,
         },
-        ("session_id", "idempotency_key"),
+        ("session_id",),
     ),
     "session.list": _object_schema(
         {
@@ -1196,6 +1195,8 @@ def _exception_code(exc: BaseException) -> Tuple[str, Dict[str, Any]]:
             }
         if "changed" in message or "conflict" in message:
             return "CONFLICT", {}
+        if "operation receipt" in message:
+            return "INTERNAL", {}
 
         return "INVALID_ARGUMENT", {}
 
