@@ -303,6 +303,19 @@ def test_read_session_after_message_id_and_response_contract(tmp_path):
     assert result["next_after_message_id"] is None
 
 
+def test_adapter_respects_persistent_cli_operator_disable(tmp_path):
+    client = make_client(tmp_path)
+    with patch.object(client._cli, "load_rotation", return_value={"operator_disabled": ["acct2"]}):
+        assert client._active_accounts() == ("acct1",)
+        try:
+            client._validate_create_account("acct2")
+        except SessionOpsError as exc:
+            assert exc.code == "RESOURCE_EXHAUSTED"
+            assert "operator-disabled" in str(exc)
+        else:
+            raise AssertionError("adapter ignored the persistent CLI operator disable")
+
+
 def test_adapter_pins_cli_auth_root_to_runtime_despite_legacy_env(tmp_path, monkeypatch):
     client = make_client(tmp_path)
     legacy = tmp_path / "legacy-auth"
@@ -381,7 +394,7 @@ def test_explicit_create_uses_cli_strict_pin_and_work_item_context(tmp_path):
         assert kwargs["account"] == "acct2"
         return 0
 
-    with patch.object(client._cli, "load_rotation", side_effect=[previous, completed]), patch.object(
+    with patch.object(client._cli, "load_rotation", side_effect=[{"operator_disabled": []}, previous, completed]), patch.object(
         client._cli, "create_chat_rotating", side_effect=fake_create
     ) as create, patch.object(client, "_store_owner"):
         result = client._run_operation({
@@ -410,7 +423,7 @@ def test_auto_create_all_429_returns_known_rate_limit_failure(tmp_path):
             "acct2": {"reason": "HTTP 429"},
         },
     }
-    with patch.object(client._cli, "load_rotation", side_effect=[previous, cooled]), patch.object(
+    with patch.object(client._cli, "load_rotation", side_effect=[{"operator_disabled": []}, previous, cooled]), patch.object(
         client._cli, "create_chat_rotating", return_value=1
     ) as create:
         try:
@@ -438,7 +451,7 @@ def test_explicit_create_429_returns_known_rate_limit_failure_after_cooldown(tmp
         "last": {"conv_id": "old", "account": "acct2"},
         "unavailable": {"acct2": {"reason": "HTTP 429"}},
     }
-    with patch.object(client._cli, "load_rotation", side_effect=[previous, cooled]), patch.object(
+    with patch.object(client._cli, "load_rotation", side_effect=[{"operator_disabled": []}, previous, cooled]), patch.object(
         client._cli, "create_chat_rotating", return_value=1
     ) as create:
         try:

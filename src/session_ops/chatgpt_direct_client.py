@@ -272,9 +272,15 @@ class ChatGPTDirectClient:
         # from the runtime mirror; writable state remains under runtime_dir.
         self._sync_runtime_accounts()
         accounts = self._cli.discover_configured_accounts(str(self.runtime_dir))
+        rotation = self._cli.load_rotation()
+        operator_disabled = set(rotation.get("operator_disabled", []))
         with self._connect() as conn:
             health = {row["account"]: row["state"] for row in conn.execute("SELECT account,state FROM chatgpt_account_health")}
-        return tuple(a for a in accounts if health.get(a, "active") == "active")
+        return tuple(
+            account for account in accounts
+            if health.get(account, "active") == "active"
+            and account not in operator_disabled
+        )
 
     def _validate_create_account(self, requested_account: str) -> tuple[str, ...]:
         """Fail before enqueue when a pinned account is unhealthy or unavailable."""
@@ -287,7 +293,10 @@ class ChatGPTDirectClient:
             raise SessionOpsError("INVALID_ARGUMENT", "invalid account")
         if requested_account not in active:
             state, reason = self._account_health(requested_account)
-            if requested_account not in self._available_credential_accounts():
+            operator_disabled = set(self._cli.load_rotation().get("operator_disabled", []))
+            if requested_account in operator_disabled:
+                detail = f"account {requested_account} is operator-disabled"
+            elif requested_account not in self._available_credential_accounts():
                 detail = f"account {requested_account} has no complete credential set"
             else:
                 detail = f"account {requested_account} is unavailable ({state})"
