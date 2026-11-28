@@ -308,6 +308,18 @@ def load_config() -> dict[str, Any]:
 
     memory_adapter_command = load_memory_adapter_command()
 
+    accounts_dir = Path(required_env("SO_SENDER_ACCOUNTS_DIR")).expanduser()
+    if not accounts_dir.is_absolute() or not accounts_dir.is_dir():
+        raise RuntimeError("SO_SENDER_ACCOUNTS_DIR must be an existing absolute directory")
+    if not os.access(str(accounts_dir), os.R_OK | os.X_OK):
+        raise RuntimeError("SO_SENDER_ACCOUNTS_DIR is not readable by the MCP process")
+
+    state_dir = Path(required_env("CHATGPT_STATE_DIR")).expanduser()
+    if not state_dir.is_absolute() or not state_dir.is_dir():
+        raise RuntimeError("CHATGPT_STATE_DIR must be an existing absolute directory")
+    if not os.access(str(state_dir), os.R_OK | os.W_OK | os.X_OK):
+        raise RuntimeError("CHATGPT_STATE_DIR must be readable and writable by the MCP process")
+
     default_chatgpt_cli = Path(__file__).resolve().parents[1] / "scripts" / "chatgpt_send.py"
     configured_chatgpt_cli = os.environ.get("SO_MCP_CHATGPT_CLI", "").strip()
     chatgpt_cli_path = Path(configured_chatgpt_cli or default_chatgpt_cli).expanduser()
@@ -338,6 +350,8 @@ def load_config() -> dict[str, Any]:
         "discovery_url": discovery_url,
         "memory_adapter_command": memory_adapter_command,
         "chatgpt_cli_path": chatgpt_cli_path,
+        "chatgpt_accounts_dir": str(accounts_dir.resolve()),
+        "chatgpt_state_dir": str(state_dir.resolve()),
         "legacy_sender_db_path": legacy_sender_db_path,
     }
 
