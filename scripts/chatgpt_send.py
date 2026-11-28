@@ -157,7 +157,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pow_solver import solve  # noqa: E402
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+BASE = os.path.abspath(os.environ.get("CHATGPT_RUNTIME_DIR") or os.path.dirname(os.path.abspath(__file__)))
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36 Edg/157.0.4341.60")
 CTX = ssl.create_default_context()
@@ -2874,13 +2874,23 @@ def purge_expired(st):
     return changed
 
 
+def _effective_rotation_primary():
+    """Return the explicitly allowed logged-in accounts, or the legacy pool."""
+    raw = os.environ.get("CHATGPT_ALLOWED_ACCOUNTS")
+    if raw is None:
+        return ROTATION_PRIMARY
+    allowed = {item.strip() for item in raw.split(",") if item.strip()}
+    return tuple(account for account in ROTATION_PRIMARY if account in allowed)
+
+
 def rotation_plan(st):
-    """登录态身份（acct1/acct2/acct3/acct4/acct5/acct6）从游标起顺次尝试；不可用的排到末尾（避免死锁）。
-    匿名态不进入该计划——它只在**全部登录态**都 429 时由 anon_fallback_ready() 决定是否兜底。"""
+    """Rotate only through allowed logged-in accounts; anonymous stays separate."""
     st = _as_dict(st)
-    cur = _as_int(st.get("cursor"), 0)                          # F-34
-    n = len(ROTATION_PRIMARY)
-    seq = [ROTATION_PRIMARY[(cur + i) % n] for i in range(n)]
+    pool = _effective_rotation_primary()
+    if not pool:
+        return []
+    cur = _as_int(st.get("cursor"), 0) % len(pool)
+    seq = [pool[(cur + i) % len(pool)] for i in range(len(pool))]
     return [a for a in seq if not is_unavailable(st, a)] + [a for a in seq if is_unavailable(st, a)]
 
 
@@ -4631,7 +4641,18 @@ class ChatGPTAPI:
                 "account must be one of %s"
                 % ", ".join(sorted(_VALID_ACCOUNT_IDENTITIES))
             )
-        b = root if account in ("default", "acct1") else os.path.join(root, "accounts", account)
+        if account in ("default", "acct1"):
+            # Support both the standalone layout (acct1 at root) and the
+            # shared production layout (/var/lib/chatgpt-session-ops/accounts/acctN).
+            acct1_root = os.path.join(root, "accounts", "acct1")
+            b = (
+                acct1_root
+                if not os.path.isfile(os.path.join(root, "cookies.json"))
+                and os.path.isfile(os.path.join(acct1_root, "cookies.json"))
+                else root
+            )
+        else:
+            b = os.path.join(root, "accounts", account)
         self.account = account
         self.base_dir = b
         self.is_anon = account == "nologin"  # 匿名态：走 /backend-anon/，POST 需浏览器过 Turnstile
@@ -7643,8 +7664,9 @@ def _attempt_create(st, name, prompt_file, attempts, thinking=None):
 def _mark_success(st, name, conv, prompt_file, attempts):
     def mutate(s):
         s["created"][name] = s.get("created", {}).get(name, 0) + 1
-        if name in ROTATION_PRIMARY:
-            s["cursor"] = (ROTATION_PRIMARY.index(name) + 1) % len(ROTATION_PRIMARY)
+        pool = _effective_rotation_primary()
+        if name in pool:
+            s["cursor"] = (pool.index(name) + 1) % len(pool)
         else:
             # 兜底不推进游标：登录态恢复后仍按原均分顺序轮转，否则会白跳过一个账号的轮次
             s["fallback_uses"] = s.get("fallback_uses", 0) + 1

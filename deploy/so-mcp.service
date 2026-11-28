@@ -16,6 +16,8 @@ WorkingDirectory=/opt/so-mcp
 EnvironmentFile=/etc/so-mcp/so-mcp.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=CHATGPT_SESSION_OPS_ACCOUNTS_DIR=/var/lib/chatgpt-session-ops/accounts
+Environment=CHATGPT_SESSION_OPS_RUNTIME_DIR=/var/lib/so-mcp/chatgpt-session-ops
 
 ExecStart=/opt/so-mcp/.venv/bin/python -m scripts.run_mcp_server
 
@@ -35,7 +37,10 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 
-ReadWritePaths=/var/lib/so-mcp
+# SO-MCP now invokes the repository's session engine directly. The account
+# vault is the only additional writable path; credentials remain owned by
+# chatgpt-sender and are group-accessible only to the SO-MCP service account.
+ReadWritePaths=/var/lib/so-mcp /var/lib/chatgpt-session-ops/accounts
 
 [Install]
 WantedBy=multi-user.target

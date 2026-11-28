@@ -272,6 +272,14 @@ class MCPContractTests(unittest.TestCase):
         self.assert_success(result)
         self.assertEqual(result["data"]["status"], "paused")
 
+    def test_work_item_update_rejects_terminal_status(self):
+        result = self.dispatch(
+            "work_item.update",
+            {"work_item_id": WORK_ITEM_ID, "status": "completed"},
+        )
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["error"]["code"], "INVALID_ARGUMENT")
+
     def test_work_item_grant(self):
         result = self.dispatch(
             "work_item.grant",
@@ -1009,3 +1017,38 @@ class ArgumentValidationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChatGPTSessionArgumentContractTests(unittest.TestCase):
+    def test_session_send_requires_conversation_id(self):
+        with self.assertRaisesRegex(ValueError, "required argument missing"):
+            _validate_arguments(
+                "chatgpt.session.send",
+                {
+                    "prompt": "probe",
+                    "idempotency_key": str(uuid.uuid4()),
+                },
+            )
+
+    def test_session_send_rejects_malformed_conversation_id(self):
+        with self.assertRaisesRegex(ValueError, "invalid format"):
+            _validate_arguments(
+                "chatgpt.session.send",
+                {
+                    "conversation_id": "not-a-conversation-id",
+                    "prompt": "probe",
+                    "idempotency_key": str(uuid.uuid4()),
+                },
+            )
+
+    def test_session_send_accepts_valid_conversation_id(self):
+        args = _validate_arguments(
+            "chatgpt.session.send",
+            {
+                "conversation_id": SESSION_ID,
+                "prompt": "probe",
+                "idempotency_key": str(uuid.uuid4()),
+            },
+        )
+        self.assertEqual(args["conversation_id"], SESSION_ID)
+        self.assertEqual(args["account"], "auto")

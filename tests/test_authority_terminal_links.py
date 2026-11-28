@@ -20,7 +20,7 @@ class TerminalSessionLinkAuditTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tempdir.cleanup()
 
-    def test_terminal_transition_unlinks_and_audits_each_link(self) -> None:
+    def test_generic_terminal_transition_is_rejected_without_unlinking(self) -> None:
         for terminal_status in ("completed", "cancelled"):
             with self.subTest(status=terminal_status):
                 item = self.store.create_work_item(self.principal)
@@ -47,38 +47,29 @@ class TerminalSessionLinkAuditTests(unittest.TestCase):
                     attempt_id,
                 )
 
-                updated = self.store.set_status(
-                    self.principal,
-                    item.work_item_id,
-                    terminal_status,
-                    request_id="terminal-" + terminal_status,
-                )
-                self.assertEqual(updated.status, terminal_status)
+                from src.session_ops.work_items import InvalidTransition
 
-                # 1. A terminal WorkItem's link is absent from the default view.
+                with self.assertRaises(InvalidTransition):
+                    self.store.set_status(
+                        self.principal,
+                        item.work_item_id,
+                        terminal_status,
+                        request_id="terminal-" + terminal_status,
+                    )
                 self.assertEqual(
-                    self.store.list_sessions(self.principal, item.work_item_id), []
+                    self.store.get_work_item(self.principal, item.work_item_id).status,
+                    "active",
                 )
-
-                # 2. History remains queryable and records the unlink timestamp.
-                history = self.store.list_sessions(
-                    self.principal, item.work_item_id, include_unlinked=True
+                self.assertEqual(
+                    self.store.list_sessions(self.principal, item.work_item_id),
+                    [linked],
                 )
-                self.assertEqual(len(history), 1)
-                self.assertEqual(history[0].link_id, linked.link_id)
-                self.assertIsNotNone(history[0].unlinked_at)
-
-                # 3. Exactly one terminal-auto-unlink audit row identifies this link.
-                audit = [
-                    event
-                    for event in self.store.list_audit_events(item.work_item_id)
-                    if event["action"] == "session.auto_unlink_terminal"
-                    and event["link_id"] == linked.link_id
-                ]
-                self.assertEqual(len(audit), 1)
-                self.assertEqual(audit[0]["session_id"], session_id)
-                self.assertEqual(audit[0]["principal_id"], self.principal.principal_id)
-                self.assertEqual(audit[0]["request_id"], "terminal-" + terminal_status)
+                self.assertFalse(
+                    any(
+                        event["action"] == "session.auto_unlink_terminal"
+                        for event in self.store.list_audit_events(item.work_item_id)
+                    )
+                )
 
     def test_manual_unlink_audit_is_distinct_and_link_specific(self) -> None:
         item = self.store.create_work_item(self.principal)
@@ -187,14 +178,14 @@ class TerminalSessionLinkAuditTests(unittest.TestCase):
         self.assertEqual(historical_active[0].link_id, active_link.link_id)
         self.assertIsNotNone(historical_active[0].unlinked_at)
 
-        # 4. 终态 WorkItem：默认视图不返回，历史视图仍返回回填/解链记录。
+        # 4. Legacy terminal WorkItem rows are hidden from the default view.
+        # Their old links remain historical records; the generic public
+        # status API no longer performs terminal transitions or auto-unlinks.
         terminal_item = self.store.create_work_item(self.principal)
         terminal_link = create_link(terminal_item)
-        self.store.set_status(
-            self.principal,
-            terminal_item.work_item_id,
-            "cancelled",
-        )
+        # The lower-level migration store is used only to construct a legacy
+        # terminal fixture; public AuthorityStore writes cannot set terminal state.
+        self.store._store.set_status(terminal_item.work_item_id, "cancelled")
         self.assertEqual(
             list(
                 self.store.list_sessions(
@@ -213,7 +204,7 @@ class TerminalSessionLinkAuditTests(unittest.TestCase):
         )
         self.assertEqual(len(terminal_history), 1)
         self.assertEqual(terminal_history[0].link_id, terminal_link.link_id)
-        self.assertIsNotNone(terminal_history[0].unlinked_at)
+        self.assertIsNone(terminal_history[0].unlinked_at)
 
     def test_get_active_link_respects_owner_visibility_and_unlink(self) -> None:
         item = self.store.create_work_item(self.principal)
