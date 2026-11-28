@@ -446,7 +446,7 @@ only the message and the traceback frame differ.
 
 `SO_MCP_DB` is only checked against the literal `:memory:`, not for being
 absolute; a relative path resolves against `WorkingDirectory=/opt/so-mcp`. The
-unit is `ProtectSystem=strict` with `ReadWritePaths=/var/lib/so-mcp` and `ReadOnlyPaths=/var/lib/chatgpt-session-ops/accounts`. The database must live under `/var/lib/so-mcp` or SQLite fails to create its WAL files at runtime. The service's `chatgpt-sender` primary group grants read-only access to the existing credential vault; do not grant the MCP process write access to credentials. The WorkItem database is also the Events outbox database; a separate Events database is rejected to preserve atomic terminal-state publication.
+unit is `ProtectSystem=strict` with `ReadWritePaths=/var/lib/so-mcp` and `ReadOnlyPaths=/var/lib/chatgpt-session-ops/accounts`. The database must live under `/var/lib/so-mcp` or SQLite fails to create its WAL files at runtime. The service's `chatgpt-sender` primary group grants read-only access to the existing credential vault; do not grant the MCP process write access to credentials. Account preflight requires only read access to `cookies.json` and `access_token.txt`; cookie warm-up writes are best-effort and may be skipped on the read-only vault. Writable CLI state and prompt files stay under the runtime directory. The WorkItem database is also the Events outbox database; a separate Events database is rejected to preserve atomic terminal-state publication.
 
 `CHATGPT_SESSION_OPS_ACCOUNTS_DIR` and `CHATGPT_SESSION_OPS_RUNTIME_DIR` are the only runtime path settings for the in-process direct client. Do not override them to point into `/opt/so-mcp`: the application tree is intentionally read-only.
 
@@ -534,10 +534,16 @@ automatically after expiry. If the key/database pair is suspect, follow the
 immutable-key recovery procedure above rather than generating a replacement
 key in place.
 
-`TimeoutStopSec=45` leaves margin for the dispatcher's bounded shutdown: it
-waits at most 30 seconds for an in-flight callback/SQLite operation and 3
-seconds for its thread to exit. Keep this budget aligned with those code-level
-bounds.
+`TimeoutStopSec=1900` covers the full in-process shutdown, not just the
+event dispatcher. The dispatcher waits at most 30 seconds for an in-flight
+callback/SQLite operation and 3 seconds for its thread to exit. The ChatGPT CLI
+socket timeout can be 420 seconds in normal mode or 1800 seconds in thinking
+mode. On ASGI shutdown, `ChatGPTDirectClient.stop()` cancels queued executor
+futures (their durable DB rows remain `queued` for restart recovery) and waits
+for the single active remote operation to finish. The additional budget covers
+the 5-second Uvicorn graceful-shutdown window and margin. Do not lower this
+below 1900 seconds unless the CLI maximum is reduced and the shutdown path is
+retested.
 
 `/healthz` remains a liveness check; a 200 there does not imply event
 delivery readiness. Keep the dispatcher in-process; this endpoint adds no
