@@ -6,6 +6,7 @@ repository's SDK isolation boundary.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -566,11 +567,13 @@ class DeploymentASGI:
         issuer: str,
         audience: str,
         background_tasks: Optional[list[Any]] = None,
+        readiness_snapshot: Optional[Any] = None,
     ) -> None:
         self.inner = inner
         self.issuer = issuer
         self.audience = audience
         self.background_tasks = list(background_tasks or [])
+        self.readiness_snapshot = readiness_snapshot
 
         resource = urlsplit(audience)
         self.endpoint_path = resource.path
@@ -669,6 +672,31 @@ class DeploymentASGI:
             )
             return
 
+        if path == "/readyz" and method in ("GET", "HEAD"):
+            if self.readiness_snapshot is None:
+                readiness = {"status": "ready", "events": {"enabled": False}}
+                status_code = 200
+            else:
+                try:
+                    event_snapshot = await asyncio.to_thread(self.readiness_snapshot)
+                    dispatcher = event_snapshot.get("dispatcher", {})
+                    running = isinstance(dispatcher, dict) and dispatcher.get("running") is True
+                    readiness = {
+                        "status": "ready" if running else "degraded",
+                        "events": {"enabled": True, **event_snapshot},
+                    }
+                    status_code = 200 if running else 503
+                except Exception:
+                    # Do not leak exception messages, DB paths, or payloads.
+                    readiness = {
+                        "status": "degraded",
+                        "events": {"enabled": True, "snapshot": "unavailable"},
+                    }
+                    status_code = 503
+            body = json.dumps(readiness, separators=(",", ":"), sort_keys=True).encode("utf-8")
+            await self._respond(scope, send, status_code, body)
+            return
+
         if path == self.metadata_path and method in ("GET", "HEAD"):
             await self._respond(
                 scope,
@@ -756,12 +784,20 @@ def create_application(
     )
 
     background_tasks: list[Any] = []
+    readiness_snapshot = None
     if events_store is not None:
         def authorize_event(*, tenant_id: str, principal_id: str, job_id: str) -> bool:
             return _authorize_event_resource(
                 store, tenant_id=tenant_id, principal_id=principal_id, job_id=job_id
             )
-        background_tasks.append(MCPEventDispatcher(events_store, authorize=authorize_event))
+        dispatcher = MCPEventDispatcher(events_store, authorize=authorize_event)
+        background_tasks.append(dispatcher)
+
+        def readiness_snapshot() -> dict[str, Any]:
+            return {
+                "store": events_store.health_snapshot(),
+                "dispatcher": dispatcher.health_snapshot(),
+            }
 
     mcp_app = build_mcp_server(service, verifier, events_store=events_store)
     return DeploymentASGI(
@@ -769,6 +805,7 @@ def create_application(
         issuer=config["issuer"],
         audience=config["audience"],
         background_tasks=background_tasks,
+        readiness_snapshot=readiness_snapshot,
     )
 
 
