@@ -486,27 +486,85 @@ class OperationReceiptTests(Base):
                 request_id="link-receipt-1",
             )
 
-        unlinked = self.store.unlink_session(
-            self.alice, sid, expected_link_id=link.link_id,
-            request_id="unlink-receipt-1",
-        )
         reopened = SecureWorkItemStore(
             self.db, principal_directory=self.directory
         )
         reopened.initialize()
         self.assertEqual(
-            reopened.unlink_session(
+            reopened.link_session(
+                self.alice, sid, item.work_item_id, attempt_id,
+                request_id="link-receipt-1",
+            ),
+            link,
+        )
+        unlinked = reopened.unlink_session(
+            self.alice, sid, expected_link_id=link.link_id,
+            request_id="unlink-receipt-1",
+        )
+        restarted = SecureWorkItemStore(
+            self.db, principal_directory=self.directory
+        )
+        restarted.initialize()
+        self.assertEqual(
+            restarted.unlink_session(
                 self.alice, sid, expected_link_id=link.link_id,
                 request_id="unlink-receipt-1",
             ),
             unlinked,
         )
         with self.assertRaises(AuthorityError):
-            reopened.unlink_session(
+            restarted.unlink_session(
                 self.alice, sid, expected_link_id="sl_" + str(uuid.uuid4()),
                 request_id="unlink-receipt-1",
             )
 
+
+    def test_create_and_operation_receipt_rollback_together_before_commit(self):
+        with patch.object(
+            self.store,
+            "_operation_complete",
+            side_effect=RuntimeError("receipt completion failed"),
+        ):
+            with self.assertRaises(RuntimeError):
+                self.store.create_work_item(
+                    self.alice, request_id="atomic-create-receipt"
+                )
+
+        reopened = SecureWorkItemStore(
+            self.db, principal_directory=self.directory
+        )
+        reopened.initialize()
+        conn = reopened._connect()
+        try:
+            work_item_count = conn.execute(
+                "SELECT count(*) FROM work_items"
+            ).fetchone()[0]
+            receipt_count = conn.execute(
+                "SELECT count(*) FROM authority_operation_receipts "
+                "WHERE request_id = ?",
+                ("atomic-create-receipt",),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(work_item_count, 0)
+        self.assertEqual(receipt_count, 0)
+
+        created = reopened.create_work_item(
+            self.alice, request_id="atomic-create-receipt"
+        )
+        self.assertTrue(created.work_item_id.startswith("wi_"))
+        conn = reopened._connect()
+        try:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT count(*) FROM authority_operation_receipts "
+                    "WHERE request_id = ? AND state = 'completed'",
+                    ("atomic-create-receipt",),
+                ).fetchone()[0],
+                1,
+            )
+        finally:
+            conn.close()
 
 class LandingEvidenceTests(Base):
     def test_caller_supplied_evidence_is_rejected(self) -> None:
