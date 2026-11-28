@@ -51,6 +51,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -783,7 +784,15 @@ class TestDeploymentASGIReadiness(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload, {"status": "ready", "events": {"enabled": False}})
 
-        snapshot = {"store": {"outbox": {"pending": 3}}, "dispatcher": {"running": False}}
+        snapshot = {
+            "store": {"outbox": {
+                "pending": 3, "oldest_pending_age_seconds": 0, "retry_exhausted": 0
+            }},
+            "dispatcher": {
+                "running": False, "consecutive_errors": 0,
+                "last_loop_at": time.time(), "loop_count": 1,
+            },
+        }
         stalled = DeploymentASGI(Inner(), readiness_snapshot=lambda: snapshot, **base)
         status, payload = self._get_readyz(stalled)
         self.assertEqual(status, 503)
@@ -795,6 +804,12 @@ class TestDeploymentASGIReadiness(unittest.TestCase):
         status, payload = self._get_readyz(live)
         self.assertEqual(status, 200)
         self.assertEqual(payload["status"], "ready")
+
+        snapshot["dispatcher"]["last_loop_at"] = time.time() - 90
+        stale = DeploymentASGI(Inner(), readiness_snapshot=lambda: snapshot, **base)
+        status, payload = self._get_readyz(stale)
+        self.assertEqual(status, 503)
+        self.assertIn("dispatcher_stale", payload["reasons"])
 
 
 class TestMCPEventsRuntimeWiring(unittest.TestCase):
