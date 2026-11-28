@@ -190,6 +190,35 @@ archive makes the application tree one immutable Git snapshot.
 
 The active tree is `/opt/so-mcp`.
 
+The application tree is immutable at runtime. The service unit sets:
+
+- `CHATGPT_STATE_DIR=/var/lib/so-mcp/runtime` for account rotation, conversation
+  ownership, proxy configuration, anonymous-session state, slots, and logs.
+- `CHATGPT_AUTH_DIR=/var/lib/so-mcp` for credentials under
+  `accounts/acct1/` through `accounts/acct6/` and anonymous device state.
+
+Prepare these directories before installing credentials or starting the
+service. They must be writable by `ubuntu`; credential files remain mode `0600`.
+
+```bash
+sudo install -d -o ubuntu -g ubuntu -m 0700 \
+  /var/lib/so-mcp/runtime \
+  /var/lib/so-mcp/accounts \
+  /var/lib/so-mcp/accounts/acct1 \
+  /var/lib/so-mcp/accounts/acct2 \
+  /var/lib/so-mcp/accounts/acct3 \
+  /var/lib/so-mcp/accounts/acct4 \
+  /var/lib/so-mcp/accounts/acct5 \
+  /var/lib/so-mcp/accounts/acct6 \
+  /var/lib/so-mcp/accounts/nologin
+```
+
+Do not put mutable rotation/ownership/proxy files or live credentials under
+`/opt/so-mcp`. The CLI keeps its historical `scripts/` defaults for local use,
+but the systemd unit redirects state and credentials into `/var/lib/so-mcp`.
+If proxy configuration is file-based rather than `CHATGPT_PROXY`, place
+`proxy.json` in `/var/lib/so-mcp/runtime/`.
+
 The immediately previous tree is retained as:
 
 `/opt/so-mcp.prev-<12-character-short-sha>`
@@ -423,6 +452,12 @@ database must live under `/var/lib/so-mcp` or SQLite fails to create its WAL
 files at runtime. Use the path shown above. The same file is also what
 `scripts/chatgpt_send.py` opens for trusted WorkItem delivery (`--db`, or the
 `SO_MCP_DB` environment variable in that process), so both must name one path.
+
+The unit also sets `CHATGPT_STATE_DIR` and `CHATGPT_AUTH_DIR` to the writable
+locations documented in section 2. Do not override them to point into
+`/opt/so-mcp`: `ProtectSystem=strict` intentionally makes the application tree
+read-only, and the CLI must persist account rotation and conversation ownership
+outside it.
 
 `scripts/run_mcp_server.py` also reads `LOG_LEVEL` for the Python logger
 (`logging.basicConfig`). It is not validated, has no failure mode, and is not

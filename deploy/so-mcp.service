@@ -16,6 +16,8 @@ WorkingDirectory=/opt/so-mcp
 EnvironmentFile=/etc/so-mcp/so-mcp.env
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=CHATGPT_STATE_DIR=/var/lib/so-mcp/runtime
+Environment=CHATGPT_AUTH_DIR=/var/lib/so-mcp
 
 ExecStart=/opt/so-mcp/.venv/bin/python -m scripts.run_mcp_server
 

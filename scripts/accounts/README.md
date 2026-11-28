@@ -1,4 +1,4 @@
-# 凭据目录结构（acct2–acct6 / nologin）
+# 凭据目录结构（acct1–acct6 / nologin）
 
 **这些目录不入库**（`.gitignore` 已排除 `cookies.json` / `access_token.txt` /
 `devices/` / `device-cookie.txt`）。这里只说明**该放什么、放成什么样**，
@@ -14,8 +14,10 @@ accounts/<acct>/
 └── access_token.txt   # 纯文本，单行，无尾随换行
 ```
 
-`acct1` 是例外：它复用默认凭据根（`CHATGPT_AUTH_DIR` 或 `scripts/` 本身），
-不在 `accounts/` 下。
+`acct1` 优先使用 `accounts/acct1/`。为兼容旧版本地 CLI，如果该目录
+不存在，才回退到默认凭据根（`CHATGPT_AUTH_DIR` 或 `scripts/` 本身）。
+统一 MCP 部署时，凭据根固定为 `/var/lib/so-mcp`，因此六个登录账号统一放在
+`/var/lib/so-mcp/accounts/<acct>/`；不要把凭据放进只读的 `/opt/so-mcp` 应用树。
 
 ### cookies.json
 

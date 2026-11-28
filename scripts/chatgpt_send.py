@@ -157,7 +157,16 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pow_solver import solve  # noqa: E402
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+CODE_BASE = os.path.dirname(os.path.abspath(__file__))
+# Mutable state must not live under the immutable application tree in the MCP
+# systemd unit (ProtectSystem=strict). Local CLI use keeps the historical
+# scripts/ default; the deployed MCP sets CHATGPT_STATE_DIR under /var/lib.
+BASE = os.path.abspath(os.environ.get("CHATGPT_STATE_DIR") or CODE_BASE)
+
+
+def _auth_base():
+    """Credential root, separate from mutable runtime state when configured."""
+    return os.path.abspath(os.environ.get("CHATGPT_AUTH_DIR") or BASE)
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36 Edg/157.0.4341.60")
 CTX = ssl.create_default_context()
@@ -3846,7 +3855,7 @@ DEVICE_TRY_MAX = 8          # 一次读取最多试几个设备快照：别把 4
 
 
 def anon_device_dir():
-    return os.path.join(BASE, "accounts", "nologin", "devices")
+    return os.path.join(_auth_base(), "accounts", "nologin", "devices")
 
 
 def _read_text(path, default=""):
@@ -4448,7 +4457,7 @@ def save_device_cookie(cookie):
         return ""
     try:
         os.makedirs(anon_device_dir(), exist_ok=True)
-        _atomic_write(os.path.join(BASE, "accounts", "nologin", "device-cookie.txt"), header)
+        _atomic_write(os.path.join(_auth_base(), "accounts", "nologin", "device-cookie.txt"), header)
         if jar:
             _atomic_write(_device_jar(did), json.dumps(jar, ensure_ascii=False, indent=2))
         _atomic_write(_device_txt(did), header)
@@ -4511,7 +4520,7 @@ def device_summary():
         if d:
             counts[d] = counts.get(d, 0) + 1
     current = device_id_from_cookie(
-        _read_text(os.path.join(BASE, "accounts", "nologin", "device-cookie.txt")))
+        _read_text(os.path.join(_auth_base(), "accounts", "nologin", "device-cookie.txt")))
     rows = []
     for did in list_device_ids(limit=200):
         jar = load_device_jar(did)
@@ -4625,13 +4634,21 @@ def _filter_openai_cookies(cookies):
 class ChatGPTAPI:
     def __init__(self, base_dir=None, account="default"):
         # CHATGPT_AUTH_DIR selects credential/cache root; account data stays isolated.
-        root = base_dir or os.environ.get("CHATGPT_AUTH_DIR") or BASE
+        root = os.path.abspath(base_dir or _auth_base())
         if account not in _VALID_ACCOUNT_IDENTITIES:
             raise ValueError(
                 "account must be one of %s"
                 % ", ".join(sorted(_VALID_ACCOUNT_IDENTITIES))
             )
-        b = root if account in ("default", "acct1") else os.path.join(root, "accounts", account)
+        if account == "default":
+            b = root
+        elif account == "acct1":
+            # Prefer the explicit per-account layout used by deployed vaults;
+            # retain the historical root-level acct1 layout for local users.
+            acct1_dir = os.path.join(root, "accounts", "acct1")
+            b = acct1_dir if os.path.isdir(acct1_dir) else root
+        else:
+            b = os.path.join(root, "accounts", account)
         self.account = account
         self.base_dir = b
         self.is_anon = account == "nologin"  # 匿名态：走 /backend-anon/，POST 需浏览器过 Turnstile
@@ -4668,7 +4685,7 @@ class ChatGPTAPI:
 
     # ---------- 匿名态设备身份 ----------
     def device_cookie_path(self):
-        return os.path.join(BASE, "accounts", "nologin", "device-cookie.txt")
+        return os.path.join(_auth_base(), "accounts", "nologin", "device-cookie.txt")
 
     def ensure_device_cookie(self, refresh=False):
         """匿名态的 cookie 来源：优先当前浏览器，其次上次落盘的 device-cookie.txt。"""

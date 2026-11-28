@@ -25,3 +25,6 @@ def test_service_uses_the_immutable_runtime_artifact():
     assert "WorkingDirectory=/opt/so-mcp" in service
     assert "ExecStart=/opt/so-mcp/.venv/bin/python -m scripts.run_mcp_server" in service
     assert "SenderGatewayClient" not in service
+    assert "Environment=CHATGPT_STATE_DIR=/var/lib/so-mcp/runtime" in service
+    assert "Environment=CHATGPT_AUTH_DIR=/var/lib/so-mcp" in service
+    assert "ReadWritePaths=/var/lib/so-mcp" in service
