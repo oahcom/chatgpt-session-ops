@@ -268,6 +268,20 @@ class TestPinnedHTTPSConnectionConnect(unittest.TestCase):
             context=context,
         )
 
+    def test_connection_without_total_deadline_does_not_retain_watchdog_socket(self):
+        local, peer = socket.socketpair()
+        connection = self.make_connection(_FakeTLSContext())
+        try:
+            with patch(
+                "src.session_ops.mcp_auth.socket.create_connection",
+                return_value=local,
+            ):
+                connection.connect()
+            self.assertIsNone(connection._watchdog_sock)
+        finally:
+            connection.close()
+            peer.close()
+
     def test_proxy_tunnel_refused_before_dial(self):
         dialled = []
         connection = self.make_connection(_FakeTLSContext())

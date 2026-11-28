@@ -724,7 +724,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
                     sock.close()
                     raise TimeoutError("HTTPS request exceeded its total deadline")
                 self.sock = sock
-                self._watchdog_sock = sock
+                self._watchdog_sock = sock if self._deadline is not None else None
             if self._deadline is not None:
                 remaining = self._deadline - time.monotonic()
                 if remaining <= 0:
@@ -746,7 +746,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
                     self.sock = None
                     raise TimeoutError("HTTPS request exceeded its total deadline")
                 self.sock = wrapped
-                self._watchdog_sock = wrapped
+                self._watchdog_sock = wrapped if self._deadline is not None else None
                 if self._deadline is not None:
                     remaining = self._deadline - time.monotonic()
                     if remaining <= 0:
