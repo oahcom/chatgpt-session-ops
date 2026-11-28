@@ -138,6 +138,8 @@ test ! -e "$TMP"
 install -d -o ubuntu -g ubuntu -m 0750 "$TMP"
 git archive --format=tar "$COMMIT" \
   scripts/run_mcp_server.py \
+  scripts/chatgpt_send.py \
+  scripts/pow_solver.py \
   src \
   requirements-mcp.txt \
   tools/verify_deploy.py \
@@ -149,7 +151,11 @@ script. Check the extracted tree before switching production:
 
 ```bash
 test -f "$TMP/scripts/run_mcp_server.py"
+test -f "$TMP/scripts/chatgpt_send.py"
+test -f "$TMP/scripts/pow_solver.py"
 test -f "$TMP/src/session_ops/authority.py"
+test -f "$TMP/src/session_ops/chatgpt_cli.py"
+test -f "$TMP/src/session_ops/chatgpt_sessions.py"
 test -f "$TMP/src/session_ops/mcp_auth.py"
 test -f "$TMP/src/session_ops/mcp_server.py"
 test -f "$TMP/src/session_ops/memory_adapter_client.py"
@@ -163,11 +169,9 @@ test ! -e "$TMP/deploy"
 test ! -e "$TMP/docs"
 test ! -e "$TMP/references"
 test ! -e "$TMP/.github"
-test ! -e "$TMP/scripts/chatgpt_send.py"
 test ! -e "$TMP/scripts/continue_full.py"
 test ! -e "$TMP/scripts/extract_auth.py"
 test ! -e "$TMP/scripts/mcp_connector.py"
-test ! -e "$TMP/scripts/pow_solver.py"
 test ! -e "$TMP/scripts/accounts"
 ```
 
@@ -347,7 +351,9 @@ RuntimeError: required environment variable is missing: SO_MCP_ISSUER
 
 Create the file as `root:root` mode `0600`. systemd reads it before the service
 process starts, while it still has the privileges to read a root-only file, so
-`0600` does not stop `User=ubuntu` from receiving the values.
+`0600` does not stop `User=ubuntu` from receiving the values. The unit also adds
+`SupplementaryGroups=chatgpt-sender` so the MCP process can access the account
+credentials without changing its primary service identity.
 
 ```bash
 sudo install -d -o root -g root -m 0755 /etc/so-mcp
@@ -361,7 +367,7 @@ file produces a hash for something that cannot start the service.
 
 ### Example file
 
-Copy this to `/etc/so-mcp/so-mcp.env` and replace the four required values.
+Copy this to `/etc/so-mcp/so-mcp.env` and replace the required values.
 The optional lines are commented out and show each variable's default.
 
 ```ini
@@ -374,6 +380,12 @@ SO_MCP_ISSUER=https://auth.example.com/realms/so-mcp
 SO_MCP_AUDIENCE=https://mcp.example.com/so-mcp
 SO_MCP_DB=/var/lib/so-mcp/work-items.sqlite3
 SO_MCP_TENANT_CLAIM=tenant_id
+SO_SENDER_ACCOUNTS_DIR=/var/lib/chatgpt-session-ops/accounts
+CHATGPT_STATE_DIR=/var/lib/chatgpt-session-ops
+
+# --- one-time migration from the retired Sender Gateway database ---
+SO_MCP_LEGACY_SENDER_DB=/var/lib/chatgpt-session-ops/state/sender-gateway.sqlite3
+SO_SENDER_ACCOUNT_LOCK_DIR=/var/lib/chatgpt-session-ops/state/account-locks
 
 # --- optional; uncomment only to override the default shown ---
 #SO_MCP_REALM_NAMESPACE=so-mcp
@@ -392,6 +404,11 @@ SO_MCP_TENANT_CLAIM=tenant_id
 | `SO_MCP_AUDIENCE` | required | none | Absolute `https://` URL with a path below `/`. No credentials, query, or fragment. | `required environment variable is missing: SO_MCP_AUDIENCE` / `SO_MCP_AUDIENCE must be an absolute HTTPS URL` / `SO_MCP_AUDIENCE must contain a non-root resource path` / `SO_MCP_AUDIENCE must not contain a query or fragment` |
 | `SO_MCP_DB` | required | none | Path to a persistent SQLite file. The literal string `:memory:` is rejected. | `required environment variable is missing: SO_MCP_DB` / `SO_MCP_DB must be a persistent filesystem path` |
 | `SO_MCP_TENANT_CLAIM` | required | none | Name of the access-token claim that carries the tenant identifier. Only checked non-empty at load time. | `required environment variable is missing: SO_MCP_TENANT_CLAIM` |
+| `SO_SENDER_ACCOUNTS_DIR` | required | none | Absolute readable directory containing dynamic `acctN` credential directories. | `SO_SENDER_ACCOUNTS_DIR must be an existing absolute directory` / `not readable by the MCP process` |
+| `CHATGPT_STATE_DIR` | required | none | Absolute writable runtime state directory for account rotation, conversation mapping, proxy config and logs. | `CHATGPT_STATE_DIR must be an existing absolute directory` / `must be readable and writable by the MCP process` |
+| `SO_MCP_LEGACY_SENDER_DB` | optional during fresh installs; required for this migration | unset | Existing absolute Sender Gateway SQLite database. Only `session_owners` is imported once; jobs and outbox rows are not migrated. | `SO_MCP_LEGACY_SENDER_DB must name an existing absolute database path` |
+| `SO_SENDER_ACCOUNT_LOCK_DIR` | optional | `/var/lib/chatgpt-session-ops/state/account-locks` | Shared cross-process account lock directory used by the CLI. | CLI reports account lock unavailable |
+
 | `SO_MCP_REALM_NAMESPACE` | optional | derived from `SO_MCP_ISSUER` | Keycloak realm name: `[A-Za-z0-9][A-Za-z0-9._-]{0,47}`. | omitted and underivable: `cannot derive realm namespace from SO_MCP_ISSUER; set SO_MCP_REALM_NAMESPACE explicitly`; set but malformed: `valid realm_namespace is required` |
 | `SO_MCP_HOST` | optional | `127.0.0.1` | Bind address. Section 2a constrains this to loopback; only `127.0.0.1` or `::1` are accepted at startup. | `SO_MCP_HOST must not be empty and must be loopback-only; only 127.0.0.1 or ::1 are allowed` |
 | `SO_MCP_PORT` | optional | `8791` | Integer 1–65535. | `SO_MCP_PORT must be an integer` / `SO_MCP_PORT must be between 1 and 65535` |
@@ -403,7 +420,8 @@ Where each check runs:
 
 - `load_config()` in `scripts/run_mcp_server.py` validates `SO_MCP_ISSUER`,
   `SO_MCP_AUDIENCE`, `SO_MCP_DB`, `SO_MCP_TENANT_CLAIM`, `SO_MCP_HOST`,
-  `SO_MCP_PORT` and `UVICORN_LOG_LEVEL`, derives `SO_MCP_REALM_NAMESPACE`, and
+  `SO_MCP_PORT`, `UVICORN_LOG_LEVEL`, `SO_SENDER_ACCOUNTS_DIR` and
+  `CHATGPT_STATE_DIR`, derives `SO_MCP_REALM_NAMESPACE`, and
   calls `load_memory_adapter_command()` for `SO_MCP_MEMORY_STDIO`.
 - The realm-name syntax and `SO_MCP_DISCOVERY_URL` are validated when
   `JWTVerifier` is constructed in `create_application()`.
@@ -1357,3 +1375,51 @@ observed values for that deployment.
 verifier that did not yet report the field. Do not back-fill a value that was
 never measured, and do not omit the line: a reader must be able to tell
 "not applicable" from "not recorded".
+
+
+## 2c. Direct ChatGPT execution (no Sender Gateway)
+
+The MCP server executes `scripts/chatgpt_send.py` directly in a subprocess from
+its own process. `chatgpt.session.create` and `chatgpt.session.send` are
+synchronous: the tool call returns the completed CLI result. There is no
+separate Sender HTTP service, sender job queue, JobStore, or sender Worker.
+
+The MCP process remains `User=ubuntu` and receives only the supplementary
+`chatgpt-sender` group. Before starting it, grant that group the required access
+to the account and state directories:
+
+```bash
+sudo chgrp -R chatgpt-sender /var/lib/chatgpt-session-ops
+sudo find /var/lib/chatgpt-session-ops -type d -exec chmod 2770 {} +
+sudo find /var/lib/chatgpt-session-ops -type f -exec chmod 0660 {} +
+```
+
+`CHATGPT_STATE_DIR` is `/var/lib/chatgpt-session-ops`; `SO_SENDER_ACCOUNTS_DIR`
+is `/var/lib/chatgpt-session-ops/accounts`. This preserves the existing CLI
+rotation, conversation map, proxy file, logs and account-lock directory without
+keeping the CLI code under `/opt/so-sender`.
+
+Before switching the service, copy the existing runtime state files once. Do
+not overwrite a destination that already exists with different content:
+
+```bash
+STATE=/var/lib/chatgpt-session-ops
+for name in account-rotation.json conv-accounts.json conv-accounts.json.highwater.json proxy.json; do
+  src="/opt/so-sender/cli/$name"
+  dst="$STATE/$name"
+  test -f "$src"
+  if test -e "$dst"; then
+    cmp -s "$src" "$dst" || { echo "state conflict: $dst" >&2; exit 1; }
+  else
+    sudo install -o chatgpt-sender -g chatgpt-sender -m 0600 "$src" "$dst"
+  fi
+done
+```
+
+On first startup, `SO_MCP_LEGACY_SENDER_DB` is read-only migration input. The
+MCP process imports only the legacy `session_owners` mapping rows into
+`chatgpt_session_owners` in `SO_MCP_DB`, guarded by a one-time migration marker.
+It does not import legacy jobs or outbox events: those are historical Gateway
+records, not part of the synchronous execution contract. Keep the old database
+as an archive until the deployment has passed verification. Drain any queued
+or running jobs before disabling `so-sender.service`.
