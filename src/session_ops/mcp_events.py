@@ -19,6 +19,7 @@ import urllib.error
 import urllib.request
 import uuid
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from src.session_ops.authority import UnconfirmedSession, validate_conversation_id
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -262,7 +263,7 @@ class MCPEventsStore:
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "conversation_id": {"type": "string", "minLength": 1, "description": "The exact ChatGPT Work conversation to receive events for."},
+                    "conversation_id": {"type": "string", "minLength": 36, "maxLength": 36, "description": "The exact canonical ChatGPT Work conversation UUID to receive events for."},
                     "job_id": {"type": "string", "description": "Optional WorkItem ID to monitor within this conversation."}
                 },
                 "required": ["conversation_id"],
@@ -334,6 +335,10 @@ class MCPEventsStore:
         ):
             raise ValueError("a conversation_id-scoped chatgpt.job.completed subscription is required")
         conversation_id = arguments["conversation_id"]
+        try:
+            validate_conversation_id(conversation_id)
+        except UnconfirmedSession as exc:
+            raise ValueError("conversation_id must be a canonical lowercase UUID") from exc
         job_id = arguments.get("job_id")
         if job_id is not None:
             # Completion events are owned and published by the WorkItem

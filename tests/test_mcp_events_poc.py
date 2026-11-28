@@ -46,7 +46,7 @@ class MCPEventsStoreTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def subscribe(self, **kwargs):
-        kwargs.setdefault("conversation_id", "test-conversation")
+        kwargs.setdefault("conversation_id", "12345678-1234-4234-8234-123456789abc")
         return self.store.subscribe(self.auth, {
             "name": "chatgpt.job.completed",
             "arguments": kwargs,
@@ -54,7 +54,7 @@ class MCPEventsStoreTests(unittest.TestCase):
         })
 
     def publish_job_completed(self, *args, **kwargs):
-        kwargs.setdefault("conversation_id", "test-conversation")
+        kwargs.setdefault("conversation_id", "12345678-1234-4234-8234-123456789abc")
         return self.store.publish_job_completed(*args, **kwargs)
 
     def test_event_catalog_requires_conversation_scoped_payload(self):
@@ -62,8 +62,16 @@ class MCPEventsStoreTests(unittest.TestCase):
         properties = definition["payloadSchema"]["properties"]
         required = definition["payloadSchema"]["required"]
         self.assertEqual(properties["conversation_id"], {"type": "string"})
+        input_property = definition["inputSchema"]["properties"]["conversation_id"]
+        self.assertEqual(input_property["minLength"], 36)
+        self.assertEqual(input_property["maxLength"], 36)
         self.assertIn("conversation_id", required)
         self.assertNotIn("conversation_ids", properties)
+
+    def test_subscribe_rejects_noncanonical_conversation_id_before_callback(self):
+        with self.assertRaisesRegex(ValueError, "canonical lowercase UUID"):
+            self.subscribe(conversation_id="not-a-session-id")
+        self.assertEqual(self.callback.requests, [])
 
     def test_subscribe_verifies_challenge_and_persists_subscription(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
@@ -109,13 +117,13 @@ class MCPEventsStoreTests(unittest.TestCase):
             with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
                 finite = store.subscribe(auth, {
                     "name": "chatgpt.job.completed",
-                    "arguments": {"job_id": "job-cleanup", "conversation_id": "test-conversation"},
+                    "arguments": {"job_id": "job-cleanup", "conversation_id": "12345678-1234-4234-8234-123456789abc"},
                     "delivery": delivery,
                     "ttlMs": 60_000,
                 })
                 permanent = store.subscribe(auth, {
                     "name": "chatgpt.job.completed",
-                    "arguments": {"conversation_id": "test-conversation"},
+                    "arguments": {"conversation_id": "12345678-1234-4234-8234-123456789abc"},
                     "delivery": {
                         **delivery,
                         "url": "https://events.example.test/permanent",
@@ -126,7 +134,7 @@ class MCPEventsStoreTests(unittest.TestCase):
                 "tenant-a", "issuer:user-a", "job-cleanup", "Finished",
                 event_id="evt_cleanup_old",
                 completed_at="2027-01-01T00:00:00Z",
-                conversation_id="test-conversation",
+                conversation_id="12345678-1234-4234-8234-123456789abc",
             )
             self.assertEqual(store.deliver_pending(), 2)
             now[0] += 31 * 24 * 60 * 60
@@ -178,7 +186,7 @@ class MCPEventsStoreTests(unittest.TestCase):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             subscription = self.store.subscribe(self.auth, {
                 "name": "chatgpt.job.completed",
-                "arguments": {"job_id": "job-expires-during-auth", "conversation_id": "test-conversation"},
+                "arguments": {"job_id": "job-expires-during-auth", "conversation_id": "12345678-1234-4234-8234-123456789abc"},
                 "delivery": self.delivery,
                 "ttlMs": 60_000,
             })
@@ -334,7 +342,7 @@ class MCPEventsStoreTests(unittest.TestCase):
             new_secret = "whsec_" + base64.b64encode(b"n" * 32).decode()
             refreshed = self.store.subscribe(self.auth, {
                 "name": "chatgpt.job.completed",
-                "arguments": {"job_id": "rotation-task", "conversation_id": "test-conversation"},
+                "arguments": {"job_id": "rotation-task", "conversation_id": "12345678-1234-4234-8234-123456789abc"},
                 "delivery": {**self.delivery, "secret": new_secret},
             })
         self.assertEqual(first["id"], refreshed["id"])
@@ -455,7 +463,7 @@ class MCPEventsStoreTests(unittest.TestCase):
 
     def test_null_ttl_means_no_expiration(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
-            result = self.store.subscribe(self.auth, {"name": "chatgpt.job.completed", "arguments": {"conversation_id": "test-conversation"}, "delivery": self.delivery, "ttlMs": None})
+            result = self.store.subscribe(self.auth, {"name": "chatgpt.job.completed", "arguments": {"conversation_id": "12345678-1234-4234-8234-123456789abc"}, "delivery": self.delivery, "ttlMs": None})
         self.assertIsNone(result["refreshBefore"])
 
     def test_new_database_parent_is_created_private(self):
@@ -490,7 +498,7 @@ class MCPEventsStoreTests(unittest.TestCase):
         )
         self.store.unsubscribe(self.auth, {
             "name": "chatgpt.job.completed",
-            "arguments": {"job_id": "job-unsubscribe-pending", "conversation_id": "test-conversation"},
+            "arguments": {"job_id": "job-unsubscribe-pending", "conversation_id": "12345678-1234-4234-8234-123456789abc"},
             "delivery": {"url": self.delivery["url"]},
         })
         self.assertEqual(self.store.deliver_pending(), 0)
@@ -525,8 +533,8 @@ class MCPEventsStoreTests(unittest.TestCase):
     def test_unsubscribe_is_owner_scoped_and_idempotent(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
             self.subscribe()
-        self.store.unsubscribe(self.auth, {"name": "chatgpt.job.completed", "arguments": {"conversation_id": "test-conversation"}, "delivery": {"url": self.delivery["url"]}})
-        self.store.unsubscribe(self.auth, {"name": "chatgpt.job.completed", "arguments": {"conversation_id": "test-conversation"}, "delivery": {"url": self.delivery["url"]}})
+        self.store.unsubscribe(self.auth, {"name": "chatgpt.job.completed", "arguments": {"conversation_id": "12345678-1234-4234-8234-123456789abc"}, "delivery": {"url": self.delivery["url"]}})
+        self.store.unsubscribe(self.auth, {"name": "chatgpt.job.completed", "arguments": {"conversation_id": "12345678-1234-4234-8234-123456789abc"}, "delivery": {"url": self.delivery["url"]}})
         with self.store._db() as db:
             self.assertEqual(db.execute("SELECT count(*) FROM event_subscriptions WHERE active=1").fetchone()[0], 0)
 
@@ -540,7 +548,7 @@ class MCPEventsStoreTests(unittest.TestCase):
         )
         self.store.unsubscribe(self.auth, {
             "name": "chatgpt.job.completed",
-            "arguments": {"job_id": "job-generation", "conversation_id": "test-conversation"},
+            "arguments": {"job_id": "job-generation", "conversation_id": "12345678-1234-4234-8234-123456789abc"},
             "delivery": {"url": self.delivery["url"]},
         })
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
