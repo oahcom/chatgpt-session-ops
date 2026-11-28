@@ -150,9 +150,22 @@ API_BASE = os.environ.get("CHATGPT_BASE", "https://chatgpt.com").rstrip("/")
 # 优先登录态：acct1 / acct2 / acct3 / acct4 / acct5 / acct6 均分轮转；nologin（匿名）只作兜底——
 # 实测匿名会话不进任何会话历史（list 返回 0 条），随时可能被服务端回收，
 # 仅按 conv_id 在短期内可读，因此只在全部登录态都 429 时启用。
+# acct4 is auth-revoked and acct5 is operator-disabled; neither is routable.
 ROTATION_ORDER = ("acct1", "acct2", "acct3", "acct4", "acct5", "acct6", "nologin")
-ROTATION_PRIMARY = ("acct1", "acct2", "acct3", "acct4", "acct5", "acct6")
+ROTATION_PRIMARY = ("acct1", "acct2", "acct3", "acct6")
 ROTATION_FALLBACK = ("nologin",)
+
+def _effective_rotation_primary():
+    """Use the gateway's discovered, health-filtered accounts when supplied."""
+    raw = os.environ.get("CHATGPT_ALLOWED_ACCOUNTS")
+    if raw is None:
+        return ROTATION_PRIMARY
+    allowed = {
+        part.strip() for part in raw.split(",")
+        if part.strip().startswith("acct") and part.strip()[4:].isdigit()
+    }
+    return tuple(sorted(allowed, key=lambda name: int(name[4:])))
+
 ROTATION_FILE = os.path.join(BASE, "account-rotation.json")
 CONV_MAP_FILE = os.path.join(BASE, "conv-accounts.json")
 ANON_SESSIONS_FILE = os.path.join(BASE, "anon-sessions.json")
@@ -207,11 +220,14 @@ def cli_id(value):
 
 
 def _harden_perms(path):
-    """凭据/状态文件在 POSIX 上收成 0600；Windows 无此语义，静默跳过。"""
+    """Keep secrets 0600; rotation counters are group-readable by the service operator."""
     if os.name != "posix":
         return
+    rotation_path = globals().get("ROTATION_FILE")
     try:
-        os.chmod(path, 0o600)
+        mode = (0o640 if rotation_path and
+                os.path.abspath(path) == os.path.abspath(rotation_path) else 0o600)
+        os.chmod(path, mode)
     except OSError:
         pass
 
@@ -1157,21 +1173,21 @@ def _load_json(path, default):
         return data
     except FileNotFoundError:
         return copy.deepcopy(default)
-    except (OSError, ValueError) as e:   # JSONDecodeError 是 ValueError 子类
+    except OSError:
+        # Permission/I/O failures say nothing about JSON integrity. Never rename
+        # an unreadable file as corrupt or return an empty state that can later
+        # overwrite the original data. Let the caller fail closed.
+        raise
+    except ValueError as e:   # JSONDecodeError / invalid top-level shape only
+        bad = "%s.corrupt-%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
         try:
-            size = os.path.getsize(path)
-        except OSError:
-            size = 0
-        if size > 0:
-            bad = "%s.corrupt-%s" % (path, time.strftime("%Y%m%d-%H%M%S"))
-            try:
-                os.replace(path, bad)
-                print("WARN: 状态文件损坏已隔离 %s -> %s（后续按空状态重建，旧内容在隔离文件里）"
-                      % (os.path.basename(path), os.path.basename(bad)), flush=True)
-                return copy.deepcopy(default)
-            except OSError:
-                pass
-        print("WARN: 读取 %s 失败：%s" % (os.path.basename(path), e), flush=True)
+            os.replace(path, bad)
+        except OSError as quarantine_error:
+            # If quarantine cannot be completed, stop; do not continue with an
+            # empty state that a later save could overwrite.
+            raise quarantine_error from e
+        print("WARN: 状态文件损坏已隔离 %s -> %s（后续按空状态重建，旧内容在隔离文件里）"
+              % (os.path.basename(path), os.path.basename(bad)), flush=True)
         return copy.deepcopy(default)
 
 
@@ -2508,7 +2524,7 @@ def _normalize_rotation(st):
     st["order"] = order
     # 游标只在登录态身份之间推进（匿名是兜底，不参与均分）；
     # _as_int 不折叠 bool/float，垃圾游标归零而不是猜一个下标
-    st["cursor"] = _as_int(st.get("cursor"), 0) % len(ROTATION_PRIMARY)
+    st["cursor"] = _as_int(st.get("cursor"), 0) % max(len(_effective_rotation_primary()), 1)
     created, failures = _as_dict(st.get("created")), _as_dict(st.get("failures"))
     for a in order:
         created[a] = _as_int(created.get(a), 0)
@@ -2597,8 +2613,12 @@ def rotation_plan(st):
     匿名态不进入该计划——它只在**全部登录态**都 429 时由 anon_fallback_ready() 决定是否兜底。"""
     st = _as_dict(st)
     cur = _as_int(st.get("cursor"), 0)                          # F-34
-    n = len(ROTATION_PRIMARY)
-    seq = [ROTATION_PRIMARY[(cur + i) % n] for i in range(n)]
+    pool = _effective_rotation_primary()
+    n = len(pool)
+    if not n:
+        return []
+    cur %= n
+    seq = [pool[(cur + i) % n] for i in range(n)]
     return [a for a in seq if not is_unavailable(st, a)] + [a for a in seq if is_unavailable(st, a)]
 
 
@@ -2687,7 +2707,9 @@ def _normalize_conv_registry_record(conv_id, raw):
         return None, "conversation id requires normalization"
 
     if isinstance(raw, str):
-        if not validate_account_identity(raw):
+        # Historical ownership must survive even when an account is currently
+        # disabled for routing. Validate identity, not present-day health.
+        if raw not in _VALID_ACCOUNT_IDENTITIES:
             return None, "invalid legacy account identity"
 
         return {
@@ -2701,7 +2723,9 @@ def _normalize_conv_registry_record(conv_id, raw):
 
     account = raw.get("account")
 
-    if not validate_account_identity(account):
+    # Preserve a disabled account's historical owner; health gating happens
+    # at routing/read/send boundaries, never by rewriting ownership metadata.
+    if account not in _VALID_ACCOUNT_IDENTITIES:
         return None, "invalid or missing account identity"
 
     # Preserve every existing field, including note and free-form owner.
@@ -3290,16 +3314,24 @@ def restore_conv_map_minimal(candidate):
     }
 
 
-_VALID_ACCOUNT_IDENTITIES = frozenset((
-    "default",
-    "acct1",
-    "acct2",
-    "acct3",
-    "acct4",
-    "acct5",
-    "acct6",
-    "nologin",
-))
+def _discover_account_identities():
+    """Discover configured acctN identities; adding credentials needs no code edit."""
+    from pathlib import Path
+    names = {"acct1", "acct2", "acct3", "acct4", "acct5", "acct6"}
+    roots = [Path(os.environ.get("SO_SENDER_ACCOUNTS_DIR", "")), Path(BASE) / "accounts"]
+    for root in roots:
+        if root.is_dir():
+            names.update(
+                entry.name for entry in root.iterdir()
+                if entry.is_dir() and entry.name.startswith("acct")
+                and entry.name[4:].isdigit()
+                and (entry / "cookies.json").is_file()
+                and (entry / "access_token.txt").is_file()
+            )
+    return frozenset({"default", "nologin", *names})
+
+
+_VALID_ACCOUNT_IDENTITIES = _discover_account_identities()
 
 
 def normalize_account_identity(account):
@@ -3317,12 +3349,14 @@ def normalize_account_identity(account):
 
 
 def validate_account_identity(account):
-    """Return True only for a configured account identity."""
+    """Return True only for an account in the effective routing allowlist."""
     try:
-        normalize_account_identity(account)
-        return True
+        normalized = normalize_account_identity(account)
     except ValueError:
         return False
+    if normalized == "nologin":
+        return True
+    return normalized in _effective_rotation_primary()
 
 
 def lookup_conversation_owner(conv_id):
@@ -4686,6 +4720,9 @@ class ChatGPTAPI:
                 return self.tail_from_mapping(body), body
             kind = self.classify_failure(st, body)
             _line = "GET %s -> %s (try %d, 定性=%s)" % (id8(conv_id), st, attempt + 1, kind)
+            if st == 429:
+                print(_line, file=sys.stderr, flush=True)
+                return None, None
             if st in (401, 403):
                 # 401/403 fail-fast（Owner 裁定）：只允许一次 GET，不重试、不睡眠、不换号。
                 # 走 stderr：--json 读取路径会 redirect_stdout，Sidecar 仍须看到 `-> 401`。
@@ -7193,8 +7230,8 @@ def _attempt_create(st, name, prompt_file, attempts, thinking=None):
 def _mark_success(st, name, conv, prompt_file, attempts):
     def mutate(s):
         s["created"][name] = s.get("created", {}).get(name, 0) + 1
-        if name in ROTATION_PRIMARY:
-            s["cursor"] = (ROTATION_PRIMARY.index(name) + 1) % len(ROTATION_PRIMARY)
+        if name in _effective_rotation_primary():
+            s["cursor"] = (_effective_rotation_primary().index(name) + 1) % len(_effective_rotation_primary())
         else:
             # 兜底不推进游标：登录态恢复后仍按原均分顺序轮转，否则会白跳过一个账号的轮次
             s["fallback_uses"] = s.get("fallback_uses", 0) + 1
@@ -7230,7 +7267,7 @@ def create_chat_rotating(prompt_file, thinking=None):
 
     outcomes, attempts, skipped = {}, [], {}
 
-    for name in ROTATION_PRIMARY:
+    for name in _effective_rotation_primary():
         if is_unavailable(st, name):
             reason = _as_dict(
                 _as_dict(st.get("unavailable")).get(name)
@@ -7317,7 +7354,7 @@ def create_chat_rotating(prompt_file, thinking=None):
 
     all_thinking_unavailable = all(
         is_thinking_unavailable(outcomes.get(name))
-        for name in ROTATION_PRIMARY
+        for name in _effective_rotation_primary()
     )
 
     if thinking_requested and all_thinking_unavailable:
@@ -7398,14 +7435,15 @@ def create_chat_rotating(prompt_file, thinking=None):
 def rotation_summary():
     st = load_rotation()
     created = st.get("created", {})
-    prim = {a: _as_float(created.get(a), 0.0) for a in ROTATION_PRIMARY}   # F-30
+    pool = _effective_rotation_primary()
+    prim = {a: _as_float(created.get(a), 0.0) for a in pool}   # F-30
     prim_total = sum(prim.values()) or 1
     return {
-        "policy": "acct1/acct2/acct3/acct4/acct5/acct6 均分轮转；nologin 仅在全部 429 时兜底（其会话不入历史）",
-        "primary": list(ROTATION_PRIMARY),
+        "policy": "仅在持久化健康 allowlist 内轮转；nologin 仅在全部允许账号 429 时兜底",
+        "primary": list(pool),
         "fallback": list(ROTATION_FALLBACK),
         "cursor": st["cursor"],
-        "next": ROTATION_PRIMARY[st["cursor"]],
+        "next": (pool[st["cursor"] % len(pool)] if pool else None),
         "created": created,
         # share 只在登录态之间算，兜底的匿名次数单列，避免把 1/3 当成「没均分好」
         "share": {k: round(v / float(prim_total), 2) for k, v in prim.items()},
@@ -7800,6 +7838,17 @@ def _cli_print_json(payload):
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
+def _cli_retry_after_seconds(api, default=60):
+    """Expose upstream Retry-After/reset metadata without contaminating JSON stdout."""
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            value = api._retry_after(default, getattr(api, "last_body", None))
+        value = float(value)
+    except Exception:
+        value = float(default)
+    return max(1, min(3600, int(value + 0.999)))
+
+
 def _cli_flag_present(args, flag):
     return any(a == flag for a in args)
 
@@ -7964,9 +8013,12 @@ def _cli_list_result(account):
         return 1
     error = error or ""
     if status != 200:
-        _cli_print_json({"event": "list_result", "ok": False,
-                         "reason": error or "http_error",
-                         "http_status": status})
+        payload = {"event": "list_result", "ok": False,
+                   "reason": "rate_limited" if status == 429 else (error or "http_error"),
+                   "http_status": status}
+        if status == 429:
+            payload["retry_after_seconds"] = _cli_retry_after_seconds(api)
+        _cli_print_json(payload)
         return 1
     conversations = []
     for item in items if isinstance(items, list) else []:
@@ -8046,14 +8098,23 @@ def _cli_read_result(argv, account, explicit_account):
         with contextlib.redirect_stdout(io.StringIO()):
             _tail, raw = api.live_tail(conv_id, tries=2)
     except Exception as e:
-        _cli_print_json({"event": "read_result", "ok": False,
-                         "reason": "read_failed",
-                         "conversation_id": conv_id, "detail": str(e)})
+        status = getattr(api, "last_status", None)
+        payload = {"event": "read_result", "ok": False,
+                   "reason": "rate_limited" if status == 429 else "read_failed",
+                   "http_status": status, "conversation_id": conv_id,
+                   "detail": str(e)}
+        if status == 429:
+            payload["retry_after_seconds"] = _cli_retry_after_seconds(api)
+        _cli_print_json(payload)
         return 1
     if not raw:
-        _cli_print_json({"event": "read_result", "ok": False,
-                         "reason": "read_failed",
-                         "conversation_id": conv_id})
+        status = getattr(api, "last_status", None)
+        payload = {"event": "read_result", "ok": False,
+                   "reason": "rate_limited" if status == 429 else "read_failed",
+                   "http_status": status, "conversation_id": conv_id}
+        if status == 429:
+            payload["retry_after_seconds"] = _cli_retry_after_seconds(api)
+        _cli_print_json(payload)
         return 1
 
     messages, complete = _cli_mapping_messages(raw)
@@ -8140,9 +8201,12 @@ def _cli_send_result(api, conv_id, prompt_file, account, thinking=None):
         else:
             reason = "business_status_unverified"
 
-    _cli_print_json({"event": "send_result", "ok": ok, "account": account,
-                     "conversation_id": conv_id, "http_status": http_status,
-                     "business_status": None, "reason": reason})
+    payload = {"event": "send_result", "ok": ok, "account": account,
+               "conversation_id": conv_id, "http_status": http_status,
+               "business_status": None, "reason": reason}
+    if http_status == 429:
+        payload["retry_after_seconds"] = _cli_retry_after_seconds(api)
+    _cli_print_json(payload)
     return 0 if ok else 1
 
 
@@ -8175,10 +8239,11 @@ def _cli_account_only_create(account, prompt_file, thinking=None):
         return 1
 
     if status == 429:
-        # 指定账号 429：立即停止，不换号、不重试其他账号。
+        # 指定账号 429：立即停止，不换号、不在 CLI 内重试；Gateway 负责冷却后调度。
         _cli_print_json({"event": "create_result", "ok": False,
                          "reason": "rate_limited", "account": account,
-                         "http_status": 429})
+                         "http_status": 429,
+                         "retry_after_seconds": _cli_retry_after_seconds(api)})
         return 1
 
     headers = getattr(api, "last_headers", None)
@@ -8855,7 +8920,7 @@ def _main_unlocked():
         apply_changes = "--apply" in supplied_flags
         include_nologin = "--include-nologin" in supplied_flags
 
-        configured_accounts = list(ROTATION_PRIMARY)
+        configured_accounts = list(_effective_rotation_primary())
         if include_nologin:
             configured_accounts.append("nologin")
 
@@ -9322,7 +9387,7 @@ def _main_unlocked():
             if status == 200 and conv:
                 record_conv(conv, account, args[1])
                 print("NEW_CONV %s account=%s" % (conv, account), flush=True)
-            if status == 429 and account in ROTATION_PRIMARY:
+            if status == 429 and account in _effective_rotation_primary():
                 # 429 限流 → 换账号，换不动就匿名（用户裁定）。显式指定身份只约束
                 # 「用谁起」，不该约束「限速后还能干什么」：429 还没建成会话，
                 # 重试不会重复建会话、不会多花配额。
