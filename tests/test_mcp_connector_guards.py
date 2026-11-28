@@ -221,6 +221,13 @@ class TestDynamicAccountDiscovery(TmpAccountDirs):
             os.makedirs(os.path.join(self.accounts_dir, name))
         self.assertEqual(mcp_connector.discover_accounts(), ["acct1", "acct2", "acct10"])
 
+    def test_accounts_all_reports_directory_permission_errors(self):
+        with mock.patch.object(os, "scandir", side_effect=PermissionError("denied")):
+            with mock.patch.object(sys, "stdout", io.StringIO()) as out:
+                rc = mcp_connector.main(["eligibility", "--accounts", "all"])
+        self.assertEqual(rc, 1)
+        self.assertIn("ACCOUNT_DISCOVERY_FAILED", out.getvalue())
+
     def test_accounts_all_uses_dynamic_discovery(self):
         for name in ("acct10", "acct2", "acct1"):
             os.makedirs(os.path.join(self.accounts_dir, name))

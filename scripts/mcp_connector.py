@@ -473,8 +473,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if not r.error else 1
 
     # eligibility
-    names = discover_accounts() if args.accounts == 'all' \
-        else (args.accounts or args.account).split(',')
+    try:
+        names = discover_accounts() if args.accounts == 'all' \
+            else (args.accounts or args.account).split(',')
+    except CheckError as exc:
+        print(str(exc))
+        return 1
     names = [n.strip() for n in names if n.strip()]
     if not names:
         print('No configured acctN accounts found')
