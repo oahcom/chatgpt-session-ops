@@ -840,6 +840,15 @@ class SecureWorkItemStore:
         finally:
             conn.close()
 
+    def require_owner(self, principal: Principal, work_item_id: str) -> None:
+        """Require immutable WorkItem ownership, excluding delegated grants."""
+        validate_work_item_id(work_item_id)
+        conn = self._connect()
+        try:
+            self._require_owner(conn, principal, work_item_id)
+        finally:
+            conn.close()
+
     def _require_owner(
         self, conn: sqlite3.Connection, principal: Principal, work_item_id: str
     ) -> None:

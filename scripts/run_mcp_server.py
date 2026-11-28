@@ -582,12 +582,16 @@ class DeploymentASGI:
 
 def create_application(config: dict[str, Any]) -> Any:
     """Initialize persistent storage and construct the authenticated app."""
-    database_path = Path(config["database_path"]).resolve()
-
+    database_value = str(config["database_path"])
     events_key_file = os.environ.get(EVENTS_KEY_FILE_ENV, "").strip()
     events_db_path = os.environ.get(EVENTS_DB_ENV, "").strip()
     if events_db_path and not events_key_file:
         raise RuntimeError(EVENTS_DB_ENV + " requires " + EVENTS_KEY_FILE_ENV)
+    if database_value == ":memory:" and events_key_file:
+        raise RuntimeError("MCP Events requires a file-backed WorkItem database")
+    database_path = Path(database_value) if database_value == ":memory:" else Path(database_value).resolve()
+    if events_db_path and not Path(events_db_path).is_absolute():
+        raise RuntimeError(EVENTS_DB_ENV + " must be an absolute path")
 
     events_store = None
     if events_key_file:

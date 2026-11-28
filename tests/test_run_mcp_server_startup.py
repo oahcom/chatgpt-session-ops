@@ -731,6 +731,40 @@ class TestMCPEventsRuntimeWiring(unittest.TestCase):
         self.assertIs(app.inner, mcp_app)
         self.assertEqual(app.background_tasks, (dispatcher,))
 
+    def test_events_reject_memory_database_and_relative_events_path(self):
+        base_config = {
+            "database_path": ":memory:",
+            "issuer": "https://issuer.example.test/realm",
+            "audience": "https://resource.example.test/mcp",
+            "realm_namespace": "realm",
+            "tenant_claim": "tenant_id",
+            "discovery_url": None,
+            "memory_adapter_command": None,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            key_path = Path(tmp) / "events.key"
+            key_path.write_bytes(b"e" * 32)
+            key_path.chmod(0o400)
+            with (
+                mock.patch.dict(os.environ, {"SO_MCP_EVENTS_KEY_FILE": str(key_path)}, clear=True),
+                mock.patch("scripts.run_mcp_server.SecureWorkItemStore") as store_type,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "file-backed WorkItem database"):
+                    create_application(base_config)
+            store_type.assert_not_called()
+
+            file_config = dict(base_config, database_path=str(Path(tmp) / "work-items.sqlite3"))
+            with (
+                mock.patch.dict(os.environ, {
+                    "SO_MCP_EVENTS_KEY_FILE": str(key_path),
+                    "SO_MCP_EVENTS_DB": "relative-events.sqlite3",
+                }, clear=True),
+                mock.patch("scripts.run_mcp_server.SecureWorkItemStore") as store_type,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "must be an absolute path"):
+                    create_application(file_config)
+            store_type.assert_not_called()
+
 
 class TestMain(unittest.TestCase):
     """L537: startup failure is logged then re-raised unchanged."""

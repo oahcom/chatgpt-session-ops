@@ -256,6 +256,19 @@ class WorkItemCompletionEventTests(unittest.TestCase):
                 })
         verify.assert_not_called()
 
+    def test_require_owner_rejects_delegated_writer_even_with_write_grant(self):
+        from src.session_ops.authority import NotAuthorized
+
+        item = self.store.create_work_item(self.principal)
+        self.store.grant(self.principal, item.work_item_id, self.delegate.principal_id, "write")
+        self.store.require_owner(self.principal, item.work_item_id)
+        with self.assertRaises(NotAuthorized):
+            self.store.require_owner(self.delegate, item.work_item_id)
+
+    def test_events_store_rejects_in_memory_database(self):
+        with self.assertRaisesRegex(ValueError, "file-backed SQLite database"):
+            MCPEventsStore(":memory:", encryption_key=b"k" * 32)
+
     def test_completion_event_belongs_to_owner_not_delegated_writer(self):
         from src.session_ops.authority import NotAuthorized
 

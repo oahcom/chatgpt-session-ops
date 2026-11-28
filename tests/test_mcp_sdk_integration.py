@@ -187,7 +187,17 @@ class MCPSDKIntegrationTests(unittest.TestCase):
                 ),
                 encryption_key=b"e" * 32,
             )
-            app = build_mcp_server(self.service, self.verifier, events_store=store)
+            from src.session_ops.authority import NotAuthorized
+
+            class WorkItemAuthority:
+                def require_owner(self, principal, work_item_id):
+                    if principal.principal_id != "session_ops:user-a":
+                        raise NotAuthorized()
+                    if work_item_id != "wi_12345678-1234-4234-8234-123456789abc":
+                        raise NotAuthorized()
+
+            service = MCPToolService(WorkItemAuthority())
+            app = build_mcp_server(service, self.verifier, events_store=store)
             previous_app = type(self).app
             try:
                 type(self).app = app
@@ -245,7 +255,34 @@ class MCPSDKIntegrationTests(unittest.TestCase):
                 ))
             self.assertTrue(subscribed["id"].startswith("sub_"))
 
+            # Filtered subscriptions must be owned by the authenticated principal.
+            filtered_params = EventsSubscribeParams.model_validate({
+                "name": "chatgpt.job.completed",
+                "arguments": {"job_id": "wi_12345678-1234-4234-8234-123456789abc"},
+                "delivery": {
+                    "mode": "webhook",
+                    "url": "https://events.example.test/filtered-owner",
+                    "secret": "whsec_" + base64.b64encode(b"f" * 32).decode(),
+                },
+            })
+            with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
+                filtered = asyncio.run(handlers[1].handler(context, filtered_params))
+            self.assertTrue(filtered["id"].startswith("sub_"))
+
+            delegate_auth = AuthContext(
+                Principal(tenant_id="tenant-a", principal_id="session_ops:delegate"),
+                ["session_ops.chatgpt.session.read", "session_ops.chatgpt.session.write"],
+                "https://issuer.example.test/realm",
+                "delegate",
+                "session_ops",
+            )
+            delegate_context = self._request_context("events/subscribe")
+            delegate_context.request = SimpleNamespace(scope={"state": {"session_ops_auth": delegate_auth}})
             from mcp.shared.exceptions import MCPError
+            with self.assertRaises(MCPError) as ownership_error:
+                asyncio.run(handlers[1].handler(delegate_context, filtered_params))
+            self.assertEqual(ownership_error.exception.data, {"reason": "job_not_owned"})
+
             store.post_json = lambda _url, _body, _headers: (200, b'{"challenge":"wrong"}')
             with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
                 with self.assertRaises(MCPError) as callback_error:

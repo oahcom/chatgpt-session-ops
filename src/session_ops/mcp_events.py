@@ -118,6 +118,8 @@ class MCPEventsStore:
         clock: Callable[[], float] = time.time,
         encryption_key: bytes | None = None,
     ) -> None:
+        if database == ":memory:":
+            raise ValueError("MCP Events requires a file-backed SQLite database")
         self.database = database
         self.post_json = post_json or _post_public_https
         self.clock = clock
@@ -234,12 +236,12 @@ class MCPEventsStore:
     def event_catalog() -> list[dict[str, Any]]:
         return [{
             "name": "chatgpt.job.completed",
-            "description": "A task owned by the connected account has reached a terminal state.",
+            "description": "A Session Ops WorkItem owned by the connected account has reached a terminal state.",
             "delivery": ["webhook"],
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "job_id": {"type": "string", "description": "Optional task ID to monitor."}
+                    "job_id": {"type": "string", "description": "Optional WorkItem ID to monitor."}
                 },
                 "additionalProperties": False,
             },
@@ -484,13 +486,12 @@ class MCPEventsStore:
             raise ValueError("tenant, principal, and job identifiers are required")
         if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
             raise ValueError("an active SQLite transaction is required")
-        if self.database != ":memory:":
-            main_path = next(
-                (row[2] for row in db.execute("PRAGMA database_list") if row[1] == "main"),
-                "",
-            )
-            if not main_path or os.path.realpath(main_path) != os.path.realpath(self.database):
-                raise ValueError("completion event and WorkItem must share the same SQLite database")
+        main_path = next(
+            (row[2] for row in db.execute("PRAGMA database_list") if row[1] == "main"),
+            "",
+        )
+        if not main_path or os.path.realpath(main_path) != os.path.realpath(self.database):
+            raise ValueError("completion event and WorkItem must share the same SQLite database")
         if not isinstance(summary, str):
             raise ValueError("job summary must be text")
         if conversation_id is not None and (not isinstance(conversation_id, str) or not conversation_id):

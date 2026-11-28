@@ -1298,12 +1298,16 @@ def build_mcp_server(
             if "session_ops.chatgpt.session.write" not in auth.scopes:
                 raise ScopeError(("session_ops.chatgpt.session.write",))
             def create_subscription() -> Any:
-                # Event rows and subscriptions are scoped to the verified
-                # tenant/principal in MCPEventsStore; no external job service
-                # is involved in subscription authorization.
+                payload = params.model_dump(by_alias=True, exclude_unset=True)
+                arguments = payload.get("arguments") or {}
+                job_id = arguments.get("job_id")
+                if job_id is not None:
+                    # Completion events are attributed to the WorkItem owner.
+                    # A delegated writer cannot create an owner-filtered feed.
+                    service.store.require_owner(auth.principal, job_id)
                 return events_store.subscribe(
                     auth,
-                    params.model_dump(by_alias=True, exclude_unset=True),
+                    payload,
                 )
 
             try:
@@ -1318,6 +1322,13 @@ def build_mcp_server(
             except ValueError as exc:
                 from mcp.shared.exceptions import MCPError
                 raise MCPError(code=-32602, message="Invalid event subscription", data={"reason": "invalid_subscription"}) from exc
+            except (NotAuthorized, InvalidIdentifier) as exc:
+                from mcp.shared.exceptions import MCPError
+                raise MCPError(
+                    code=-32602,
+                    message="Invalid event subscription",
+                    data={"reason": "job_not_owned"},
+                ) from exc
 
         async def on_events_unsubscribe(ctx: Any, params: Any) -> Any:
             auth = _event_auth(ctx)
