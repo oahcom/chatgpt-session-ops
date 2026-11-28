@@ -89,7 +89,7 @@ class ChatGPTSessionRegistry:
             raise ChatGPTSessionRegistryError(
                 "INVALID_ARGUMENT", "legacy and MCP databases must be different files"
             )
-        source = sqlite3.connect(str(source_path), timeout=3.0)
+        source = sqlite3.connect("file:" + str(source_path.resolve()) + "?mode=ro", uri=True, timeout=3.0)
         source.row_factory = sqlite3.Row
         try:
             source.execute("PRAGMA query_only = ON")
