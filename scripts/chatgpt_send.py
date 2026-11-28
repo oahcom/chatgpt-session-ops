@@ -429,15 +429,110 @@ def _send_exit_code(status, conv=None):
     return 0 if status == 200 else 1
 
 # ---------- 建会话身份轮转 ----------
-# 优先登录态：acct1 / acct2 / acct3 / acct4 / acct5 / acct6 均分轮转；nologin（匿名）只作兜底——
-# 实测匿名会话不进任何会话历史（list 返回 0 条），随时可能被服务端回收，
-# 仅按 conv_id 在短期内可读，因此只在全部登录态都 429 时启用。
-ROTATION_ORDER = ("acct1", "acct2", "acct3", "acct4", "acct5", "acct6", "nologin")
-ROTATION_PRIMARY = ("acct1", "acct2", "acct3", "acct4", "acct5", "acct6")
+# 账户身份来自凭据目录发现；增加 acctN 只需放入凭据，不改代码或白名单。
+def _account_discovery_roots():
+    from pathlib import Path
+    roots = []
+    configured = os.environ.get("SO_SENDER_ACCOUNTS_DIR")
+    if configured:
+        roots.append(Path(configured))
+    roots.append(Path(BASE) / "accounts")
+    return roots
+
+
+def _account_has_credentials(directory):
+    from pathlib import Path
+    root = Path(directory)
+    cookies, token = root / "cookies.json", root / "access_token.txt"
+    try:
+        return (
+            not cookies.is_symlink() and not token.is_symlink()
+            and cookies.is_file() and token.is_file()
+            and os.access(str(cookies), os.R_OK)
+            and os.access(str(token), os.R_OK)
+        )
+    except OSError:
+        return False
+
+
+def _discover_account_identities():
+    names = set()
+    for root in _account_discovery_roots():
+        try:
+            entries = tuple(root.iterdir()) if root.is_dir() else ()
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if (
+                    not entry.is_symlink() and entry.is_dir()
+                    and re.fullmatch(r"acct[1-9][0-9]*", entry.name)
+                ):
+                    names.add(entry.name)
+            except OSError:
+                continue
+    auth_root = os.environ.get("CHATGPT_AUTH_DIR") or BASE
+    if _account_has_credentials(auth_root):
+        names.add("acct1")
+    return frozenset(names)
+
+
+def _discover_account_credentials():
+    names = set()
+    auth_root = os.environ.get("CHATGPT_AUTH_DIR") or BASE
+    if _account_has_credentials(auth_root):
+        names.add("acct1")
+    for root in _account_discovery_roots():
+        try:
+            entries = tuple(root.iterdir()) if root.is_dir() else ()
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if (
+                    not entry.is_symlink() and entry.is_dir()
+                    and re.fullmatch(r"acct[1-9][0-9]*", entry.name)
+                    and _account_has_credentials(entry)
+                ):
+                    # acct1 uses CHATGPT_AUTH_DIR as its credential root.
+                    if entry.name != "acct1" or "acct1" in names:
+                        names.add(entry.name)
+            except OSError:
+                continue
+    return frozenset(names)
+
+
+def _effective_rotation_primary():
+    discovered = _discover_account_credentials()
+    raw = os.environ.get("CHATGPT_ALLOWED_ACCOUNTS")
+    if raw is not None:
+        requested = {
+            part.strip() for part in raw.split(",")
+            if re.fullmatch(r"acct[1-9][0-9]*", part.strip())
+        }
+        discovered &= requested
+    return tuple(sorted(discovered, key=lambda name: int(name[4:])))
+
+
+_VALID_ACCOUNT_IDENTITIES = frozenset({
+    "default", "nologin", *_discover_account_identities()
+})
+ROTATION_ORDER = tuple(sorted(
+    (name for name in _VALID_ACCOUNT_IDENTITIES if name.startswith("acct")),
+    key=lambda name: int(name[4:]),
+)) + ("nologin",)
+ROTATION_PRIMARY = _effective_rotation_primary()
 ROTATION_FALLBACK = ("nologin",)
-ROTATION_FILE = os.path.join(BASE, "account-rotation.json")
-CONV_MAP_FILE = os.path.join(BASE, "conv-accounts.json")
-ANON_SESSIONS_FILE = os.path.join(BASE, "anon-sessions.json")
+
+def _state_dir():
+    return os.path.abspath(os.environ.get("CHATGPT_STATE_DIR") or BASE)
+
+
+STATE_DIR = _state_dir()
+os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+ROTATION_FILE = os.path.join(STATE_DIR, "account-rotation.json")
+CONV_MAP_FILE = os.path.join(STATE_DIR, "conv-accounts.json")
+ANON_SESSIONS_FILE = os.path.join(STATE_DIR, "anon-sessions.json")
 UNAVAILABLE_TTL = 6 * 3600  # 不可用标记有效期：过期后容许再试一次（凭据可能已刷新）
 COOLDOWN_429 = 180          # 429 只是临时限速，短冷却后重新纳入轮转
 COOLDOWN_403 = 900          # 403 多为 PoW/风控或隐性限速，15 分钟后允许重试
@@ -3641,16 +3736,7 @@ def restore_conv_map_minimal(candidate):
     }
 
 
-_VALID_ACCOUNT_IDENTITIES = frozenset((
-    "default",
-    "acct1",
-    "acct2",
-    "acct3",
-    "acct4",
-    "acct5",
-    "acct6",
-    "nologin",
-))
+# _VALID_ACCOUNT_IDENTITIES is populated by credential-directory discovery above.
 
 
 def normalize_account_identity(account):
