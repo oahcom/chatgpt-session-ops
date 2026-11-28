@@ -8,8 +8,8 @@ These patches were generated from deployed Python source snapshots on 2026-11-27
 - MCP patches apply from `/opt/so-mcp`:
   - `mcp-sender-event-client.patch`: add `SenderGatewayClient.claim_events()` / `ack_event()` using the existing mTLS + service-token + HMAC identity assertion path.
   - `mcp-server-events.patch`: register MCP Events request handlers and advertise `capabilities.events`.
-  - `mcp-runtime-events.patch`: add key-file loading, opt-in store creation, and ASGI-lifespan-managed collector/delivery workers.
-  - `mcp-event-modules.patch`: add `mcp_events.py`, `mcp_event_collector.py`, and `mcp_event_workers.py` with subscribe-time job ownership checks, per-delivery authorization and subscription-expiry rechecks immediately before callback I/O, bounded retry, and retention cleanup.
+  - `mcp-runtime-events.patch`: add key-file loading, opt-in store creation, and ASGI-lifespan-managed single event dispatcher.
+  - `mcp-event-modules.patch`: add `mcp_events.py`, `mcp_event_collector.py`, and `mcp_event_dispatcher.py` (one in-process dispatcher thread) with subscribe-time job ownership checks, per-delivery authorization and subscription-expiry rechecks immediately before callback I/O, bounded retry, and retention cleanup.
 
 `deployed-source.sha256` records the original deployed base before any Sender Gateway changes. `deployed-source-post-combined.sha256` records the production state after the combined cleanup + success-outbox patch and is the base for `sender-gateway-failed-terminal-event.patch`. `deployed-source-post-failure-event.sha256` records the current files after that incremental patch was applied to disk. `sender-original-base.sha256` records the original Sender Gateway files preserved under `/var/backups`. The sender-gateway and MCP client patches are not guaranteed to apply to the older `/srv/so-mcp-trusted` client file; the MCP client patch is based on the current deployed `/opt/so-mcp` version.
 
@@ -17,7 +17,7 @@ These patches were generated from deployed Python source snapshots on 2026-11-27
 
 Provision a raw 32-byte AES-GCM key at `/etc/so-mcp/events.key`, owned by the `ubuntu` service user with mode `0400`. Add `SO_MCP_EVENTS_KEY_FILE=/etc/so-mcp/events.key` to the MCP service environment. Optional `SO_MCP_EVENTS_DB` must be an absolute path; otherwise the default is `/var/lib/so-mcp/events/events.sqlite3`. The events directory is created mode `0700`, and the SQLite database mode is `0600`.
 
-Without `SO_MCP_EVENTS_KEY_FILE`, the feature remains disabled and the MCP server does not advertise Events. Setting the key file enables both the Events handlers and the supervised background collector/delivery loops.
+Without `SO_MCP_EVENTS_KEY_FILE`, the feature remains disabled and the MCP server does not advertise Events. Setting the key file enables both the Events handlers and the one in-process event-dispatch loop.
 
 ## Safety
 

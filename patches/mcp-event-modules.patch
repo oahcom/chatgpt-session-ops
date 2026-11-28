@@ -680,12 +680,10 @@
 +    return EventsListParams, EventsSubscribeParams, EventsUnsubscribeParams
 --- /dev/null
 +++ b/src/session_ops/mcp_event_collector.py
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,86 @@
 +"""MCP-side polling bridge from the Sender Gateway outbox into MCP Events."""
 +from __future__ import annotations
 +
-+import logging
-+import threading
 +from collections.abc import Mapping
 +from typing import Any
 +
@@ -704,12 +702,14 @@
 +        events_store: Any,
 +        *,
 +        worker_id: str,
-+        batch_size: int = 25,
++        batch_size: int = 2,
 +    ) -> None:
 +        if not isinstance(worker_id, str) or not worker_id.strip():
 +            raise ValueError("worker_id is required")
-+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 100:
-+            raise ValueError("batch_size must be in 1..100")
++        # Sender leases are deliberately short. Keep each claim small enough
++        # that later items cannot expire behind slow earlier ingestions.
++        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 2:
++            raise ValueError("batch_size must be in 1..2")
 +        self.sender_client = sender_client
 +        self.events_store = events_store
 +        self.worker_id = worker_id
@@ -725,67 +725,52 @@
 +
 +        acknowledged = 0
 +        for item in response["items"]:
-+            if not isinstance(item, Mapping):
-+                raise ValueError("Sender Gateway returned a malformed event")
-+            event_id = item.get("event_id")
-+            job_id = item.get("job_id")
-+            tenant_id = item.get("tenant_id")
-+            principal_id = item.get("principal_id")
-+            lease_token = item.get("lease_token")
-+            payload = item.get("payload")
-+            if item.get("name") != "chatgpt.job.completed" or not isinstance(payload, Mapping):
-+                raise ValueError("Sender Gateway returned an unsupported event")
-+            if payload.get("job_id") != job_id or payload.get("status") not in ("succeeded", "failed"):
-+                raise ValueError("Sender Gateway event owner or terminal state does not match its payload")
-+            summary = payload.get("summary")
-+            completed_at = payload.get("completed_at")
-+            if not all(isinstance(value, str) and value for value in (event_id, job_id, tenant_id, principal_id, lease_token, summary, completed_at)):
-+                raise ValueError("Sender Gateway event is missing required fields")
++            event_id = item.get("event_id") if isinstance(item, Mapping) else None
++            try:
++                if not isinstance(item, Mapping):
++                    raise ValueError("Sender Gateway returned a malformed event")
++                event_id = item.get("event_id")
++                job_id = item.get("job_id")
++                tenant_id = item.get("tenant_id")
++                principal_id = item.get("principal_id")
++                lease_token = item.get("lease_token")
++                payload = item.get("payload")
++                if item.get("name") != "chatgpt.job.completed" or not isinstance(payload, Mapping):
++                    raise ValueError("Sender Gateway returned an unsupported event")
++                if payload.get("job_id") != job_id or payload.get("status") not in ("succeeded", "failed"):
++                    raise ValueError("Sender Gateway event owner or terminal state does not match its payload")
++                summary = payload.get("summary")
++                completed_at = payload.get("completed_at")
++                if not all(isinstance(value, str) and value for value in (event_id, job_id, tenant_id, principal_id, lease_token, summary, completed_at)):
++                    raise ValueError("Sender Gateway event is missing required fields")
 +
-+            # The event ID is the cross-service idempotency key. If this write
-+            # succeeds but ack fails, a later lease redelivery is harmless.
-+            self.events_store.publish_job_completed(
-+                tenant_id,
-+                principal_id,
-+                job_id,
-+                summary,
-+                event_id=event_id,
-+                completed_at=completed_at,
-+                status=payload["status"],
-+                error_code=payload.get("error_code"),
-+                outcome_unknown=payload.get("outcome_unknown"),
-+            )
-+            result = self.sender_client.ack_event(
-+                event_id=event_id,
-+                lease_token=lease_token,
-+            )
-+            if not isinstance(result, Mapping) or result.get("acknowledged") is not True:
-+                raise RuntimeError("Sender Gateway did not acknowledge the event lease")
-+            acknowledged += 1
++                # Persist before ack. A lost ack is safe because event_id is stable.
++                self.events_store.publish_job_completed(
++                    tenant_id,
++                    principal_id,
++                    job_id,
++                    summary,
++                    event_id=event_id,
++                    completed_at=completed_at,
++                    status=payload["status"],
++                    error_code=payload.get("error_code"),
++                    outcome_unknown=payload.get("outcome_unknown"),
++                )
++                result = self.sender_client.ack_event(event_id=event_id, lease_token=lease_token)
++                if not isinstance(result, Mapping) or result.get("acknowledged") is not True:
++                    raise RuntimeError("Sender Gateway did not acknowledge the event lease")
++                acknowledged += 1
++            except Exception:
++                # Isolate poison/failed rows. Never ack an event that was not
++                # durably ingested, but do not starve unrelated events in batch.
++                logging.exception("MCP Sender event ingestion failed (event_id=%s)", event_id)
++                continue
 +        return acknowledged
 +
-+    def run_forever(
-+        self,
-+        stop_event: threading.Event,
-+        *,
-+        poll_seconds: float = 1.0,
-+    ) -> None:
-+        if not isinstance(stop_event, threading.Event):
-+            raise ValueError("stop_event must be a threading.Event")
-+        if not 0.05 <= float(poll_seconds) <= 60.0:
-+            raise ValueError("poll_seconds must be in 0.05..60")
-+        while not stop_event.is_set():
-+            try:
-+                count = self.run_once()
-+                if count == 0:
-+                    stop_event.wait(poll_seconds)
-+            except Exception:
-+                logging.exception("MCP Sender Gateway event collection failed")
-+                stop_event.wait(poll_seconds)
 --- /dev/null
-+++ b/src/session_ops/mcp_event_workers.py
-@@ -0,0 +1,96 @@
-+"""Supervised background loops for MCP event collection and webhook delivery."""
++++ b/src/session_ops/mcp_event_dispatcher.py
+@@ -0,0 +1,101 @@
++"""One in-process dispatcher for Sender completion events and MCP webhooks."""
 +from __future__ import annotations
 +
 +import logging
@@ -794,90 +779,95 @@
 +from typing import Any
 +
 +
-+class MCPEventDeliveryWorker:
++class MCPEventDispatcher:
++    """Bridge Sender outbox events to subscribed ChatGPT callbacks.
++
++    This is one lightweight thread inside the existing MCP service, not a
++    separate service or job-execution worker. Sender jobs continue to run in
++    the existing Sender worker.
++    """
++
 +    def __init__(
 +        self,
++        collector: Any,
 +        events_store: Any,
 +        *,
 +        authorize: Any = None,
-+        poll_seconds: float = 0.5,
-+        batch_size: int = 100,
++        poll_seconds: float = 1.0,
++        delivery_batch_size: int = 1,
 +        cleanup_interval_seconds: float = 3600,
 +    ) -> None:
 +        if not 0.05 <= float(poll_seconds) <= 60:
 +            raise ValueError("poll_seconds must be in 0.05..60")
-+        if isinstance(batch_size, bool) or not isinstance(batch_size, int) or not 1 <= batch_size <= 500:
-+            raise ValueError("batch_size must be in 1..500")
++        if isinstance(delivery_batch_size, bool) or not isinstance(delivery_batch_size, int) or not 1 <= delivery_batch_size <= 2:
++            raise ValueError("delivery_batch_size must be in 1..2")
 +        if not 60 <= float(cleanup_interval_seconds) <= 86400:
 +            raise ValueError("cleanup_interval_seconds must be in 60..86400")
++        self.collector = collector
 +        self.events_store = events_store
 +        self.authorize = authorize
 +        self.poll_seconds = float(poll_seconds)
-+        self.batch_size = batch_size
++        self.delivery_batch_size = delivery_batch_size
 +        self.cleanup_interval_seconds = float(cleanup_interval_seconds)
++        self._stop_event: threading.Event | None = None
++        self._thread: threading.Thread | None = None
++        self._lock = threading.Lock()
 +
-+    def run_forever(self, stop_event: threading.Event) -> None:
-+        last_cleanup = 0.0
++    def _run(self, stop_event: threading.Event) -> None:
++        last_cleanup = float("-inf")
 +        while not stop_event.is_set():
++            did_work = False
++            try:
++                did_work = self.collector.run_once() > 0 or did_work
++            except Exception:
++                logging.exception("MCP Sender event collection failed")
++
 +            now = time.monotonic()
 +            if now - last_cleanup >= self.cleanup_interval_seconds:
 +                try:
 +                    self.events_store.cleanup_expired()
 +                except Exception:
 +                    logging.exception("MCP event retention cleanup failed")
-+                    # Retry cleanup after a bounded delay, but do not block
-+                    # event delivery while the maintenance operation is down.
 +                    last_cleanup = now - self.cleanup_interval_seconds + min(60.0, self.cleanup_interval_seconds)
 +                else:
 +                    last_cleanup = now
++
 +            try:
 +                delivered = self.events_store.deliver_pending(
-+                    limit=self.batch_size,
++                    limit=self.delivery_batch_size,
 +                    authorize=self.authorize,
 +                )
-+                if delivered == 0:
-+                    stop_event.wait(self.poll_seconds)
++                did_work = delivered > 0 or did_work
 +            except Exception:
-+                logging.exception("MCP webhook delivery worker failed")
++                logging.exception("MCP webhook delivery failed")
++
++            if not did_work:
 +                stop_event.wait(self.poll_seconds)
-+
-+
-+class MCPEventWorkers:
-+    """Start/stop the sender collector and webhook dispatcher as one lifespan unit."""
-+
-+    def __init__(self, collector: Any, delivery_worker: MCPEventDeliveryWorker) -> None:
-+        self.collector = collector
-+        self.delivery_worker = delivery_worker
-+        self._stop = threading.Event()
-+        self._threads: list[threading.Thread] = []
-+        self._lock = threading.Lock()
 +
 +    def start(self) -> None:
 +        with self._lock:
-+            if any(thread.is_alive() for thread in self._threads):
++            if self._thread is not None and self._thread.is_alive():
 +                return
-+            self._stop.clear()
-+            self._threads = [
-+                threading.Thread(
-+                    target=self.collector.run_forever,
-+                    args=(self._stop,),
-+                    kwargs={"poll_seconds": 1.0},
-+                    name="mcp-event-collector",
-+                    daemon=True,
-+                ),
-+                threading.Thread(
-+                    target=self.delivery_worker.run_forever,
-+                    args=(self._stop,),
-+                    name="mcp-event-delivery",
-+                    daemon=True,
-+                ),
-+            ]
-+            for thread in self._threads:
-+                thread.start()
++            stop_event = threading.Event()
++            thread = threading.Thread(
++                target=self._run,
++                args=(stop_event,),
++                name="mcp-events",
++                daemon=True,
++            )
++            self._stop_event = stop_event
++            self._thread = thread
++            thread.start()
 +
 +    def stop(self) -> None:
-+        self._stop.set()
-+        for thread in self._threads:
-+            if thread.is_alive():
-+                thread.join(timeout=10)
-+        self._threads = []
++        with self._lock:
++            stop_event = self._stop_event
++            thread = self._thread
++            if stop_event is not None:
++                stop_event.set()
++        if thread is not None and thread.is_alive():
++            thread.join(timeout=10)
++        with self._lock:
++            if thread is None or not thread.is_alive():
++                self._thread = None
++                self._stop_event = None

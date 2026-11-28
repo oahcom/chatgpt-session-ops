@@ -29,7 +29,7 @@ records the current reconstructed tree after the Events changes.
   `/internal/v1/events/{event_id}/ack` routes. The dispatcher identity is
   `session_ops:event-dispatcher` in tenant `session_ops`.
 - The MCP Sender client uses its existing mTLS + signed identity path for claim
-  and ack. MCP Events store, collector, delivery worker, MCP protocol handlers,
+  and ack. MCP Events store, collector, single in-process event dispatcher, MCP protocol handlers,
   and ASGI lifecycle wiring are included from the tested project implementation.
 
 ## Validation

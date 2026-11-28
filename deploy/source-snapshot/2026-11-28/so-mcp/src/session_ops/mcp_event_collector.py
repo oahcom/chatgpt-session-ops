@@ -1,8 +1,6 @@
 """MCP-side polling bridge from the Sender Gateway outbox into MCP Events."""
 from __future__ import annotations
 
-import logging
-import threading
 from collections.abc import Mapping
 from typing import Any
 
@@ -85,22 +83,3 @@ class MCPEventCollector:
                 logging.exception("MCP Sender event ingestion failed (event_id=%s)", event_id)
                 continue
         return acknowledged
-
-    def run_forever(
-        self,
-        stop_event: threading.Event,
-        *,
-        poll_seconds: float = 1.0,
-    ) -> None:
-        if not isinstance(stop_event, threading.Event):
-            raise ValueError("stop_event must be a threading.Event")
-        if not 0.05 <= float(poll_seconds) <= 60.0:
-            raise ValueError("poll_seconds must be in 0.05..60")
-        while not stop_event.is_set():
-            try:
-                count = self.run_once()
-                if count == 0:
-                    stop_event.wait(poll_seconds)
-            except Exception:
-                logging.exception("MCP Sender Gateway event collection failed")
-                stop_event.wait(poll_seconds)

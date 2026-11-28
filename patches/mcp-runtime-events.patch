@@ -19,7 +19,7 @@
  from src.session_ops.mcp_server import MCPToolService, build_mcp_server
 +from src.session_ops.mcp_events import MCPEventsStore
 +from src.session_ops.mcp_event_collector import MCPEventCollector
-+from src.session_ops.mcp_event_workers import MCPEventDeliveryWorker, MCPEventWorkers
++from src.session_ops.mcp_event_dispatcher import MCPEventDispatcher
  from src.session_ops.sender_gateway_client import SenderGatewayClient
  
  
@@ -62,12 +62,12 @@
          *,
          issuer: str,
          audience: str,
-+        background_workers: Optional[Sequence[Any]] = None,
++        background_tasks: Optional[Sequence[Any]] = None,
      ) -> None:
          self.inner = inner
          self.issuer = issuer
          self.audience = audience
-+        self.background_workers = tuple(background_workers or ())
++        self.background_tasks = tuple(background_tasks or ())
  
          resource = urlsplit(audience)
          self.endpoint_path = resource.path
@@ -75,34 +75,34 @@
          )
  
      async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-+        if scope.get("type") == "lifespan" and self.background_workers:
-+            started_workers: list[Any] = []
-+            stopped_workers: set[int] = set()
++        if scope.get("type") == "lifespan" and self.background_tasks:
++            started_tasks: list[Any] = []
++            stopped_tasks: set[int] = set()
 +
-+            async def receive_with_worker_lifecycle() -> dict[str, Any]:
++            async def receive_with_task_lifecycle() -> dict[str, Any]:
 +                message = await receive()
 +                if message.get("type") == "lifespan.startup":
-+                    for worker in self.background_workers:
-+                        worker.start()
-+                        started_workers.append(worker)
++                    for task in self.background_tasks:
++                        task.start()
++                        started_tasks.append(task)
 +                elif message.get("type") == "lifespan.shutdown":
-+                    for worker in reversed(started_workers):
-+                        worker.stop()
-+                        stopped_workers.add(id(worker))
++                    for task in reversed(started_tasks):
++                        task.stop()
++                        stopped_tasks.add(id(task))
 +                return message
 +
 +            try:
-+                await self.inner(scope, receive_with_worker_lifecycle, send)
++                await self.inner(scope, receive_with_task_lifecycle, send)
 +            finally:
-+                for worker in reversed(started_workers):
-+                    if id(worker) not in stopped_workers:
-+                        worker.stop()
++                for task in reversed(started_tasks):
++                    if id(task) not in stopped_tasks:
++                        task.stop()
 +            return
 +
          if scope.get("type") != "http":
              await self.inner(scope, receive, send)
              return
-@@ -649,12 +701,66 @@
+@@ -649,12 +701,68 @@
          memory_adapter=config.get("memory_adapter_command"),
          sender_gateway=sender_gateway,
      )
@@ -114,7 +114,7 @@
 +        raise RuntimeError(EVENTS_DB_ENV + " requires " + EVENTS_KEY_FILE_ENV)
 +
 +    events_store = None
-+    background_workers: list[Any] = []
++    background_tasks: list[Any] = []
 +    if events_key_file:
 +        encryption_key = _load_events_encryption_key(events_key_file)
 +        if events_db_path and not Path(events_db_path).is_absolute():
@@ -149,11 +149,13 @@
 +                    return False
 +                raise
 +
-+        delivery_worker = MCPEventDeliveryWorker(
-+            events_store,
-+            authorize=authorize_event,
++        background_tasks.append(
++            MCPEventDispatcher(
++                collector,
++                events_store,
++                authorize=authorize_event,
++            )
 +        )
-+        background_workers.append(MCPEventWorkers(collector, delivery_worker))
 +
 +    mcp_app = build_mcp_server(
 +        service,
@@ -166,7 +168,7 @@
          mcp_app,
          issuer=config["issuer"],
          audience=config["audience"],
-+        background_workers=background_workers,
++        background_tasks=background_tasks,
      )
  
  

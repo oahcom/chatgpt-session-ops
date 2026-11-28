@@ -90,7 +90,7 @@ class DeployedMCPEventsTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "absolute path"):
                 _load_events_encryption_key("relative/events.key")
 
-    def test_deployment_lifespan_starts_and_stops_background_workers(self):
+    def test_deployment_lifespan_starts_and_stops_background_tasks(self):
         class Worker:
             def __init__(self):
                 self.started = 0
@@ -114,7 +114,7 @@ class DeployedMCPEventsTests(unittest.TestCase):
             inner,
             issuer="https://issuer.example.test/realms/session-ops",
             audience=TokenProvider.audience,
-            background_workers=[worker],
+            background_tasks=[worker],
         )
         messages = iter([
             {"type": "lifespan.startup"},
@@ -176,17 +176,18 @@ class DeployedMCPEventsTests(unittest.TestCase):
                 "scripts.run_mcp_server.build_mcp_server", return_value=inner_app
             ) as build:
                 app = create_application(config, sender_gateway=Sender())
-            self.assertEqual(len(app.background_workers), 1)
+            self.assertEqual(len(app.background_tasks), 1)
             self.assertIs(build.call_args.kwargs["sender_gateway"], build.call_args.kwargs["sender_gateway"])
-            worker_group = app.background_workers[0]
-            self.assertTrue(callable(worker_group.delivery_worker.authorize))
-            self.assertTrue(worker_group.delivery_worker.authorize(
+            dispatcher = app.background_tasks[0]
+            self.assertTrue(callable(dispatcher.authorize))
+            self.assertTrue(dispatcher.authorize(
                 tenant_id="tenant-a", principal_id="user-a", job_id="job-1"
             ))
-            worker_group.start()
+            dispatcher.start()
+            self.assertEqual(dispatcher._thread.name, "mcp-events")
             asyncio.run(asyncio.sleep(0.05))
-            worker_group.stop()
-            self.assertFalse(any(thread.is_alive() for thread in worker_group._threads))
+            dispatcher.stop()
+            self.assertIsNone(dispatcher._thread)
             self.assertTrue(db_path.exists())
             self.assertEqual(build.call_args.kwargs["events_store"].database, str(db_path))
 
@@ -200,7 +201,7 @@ class DeployedMCPEventsTests(unittest.TestCase):
                 "scripts.run_mcp_server.build_mcp_server", return_value=inner_app
             ) as build:
                 app = create_application(config, sender_gateway=Sender())
-            self.assertEqual(app.background_workers, ())
+            self.assertEqual(app.background_tasks, ())
             self.assertIsNone(build.call_args.kwargs["events_store"])
 
     def test_real_deployed_mcp_server_events_protocol_lifecycle(self):
