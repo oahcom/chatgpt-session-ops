@@ -20,7 +20,6 @@ Environment=SO_SENDER_ACCOUNTS_DIR=/var/lib/chatgpt-session-ops/accounts
 Environment=CHATGPT_STATE_DIR=/var/lib/chatgpt-session-ops/mcp-state
 Environment=SO_SENDER_ACCOUNT_LOCK_DIR=/var/lib/chatgpt-session-ops/mcp-state/account-locks
 Environment=CHATGPT_PROXY_FILE=/var/lib/chatgpt-session-ops/mcp-state/proxy.json
-Environment=SO_MCP_LEGACY_SENDER_DB=/var/lib/chatgpt-session-ops/state/sender-gateway.sqlite3
 
 ExecStart=/opt/so-mcp/.venv/bin/python -m scripts.run_mcp_server
 
