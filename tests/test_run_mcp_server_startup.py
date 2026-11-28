@@ -507,6 +507,7 @@ class TestLoadConfig(unittest.TestCase):
                 "chatgpt_cli_path": str(
                     Path(__file__).resolve().parents[1] / "scripts" / "chatgpt_send.py"
                 ),
+                "legacy_sender_db_path": None,
             },
         )
 
