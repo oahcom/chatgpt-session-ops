@@ -1049,7 +1049,8 @@ class ChatGPTCLIAdapter:
             if isinstance(payload, dict):
                 status = payload.get("http_status") or status
                 retry_after_seconds = payload.get("retry_after_seconds", retry_after_seconds)
-        if "account_busy" in lowered or "account_lock_unavailable" in lowered:
+        if ("account_busy" in lowered or "account_lock_unavailable" in lowered
+                or "account_disabled" in lowered):
             code = CODE_RESOURCE_EXHAUSTED
         elif "nologin" in lowered and ("fallback" in lowered or "匿名" in text):
             code = CODE_RESOURCE_EXHAUSTED
