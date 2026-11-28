@@ -26,3 +26,13 @@ The live `/opt/so-sender/sender_gateway/job_store.py` and `app.py` inspected on 
 ## Reproducing isolated deployed-source tests
 
 The deployed-runtime and Sender Gateway tests are preserved under `patches/tests/`. Build clean source snapshots from the exact base files and apply the patch sequence above, then run the corresponding test files with those snapshot roots on `PYTHONPATH`. The test receiver is mocked; no production callback, credential, or database is used.
+
+- `mcp-request-id-idempotency.patch` applies from `/opt/so-mcp` to live
+  `src/session_ops/mcp_server.py` base SHA-256
+  `4aebe295b53bdc14d99765f61eb1d526329bbacdb604f7dd4eed739439d4a82c`.
+  It marks `idempotency_key` required in the live tool schemas, preserves
+  caller-supplied keys, and derives a deterministic UUIDv4 from authenticated
+  tenant/principal, MCP session id, tool, and JSON-RPC request id before
+  validation when legacy connectors omit the key. Same-request replay is
+  deduplicated; a new request id is a new intent. Test with
+  `PYTHONPATH=/opt/so-mcp pytest patches/tests/test_mcp_request_id_idempotency.py`.
