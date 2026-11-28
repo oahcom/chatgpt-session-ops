@@ -57,7 +57,7 @@ class MCPEventsStoreTests(unittest.TestCase):
         kwargs.setdefault("conversation_id", "12345678-1234-4234-8234-123456789abc")
         return self.store.publish_job_completed(*args, **kwargs)
 
-    def test_event_catalog_requires_conversation_scoped_payload(self):
+    def test_event_catalog_requires_destination_conversation_and_optional_job_filter(self):
         definition = self.store.event_catalog()[0]
         properties = definition["payloadSchema"]["properties"]
         required = definition["payloadSchema"]["required"]
@@ -66,7 +66,10 @@ class MCPEventsStoreTests(unittest.TestCase):
         self.assertEqual(input_property["minLength"], 36)
         self.assertEqual(input_property["maxLength"], 36)
         self.assertIn("conversation_id", required)
+        input_required = definition["inputSchema"]["required"]
+        self.assertNotIn("job_id", input_required)
         self.assertNotIn("conversation_ids", properties)
+        self.assertIn("owner", input_property["description"])
 
     def test_subscribe_rejects_noncanonical_conversation_id_before_callback(self):
         with self.assertRaisesRegex(ValueError, "canonical lowercase UUID"):

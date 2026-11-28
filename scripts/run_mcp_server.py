@@ -414,17 +414,49 @@ def _load_events_encryption_key(path_value: str) -> bytes:
     if not path.is_absolute():
         raise RuntimeError(EVENTS_KEY_FILE_ENV + " must be an absolute path")
     try:
-        metadata = path.stat()
-        if not stat.S_ISREG(metadata.st_mode):
-            raise RuntimeError(EVENTS_KEY_FILE_ENV + " must reference a regular file")
-        if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
+        # O_NOFOLLOW closes the lstat/open symlink race on supported systems.
+        # Keep the explicit lstat check for a clear fail-closed fallback on
+        # platforms that do not expose O_NOFOLLOW.
+        path_metadata = path.lstat()
+        if not stat.S_ISREG(path_metadata.st_mode):
+            raise RuntimeError(EVENTS_KEY_FILE_ENV + " must reference a regular non-symlink file")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOCTTY", 0)
+        )
+        descriptor = os.open(str(path), flags)
+    except OSError as exc:
+        raise RuntimeError(EVENTS_KEY_FILE_ENV + " is unavailable") from exc
+
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_dev != path_metadata.st_dev
+            or metadata.st_ino != path_metadata.st_ino
+        ):
+            raise RuntimeError(EVENTS_KEY_FILE_ENV + " must reference a regular non-symlink file")
+        if metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) not in (0o400, 0o600):
             raise RuntimeError(
                 EVENTS_KEY_FILE_ENV
                 + " must be owned by the MCP service user and mode 0400/0600"
             )
-        key = path.read_bytes()
+        # Read at most 33 bytes: enough to distinguish the required 32-byte
+        # key from an oversized file without loading arbitrary file contents.
+        chunks = bytearray()
+        while len(chunks) < 33:
+            chunk = os.read(descriptor, 33 - len(chunks))
+            if not chunk:
+                break
+            chunks.extend(chunk)
+        key = bytes(chunks)
     except OSError as exc:
         raise RuntimeError(EVENTS_KEY_FILE_ENV + " is unavailable") from exc
+    finally:
+        os.close(descriptor)
     if len(key) != 32:
         raise RuntimeError(EVENTS_KEY_FILE_ENV + " must contain exactly 32 raw bytes")
     return key

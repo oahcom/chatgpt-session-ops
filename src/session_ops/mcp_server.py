@@ -827,7 +827,8 @@ class MCPToolService:
                 work_item_id,
                 attempt_id,
                 request_hash=request_hash,
-            )
+            ),
+            mutation=True,
         )
         if not created:
             previous_status = attempt["status"]
@@ -886,8 +887,11 @@ class MCPToolService:
                         attempt_id,
                         status="failed",
                         error=type(exc).__name__,
-                    )
+                    ),
+                    mutation=True,
                 )
+            except _IndeterminateOperation as completion_exc:
+                raise completion_exc from exc
             except BaseException:
                 pass
             if prompt_path is not None:
@@ -997,7 +1001,8 @@ class MCPToolService:
                     account=resolved_account,
                     http_status=http_status,
                     error=attempt_error,
-                )
+                ),
+                mutation=True,
             )
             return {
                 "work_item_id": work_item_id,
@@ -1010,6 +1015,11 @@ class MCPToolService:
                 "replayed": False,
             }
         except BaseException as exc:
+            # A timed-out completion write may still commit. Do not race it
+            # with a second status update that could overwrite a successful
+            # result; the caller must query/replay the same attempt ID.
+            if isinstance(exc, _IndeterminateOperation):
+                raise
             # Only failures after a POST may have reached ChatGPT are unknown.
             # Authorization/account/prompt preflight failures are definitely
             # non-deliveries and must not poison the WorkItem send slot.
@@ -1028,8 +1038,11 @@ class MCPToolService:
                         attempt_id,
                         status=attempt_status,
                         error=type(exc).__name__,
-                    )
+                    ),
+                    mutation=True,
                 )
+            except _IndeterminateOperation as completion_exc:
+                raise completion_exc from exc
             except BaseException:
                 pass
             raise

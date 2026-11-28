@@ -64,6 +64,7 @@ except ModuleNotFoundError:  # pragma: no cover
 from scripts.run_mcp_server import (  # noqa: E402
     DeploymentASGI,
     MEMORY_STDIO_ENV,
+    _load_events_encryption_key,
     _realm_namespace_from_issuer,
     _resolve_memory_executable,
     _validate_https_url,
@@ -73,6 +74,72 @@ from scripts.run_mcp_server import (  # noqa: E402
     main,
     required_env,
 )
+
+
+class TestEventsEncryptionKey(unittest.TestCase):
+    """The Events key must be a private, regular, owner-controlled file."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.key = b"k" * 32
+        self.path = self.tmp / "events.key"
+
+    def write_key(self, mode=0o400, content=None):
+        if self.path.exists():
+            self.path.chmod(0o600)
+        self.path.write_bytes(self.key if content is None else content)
+        self.path.chmod(mode)
+        return self.path
+
+    def test_accepts_only_the_two_documented_owner_modes(self):
+        for mode in (0o400, 0o600):
+            with self.subTest(mode=oct(mode)):
+                self.write_key(mode)
+                self.assertEqual(_load_events_encryption_key(str(self.path)), self.key)
+
+    def test_rejects_other_owner_only_modes(self):
+        for mode in (0o500, 0o700):
+            with self.subTest(mode=oct(mode)):
+                self.write_key(mode)
+                with self.assertRaisesRegex(RuntimeError, "mode 0400/0600"):
+                    _load_events_encryption_key(str(self.path))
+
+    def test_rejects_group_or_world_permissions(self):
+        for mode in (0o440, 0o640, 0o644):
+            with self.subTest(mode=oct(mode)):
+                self.write_key(mode)
+                with self.assertRaisesRegex(RuntimeError, "mode 0400/0600"):
+                    _load_events_encryption_key(str(self.path))
+
+    def test_rejects_symlink_even_when_target_is_valid(self):
+        self.write_key(0o400)
+        link = self.tmp / "events-link.key"
+        link.symlink_to(self.path)
+        with self.assertRaisesRegex(RuntimeError, "regular non-symlink"):
+            _load_events_encryption_key(str(link))
+
+    def test_rejects_directory(self):
+        with self.assertRaisesRegex(RuntimeError, "regular non-symlink"):
+            _load_events_encryption_key(str(self.tmp))
+
+    def test_rejects_wrong_owner(self):
+        self.write_key(0o400)
+        with mock.patch("scripts.run_mcp_server.os.geteuid", return_value=os.geteuid() + 1):
+            with self.assertRaisesRegex(RuntimeError, "owned by the MCP service user"):
+                _load_events_encryption_key(str(self.path))
+
+    def test_rejects_short_and_oversized_keys(self):
+        for content in (b"k" * 31, b"k" * 33):
+            with self.subTest(length=len(content)):
+                self.write_key(0o400, content)
+                with self.assertRaisesRegex(RuntimeError, "exactly 32 raw bytes"):
+                    _load_events_encryption_key(str(self.path))
+
+    def test_rejects_relative_path(self):
+        with self.assertRaisesRegex(RuntimeError, "must be an absolute path"):
+            _load_events_encryption_key("events.key")
 
 
 class TestRequiredEnv(unittest.TestCase):

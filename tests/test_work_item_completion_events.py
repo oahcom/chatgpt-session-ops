@@ -151,20 +151,20 @@ class WorkItemCompletionEventTests(unittest.TestCase):
         self.assertTrue(all("conversation_ids" not in payload for payload in delivered_payloads))
 
 
-    def test_same_owner_conversations_do_not_cross_deliver(self):
+    def test_owner_subscriptions_receive_all_workitem_events_in_their_destination_conversations(self):
         first_session = "12345678-1234-4234-8234-123456789abc"
         other_session = "32345678-1234-4234-8234-123456789abc"
         self._subscribe("https://events.example.test/first", conversation_id=first_session)
         self._subscribe("https://events.example.test/other", conversation_id=other_session)
         item, _ = self._create_linked_item()
         self.store.set_status(self.principal, item.work_item_id, "completed")
-        self.assertEqual(self.events.deliver_pending(), 1)
+        self.assertEqual(self.events.deliver_pending(), 2)
         payloads = [json.loads(body) for _url, body, _headers in self.callback.requests if json.loads(body).get("type") != "verification"]
-        self.assertEqual(len(payloads), 1)
-        self.assertEqual(payloads[0]["data"]["conversation_id"], first_session)
-        self.assertNotIn("conversation_ids", payloads[0]["data"])
+        self.assertEqual(len(payloads), 2)
+        self.assertEqual({payload["data"]["conversation_id"] for payload in payloads}, {first_session, other_session})
+        self.assertTrue(all("conversation_ids" not in payload["data"] for payload in payloads))
 
-    def test_replay_backfill_matches_exact_conversation(self):
+    def test_replay_backfill_targets_all_owner_destinations_not_source_sessions(self):
         first_session = "12345678-1234-4234-8234-123456789abc"
         other_session = "32345678-1234-4234-8234-123456789abc"
         self.events.clock = lambda: 1000.0
@@ -183,7 +183,10 @@ class WorkItemCompletionEventTests(unittest.TestCase):
             rows = db.execute(
                 "SELECT s.callback_url FROM event_deliveries d JOIN event_subscriptions s ON s.id=d.subscription_id WHERE d.event_id='evt_replay_scoped'"
             ).fetchall()
-        self.assertEqual([row["callback_url"] for row in rows], ["https://events.example.test/replay-first"])
+        self.assertEqual(
+            {row["callback_url"] for row in rows},
+            {"https://events.example.test/replay-first", "https://events.example.test/replay-other"},
+        )
 
     def test_unscoped_subscription_is_rejected(self):
         auth = SimpleNamespace(principal=SimpleNamespace(
@@ -194,19 +197,41 @@ class WorkItemCompletionEventTests(unittest.TestCase):
             "url": "https://events.example.test/unscoped",
             "secret": "whsec_" + base64.b64encode(b"u" * 32).decode(),
         }
-        with self.assertRaisesRegex(ValueError, "conversation_id-scoped"):
+        with self.assertRaisesRegex(ValueError, "destination conversation_id"):
             self.events.subscribe(auth, {
                 "name": "chatgpt.job.completed", "arguments": {}, "delivery": delivery
             })
 
-    def test_completion_without_linked_conversation_is_not_broadcast(self):
+    def test_one_owner_conversation_aggregates_multiple_distinct_workitems(self):
+        destination = "92345678-1234-4234-8234-123456789abc"
+        self._subscribe(conversation_id=destination)
+        first, _ = self._create_linked_item()
+        second = self.store.create_work_item(self.principal)
+        self.store.set_status(self.principal, first.work_item_id, "completed")
+        self.store.set_status(self.principal, second.work_item_id, "completed")
+        self.assertEqual(self.events.deliver_pending(), 2)
+        payloads = [json.loads(body)["data"] for _url, body, _headers in self.callback.requests if json.loads(body).get("type") != "verification"]
+        self.assertEqual({payload["job_id"] for payload in payloads}, {first.work_item_id, second.work_item_id})
+        self.assertEqual({payload["conversation_id"] for payload in payloads}, {destination})
+
+    def test_owner_destination_does_not_receive_another_principals_workitems(self):
+        destination = "92345678-1234-4234-8234-123456789abc"
+        self._subscribe(conversation_id=destination)
+        other = Principal("tenant-a", "another-owner")
+        foreign = self.store.create_work_item(other)
+        self.store.set_status(other, foreign.work_item_id, "completed")
+        self.assertEqual(self.events.deliver_pending(), 0)
+
+    def test_owner_destination_receives_completion_even_without_workitem_session_link(self):
         self._subscribe()
         item = self.store.create_work_item(self.principal)
         self.store.set_status(self.principal, item.work_item_id, "completed")
         with self.events._db() as db:
             self.assertEqual(db.execute("SELECT count(*) FROM event_outbox").fetchone()[0], 1)
-            self.assertEqual(db.execute("SELECT count(*) FROM event_deliveries").fetchone()[0], 0)
-        self.assertEqual(self.events.deliver_pending(), 0)
+            self.assertEqual(db.execute("SELECT count(*) FROM event_deliveries").fetchone()[0], 1)
+        self.assertEqual(self.events.deliver_pending(), 1)
+        delivered = [json.loads(body)["data"] for _url, body, _headers in self.callback.requests if json.loads(body).get("type") != "verification"]
+        self.assertEqual(delivered[0]["conversation_id"], "12345678-1234-4234-8234-123456789abc")
 
     def test_unscoped_legacy_subscription_is_disabled_on_startup(self):
         # Create an old-format subscription row directly to model an upgrade.

@@ -1,3 +1,4 @@
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -81,7 +82,13 @@ class MCPChatGPTToolTests(unittest.TestCase):
         store = FakeStore(link=link)
         service = MCPToolService(store)
         api = SimpleNamespace(account="acct2")
+        db_mutation_flags = []
+        original_run_db = service._run_db
+        def checked_run_db(function, *, mutation=False):
+            db_mutation_flags.append(mutation)
+            return original_run_db(function, mutation=mutation)
         with (
+            mock.patch.object(service, "_run_db", side_effect=checked_run_db),
             mock.patch("scripts.chatgpt_send.resolve_conversation_account", return_value={"status": "known", "account": "acct2"}),
             mock.patch("scripts.chatgpt_send.ChatGPTAPI", return_value=api),
             mock.patch("scripts.chatgpt_send.send_prompt", return_value=(200, "/tmp/reply", SESSION_ID)) as send,
@@ -103,6 +110,7 @@ class MCPChatGPTToolTests(unittest.TestCase):
         self.assertEqual(result["data"]["conversation_id"], SESSION_ID)
         self.assertEqual(store.access_checks[0][2], "write")
         self.assertEqual(send.call_args.args[1], SESSION_ID)
+        self.assertEqual(db_mutation_flags, [True, False, True])
         prompt_path = send.call_args.args[2]
         self.assertFalse(__import__("os").path.exists(prompt_path))
 
@@ -119,6 +127,105 @@ class MCPChatGPTToolTests(unittest.TestCase):
         self.assertTrue(replay["ok"])
         self.assertEqual(replay["data"]["status"], "sent")
         self.assertTrue(replay["data"]["replayed"])
+        send.assert_called_once()
+
+    def test_reservation_timeout_is_indeterminate_and_never_starts_remote_send(self):
+        store = FakeStore()
+        service = MCPToolService(store)
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        original_reserve = store.reserve_send_attempt
+
+        def delayed_reserve(*args, **kwargs):
+            started.set()
+            if not release.wait(2):
+                raise AssertionError("test did not release delayed reservation")
+            try:
+                return original_reserve(*args, **kwargs)
+            finally:
+                finished.set()
+
+        store.reserve_send_attempt = delayed_reserve
+        with (
+            mock.patch("src.session_ops.mcp_server.DB_DEADLINE_SECONDS", 0.05),
+            mock.patch("scripts.chatgpt_send.send_prompt") as send,
+        ):
+            result = service.dispatch(
+                "chatgpt.session.send",
+                {"work_item_id": WORK_ITEM_ID, "prompt": "send once", "attempt_id": ATTEMPT_ID},
+                make_auth("session_ops.session.write", "session_ops.work_item.write"),
+            )
+        self.assertTrue(started.is_set())
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "INDETERMINATE")
+        self.assertFalse(result["error"]["retryable"])
+        send.assert_not_called()
+
+        release.set()
+        self.assertTrue(finished.wait(2))
+        replay = service.dispatch(
+            "chatgpt.session.send",
+            {"work_item_id": WORK_ITEM_ID, "prompt": "send once", "attempt_id": ATTEMPT_ID},
+            make_auth("session_ops.session.write", "session_ops.work_item.write"),
+        )
+        self.assertTrue(replay["ok"])
+        self.assertEqual(replay["data"]["status"], "in_progress")
+        send.assert_not_called()
+
+    def test_completion_timeout_does_not_race_a_second_status_write(self):
+        link = SimpleNamespace(link_id="link-a", session_id=SESSION_ID,
+                               work_item_id=WORK_ITEM_ID, linked_at="now", unlinked_at=None)
+        store = FakeStore(link=link)
+        service = MCPToolService(store)
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        original_complete = store.complete_send_attempt
+        calls = []
+
+        def delayed_complete(*args, **kwargs):
+            calls.append(dict(kwargs))
+            if len(calls) == 1:
+                started.set()
+                if not release.wait(2):
+                    raise AssertionError("test did not release delayed completion")
+            try:
+                return original_complete(*args, **kwargs)
+            finally:
+                finished.set()
+
+        store.complete_send_attempt = delayed_complete
+        with (
+            mock.patch("src.session_ops.mcp_server.DB_DEADLINE_SECONDS", 0.05),
+            mock.patch("scripts.chatgpt_send.resolve_conversation_account", return_value={"status": "known", "account": "acct2"}),
+            mock.patch("scripts.chatgpt_send.ChatGPTAPI", return_value=SimpleNamespace(account="acct2")),
+            mock.patch("scripts.chatgpt_send.send_prompt", return_value=(200, "/tmp/reply", SESSION_ID)) as send,
+        ):
+            result = service.dispatch(
+                "chatgpt.session.send",
+                {"work_item_id": WORK_ITEM_ID, "conversation_id": SESSION_ID,
+                 "prompt": "send once", "attempt_id": ATTEMPT_ID},
+                make_auth("session_ops.session.write", "session_ops.work_item.write"),
+            )
+        self.assertTrue(started.is_set())
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "INDETERMINATE")
+        self.assertFalse(result["error"]["retryable"])
+        self.assertEqual(len(calls), 1)
+
+        release.set()
+        self.assertTrue(finished.wait(2))
+        replay = service.dispatch(
+            "chatgpt.session.send",
+            {"work_item_id": WORK_ITEM_ID, "conversation_id": SESSION_ID,
+             "prompt": "send once", "attempt_id": ATTEMPT_ID},
+            make_auth("session_ops.session.write", "session_ops.work_item.write"),
+        )
+        self.assertTrue(replay["ok"])
+        self.assertEqual(replay["data"]["status"], "sent")
+        self.assertTrue(replay["data"]["replayed"])
+        self.assertEqual(len(calls), 1)
         send.assert_called_once()
 
     def test_existing_link_does_not_make_failed_send_look_successful(self):

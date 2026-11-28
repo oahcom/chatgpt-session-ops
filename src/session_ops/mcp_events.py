@@ -193,7 +193,7 @@ class MCPEventsStore:
             delivery_columns = {row["name"] for row in db.execute("PRAGMA table_info(event_deliveries)")}
             if "generation" not in delivery_columns:
                 db.execute("ALTER TABLE event_deliveries ADD COLUMN generation INTEGER NOT NULL DEFAULT 1")
-            # Legacy owner-wide subscriptions have no conversation boundary.
+            # Legacy unscoped subscriptions have no explicit destination.
             # Disable them and cancel only their pending deliveries; never
             # reinterpret historical outbox rows or fan them out broadly.
             legacy_rows = db.execute(
@@ -258,13 +258,13 @@ class MCPEventsStore:
     def event_catalog() -> list[dict[str, Any]]:
         return [{
             "name": "chatgpt.job.completed",
-            "description": "A Session Ops WorkItem owned by the connected account has reached a terminal state.",
+            "description": "A WorkItem owned by the connected account has reached a terminal state; the subscribed conversation is the owner-level notification destination.",
             "delivery": ["webhook"],
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "conversation_id": {"type": "string", "minLength": 36, "maxLength": 36, "description": "The exact canonical ChatGPT Work conversation UUID to receive events for."},
-                    "job_id": {"type": "string", "description": "Optional WorkItem ID to monitor within this conversation."}
+                    "conversation_id": {"type": "string", "minLength": 36, "maxLength": 36, "description": "The canonical ChatGPT Work conversation UUID that receives this owner’s WorkItem completion events."},
+                    "job_id": {"type": "string", "description": "Optional WorkItem ID filter. Omit it to receive all WorkItem completion events owned by this authenticated principal in the destination conversation."}
                 },
                 "required": ["conversation_id"],
                 "additionalProperties": False,
@@ -333,7 +333,7 @@ class MCPEventsStore:
             or not arguments["conversation_id"]
             or ("job_id" in arguments and (not isinstance(arguments["job_id"], str) or not arguments["job_id"]))
         ):
-            raise ValueError("a conversation_id-scoped chatgpt.job.completed subscription is required")
+            raise ValueError("an explicit destination conversation_id is required for chatgpt.job.completed")
         conversation_id = arguments["conversation_id"]
         try:
             validate_conversation_id(conversation_id)
@@ -436,13 +436,11 @@ class MCPEventsStore:
             ).fetchall()
             for event in recent_events:
                 event_data = json.loads(event["data_json"])
-                event_conversations = set(event_data.get("conversation_ids") or [])
-                if event_data.get("conversation_id"):
-                    event_conversations.add(event_data["conversation_id"])
-                if (
-                    conversation_id not in event_conversations
-                    or arguments.get("job_id") not in (None, event_data.get("job_id"))
-                ):
+                # conversation_id is the notification destination, not a
+                # requirement that this WorkItem originated in that chat.
+                # With no job_id filter, one owner-level subscription receives
+                # every completion event for this verified principal.
+                if arguments.get("job_id") not in (None, event_data.get("job_id")):
                     continue
                 db.execute(
                     """INSERT OR IGNORE INTO event_deliveries(event_id, subscription_id, status, generation)
@@ -593,13 +591,10 @@ class MCPEventsStore:
             "INSERT INTO event_outbox VALUES (?, ?, ?, ?, ?, ?)",
             (event_id, tenant_id, principal_id, "chatgpt.job.completed", canonical_data, event_created_at),
         )
-        event_conversations = set(conversation_ids or [])
-        if conversation_id is not None:
-            event_conversations.add(conversation_id)
-        # A completion with no linked conversation is not a deliverable
-        # ChatGPT Work event. In particular, never broadcast it owner-wide.
-        if not event_conversations:
-            return event_id
+        # Subscriptions are explicit owner-scoped notification destinations.
+        # The destination conversation need not be linked to each WorkItem;
+        # omitting job_id intentionally aggregates all of this principal's
+        # WorkItem completions into one stable ChatGPT Work conversation.
         subscriptions = db.execute(
             "SELECT id, arguments_json, generation FROM event_subscriptions WHERE tenant_id=? AND principal_id=? AND name='chatgpt.job.completed' AND active=1 AND (expires_at IS NULL OR expires_at>?)",
             (tenant_id, principal_id, now),
@@ -609,7 +604,6 @@ class MCPEventsStore:
             scoped_conversation = filters.get("conversation_id")
             if (
                 not isinstance(scoped_conversation, str)
-                or scoped_conversation not in event_conversations
                 or filters.get("job_id") not in (None, job_id)
             ):
                 continue
@@ -731,15 +725,16 @@ class MCPEventsStore:
             event_data = json.loads(row["data_json"])
             filters = json.loads(row["arguments_json"])
             scoped_conversation = filters.get("conversation_id")
-            event_conversations = set(event_data.get("conversation_ids") or [])
-            if event_data.get("conversation_id"):
-                event_conversations.add(event_data["conversation_id"])
-            if not isinstance(scoped_conversation, str) or scoped_conversation not in event_conversations:
-                # Old or corrupt deliveries must never cross a conversation boundary.
+            if not isinstance(scoped_conversation, str):
+                # Old or corrupt deliveries without an explicit destination
+                # must fail closed. Source WorkItem sessions are independent.
                 status = 403
                 event = None
                 body = b""
             else:
+                # Always route the callback to the explicitly subscribed
+                # destination conversation, regardless of the WorkItem's
+                # source session links (which may be absent or different).
                 event_data.pop("conversation_ids", None)
                 event_data["conversation_id"] = scoped_conversation
                 event = {
