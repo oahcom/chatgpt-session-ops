@@ -35,6 +35,10 @@ Keep `event_outbox` and all WorkItem data. Provision a new key and restart; all 
 
 There is no re-encryption migration, so interrupted rotation and rotation rollback are not supported operations. A wrong-key startup is fail-closed and does not modify the existing key metadata or subscription rows. Recovery is either restore the matching database/key pair or deliberately discard all subscriptions and re-establish them with a new key.
 
+## Lifecycle boundary
+
+`work_item.finish` is a narrow v0.1 Owner-only terminal operation. It prevents generic `work_item.update` from setting terminal statuses and atomically commits the terminal projection, audit, SessionLink unlink, request receipt, and optional completion Outbox event. It is not the full Owner Acceptance/cancellation model: there is no immutable Acceptance record bound to WorkItemSpec, Assignment, head SHA, and required Evidence, and cancellation has no separate immutable cancellation record or required reason. A delivered `chatgpt.job.completed` event is a terminal-state notification, not Acceptance evidence. Keep #196/#166 open until those lifecycle semantics are implemented; the event publisher must ultimately be called by the authoritative Acceptance/cancellation transaction.
+
 ## Direct ChatGPT execution
 
 - `chatgpt.session.create` and `chatgpt.session.send` use `ChatGPTDirectClient`, an in-process adapter over the repository's existing `scripts/chatgpt_send.py` implementation. There is no Sender Gateway, HTTP sidecar, mTLS client, or separate worker service.
@@ -56,7 +60,7 @@ There is no re-encryption migration, so interrupted rotation and rotation rollba
 
 ## Verification
 
-Local full-suite verification before the immutable-key patch, on PR head `786c4f0da7fe68605bf6274afcf01c2a8fcc8913`: `python3 -m pytest -q tests` — **1,359 passed, 13 skipped, 1,587 subtests passed**; pinned MCP SDK 2.3.0 integration suite — **6 passed**. On the current immutable-key head `e75ffb5db41620ba82dc5788127897b800372aa9`, GitHub Actions PR run #802 passed all four jobs: unit tests (**1,367 run, 7 skipped**), tools/tests guards, real MCP SDK integration (**6 passed**), and real memory-stdio E2E. Python compilation and `git diff --check` passed on the preceding tested head; the exact current head is covered by CI.
+Local full-suite verification on the pre-idempotency head `786c4f0da7fe68605bf6274afcf01c2a8fcc8913`: `python3 -m pytest -q tests` — **1,359 passed, 13 skipped, 1,587 subtests passed**; pinned MCP SDK 2.3.0 integration suite — **6 passed**. GitHub Actions PR run #813 on current code head `1cb003c07c4538cddaf00ed3b38fdb7f2031b94e` passed all four jobs: unit tests, tools/tests guards, real MCP SDK integration (**6 passed**), and real memory-stdio E2E. The latest follow-up commit only changes this documentation and must pass its own exact-head CI.
 
 Focused integration tests cover the full local path: authenticated WorkItem -> owner-authorized terminal transition -> same-transaction outbox insert -> webhook delivery. They verify delegated writers cannot complete/cancel a WorkItem, cannot create a filtered subscription for another owner's WorkItem, one destination conversation aggregates multiple WorkItems from one owner and can be shared by multiple owners' independent subscriptions, source sessions can differ or be absent, cross-principal isolation, destination payload sanitization, owner/job-filtered replay/backfill, rejection and migration shutdown of unscoped subscriptions, and outbox rollback on terminal-transition failure. Additional regression tests cover bounded DNS resolution, dispatcher start/stop race fencing and shutdown failure without duplicate stop waits, direct-client queue capacity and durable idempotency, restart recovery that never replays an ambiguous remote send, account preflight, and owner-scoped session reads.
 
