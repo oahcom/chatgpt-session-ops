@@ -108,6 +108,76 @@ elif scenario == "retrieve_scope_violation":
             "score": 0.8,
         },
     ]}))
+elif scenario == "retrieve_session_mismatch":
+    emit(ok({"entries": [{
+        "memory_id": "mem-session-mismatch",
+        "work_item_id": payload.get("work_item_id"),
+        "session_id": "session-002",
+        "content": "wrong session content",
+        "provenance": {},
+        "created_at": "2026-11-21T10:00:00Z",
+        "score": 0.9,
+    }]}))
+elif scenario == "retrieve_session_missing":
+    emit(ok({"entries": [{
+        "memory_id": "mem-session-missing",
+        "work_item_id": payload.get("work_item_id"),
+        "content": "missing session id",
+        "provenance": {},
+        "created_at": "2026-11-21T10:00:00Z",
+        "score": 0.9,
+    }]}))
+elif scenario == "retrieve_session_null":
+    emit(ok({"entries": [{
+        "memory_id": "mem-session-null",
+        "work_item_id": payload.get("work_item_id"),
+        "session_id": None,
+        "content": "null session id",
+        "provenance": {},
+        "created_at": "2026-11-21T10:00:00Z",
+        "score": 0.9,
+    }]}))
+elif scenario == "retrieve_session_malformed":
+    emit(ok({"entries": [{
+        "memory_id": "mem-session-malformed",
+        "work_item_id": payload.get("work_item_id"),
+        "session_id": [],
+        "content": "malformed session id",
+        "provenance": {},
+        "created_at": "2026-11-21T10:00:00Z",
+        "score": 0.9,
+    }]}))
+elif scenario == "retrieve_session_empty":
+    emit(ok({"entries": [{
+        "memory_id": "mem-session-empty",
+        "work_item_id": payload.get("work_item_id"),
+        "session_id": "",
+        "content": "empty session id",
+        "provenance": {},
+        "created_at": "2026-11-21T10:00:00Z",
+        "score": 0.9,
+    }]}))
+elif scenario == "retrieve_cross_session":
+    emit(ok({"entries": [
+        {
+            "memory_id": "mem-session-a",
+            "work_item_id": payload.get("work_item_id"),
+            "session_id": "session-a",
+            "content": "session A",
+            "provenance": {},
+            "created_at": "2026-11-21T10:00:00Z",
+            "score": 0.9,
+        },
+        {
+            "memory_id": "mem-session-b",
+            "work_item_id": payload.get("work_item_id"),
+            "session_id": "session-b",
+            "content": "session B",
+            "provenance": {},
+            "created_at": "2026-11-21T10:00:00Z",
+            "score": 0.8,
+        },
+    ]}))
 elif scenario == "malformed_json":
     sys.stdout.write("this is not json\n")
 elif scenario == "two_lines":
@@ -397,6 +467,57 @@ class ResponseParsingTestCase(MemoryAdapterClientTestCase):
                 work_item_id=self.work_item_id, query="migration"
             )
         self.assertEqual(ctx.exception.code, "SCOPE_VIOLATION")
+
+    def test_every_retrieved_session_id_is_checked(self) -> None:
+        exact = self.client("retrieve_one")
+        result = exact.retrieve(
+            work_item_id=self.work_item_id,
+            query="migration",
+            session_id="session-001",
+        )
+        self.assertEqual(len(result.entries), 1)
+        self.assertEqual(result.entries[0].session_id, "session-001")
+
+        for scenario in (
+            "retrieve_session_mismatch",
+            "retrieve_session_missing",
+            "retrieve_session_null",
+            "retrieve_session_malformed",
+            "retrieve_session_empty",
+        ):
+            with self.subTest(scenario=scenario):
+                violating = self.client(scenario)
+                with self.assertRaises(MemoryAdapterError) as ctx:
+                    violating.retrieve(
+                        work_item_id=self.work_item_id,
+                        query="migration",
+                        session_id="session-001",
+                    )
+                self.assertEqual(ctx.exception.code, "SCOPE_VIOLATION")
+
+        # This response violates both the requested WorkItem and Session
+        # scope. The client must fail the whole retrieval, not expose the
+        # valid prefix entry before encountering the violating entry.
+        combined = self.client("retrieve_scope_violation")
+        with self.assertRaises(MemoryAdapterError) as ctx:
+            combined.retrieve(
+                work_item_id=self.work_item_id,
+                query="migration",
+                session_id="session-001",
+            )
+        self.assertEqual(ctx.exception.code, "SCOPE_VIOLATION")
+
+    def test_session_none_preserves_cross_session_work_item_scope(self) -> None:
+        client = self.client("retrieve_cross_session")
+        result = client.retrieve(
+            work_item_id=self.work_item_id,
+            query="migration",
+            session_id=None,
+        )
+        self.assertEqual(
+            {entry.session_id for entry in result.entries},
+            {"session-a", "session-b"},
+        )
 
     def test_zero_match_retrieval_is_successful_empty_result(self) -> None:
         # Assertion 24
