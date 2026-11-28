@@ -475,8 +475,8 @@ class ChatGPTCLIAdapter:
             "next_after_message_id": data["next_after_message_id"],
         }
 
-    def list_sessions(self, page_size, cursor):
-        """列会话：CLI 一次性返回全量，这里在本地分页。"""
+    def list_sessions(self, page_size, cursor, *, allowed_conversation_ids=None):
+        """列会话：CLI 一次性返回全量，先按 owner 过滤再本地分页。"""
         if (
             not isinstance(page_size, int)
             or isinstance(page_size, bool)
@@ -511,6 +511,16 @@ class ChatGPTCLIAdapter:
                     "message_count": None,
                 }
             )
+
+        if allowed_conversation_ids is not None:
+            if not isinstance(allowed_conversation_ids, (set, frozenset)):
+                raise SenderError(
+                    CODE_INVALID_ARGUMENT, "allowed conversation ids must be a set"
+                )
+            items = [
+                item for item in items
+                if item["conversation_id"] in allowed_conversation_ids
+            ]
 
         window = items[offset : offset + page_size]
         next_offset = offset + page_size
