@@ -1405,10 +1405,9 @@ sudo find /var/lib/chatgpt-session-ops/accounts -type d -name replies \
   -exec setfacl -m u:ubuntu:rwx,d:u:ubuntu:rwx {} +
 
 # Runtime state is writable; the legacy Gateway database is read-only.
-sudo setfacl -m u:ubuntu:rwx /var/lib/chatgpt-session-ops/mcp-state
-sudo setfacl -m u:ubuntu:rw- /var/lib/chatgpt-session-ops/mcp-state/*
+sudo setfacl -m u:ubuntu:rwx,d:u:ubuntu:rwx /var/lib/chatgpt-session-ops/mcp-state
 sudo setfacl -m u:ubuntu:--x /var/lib/chatgpt-session-ops/state
-sudo setfacl -m u:ubuntu:r-- /var/lib/chatgpt-session-ops/state/sender-gateway.sqlite3
+sudo find /var/lib/chatgpt-session-ops/state -maxdepth 1 -type f -name 'sender-gateway.sqlite3*' -exec setfacl -m u:ubuntu:r-- {} +
 ```
 
 Apply the same read-only credential and writable-replies ACLs when provisioning
