@@ -559,7 +559,7 @@ class MCPToolService:
                 chatgpt_cli_path,
                 timeout=1900.0,
                 read_timeout=20.0,
-                max_concurrency=4,
+                max_concurrency=2,
                 read_concurrency=2,
                 owner_lookup=self.chatgpt_registry.get_owner,
                 cwd=cli_root,
