@@ -264,9 +264,12 @@ class _FakeCLI:
             "next_after_message_id": None,
         }
 
-    def list_sessions(self, page_size, cursor):
+    def list_sessions(self, page_size, cursor, *, allowed_conversation_ids=None):
+        items = [{"conversation_id": CONV_ID, "account": "acct2"}]
+        if allowed_conversation_ids is not None:
+            items = [item for item in items if item["conversation_id"] in allowed_conversation_ids]
         return {
-            "items": [{"conversation_id": CONV_ID, "account": "acct2"}],
+            "items": items,
             "next_cursor": None,
             "partial": False,
             "errors": [],
