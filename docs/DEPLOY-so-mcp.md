@@ -504,6 +504,42 @@ restore its matching backup or follow the explicit subscription-reset recovery
 procedure in `docs/mcp-events-poc.md`; never start with a new key while leaving
 old encrypted subscriptions active.
 
+### Event readiness and bounded health snapshot
+
+`/healthz` reports HTTP process liveness only. When Events are enabled,
+`/readyz` separately reports whether the in-process dispatcher thread is
+running and returns bounded aggregate data: pending/sending/delivered/failed
+counts, oldest pending age, retry exhaustion, attempt totals, active/expired
+subscriptions, last delivery status classes, callback latency/status counters
+for the current process, SQLite busy errors, secret-decryption failures, and
+database/WAL byte sizes. It never returns event IDs, WorkItem IDs, principal
+IDs, callback URLs, signing secrets, or payload contents. When Events are
+disabled, `/readyz` returns `events.enabled=false` and HTTP 200.
+
+Check readiness from the host:
+
+```bash
+curl --fail --silent --show-error http://127.0.0.1:8791/readyz
+systemctl is-active so-mcp.service
+journalctl -u so-mcp.service --since -15min --no-pager
+```
+
+Investigate when `dispatcher.running=false` while pending deliveries exist,
+`oldest_pending_age_seconds` remains above 120, `retry_exhausted` is nonzero,
+or callback 4xx/5xx, 410, 413, SQLite-busy, or secret-decryption counters
+increase. Check callback reachability and subscription expiry first. Do not
+replay the historical legacy Sender Outbox. Do not manually edit delivery
+leases or encrypted subscription rows. For a dispatcher crash, preserve the
+database/key pair, inspect the secret-free `/readyz` snapshot and journal,
+then restart the single MCP service in the approved window; leases recover
+automatically after expiry. If the key/database pair is suspect, follow the
+immutable-key recovery procedure above rather than generating a replacement
+key in place.
+
+`/healthz` remains a liveness check; a 200 there does not imply event
+delivery readiness. Keep the dispatcher in-process; this endpoint adds no
+worker, scheduler, queue, or external metrics dependency.
+
 ### OAuth scope issuance is a separate gate
 
 The MCP resource metadata advertises the existing scopes
