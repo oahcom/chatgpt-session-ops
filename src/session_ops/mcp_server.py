@@ -105,6 +105,12 @@ _AUTH_VERIFY_SLOTS = threading.BoundedSemaphore(
     _AUTH_VERIFY_MAX_INFLIGHT
 )
 
+# ChatGPT sends are side-effecting and account rotation is process-local.
+# Keep one in-process consumer and a small bounded admission window; do not
+# fan a burst of MCP calls out into concurrent CLI children or another service.
+_SEND_WORKERS = 1
+_SEND_MAX_INFLIGHT = 9  # one executing plus at most eight waiting
+
 
 class _DeadlineExceeded(Exception):
     pass
@@ -112,6 +118,42 @@ class _DeadlineExceeded(Exception):
 
 class _ResourceExhausted(Exception):
     """A bounded service resource or payload limit was exceeded."""
+
+
+class _BoundedExecutor:
+    """ThreadPoolExecutor with bounded active + queued submissions."""
+
+    def __init__(self, *, max_workers: int, max_inflight: int, thread_name_prefix: str):
+        if max_workers < 1 or max_inflight < max_workers:
+            raise ValueError("max_inflight must be >= max_workers >= 1")
+        self._executor = ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix=thread_name_prefix,
+        )
+        self._slots = threading.BoundedSemaphore(max_inflight)
+
+    def submit(self, function: Any, *args: Any, **kwargs: Any) -> Any:
+        if not self._slots.acquire(blocking=False):
+            raise _ResourceExhausted("ChatGPT send queue is full")
+        try:
+            future = self._executor.submit(function, *args, **kwargs)
+        except BaseException:
+            self._slots.release()
+            raise
+        # Release only when the real task finishes, not when the MCP caller
+        # times out or disconnects. The queued/running send remains admitted.
+        future.add_done_callback(lambda _future: self._slots.release())
+        return future
+
+    def shutdown(self, wait: bool = True) -> None:
+        self._executor.shutdown(wait=wait)
+
+
+_SEND_EXECUTOR = _BoundedExecutor(
+    max_workers=_SEND_WORKERS,
+    max_inflight=_SEND_MAX_INFLIGHT,
+    thread_name_prefix="session-ops-send",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1216,6 +1258,31 @@ def build_mcp_server(
                         # Shield prevents wait_for from cancelling the
                         # wrapper; the underlying job remains tracked until
                         # its completion callback releases admission.
+                        envelope = await asyncio.wait_for(
+                            asyncio.shield(future),
+                            timeout=REQUEST_DEADLINE_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        envelope = _error("TIMEOUT", request_id)
+            elif params.name == "chatgpt.session.send":
+                try:
+                    job = _SEND_EXECUTOR.submit(
+                        service.dispatch,
+                        params.name,
+                        arguments,
+                        auth,
+                        request_id=request_id,
+                    )
+                except _ResourceExhausted:
+                    envelope = _error("RESOURCE_EXHAUSTED", request_id)
+                else:
+                    future = asyncio.wrap_future(job, loop=loop)
+                    try:
+                        # A caller timeout must not cancel a queued/running
+                        # send. The worker reserves the durable attempt before
+                        # the POST; retrying the same attempt_id is observational
+                        # once execution starts. Work not yet started is safe to
+                        # resubmit after a process restart.
                         envelope = await asyncio.wait_for(
                             asyncio.shield(future),
                             timeout=REQUEST_DEADLINE_SECONDS,
