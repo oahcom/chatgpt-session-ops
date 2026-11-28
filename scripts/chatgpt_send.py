@@ -157,7 +157,7 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pow_solver import solve  # noqa: E402
 
-BASE = os.path.dirname(os.path.abspath(__file__))
+BASE = os.path.abspath(os.environ.get("CHATGPT_RUNTIME_DIR") or os.path.dirname(os.path.abspath(__file__)))
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36 Edg/157.0.4341.60")
 CTX = ssl.create_default_context()
@@ -2874,13 +2874,23 @@ def purge_expired(st):
     return changed
 
 
+def _effective_rotation_primary():
+    """Return the explicitly allowed logged-in accounts, or the legacy pool."""
+    raw = os.environ.get("CHATGPT_ALLOWED_ACCOUNTS")
+    if raw is None:
+        return ROTATION_PRIMARY
+    allowed = {item.strip() for item in raw.split(",") if item.strip()}
+    return tuple(account for account in ROTATION_PRIMARY if account in allowed)
+
+
 def rotation_plan(st):
-    """登录态身份（acct1/acct2/acct3/acct4/acct5/acct6）从游标起顺次尝试；不可用的排到末尾（避免死锁）。
-    匿名态不进入该计划——它只在**全部登录态**都 429 时由 anon_fallback_ready() 决定是否兜底。"""
+    """Rotate only through allowed logged-in accounts; anonymous stays separate."""
     st = _as_dict(st)
-    cur = _as_int(st.get("cursor"), 0)                          # F-34
-    n = len(ROTATION_PRIMARY)
-    seq = [ROTATION_PRIMARY[(cur + i) % n] for i in range(n)]
+    pool = _effective_rotation_primary()
+    if not pool:
+        return []
+    cur = _as_int(st.get("cursor"), 0) % len(pool)
+    seq = [pool[(cur + i) % len(pool)] for i in range(len(pool))]
     return [a for a in seq if not is_unavailable(st, a)] + [a for a in seq if is_unavailable(st, a)]
 
 
@@ -4600,6 +4610,10 @@ class ThinkingModelUnavailable(RuntimeError):
         )
 
 
+class RemoteSendOutcomeUnknown(RuntimeError):
+    """The conversation POST may have been accepted; never rotate or replay."""
+
+
 def _cookie_domain_allowed(domain):
     """Cookie 持久化边界（DECISION-156）：只允许 OpenAI 自有域。
 
@@ -4631,7 +4645,18 @@ class ChatGPTAPI:
                 "account must be one of %s"
                 % ", ".join(sorted(_VALID_ACCOUNT_IDENTITIES))
             )
-        b = root if account in ("default", "acct1") else os.path.join(root, "accounts", account)
+        if account in ("default", "acct1"):
+            # Support both the standalone layout (acct1 at root) and the
+            # shared production layout (/var/lib/chatgpt-session-ops/accounts/acctN).
+            acct1_root = os.path.join(root, "accounts", "acct1")
+            b = (
+                acct1_root
+                if not os.path.isfile(os.path.join(root, "cookies.json"))
+                and os.path.isfile(os.path.join(acct1_root, "cookies.json"))
+                else root
+            )
+        else:
+            b = os.path.join(root, "accounts", account)
         self.account = account
         self.base_dir = b
         self.is_anon = account == "nologin"  # 匿名态：走 /backend-anon/，POST 需浏览器过 Turnstile
@@ -5200,10 +5225,18 @@ class ChatGPTAPI:
             body["conversation_id"] = conv_id
         if parent_message_id:  # 可选：GET 限速时省略，落点仍由 SSE 首事件唯一 id 校验
             body["parent_message_id"] = parent_message_id
-        return self.req("POST", API_BASE + "/backend-api/conversation", body, {
+        # Default to UNKNOWN before touching the network. A socket exception
+        # after the request write cannot prove that ChatGPT did not accept it.
+        self.last_send_certainty = "UNKNOWN"
+        status, response = self.req("POST", API_BASE + "/backend-api/conversation", body, {
             "OpenAI-Sentinel-Chat-Requirements-Token": req_token,
             "OpenAI-Sentinel-Proof-Token": proof,
         }, timeout=timeout)
+        if 200 <= status < 300:
+            self.last_send_certainty = "SUBMITTED"
+        elif status in (400, 401, 403, 404, 413, 422, 429):
+            self.last_send_certainty = "NOT_SUBMITTED"
+        return status, response
 
     # ---------- 思考模式 ----------
     @staticmethod
@@ -7102,6 +7135,18 @@ def _send_prompt_impl(
                   % (send_timeout, SEND_TIMEOUT_SOURCE or "env"), flush=True)
         st, resp = api.send(conv_id, text, tail, req_token, proof, model=model,
                             timeout=send_timeout)
+        send_certainty = getattr(api, "last_send_certainty", None)
+        if send_certainty is None:
+            send_certainty = (
+                "NOT_SUBMITTED"
+                if st in (400, 401, 403, 404, 413, 422, 429)
+                else "UNKNOWN"
+            )
+        if st != 200 and send_certainty in ("UNKNOWN", "SUBMITTED"):
+            raise RemoteSendOutcomeUnknown(
+                "ChatGPT conversation POST did not return an authoritative response "
+                "(status=%s); do not retry or rotate accounts" % st
+            )
         # 截断/超时被 _partial_result 折成 200 交回既有解析链路（不丢字节），但
         # `SEND ... -> 200` 是唯一送达凭证——截断响应绝不能打它，否则一次超时
         # 在日志、退出码、会话登记三个门禁上同时是绿的（DEF-ops-01）。
@@ -7590,18 +7635,31 @@ def _attempt_create(st, name, prompt_file, attempts, thinking=None):
         return status, None
 
     except Exception as e:
-        status, conv = 0, None
-
+        # An exception after entering send_prompt does not prove that the
+        # remote POST was never accepted. Stop account rotation: another
+        # account could create a duplicate remote session for this intent.
+        attempts.append({
+            "account": name,
+            "status": "OUTCOME_UNKNOWN",
+            "detail": "%s: %s" % (type(e).__name__, e),
+        })
         print(
-            "rotate: %s 通道异常（%s）" % (name, e),
+            "rotate: %s 通道异常，远端副作用未知；停止轮转（%s）" % (name, e),
             flush=True,
         )
+        return "OUTCOME_UNKNOWN", None
 
     attempts.append({
         "account": name,
         "status": status,
         "conv_id": conv,
     })
+
+    if isinstance(conv, ConvRef) and conv.mismatch:
+        # HTTP 200 with no unique verified conversation ID is already a
+        # possible remote create. Preserve the candidate but stop rotation.
+        attempts[-1]["status"] = "OUTCOME_UNKNOWN"
+        return "OUTCOME_UNKNOWN", None
 
     if status == 200:
         return status, conv
@@ -7643,8 +7701,9 @@ def _attempt_create(st, name, prompt_file, attempts, thinking=None):
 def _mark_success(st, name, conv, prompt_file, attempts):
     def mutate(s):
         s["created"][name] = s.get("created", {}).get(name, 0) + 1
-        if name in ROTATION_PRIMARY:
-            s["cursor"] = (ROTATION_PRIMARY.index(name) + 1) % len(ROTATION_PRIMARY)
+        pool = _effective_rotation_primary()
+        if name in pool:
+            s["cursor"] = (pool.index(name) + 1) % len(pool)
         else:
             # 兜底不推进游标：登录态恢复后仍按原均分顺序轮转，否则会白跳过一个账号的轮次
             s["fallback_uses"] = s.get("fallback_uses", 0) + 1
@@ -7709,6 +7768,22 @@ def create_chat_rotating(prompt_file, thinking=None):
             thinking_requested,
         )
         outcomes[name] = status
+
+        if status == "OUTCOME_UNKNOWN":
+            print(
+                json.dumps(
+                    {
+                        "result": "outcome_unknown",
+                        "terminal": True,
+                        "account": name,
+                        "outcomes": outcomes,
+                        "attempts": attempts,
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            return 2
 
         # Terminal failure: stop immediately.
         # Never attempt another account or anonymous fallback.

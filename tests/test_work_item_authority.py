@@ -296,16 +296,18 @@ class AuthorizationTests(Base):
             self.store.get_work_item(self.alice, item.work_item_id), changed
         )
 
-    def test_owner_can_make_terminal_transition_only_once(self) -> None:
+    def test_generic_status_update_cannot_complete_or_cancel(self) -> None:
         item = self.store.create_work_item(self.alice)
-        changed = self.store.set_status(
-            self.alice, item.work_item_id, "completed"
+        for terminal_status in ("completed", "cancelled"):
+            with self.subTest(status=terminal_status):
+                with self.assertRaises(InvalidTransition):
+                    self.store.set_status(
+                        self.alice, item.work_item_id, terminal_status
+                    )
+        self.assertEqual(
+            self.store.get_work_item(self.alice, item.work_item_id).status,
+            "active",
         )
-        self.assertEqual(changed.status, "completed")
-        with self.assertRaises(InvalidTransition):
-            self.store.set_status(
-                self.alice, item.work_item_id, "active"
-            )
 
 
 class GrantTests(Base):
@@ -497,7 +499,7 @@ class LandingEvidenceTests(Base):
 
     def test_session_link_requires_write_authority(self) -> None:
         item = self.store.create_work_item(self.alice)
-        self.store.grant(self.alice, item.work_item_id, "bob", "read")
+        self.store.grant(self.alice, item.work_item_id, "bob", "write")
         sid = conversation_id()
         attempt_id = self.record_landing(sid, item.work_item_id)
         with self.assertRaises(NotAuthorized):
@@ -522,7 +524,9 @@ class LandingEvidenceTests(Base):
 
     def test_terminal_work_item_cannot_receive_link(self) -> None:
         item = self.store.create_work_item(self.alice)
-        self.store.set_status(self.alice, item.work_item_id, "completed")
+        # Exercise the terminal-state guard independently of the public
+        # AuthorityStore API, which deliberately no longer exposes this write.
+        self.store._store.set_status(item.work_item_id, "completed")
         sid = conversation_id()
         attempt_id = self.record_landing(sid, item.work_item_id)
         with self.assertRaises(InvalidTransition):
@@ -570,6 +574,7 @@ class UnlinkAndVisibilityTests(Base):
 
     def test_unlink_absent_and_unauthorized_are_indistinguishable(self) -> None:
         item = self.store.create_work_item(self.alice)
+        self.store.grant(self.alice, item.work_item_id, "bob", "write")
         sid = conversation_id()
         attempt_id = self.record_landing(sid, item.work_item_id)
         self.store.link_session(
@@ -613,12 +618,23 @@ class UnlinkAndVisibilityTests(Base):
 
     def test_active_link_is_hidden_from_stranger(self) -> None:
         item = self.store.create_work_item(self.alice)
+        self.store.grant(self.alice, item.work_item_id, "bob", "read")
         sid = conversation_id()
         attempt_id = self.record_landing(sid, item.work_item_id)
         self.store.link_session(
             self.alice, sid, item.work_item_id, attempt_id
         )
         self.assertIsNotNone(self.store.get_active_link(self.alice, sid))
+        self.assertIsNone(self.store.get_active_link(self.bob, sid))
+
+    def test_read_grant_cannot_enumerate_session_links(self) -> None:
+        item = self.store.create_work_item(self.alice)
+        self.store.grant(self.alice, item.work_item_id, "bob", "read")
+        sid = conversation_id()
+        attempt_id = self.record_landing(sid, item.work_item_id)
+        self.store.link_session(self.alice, sid, item.work_item_id, attempt_id)
+        with self.assertRaises(NotAuthorized):
+            self.store.list_sessions(self.bob, item.work_item_id)
         self.assertIsNone(self.store.get_active_link(self.bob, sid))
 
 

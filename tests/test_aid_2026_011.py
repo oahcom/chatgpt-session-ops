@@ -247,6 +247,88 @@ class AID2026011Tests(unittest.TestCase):
         self.assertEqual(calls, ["acct1"])
         self.assertNotIn("nologin", calls)
 
+    def test_unknown_send_outcome_stops_account_rotation(self):
+        calls = []
+
+        def fake_attempt(st, name, prompt_file, attempts, thinking=None):
+            calls.append(name)
+            attempts.append({"account": name, "status": "OUTCOME_UNKNOWN"})
+            return "OUTCOME_UNKNOWN", None
+
+        with (
+            mock.patch.object(m, "_attempt_create", side_effect=fake_attempt),
+            mock.patch("builtins.print"),
+        ):
+            result = m.create_chat_rotating("unused-prompt.txt")
+
+        self.assertEqual(result, 2)
+        self.assertEqual(calls, ["acct1"])
+        self.assertNotIn("nologin", calls)
+
+    def test_ambiguous_convref_stops_rotation_before_next_account(self):
+        with tempfile.TemporaryDirectory(prefix="so-unknown-convref-") as directory:
+            prompt = os.path.join(directory, "prompt.txt")
+            with open(prompt, "w", encoding="utf-8") as stream:
+                stream.write("hello")
+            state = initial_rotation_state()
+            attempts = []
+            candidate = m.ConvRef(
+                None, mismatch=True,
+                reason="conversation_id_unresolved: no unique SSE id",
+            )
+            with (
+                mock.patch.object(m, "ChatGPTAPI", StubAPI),
+                mock.patch.object(m, "send_prompt", return_value=(1, None, candidate)),
+            ):
+                status, conversation_id = m._attempt_create(
+                    state, "acct1", prompt, attempts
+                )
+            self.assertEqual(status, "OUTCOME_UNKNOWN")
+            self.assertIsNone(conversation_id)
+            self.assertEqual(attempts[0]["status"], "OUTCOME_UNKNOWN")
+
+    def test_send_transport_error_is_unknown_not_safe_to_rotate(self):
+        api = object.__new__(m.ChatGPTAPI)
+        api.req = lambda *args, **kwargs: (0, "EXC connection reset")
+        status, _body = api.send(None, "prompt", None, "token", "proof")
+        self.assertEqual(status, 0)
+        self.assertEqual(api.last_send_certainty, "UNKNOWN")
+
+        api.req = lambda *args, **kwargs: (429, "rate limited")
+        status, _body = api.send(None, "prompt", None, "token", "proof")
+        self.assertEqual(status, 429)
+        self.assertEqual(api.last_send_certainty, "NOT_SUBMITTED")
+
+    def test_send_transport_error_raises_unknown_outcome(self):
+        class AmbiguousAPI:
+            account = "acct1"
+            is_anon = False
+            status = 0
+            certainty = "UNKNOWN"
+
+            def requirements(self):
+                return "token", "proof"
+
+            def send(self, *args, **kwargs):
+                self.last_send_certainty = self.certainty
+                return self.status, "ambiguous response"
+
+        with tempfile.TemporaryDirectory(prefix="so-unknown-send-") as directory:
+            prompt = os.path.join(directory, "prompt.txt")
+            with open(prompt, "w", encoding="utf-8") as stream:
+                stream.write("hello")
+            with self.assertRaises(m.RemoteSendOutcomeUnknown):
+                m._send_prompt_impl(
+                    AmbiguousAPI(), None, prompt, new_chat=True, thinking=False
+                )
+            accepted = AmbiguousAPI()
+            accepted.status = 202
+            accepted.certainty = "SUBMITTED"
+            with self.assertRaises(m.RemoteSendOutcomeUnknown):
+                m._send_prompt_impl(
+                    accepted, None, prompt, new_chat=True, thinking=False
+                )
+
     def test_401_403_429_preserve_failure_and_cooldown_behavior(self):
         """Assert failure counts, unavailable reasons, and existing TTLs."""
 
