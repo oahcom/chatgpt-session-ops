@@ -1,0 +1,186 @@
+--- a/sender_gateway/app.py
++++ b/sender_gateway/app.py
+@@ -311,6 +311,22 @@
+             send_timeout, lease_seconds, read_timeout
+         )
+ 
++        # The adapter's send semaphore is only a ceiling; actual job execution
++        # is bounded by the number of Worker consumers below. Keep one SQLite
++        # connection for HTTP/API work and cap consumers at the remaining pool.
++        max_workers = min(3, JobStore.POOL_CAPACITY - 1)
++        send_concurrency = _integer("SO_SENDER_MAX_CONCURRENCY", 1)
++        if send_concurrency > max_workers:
++            raise RuntimeError(
++                f"SO_SENDER_MAX_CONCURRENCY must be <= {max_workers}"
++            )
++        worker_count = _integer("SO_SENDER_WORKER_COUNT", send_concurrency)
++        if worker_count > send_concurrency or worker_count > max_workers:
++            raise RuntimeError(
++                "SO_SENDER_WORKER_COUNT must be <= SO_SENDER_MAX_CONCURRENCY "
++                f"and <= {max_workers}"
++            )
++
+         self.store = JobStore(self.database, lease_seconds=lease_seconds)
+         # Account identities come from the credential directory, not a code whitelist.
+         # New acctN directories are picked up on the next service start.
+@@ -325,7 +341,7 @@
+             cli_path,
+             timeout=send_timeout,
+             read_timeout=read_timeout,
+-            max_concurrency=_integer("SO_SENDER_MAX_CONCURRENCY", 1),
++            max_concurrency=send_concurrency,
+             read_concurrency=read_concurrency,
+             read_semaphore=threading.BoundedSemaphore(read_concurrency),
+             # Ownership is read from SQLite (session_owners) only; the JSON
+@@ -344,68 +360,116 @@
+             _read_secret(_required("SO_SENDER_SERVICE_TOKEN_FILE")),
+         )
+ 
+-        self.worker = Worker(
+-            self.store,
+-            self.router,
+-            send=lambda **kw: _adapter_call(self.adapter, "send", router=self.router, **kw),
+-            create_session=lambda **kw: _adapter_call(
+-                self.adapter, "create_session", router=self.router, **kw
+-            ),
+-            lease_seconds=lease_seconds,
++        send = lambda **kw: _adapter_call(
++            self.adapter, "send", router=self.router, **kw
+         )
++        create_session = lambda **kw: _adapter_call(
++            self.adapter, "create_session", router=self.router, **kw
++        )
++        # Multiple consumers share one durable queue, one AccountRouter, and
++        # one adapter semaphore. SQLite claim_next is atomic; the partial unique
++        # running-account index remains the final per-account exclusion guard.
++        self.workers = [
++            Worker(
++                self.store,
++                self.router,
++                worker_id=f"sender-worker-{uuid.uuid4().hex[:10]}-{index + 1}",
++                send=send,
++                create_session=create_session,
++                lease_seconds=lease_seconds,
++            )
++            for index in range(worker_count)
++        ]
++        # Preserve the singular attribute for existing diagnostics/callers.
++        self.worker = self.workers[0]
+         self._stop = threading.Event()
++        self._maintenance_lock = threading.Lock()
++        self._last_reconcile = 0.0
++        self._last_retention = 0.0
++        self._worker_started = False
++        self._closed = False
+         # Worker idle poll interval (seconds). Lower = lower claim latency.
+         self._poll_seconds = _number(
+             "SO_SENDER_WORKER_POLL_SECONDS", 0.05, minimum=0.01
+         )
+-        self._worker_thread = threading.Thread(
+-            target=self._worker_loop, name="sender-worker", daemon=False
+-        )
++        self._worker_threads = [
++            threading.Thread(
++                target=self._worker_loop,
++                args=(worker,),
++                name=f"sender-worker-{index + 1}",
++                daemon=False,
++            )
++            for index, worker in enumerate(self.workers)
++        ]
++        self._worker_thread = self._worker_threads[0]
+         self._retention_days = _integer("SO_SENDER_JOB_RETENTION_DAYS", 14)
+         self._log_dir = os.environ.get("SO_SENDER_LOG_DIR", "").strip()
+         if self._log_dir:
+             Path(self._log_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
+ 
+-    def _worker_loop(self) -> None:
+-        last_reconcile = 0.0
+-        last_retention = 0.0
++    def _worker_loop(self, worker: Worker) -> None:
+         while not self._stop.is_set():
+-            now = time.monotonic()
+             try:
+-                if now - last_reconcile >= 5:
+-                    # No safe remote probe is exposed by this CLI adapter.
+-                    # Expired sends therefore become OUTCOME_UNKNOWN, never resend.
+-                    self.worker.reconcile_expired_leases()
+-                    last_reconcile = now
+-                if now - last_retention >= 3600:
+-                    cutoff = (
+-                        datetime.now(timezone.utc)
+-                        - timedelta(days=self._retention_days)
+-                    ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+-                    self.store.prune_completed(cutoff)
+-                    last_retention = now
+-                if not self.worker.run_once():
++                # Maintenance is shared and serialized, but any idle consumer
++                # can perform it while another consumer is inside a long send.
++                with self._maintenance_lock:
++                    now = time.monotonic()
++                    if now - self._last_reconcile >= 5:
++                        # No safe remote probe is exposed by this CLI adapter.
++                        # Expired sends become OUTCOME_UNKNOWN, never resent.
++                        worker.reconcile_expired_leases()
++                        self._last_reconcile = now
++                    if now - self._last_retention >= 3600:
++                        cutoff = (
++                            datetime.now(timezone.utc)
++                            - timedelta(days=self._retention_days)
++                        ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
++                        self.store.prune_completed(cutoff)
++                        self._last_retention = now
++                if not worker.run_once():
+                     self._stop.wait(self._poll_seconds)
+             except Exception:
+-                logging.exception("sender worker loop failed")
++                logging.exception("sender worker %s loop failed", worker.worker_id)
+                 self._stop.wait(1)
+ 
+     def start_worker(self) -> None:
+-        self._worker_thread.start()
++        if self._closed:
++            raise RuntimeError("SenderApplication is already closed")
++        if self._worker_started:
++            return
++        self._worker_started = True
++        started = []
++        try:
++            for thread in self._worker_threads:
++                thread.start()
++                started.append(thread)
++        except Exception:
++            self._stop.set()
++            for thread in started:
++                thread.join(timeout=1)
++            self._worker_started = False
++            raise
+ 
+     def close(self) -> None:
++        if self._closed:
++            return
+         self._stop.set()
+-        if self._worker_thread.is_alive():
+-            self._worker_thread.join(timeout=self._drain_timeout)
+-        if self._worker_thread.is_alive():
++        deadline = time.monotonic() + self._drain_timeout
++        for thread in self._worker_threads:
++            if thread.is_alive():
++                thread.join(timeout=max(0.0, deadline - time.monotonic()))
++        alive = [thread for thread in self._worker_threads if thread.is_alive()]
++        if alive:
+             # Never close the adapter/SQLite pool underneath a live send. The
+-            # non-daemon worker keeps the process alive until systemd's longer
++            # non-daemon workers keep the process alive until systemd's longer
+             # cgroup stop deadline is reached; expired leases remain fail-closed.
+             raise RuntimeError(
+-                "Sender worker did not drain within %.1fs" % self._drain_timeout
++                "%d Sender worker(s) did not drain within %.1fs"
++                % (len(alive), self._drain_timeout)
+             )
+         self.adapter.close()
+         self.store.close()
++        self._closed = True
+ 
+ 
+ def _status_for(code: str) -> int:

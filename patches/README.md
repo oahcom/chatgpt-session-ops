@@ -36,3 +36,16 @@ The deployed-runtime and Sender Gateway tests are preserved under `patches/tests
   validation when legacy connectors omit the key. Same-request replay is
   deduplicated; a new request id is a new intent. Test with
   `PYTHONPATH=/opt/so-mcp pytest patches/tests/test_mcp_request_id_idempotency.py`.
+
+
+- `sender-gateway-worker-pool.patch` applies from `/opt/so-sender` to
+  `sender_gateway/app.py` base SHA-256
+  `213adfade19022a10035fd0e7e8f4bed22ad45c8c658b3ab4694aea0bdd7e116`.
+  It starts one Worker consumer per configured send-concurrency slot (default
+  follows `SO_SENDER_MAX_CONCURRENCY`), shares the existing adapter semaphore,
+  SQLite JobStore and AccountRouter, serializes maintenance, and drains every
+  consumer before closing shared resources. It does not add a service or queue.
+  Validate with `python -m py_compile sender_gateway/app.py` and the isolated
+  worker-pool tests in `patches/tests/test_sender_worker_pool.py`. Seven tests
+  cover consumer concurrency, per-account exclusion, exception isolation,
+  idempotent startup/close, drain ordering, drain timeout and real app config.
