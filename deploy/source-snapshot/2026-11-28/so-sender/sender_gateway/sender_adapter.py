@@ -84,13 +84,24 @@ _SEND_OK_RE = re.compile(r"^SEND \S+ -> 200 respLen=\d+ in ")
 _TAIL_RE = re.compile(r"^tail: ?(.*)$")
 
 # scripts/chatgpt_send.py:3291-3300：CLI 认得的身份集合。
-_VALID_IDENTITIES = frozenset(
-    ("default", "acct1", "acct2", "acct3", "acct4", "acct5", "acct6", "nologin")
-)
-# 本适配层只允许登录态账号；auto 由 account_router 决定，nologin 永久拒绝。
-_LOGGED_IN_ACCOUNTS = frozenset(
-    ("acct1", "acct2", "acct3", "acct4", "acct5", "acct6")
-)
+def _discover_logged_in_accounts():
+    """Discover account identities from the configured credential directory."""
+    from pathlib import Path
+    root = Path(os.environ.get("SO_SENDER_ACCOUNTS_DIR", ""))
+    names = {"acct1", "acct2", "acct3", "acct4", "acct5", "acct6"}
+    if root.is_dir():
+        names.update(
+            entry.name for entry in root.iterdir()
+            if entry.is_dir() and entry.name.startswith("acct")
+            and entry.name[4:].isdigit()
+            and (entry / "cookies.json").is_file()
+            and (entry / "access_token.txt").is_file()
+        )
+    return frozenset(names)
+
+
+_LOGGED_IN_ACCOUNTS = _discover_logged_in_accounts()
+_VALID_IDENTITIES = frozenset({"default", "nologin", *_LOGGED_IN_ACCOUNTS})
 
 _OPERATIONS = frozenset(("create", "send", "read", "list"))
 
@@ -181,10 +192,11 @@ class SenderError(RuntimeError):
     ``operation`` 只保留 read/send/create/list 之一；两者都不含响应体。
     """
 
-    def __init__(self, code, detail="", *, upstream_status=None, operation=None):
+    def __init__(self, code, detail="", *, upstream_status=None, operation=None, retry_after_seconds=None):
         self.code = code
         self.upstream_status = upstream_status
         self.operation = operation
+        self.retry_after_seconds = retry_after_seconds
         self.detail = _redact(detail)
         super().__init__("%s: %s" % (code, self.detail))
 
@@ -200,6 +212,7 @@ class ChatGPTSenderAdapter:
         max_concurrency=4,
         admission_timeout=0.25,
         read_timeout=None,
+        allowed_accounts=None,
         read_concurrency=2,
         read_semaphore=None,
         owner_lookup=None,
@@ -235,6 +248,7 @@ class ChatGPTSenderAdapter:
         )
         self._timeout = timeout
         self._read_timeout = read_timeout
+        self._allowed_accounts = allowed_accounts
         self._admission_timeout = admission_timeout
         self._max_concurrency = max_concurrency
         self._slots = threading.BoundedSemaphore(max_concurrency)
@@ -685,6 +699,8 @@ class ChatGPTSenderAdapter:
     def _child_env(self):
         env = {key: os.environ[key] for key in _ENV_ALLOWLIST if key in os.environ}
         env.update(_ENV_FORCED)
+        if self._allowed_accounts is not None:
+            env["CHATGPT_ALLOWED_ACCOUNTS"] = ",".join(self._allowed_accounts())
         return env
 
     def _popen_kwargs(self):
@@ -951,6 +967,15 @@ class ChatGPTSenderAdapter:
         text = (result.stdout or "") + "\n" + (result.stderr or "")
         lowered = text.lower()
         status = _upstream_status(text)
+        retry_after_seconds = None
+        for line in (result.stdout or "").splitlines():
+            try:
+                payload = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(payload, dict):
+                status = payload.get("http_status") or status
+                retry_after_seconds = payload.get("retry_after_seconds", retry_after_seconds)
         if "account_busy" in lowered or "account_lock_unavailable" in lowered:
             code = CODE_RESOURCE_EXHAUSTED
         elif "nologin" in lowered and ("fallback" in lowered or "匿名" in text):
@@ -975,6 +1000,7 @@ class ChatGPTSenderAdapter:
             "%s (exit=%s) %s" % (fallback, result.exit_code, _redact(text)),
             upstream_status=status,
             operation=getattr(result, "operation", None),
+            retry_after_seconds=retry_after_seconds,
         )
 
 

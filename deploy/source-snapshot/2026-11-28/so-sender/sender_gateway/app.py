@@ -10,6 +10,8 @@ stored at SO_SENDER_SERVICE_TOKEN_FILE.
 
 HTTP contract:
   POST /internal/v1/jobs
+  POST /internal/v1/events/claim
+  POST /internal/v1/events/{event_id}/ack
   GET  /internal/v1/jobs/{job_id}
   GET  /internal/v1/sessions?page_size=N&cursor=C
   GET  /internal/v1/sessions/{conversation_id}/messages?limit=N&after_message_id=ID
@@ -35,7 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from .account_router import AccountRouter
+from .account_router import AccountRouter, discover_accounts
 from .job_store import JobStore
 from .models import ErrorCode, GatewayError, JobStatus, utc_now_iso
 from .sender_adapter import ChatGPTSenderAdapter, SenderError
@@ -49,7 +51,6 @@ CONVERSATION_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 )
 JOB_RE = re.compile(r"cgj_[0-9a-f-]{36}")
-EVENT_ID_RE = re.compile(r"evt_[0-9a-f]{32}")
 EVENT_DISPATCHER_PRINCIPAL = "session_ops:event-dispatcher"
 EVENT_DISPATCHER_TENANT = "session_ops"
 
@@ -58,12 +59,16 @@ _LOG = logging.getLogger("sender_gateway.app")
 
 SYSTEMD_STOP_TIMEOUT_SECONDS = 600.0
 WORKER_DRAIN_MARGIN_SECONDS = 15.0
-HTTP_HANDLER_DRAIN_SECONDS = 15.0
+HTTP_HANDLER_CLEANUP_SECONDS = 5.0
+HTTP_HANDLER_DRAIN_SECONDS = 15.0  # default read timeout (10s) + cleanup
 
 
-def _worker_drain_timeout(send_timeout: float, lease_seconds: float) -> float:
+def _worker_drain_timeout(
+    send_timeout: float, lease_seconds: float, read_timeout: float = 10.0
+) -> float:
     drain = float(send_timeout) + WORKER_DRAIN_MARGIN_SECONDS
-    required = drain + HTTP_HANDLER_DRAIN_SECONDS
+    handler_drain = float(read_timeout) + HTTP_HANDLER_CLEANUP_SECONDS
+    required = drain + handler_drain
     if required >= SYSTEMD_STOP_TIMEOUT_SECONDS:
         raise RuntimeError("Sender execution/read budgets exceed the systemd stop timeout")
     if float(lease_seconds) >= SYSTEMD_STOP_TIMEOUT_SECONDS:
@@ -221,7 +226,7 @@ def _safe_id(value: object) -> str:
     return "-"
 
 
-def _adapter_call(adapter: ChatGPTSenderAdapter, method: str, **kwargs):
+def _adapter_call(adapter: ChatGPTSenderAdapter, method: str, *, router=None, **kwargs):
     try:
         return getattr(adapter, method)(**kwargs)
     except SenderError as exc:
@@ -250,7 +255,24 @@ def _adapter_call(adapter: ChatGPTSenderAdapter, method: str, **kwargs):
             ),
             exc.detail,
         )
-        raise GatewayError(exc.detail, code=code) from exc
+        retry_after_seconds = exc.retry_after_seconds
+        if router is not None and kwargs.get("account"):
+            try:
+                if exc.upstream_status == 401:
+                    router.mark_auth_unavailable(
+                        kwargs["account"], reason=f"upstream HTTP 401 during {method}"
+                    )
+                elif exc.upstream_status == 429:
+                    retry_after_seconds = router.mark_rate_limited(
+                        kwargs["account"], cooldown_seconds=retry_after_seconds,
+                        reason=f"upstream HTTP 429 during {method}",
+                    )
+            except Exception:
+                _LOG.exception("failed to persist upstream account health/cooldown")
+        raise GatewayError(
+            exc.detail, code=code, upstream_status=exc.upstream_status,
+            retry_after_seconds=retry_after_seconds,
+        ) from exc
 
 
 class SenderApplication:
@@ -278,6 +300,7 @@ class SenderApplication:
         send_timeout = _number("SO_SENDER_SEND_TIMEOUT_SECONDS", 450.0)
         job_timeout = _number("SO_SENDER_JOB_TIMEOUT_SECONDS", 470.0)
         lease_seconds = _number("SO_SENDER_WORKER_LEASE_SECONDS", 500.0)
+        read_timeout = _number("SO_SENDER_READ_TIMEOUT_SECONDS", 10.0)
         if send_timeout >= job_timeout:
             raise RuntimeError(
                 "SO_SENDER_SEND_TIMEOUT_SECONDS must be less than "
@@ -288,23 +311,31 @@ class SenderApplication:
                 "SO_SENDER_WORKER_LEASE_SECONDS must exceed "
                 "SO_SENDER_JOB_TIMEOUT_SECONDS"
             )
-        self._drain_timeout = _worker_drain_timeout(send_timeout, lease_seconds)
+        self._drain_timeout = _worker_drain_timeout(
+            send_timeout, lease_seconds, read_timeout
+        )
 
         self.store = JobStore(self.database, lease_seconds=lease_seconds)
-        self.router = AccountRouter(self.store)
+        # Account identities come from the credential directory, not a code whitelist.
+        # New acctN directories are picked up on the next service start.
+        account_names = discover_accounts(accounts_dir)
+        if not account_names:
+            raise RuntimeError("no account directories with cookies.json and access_token.txt")
+        self.router = AccountRouter(self.store, accounts=tuple(account_names))
         # read/list 独立槽位：长 send 占满 send 槽时读取不被饿死（Owner 裁决）。
         # send/create 的容量与语义仍由 SO_SENDER_MAX_CONCURRENCY 决定，不变。
         read_concurrency = _integer("SO_SENDER_READ_CONCURRENCY", 2)
         self.adapter = ChatGPTSenderAdapter(
             cli_path,
             timeout=send_timeout,
-            read_timeout=_number("SO_SENDER_READ_TIMEOUT_SECONDS", 10.0),
+            read_timeout=read_timeout,
             max_concurrency=_integer("SO_SENDER_MAX_CONCURRENCY", 1),
             read_concurrency=read_concurrency,
             read_semaphore=threading.BoundedSemaphore(read_concurrency),
             # Ownership is read from SQLite (session_owners) only; the JSON
             # registry is history and never a runtime input.
             owner_lookup=self.router.get_owner,
+            allowed_accounts=self.router.active_accounts,
             prompt_dir=str(state_dir / "prompts"),
         )
         # The adapter's public constructor uses sys.executable. The deployment
@@ -320,9 +351,9 @@ class SenderApplication:
         self.worker = Worker(
             self.store,
             self.router,
-            send=lambda **kw: _adapter_call(self.adapter, "send", **kw),
+            send=lambda **kw: _adapter_call(self.adapter, "send", router=self.router, **kw),
             create_session=lambda **kw: _adapter_call(
-                self.adapter, "create_session", **kw
+                self.adapter, "create_session", router=self.router, **kw
             ),
             lease_seconds=lease_seconds,
         )
@@ -402,12 +433,14 @@ def make_handler(app: SenderApplication):
         def log_message(self, fmt, *args):
             logging.info("%s - %s", self.address_string(), fmt % args)
 
-        def _json(self, status: int, payload: dict) -> None:
+        def _json(self, status: int, payload: dict, headers: dict | None = None) -> None:
             raw = _json_bytes(payload)
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(raw)))
             self.send_header("Cache-Control", "no-store")
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
 
             try:
@@ -455,35 +488,41 @@ def make_handler(app: SenderApplication):
                 parsed = urlsplit(self.path)
                 path = parsed.path
 
-                event_ack_match = re.fullmatch(r"/internal/v1/events/(evt_[0-9a-f]{32})/ack", path)
-                if self.command == "POST" and (
-                    path == "/internal/v1/events/claim" or event_ack_match
-                ):
+                if self.command == "POST" and path == "/internal/v1/events/claim":
                     if (principal_id, tenant_id) != (
-                        EVENT_DISPATCHER_PRINCIPAL, EVENT_DISPATCHER_TENANT
+                        EVENT_DISPATCHER_PRINCIPAL,
+                        EVENT_DISPATCHER_TENANT,
                     ):
-                        raise GatewayError("event dispatcher identity required",
-                                           code=ErrorCode.PERMISSION_DENIED)
+                        raise GatewayError(
+                            "event dispatcher identity required",
+                            code=ErrorCode.PERMISSION_DENIED,
+                        )
                     body = self._body()
-                    if path == "/internal/v1/events/claim":
-                        worker_id = body.get("worker_id")
-                        limit = body.get("limit", 1)
-                        if not isinstance(worker_id, str) or not worker_id.strip():
-                            raise GatewayError("worker_id is required",
-                                               code=ErrorCode.INVALID_ARGUMENT)
-                        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 25:
-                            raise GatewayError("limit must be in 1..25",
-                                               code=ErrorCode.INVALID_ARGUMENT)
-                        items = app.store.claim_events(worker_id, limit=limit, lease_seconds=30)
-                        self._json(200, {"items": items})
-                        return
-                    event_id = event_ack_match.group(1)
-                    lease_token = body.get("lease_token")
-                    if not isinstance(lease_token, str) or not lease_token:
-                        raise GatewayError("lease_token is required", code=ErrorCode.INVALID_ARGUMENT)
-                    acknowledged = app.store.ack_event(event_id, lease_token)
+                    items = app.store.claim_events(
+                        body.get("worker_id"), limit=body.get("limit", 25)
+                    )
+                    self._json(200, {"items": items})
+                    return
+
+                match = re.fullmatch(r"/internal/v1/events/(evt_[0-9a-f]{32})/ack", path)
+                if self.command == "POST" and match:
+                    if (principal_id, tenant_id) != (
+                        EVENT_DISPATCHER_PRINCIPAL,
+                        EVENT_DISPATCHER_TENANT,
+                    ):
+                        raise GatewayError(
+                            "event dispatcher identity required",
+                            code=ErrorCode.PERMISSION_DENIED,
+                        )
+                    body = self._body()
+                    acknowledged = app.store.ack_event(
+                        match.group(1), body.get("lease_token")
+                    )
                     if not acknowledged:
-                        raise GatewayError("event lease is stale or missing", code=ErrorCode.CONFLICT)
+                        raise GatewayError(
+                            "event lease is stale or unknown",
+                            code=ErrorCode.CONFLICT,
+                        )
                     self._json(200, {"acknowledged": True})
                     return
 
@@ -647,6 +686,7 @@ def make_handler(app: SenderApplication):
                     result = _adapter_call(
                         app.adapter,
                         "read",
+                        router=app.router,
                         conversation_id=conversation_id,
                         account=account,
                         after_message_id=after,
@@ -660,9 +700,14 @@ def make_handler(app: SenderApplication):
                 raise GatewayError("route not found", code=ErrorCode.NOT_FOUND)
 
             except GatewayError as exc:
+                error = {"code": exc.code.value, "message": str(exc)}
+                headers = {}
+                if exc.retry_after_seconds is not None:
+                    retry_after = max(1, int(float(exc.retry_after_seconds) + 0.999))
+                    error["retry_after_seconds"] = retry_after
+                    headers["Retry-After"] = str(retry_after)
                 self._json(
-                    _status_for(exc.code.value),
-                    {"error": {"code": exc.code.value, "message": str(exc)}},
+                    _status_for(exc.code.value), {"error": error}, headers=headers
                 )
             except (ValueError, TypeError) as exc:
                 error = GatewayError(str(exc), code=ErrorCode.INVALID_ARGUMENT)

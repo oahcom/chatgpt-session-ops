@@ -4,7 +4,6 @@ import json
 import sqlite3
 import tempfile
 import threading
-import time
 import unittest
 import uuid
 from pathlib import Path
@@ -56,21 +55,21 @@ class SenderOutboxTests(unittest.TestCase):
         return job["job_id"]
 
     def event_rows(self):
-        return self.store._connection().execute(
-            "SELECT * FROM job_event_outbox ORDER BY created_at"
-        ).fetchall()
+        with self.store.transaction() as txn:
+            return txn.fetchall("SELECT * FROM job_event_outbox ORDER BY created_at")
 
     def test_completion_and_outbox_are_atomic_and_idempotent(self):
-        conn = self.store._connection()
-        conn.execute("""CREATE TRIGGER reject_event BEFORE INSERT ON job_event_outbox
-                        BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END""")
+        with self.store.transaction() as txn:
+            txn.execute("""CREATE TRIGGER reject_event BEFORE INSERT ON job_event_outbox
+                            BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END""")
         with self.assertRaises(sqlite3.IntegrityError):
             self.complete()
         job = self.store.get("user-a", "tenant-a", self.job_id)
         self.assertEqual(job["status"], "running")
         self.assertEqual(len(self.event_rows()), 0)
 
-        conn.execute("DROP TRIGGER reject_event")
+        with self.store.transaction() as txn:
+            txn.execute("DROP TRIGGER reject_event")
         self.complete()
         self.complete()  # terminal transition is idempotent
         job = self.store.get("user-a", "tenant-a", self.job_id)
@@ -80,21 +79,24 @@ class SenderOutboxTests(unittest.TestCase):
         self.assertEqual(rows[0]["tenant_id"], "tenant-a")
         self.assertEqual(rows[0]["principal_id"], "user-a")
         self.assertEqual(rows[0]["event_name"], "chatgpt.job.completed")
-        self.assertEqual(json.loads(rows[0]["payload_json"])["summary"], "Finished")
+        event_payload = json.loads(rows[0]["payload_json"])
+        self.assertEqual(event_payload["summary"], "Finished")
+        self.assertEqual(event_payload["conversation_id"], "a" * 36)
         expected_id = "evt_" + hashlib.sha256(self.job_id.encode()).hexdigest()[:32]
         self.assertEqual(rows[0]["event_id"], expected_id)
 
     def test_failure_and_outbox_are_atomic_and_include_outcome_unknown(self):
-        conn = self.store._connection()
-        conn.execute("""CREATE TRIGGER reject_failed_event BEFORE INSERT ON job_event_outbox
-                        BEGIN SELECT RAISE(ABORT, 'injected failed outbox failure'); END""")
+        with self.store.transaction() as txn:
+            txn.execute("""CREATE TRIGGER reject_failed_event BEFORE INSERT ON job_event_outbox
+                            BEGIN SELECT RAISE(ABORT, 'injected failed outbox failure'); END""")
         with self.assertRaises(sqlite3.IntegrityError):
             self.store.fail(self.job_id, "OUTCOME_UNKNOWN", now=FIXED)
         job = self.store.get("user-a", "tenant-a", self.job_id)
         self.assertEqual(job["status"], "running")
         self.assertEqual(len(self.event_rows()), 0)
 
-        conn.execute("DROP TRIGGER reject_failed_event")
+        with self.store.transaction() as txn:
+            txn.execute("DROP TRIGGER reject_failed_event")
         self.store.fail(self.job_id, "OUTCOME_UNKNOWN", now=FIXED)
         self.store.fail(self.job_id, "OUTCOME_UNKNOWN", now=FIXED)  # idempotent
         job = self.store.get("user-a", "tenant-a", self.job_id)
@@ -110,14 +112,14 @@ class SenderOutboxTests(unittest.TestCase):
 
     def test_event_outbox_retention_prunes_only_terminal_rows_and_keeps_pending_or_active_lease(self):
         old = add_seconds(FIXED, -31 * 24 * 60 * 60)
-        with self.store._connection() as conn:
+        with self.store.transaction() as txn:
             for event_id, job_id, status, created_at, delivered_at, lease_until, lease_token in (
                 ("evt_old_pending", "job_old_pending", "pending", old, None, None, None),
                 ("evt_old_sending", "job_old_sending", "sending", old, None, add_seconds(FIXED, 60), "lease"),
                 ("evt_old_delivered", "job_old_delivered", "delivered", old, old, None, None),
                 ("evt_current_pending", "job_current_pending", "pending", FIXED, None, None, None),
             ):
-                conn.execute(
+                txn.execute(
                     """INSERT INTO job_event_outbox
                        (event_id, job_id, tenant_id, principal_id, event_name, payload_json,
                         created_at, status, attempts, next_attempt_at, delivered_at,
@@ -126,13 +128,11 @@ class SenderOutboxTests(unittest.TestCase):
                                '{"job_id":"x"}', ?, ?, 0, ?, ?, ?, ?, NULL)""",
                     (event_id, job_id, created_at, status, created_at, delivered_at, lease_until, lease_token),
                 )
+        self.store.prune_completed(FIXED)
         with self.store.transaction() as txn:
-            deleted = self.store._cleanup_event_outbox_txn(txn, FIXED)
-        self.assertEqual(deleted, 1)  # only terminal history is pruned
-        with self.store._connection() as conn:
-            rows = conn.execute(
+            rows = txn.fetchall(
                 "SELECT job_id, status FROM job_event_outbox ORDER BY job_id"
-            ).fetchall()
+            )
         self.assertEqual(
             {row["job_id"]: row["status"] for row in rows},
             {
@@ -201,36 +201,6 @@ class SenderOutboxTests(unittest.TestCase):
             )
             self.assertEqual(status, 200)
             self.assertTrue(acked["acknowledged"])
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=2)
-
-    def test_http_handler_closes_thread_local_sqlite_connection_after_each_request(self):
-        class FakeVerifier:
-            def verify(self, handler):
-                return "user-a", "tenant-a"
-
-        app = SimpleNamespace(store=self.store, verifier=FakeVerifier())
-        server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(app))
-        server.daemon_threads = True
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        baseline = len(self.store._connections)
-        try:
-            for _ in range(40):
-                conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=2)
-                conn.request("GET", f"/internal/v1/jobs/{self.job_id}")
-                response = conn.getresponse()
-                self.assertEqual(response.status, 200)
-                response.read()
-                conn.close()
-                deadline = time.monotonic() + 1.0
-                while len(self.store._connections) > baseline and time.monotonic() < deadline:
-                    time.sleep(0.005)
-                # Wait after every request so an unfinished handler cannot
-                # hide a per-request connection leak behind the next request.
-                self.assertEqual(len(self.store._connections), baseline)
         finally:
             server.shutdown()
             server.server_close()

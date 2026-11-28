@@ -12,29 +12,33 @@
  
  #: Top-level job fields the client owns; business arguments go in ``payload``.
  _RESERVED_JOB_FIELDS = frozenset({"operation", "idempotency_key", "payload"})
-@@ -751,6 +756,36 @@
+@@ -755,6 +760,40 @@
+             timeout_code="TIMEOUT",
          )
- 
  
 +
 +    def claim_events(self, *, worker_id: str, limit: int = 25) -> Dict[str, Any]:
-+        """Claim cross-tenant completion events using the dedicated service identity."""
++        """Claim Sender completion events with the dedicated dispatcher identity."""
 +        if not isinstance(worker_id, str) or not worker_id.strip():
 +            raise SenderGatewayError("INVALID_ARGUMENT", "worker_id is required")
-+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
-+            raise SenderGatewayError("INVALID_ARGUMENT", "limit must be in 1..100")
++        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 25:
++            raise SenderGatewayError("INVALID_ARGUMENT", "limit must be in 1..25")
 +        return self._request(
 +            "POST",
 +            self._base_path + EVENTS_PATH + "/claim",
 +            {"worker_id": worker_id, "limit": limit},
 +            EVENT_DISPATCHER_IDENTITY,
-+            timeout=self.read_timeout_seconds,
 +            timeout_code="TIMEOUT",
 +        )
 +
 +    def ack_event(self, *, event_id: str, lease_token: str) -> Dict[str, Any]:
-+        """Acknowledge an event only after the MCP event store commits it."""
-+        if not isinstance(event_id, str) or not event_id.startswith("evt_"):
++        """Acknowledge only after the MCP SQLite event store has committed the event."""
++        if (
++            not isinstance(event_id, str)
++            or len(event_id) != 36
++            or not event_id.startswith("evt_")
++            or any(char not in "0123456789abcdef" for char in event_id[4:])
++        ):
 +            raise SenderGatewayError("INVALID_ARGUMENT", "event_id is invalid")
 +        if not isinstance(lease_token, str) or not lease_token:
 +            raise SenderGatewayError("INVALID_ARGUMENT", "lease_token is required")
@@ -43,9 +47,9 @@
 +            self._base_path + EVENTS_PATH + "/" + quote(event_id, safe="") + "/ack",
 +            {"lease_token": lease_token},
 +            EVENT_DISPATCHER_IDENTITY,
++            timeout_code="TIMEOUT",
 +        )
 +
-+
+ 
  def _validated_injected_context(context: Any) -> ssl.SSLContext:
      """Accept an injected context only if server verification stays enabled."""
-     if not isinstance(context, ssl.SSLContext):

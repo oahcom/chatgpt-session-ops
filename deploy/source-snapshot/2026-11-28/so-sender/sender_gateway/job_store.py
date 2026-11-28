@@ -653,7 +653,10 @@ class JobStore:
         completed_at = now or self._now()
 
         with self.transaction() as txn:
-            row = txn.fetchone("SELECT status, tenant_id, principal_id FROM jobs WHERE job_id = ?", (job_id,))
+            row = txn.fetchone(
+                "SELECT status, tenant_id, principal_id, conversation_id FROM jobs WHERE job_id = ?",
+                (job_id,),
+            )
             if row is None:
                 raise JobStateError(f"unknown job {job_id}", code=ErrorCode.NOT_FOUND)
             status = row["status"]
@@ -681,9 +684,16 @@ class JobStore:
                     f"job {job_id} left the running state", code=ErrorCode.CONFLICT
                 )
             event_id = "evt_" + hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:32]
-            event_payload = {"job_id": job_id, "status": "succeeded",
-                             "summary": "Job completed successfully.",
-                             "completed_at": completed_at}
+            summary = result.get("summary")
+            if not isinstance(summary, str) or not summary.strip():
+                summary = "Job completed successfully."
+            event_payload = {
+                "job_id": job_id,
+                "conversation_id": row["conversation_id"],
+                "status": "succeeded",
+                "summary": summary.strip()[:500],
+                "completed_at": completed_at,
+            }
             txn.execute(
                 """INSERT INTO job_event_outbox
                    (event_id, job_id, tenant_id, principal_id, event_name, payload_json,
@@ -722,7 +732,7 @@ class JobStore:
 
         with self.transaction() as txn:
             row = txn.fetchone(
-                "SELECT status, error_code, outcome_unknown, tenant_id, principal_id FROM jobs WHERE job_id = ?",
+                "SELECT status, error_code, outcome_unknown, tenant_id, principal_id, conversation_id FROM jobs WHERE job_id = ?",
                 (job_id,),
             )
             if row is None:
@@ -765,10 +775,15 @@ class JobStore:
                     f"job {job_id} left the running state", code=ErrorCode.CONFLICT
                 )
             event_id = "evt_" + hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:32]
-            event_payload = {"job_id": job_id, "status": "failed",
-                             "summary": f"Job failed with error code {code.value}.",
-                             "completed_at": completed_at, "error_code": code.value,
-                             "outcome_unknown": outcome_unknown}
+            event_payload = {
+                "job_id": job_id,
+                "conversation_id": row["conversation_id"],
+                "status": "failed",
+                "summary": f"Job failed with error code {code.value}.",
+                "completed_at": completed_at,
+                "error_code": code.value,
+                "outcome_unknown": outcome_unknown,
+            }
             txn.execute(
                 """INSERT INTO job_event_outbox
                    (event_id, job_id, tenant_id, principal_id, event_name, payload_json,
@@ -929,6 +944,10 @@ class JobStore:
     def prune_completed(self, before: str) -> int:
         """Replace expired terminal jobs with minimal permanent ownership/idempotency tombstones."""
         with self.transaction() as txn:
+            txn.execute(
+                "DELETE FROM job_event_outbox WHERE status='delivered' AND created_at < ?",
+                (before,),
+            )
             rows = txn.fetchall(
                 "SELECT * FROM jobs WHERE status IN ('succeeded','failed')"
                 " AND completed_at IS NOT NULL AND completed_at < ?",

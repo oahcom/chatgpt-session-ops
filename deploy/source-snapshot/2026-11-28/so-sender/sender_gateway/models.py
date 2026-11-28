@@ -156,8 +156,12 @@ class GatewayError(Exception):
         message: str | None = None,
         *,
         code: ErrorCode | str | None = None,
+        upstream_status: int | None = None,
+        retry_after_seconds: float | None = None,
     ) -> None:
         self.code = ErrorCode(code) if code is not None else self.default_code
+        self.upstream_status = upstream_status
+        self.retry_after_seconds = retry_after_seconds
         super().__init__(message or self.code.value)
 
     def __str__(self) -> str:  # pragma: no cover - trivial

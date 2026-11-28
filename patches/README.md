@@ -1,28 +1,33 @@
-# Historical deployed-source integration patch artifacts (not production-ready)
+# MCP Events integration patches
 
-These patches were generated from deployed Python source snapshots on 2026-11-27. **The Sender Gateway patch set is currently stale against `/opt/so-sender`:** its `job_store.py` / `app.py` hunks do not match the current deployed files (verified 2026-11-28), so do not apply it as-is. Rebase/regenerate it against the current deployed-source hashes before any deployment. The patches are intentionally split by service root because MCP and Sender Gateway are deployed separately.
+These patches describe the minimal production integration for ChatGPT Work MCP Events. They are **not deployed**. All patches are generated against the current source files read from `/opt/so-mcp` and `/opt/so-sender` on 2026-11-28 and were checked in isolated copies of those exact base files. Do not apply them to a different revision without regenerating and rechecking the diffs.
 
-## Apply roots
+## Patch set
 
-- Sender Gateway patch artifacts (`sender-gateway-event-outbox.patch`, `sender-gateway-thread-connection-cleanup.patch`, `sender-gateway-failed-terminal-event.patch`, and `sender-gateway-outbox-retention.patch`) are historical. **None is approved for application to the current `/opt/so-sender` tree.** The current source already has a bounded SQLite connection pool, but does not contain the event outbox or event claim/ack routes. Reconstruct the desired changes against the live hashes and validate all patch hunks in a clean fixture before considering deployment.
-- MCP patches apply from `/opt/so-mcp`:
-  - `mcp-sender-event-client.patch`: add `SenderGatewayClient.claim_events()` / `ack_event()` using the existing mTLS + service-token + HMAC identity assertion path.
-  - `mcp-server-events.patch`: register MCP Events request handlers and advertise `capabilities.events`.
-  - `mcp-runtime-events.patch`: add key-file loading, opt-in store creation, and ASGI-lifespan-managed single event dispatcher.
-  - `mcp-event-modules.patch`: add `mcp_events.py`, `mcp_event_collector.py`, and `mcp_event_dispatcher.py` (one in-process dispatcher thread) with subscribe-time job ownership checks, per-delivery authorization and subscription-expiry rechecks immediately before callback I/O, bounded retry, and retention cleanup.
+Apply the Sender patch from `/opt/so-sender`:
 
-`deployed-source.sha256` records the original deployed base before any Sender Gateway changes. `deployed-source-post-combined.sha256` records the production state after the combined cleanup + success-outbox patch and is the base for `sender-gateway-failed-terminal-event.patch`. `deployed-source-post-failure-event.sha256` records the current files after that incremental patch was applied to disk. `sender-original-base.sha256` records the original Sender Gateway files preserved under `/var/backups`. The sender-gateway and MCP client patches are not guaranteed to apply to the older `/srv/so-mcp-trusted` client file; the MCP client patch is based on the current deployed `/opt/so-mcp` version.
+- `sender-gateway-event-outbox.patch` — adds the durable `job_event_outbox`, writes one event atomically with each terminal job transition, exposes the authenticated claim/ACK endpoints, and prunes delivered event history with existing job retention.
 
-## Required deployment configuration (not created)
+Apply the MCP patches from `/opt/so-mcp`:
 
-Provision a raw 32-byte AES-GCM key at `/etc/so-mcp/events.key`, owned by the `ubuntu` service user with mode `0400`. Add `SO_MCP_EVENTS_KEY_FILE=/etc/so-mcp/events.key` to the MCP service environment. Optional `SO_MCP_EVENTS_DB` must be an absolute path; otherwise the default is `/var/lib/so-mcp/events/events.sqlite3`. The events directory is created mode `0700`, and the SQLite database mode is `0600`.
+- `mcp-sender-event-client.patch` — adds claim/ACK methods to the existing Sender client, reusing mTLS, the existing service token, and the existing HMAC identity key.
+- `mcp-event-modules.patch` — adds the SQLite Events store, Sender collector, and one in-process `MCPEventDispatcher` thread. It does not add a Sender worker, scheduler, queue service, Redis, or Kafka.
+- `mcp-server-events.patch` — registers `events/list`, `events/subscribe`, and `events/unsubscribe`, and advertises the Events capability. Blocking Sender authorization and callback verification are offloaded from the MCP event loop.
+- `mcp-runtime-events.patch` — loads the event encryption key, conditionally enables Events, and starts/stops the single dispatcher through the existing ASGI lifespan.
 
-Without `SO_MCP_EVENTS_KEY_FILE`, the feature remains disabled and the MCP server does not advertise Events. Setting the key file enables both the Events handlers and the one in-process event-dispatch loop.
+The Sender event dispatcher identity is `session_ops:event-dispatcher` in tenant `session_ops`. It uses the existing mTLS + Bearer + signed identity path; no new OAuth client or account credential is introduced.
 
-## Safety
+## Required runtime configuration
 
-The live `/opt/so-sender/sender_gateway/job_store.py` and `app.py` inspected on 2026-11-28 do **not** contain `job_event_outbox` or the `/internal/v1/events/claim` and `/internal/v1/events/{event_id}/ack` routes. Their SHA256 values differ from the patch's expected base, and the event-outbox patch fails its first hunk in a read-only fixture. Treat all previous deployment-state notes in this file as historical, not current production evidence. No production files, database rows, credentials, or service state were changed during this verification. The local snapshots under `/dev/shm` must not be treated as production source or used to consume historical outbox records.
+The feature stays disabled unless `SO_MCP_EVENTS_KEY_FILE` points to a raw 32-byte AES-GCM key. The intended path is `/etc/so-mcp/events.key`, mode `0400`, owned by the MCP service user. The default database is `/var/lib/so-mcp/events/events.sqlite3` (directory mode `0700`, database mode `0600`). These files and settings have **not** been provisioned in production.
 
-## Reproducing isolated deployed-source tests
+## Verification
 
-The deployed-runtime and Sender Gateway tests are preserved under `patches/tests/`. Build clean source snapshots from the exact base files and apply the patch sequence above, then run the corresponding test files with those snapshot roots on `PYTHONPATH`. The test receiver is mocked; no production callback, credential, or database is used.
+- Sender outbox and authenticated route tests: 11 passed.
+- MCP Events ASGI and Sender-to-MCP pipeline tests: 7 passed.
+- Python compilation passed for the reconstructed MCP and Sender modules.
+- Sender and MCP-client patches passed `git apply --check` against the current live source files; MCP server/runtime patches passed the same check against their current live source files; the additive module patch passed its clean-tree check.
+- Full project suite: **1295 passed, 7 skipped, 1573 subtests passed**.
+- `git diff --check` clean.
+
+No production files, databases, credentials, service configuration, or processes were changed. The historical outbox rows were not read, claimed, replayed, acknowledged, or deleted.

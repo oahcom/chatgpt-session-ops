@@ -1,11 +1,10 @@
 # Production source snapshot — 2026-11-28
 
-This directory is a source-only reconstruction of the files read from the live
-`/opt/so-mcp` and `/opt/so-sender` trees on 2026-11-28 18:19–18:26 +08.
-The snapshot preserves the exact pre-change bytes of the deployed runtime files
-except for the three MCP Events modules and the Sender outbox/client/route
-changes described below. `BASE-SHA256SUMS` records the pre-feature production source hashes.
-`SHA256SUMS` records the current reconstructed tree after the Events changes.
+This directory is a source-only reconstruction of the live `/opt/so-mcp` and
+`/opt/so-sender` source trees. Sender runtime files were refreshed again after
+the account-health convergence at 2026-11-28 20:53 +08.
+`BASE-SHA256SUMS` records the current deployed source hashes before the Events
+patches; `SHA256SUMS` records the reconstructed tree including the Events changes.
 
 ## Provenance
 
@@ -23,8 +22,9 @@ changes described below. `BASE-SHA256SUMS` records the pre-feature production so
 
 - Sender `JobStore.complete()` and `JobStore.fail()` now insert one stable
   `chatgpt.job.completed` event into `job_event_outbox` in the same SQLite
-  transaction as the terminal job transition. Event summaries are generic and
-  do not copy job result content into the notification.
+  transaction as the terminal job transition. The event carries the job and
+  conversation IDs so the original conversation can read the actual messages;
+  it does not copy the full job result into the notification.
 - Sender exposes dispatcher-only `/internal/v1/events/claim` and
   `/internal/v1/events/{event_id}/ack` routes. The dispatcher identity is
   `session_ops:event-dispatcher` in tenant `session_ops`.
@@ -34,7 +34,14 @@ changes described below. `BASE-SHA256SUMS` records the pre-feature production so
 
 ## Validation
 
-The exact reconstructed snapshot was compiled and tested without touching the
-live `/opt` trees, production databases, service configuration, or processes.
+The reconstructed snapshot was compiled and tested without changing the live
+`/opt` trees, production databases, service configuration, or processes.
 See the project test file `patches/tests/test_sender_outbox_current_snapshot.py`
 and the MCP Events tests for current-snapshot coverage.
+
+
+## Runtime convergence refresh (2026-11-28)
+
+This snapshot was refreshed from the deployed source after the Sender runtime convergence work. The refreshed files cover persistent account-health gating (acct4 unavailable, acct5 operator-disabled by default), structured upstream 401/429 handling, bounded Retry-After cooldown with jitter, Worker deferral through `next_eligible_at`, stable account-identity rotation cursors, read/list 429 fail-fast behavior, and permission-safe JSON state loading. The rotation counter file is group-readable (`0640`, group `chatgpt-sender`); credential-bearing state remains `0600`.
+
+Verification against the refreshed source and current event changes: **1295 passed, 7 skipped, 1573 subtests passed**; Python compilation and `git diff --check` clean. Production MCP and Sender services were active at refresh time with no queued/running Sender jobs. No live upstream 429 was induced; cooldown/deferral behavior is covered by deterministic regression tests. No credentials, tokens, certificates, private keys, databases, environment files, or virtual environments are included in this source snapshot.

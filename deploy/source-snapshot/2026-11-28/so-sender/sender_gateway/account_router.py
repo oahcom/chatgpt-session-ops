@@ -34,6 +34,10 @@ remote create returns, so rotation (transaction A) and the owner insert
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+import math
+import random
+from pathlib import Path
 from typing import Sequence
 
 from .job_store import JobStore
@@ -52,23 +56,53 @@ from .models import (
 
 #: The six sending accounts of report section 1.5.  ``nologin`` is the
 #: anonymous browser fallback that section 5.1 forbids; it must never appear.
+# acct4 is auth-revoked and acct5 is operator-disabled. Keep both out of
+# every automatic and pinned reservation until an explicit health recovery.
+class AccountCoolingDown(ResourceExhausted):
+    """Retryable account cooldown carrying the remaining delay."""
+
+    def __init__(self, account: str | None, retry_after_seconds: float) -> None:
+        self.account = account
+        delay = max(1.0, float(retry_after_seconds))
+        label = account or "all active accounts"
+        super().__init__(
+            f"{label} rate limited; retry in {delay:.1f}s",
+            retry_after_seconds=delay,
+        )
+        self.retry_after_seconds = delay
+
+
 DEFAULT_ACCOUNTS: tuple[str, ...] = (
-    "acct1",
-    "acct2",
-    "acct3",
-    "acct4",
-    "acct5",
-    "acct6",
+    "acct1", "acct2", "acct3", "acct4", "acct5", "acct6",
 )
 
 FORBIDDEN_ACCOUNT_MARKER = "nologin"
 AUTO = "auto"
+
+
+def discover_accounts(accounts_dir: str | Path) -> tuple[str, ...]:
+    """Return credential-backed acctN directories in numeric order."""
+    root = Path(accounts_dir)
+    if not root.is_dir():
+        return ()
+    return tuple(sorted(
+        (
+            entry.name for entry in root.iterdir()
+            if entry.is_dir()
+            and entry.name.startswith("acct")
+            and entry.name[4:].isdigit()
+            and (entry / "cookies.json").is_file()
+            and (entry / "access_token.txt").is_file()
+        ),
+        key=lambda name: int(name[4:]),
+    ))
 
 _ROUTER_SCHEMA: Sequence[str] = (
     """
     CREATE TABLE IF NOT EXISTS account_rotation (
         pool TEXT PRIMARY KEY,
         last_index INTEGER NOT NULL,
+        last_account TEXT,
         updated_at TEXT NOT NULL
     )
     """,
@@ -79,7 +113,21 @@ _ROUTER_SCHEMA: Sequence[str] = (
         until_at TEXT NOT NULL
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS account_health (
+        account TEXT PRIMARY KEY,
+        state TEXT NOT NULL CHECK (state IN ('active', 'auth_unavailable', 'operator_disabled')),
+        reason TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
 )
+
+_DEFAULT_ACCOUNT_HEALTH = (
+    ("acct4", "auth_unavailable", "upstream HTTP 401; awaiting authorized reauthentication and read-only probe"),
+    ("acct5", "operator_disabled", "operator disabled; do not reauthenticate"),
+)
+_ACCOUNT_HEALTH_STATES = frozenset(("active", "auth_unavailable", "operator_disabled"))
 
 
 @dataclass(frozen=True)
@@ -109,6 +157,7 @@ class AccountRouter:
         pool: str = "default",
         cooldown_seconds: float = 60.0,
         now=None,
+        jitter_fn=None,
     ) -> None:
         candidates = tuple(accounts)
         if not candidates:
@@ -124,6 +173,7 @@ class AccountRouter:
         self._accounts = candidates
         self._pool = pool
         self._cooldown_seconds = float(cooldown_seconds)
+        self._jitter_fn = jitter_fn or random.uniform
         self._now = now or store.now
         self._ensure_schema()
 
@@ -133,10 +183,66 @@ class AccountRouter:
         with self._store.transaction() as txn:
             for statement in _ROUTER_SCHEMA:
                 txn.execute(statement)
+            rotation_columns = {
+                row["name"] for row in txn.fetchall("PRAGMA table_info(account_rotation)")
+            }
+            if "last_account" not in rotation_columns:
+                txn.execute("ALTER TABLE account_rotation ADD COLUMN last_account TEXT")
+                txn.execute("UPDATE account_rotation SET last_index = -1, last_account = NULL")
+            now = self._now()
+            for account, state, reason in _DEFAULT_ACCOUNT_HEALTH:
+                txn.execute(
+                    "INSERT INTO account_health (account, state, reason, updated_at) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(account) DO NOTHING",
+                    (account, state, reason, now),
+                )
 
     @property
     def accounts(self) -> tuple[str, ...]:
         return self._accounts
+
+    def active_accounts(self) -> tuple[str, ...]:
+        with self._store.transaction() as txn:
+            return tuple(a for a in self._accounts if self._account_state(a, txn) == "active")
+
+    def get_account_health(self, account: str) -> dict:
+        account = self._validate_requested(account)
+        with self._store.transaction() as txn:
+            row = txn.fetchone("SELECT state, reason, updated_at FROM account_health WHERE account = ?", (account,))
+            if row is None:
+                return {"account": account, "state": "active", "reason": "", "updated_at": None}
+            return {"account": account, **dict(row)}
+
+    def _account_state(self, account: str, txn) -> str:
+        row = txn.fetchone("SELECT state FROM account_health WHERE account = ?", (account,))
+        return "active" if row is None else row["state"]
+
+    def _assert_active(self, account: str, txn) -> None:
+        state = self._account_state(account, txn)
+        if state != "active":
+            raise ResourceExhausted(f"account {account!r} is unavailable ({state})")
+
+    def _set_health(self, account: str, state: str, reason: str) -> None:
+        account = self._validate_requested(account)
+        if state not in _ACCOUNT_HEALTH_STATES:
+            raise StoreError("invalid account health state", code=ErrorCode.INVALID_ARGUMENT)
+        with self._store.transaction() as txn:
+            txn.execute(
+                "INSERT INTO account_health (account, state, reason, updated_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(account) DO UPDATE SET state=excluded.state, reason=excluded.reason, updated_at=excluded.updated_at",
+                (account, state, str(reason), self._now()),
+            )
+
+    def mark_auth_unavailable(self, account: str, *, reason: str = "upstream HTTP 401") -> None:
+        self._set_health(account, "auth_unavailable", reason)
+
+    def mark_operator_disabled(self, account: str, *, reason: str = "operator disabled") -> None:
+        self._set_health(account, "operator_disabled", reason)
+
+    def restore_account(self, account: str, *, operator_authorized: bool = False, probe_ok: bool = False) -> None:
+        if operator_authorized is not True or probe_ok is not True:
+            raise StoreError("account restore requires authorized reauthentication and a successful read-only probe", code=ErrorCode.PERMISSION_DENIED)
+        self._set_health(account, "active", "authorized reauthentication and read-only probe passed")
 
     # -- validation ----------------------------------------------------
 
@@ -164,18 +270,19 @@ class AccountRouter:
         self,
         account: str,
         *,
-        reason: str = "429",
+        reason: str = "upstream HTTP 429",
         cooldown_seconds: float | None = None,
-    ) -> None:
-        """Record a 429.  Cooling accounts are skipped by rotation only."""
-
+    ) -> float:
+        """Persist a bounded Retry-After with small positive jitter."""
         account = self._validate_requested(account)
-        seconds = (
-            self._cooldown_seconds
-            if cooldown_seconds is None
-            else float(cooldown_seconds)
-        )
-        until_at = add_seconds(self._now(), seconds)
+        seconds = self._cooldown_seconds if cooldown_seconds is None else float(cooldown_seconds)
+        if not math.isfinite(seconds):
+            seconds = self._cooldown_seconds
+        seconds = max(1.0, min(3600.0, seconds))
+        jitter_cap = min(5.0, seconds * 0.1)
+        jitter = max(0.0, min(jitter_cap, float(self._jitter_fn(0.0, jitter_cap))))
+        effective_seconds = min(3600.0, seconds + jitter)
+        until_at = add_seconds(self._now(), effective_seconds)
         with self._store.transaction() as txn:
             txn.execute(
                 """
@@ -186,19 +293,28 @@ class AccountRouter:
                 """,
                 (account, reason, until_at),
             )
+        return effective_seconds
 
     def clear_rate_limit(self, account: str) -> None:
         account = self._validate_requested(account)
         with self._store.transaction() as txn:
             txn.execute("DELETE FROM account_cooldowns WHERE account = ?", (account,))
 
-    def _is_cooling(self, account: str, txn) -> bool:
+    def _cooldown_remaining_seconds(self, account: str, txn) -> float:
         row = txn.fetchone(
             "SELECT until_at FROM account_cooldowns WHERE account = ?", (account,)
         )
         if row is None:
-            return False
-        return row["until_at"] > self._now()
+            return 0.0
+        try:
+            until = datetime.fromisoformat(row["until_at"].replace("Z", "+00:00"))
+            now = datetime.fromisoformat(self._now().replace("Z", "+00:00"))
+            return max(0.0, (until - now).total_seconds())
+        except (TypeError, ValueError):
+            return self._cooldown_seconds
+
+    def _is_cooling(self, account: str, txn) -> bool:
+        return self._cooldown_remaining_seconds(account, txn) > 0.0
 
     # -- rotation ------------------------------------------------------
 
@@ -218,39 +334,37 @@ class AccountRouter:
     def _next_account(self, requested_account: str | None, txn) -> str:
         if requested_account not in (None, AUTO):
             account = self._validate_requested(requested_account)
-            if self._is_cooling(account, txn):
-                raise ResourceExhausted(f"account {account!r} is rate limited")
+            self._assert_active(account, txn)
+            remaining = self._cooldown_remaining_seconds(account, txn)
+            if remaining > 0:
+                raise AccountCoolingDown(account, remaining)
             return account
-
-        available = [
-            account for account in self._accounts if not self._is_cooling(account, txn)
-        ]
-        if not available:
-            raise ResourceExhausted("every account is rate limited")
-
-        moment = self._now()
-        row = txn.fetchone(
-            "SELECT last_index FROM account_rotation WHERE pool = ?", (self._pool,)
-        )
+        row = txn.fetchone("SELECT last_index, last_account FROM account_rotation WHERE pool = ?", (self._pool,))
         if row is None:
-            index = 0
-            txn.execute(
-                "INSERT INTO account_rotation (pool, last_index, updated_at)"
-                " VALUES (?, ?, ?)",
-                (self._pool, index, moment),
-            )
+            start = 0
+        elif row["last_account"] in self._accounts:
+            start = (self._accounts.index(row["last_account"]) + 1) % len(self._accounts)
         else:
-            index = (int(row["last_index"]) + 1) % len(available)
-            cursor = txn.execute(
-                "UPDATE account_rotation SET last_index = ?, updated_at = ?"
-                " WHERE pool = ?",
-                (index, moment, self._pool),
-            )
-            if cursor.rowcount != 1:  # pragma: no cover - guarded above
-                raise GatewayError(
-                    "rotation row disappeared", code=ErrorCode.INTERNAL
-                )
-        return available[index]
+            previous = int(row["last_index"])
+            start = (previous + 1) % len(self._accounts) if previous >= 0 else 0
+        ordered = self._accounts[start:] + self._accounts[:start]
+        active = [a for a in ordered if self._account_state(a, txn) == "active"]
+        if not active:
+            raise ResourceExhausted("no active account is available")
+        available = [a for a in active if not self._is_cooling(a, txn)]
+        if not available:
+            remaining = min(self._cooldown_remaining_seconds(a, txn) for a in active)
+            raise AccountCoolingDown(None, remaining)
+        account = available[0]
+        index = self._accounts.index(account)
+        now = self._now()
+        if row is None:
+            txn.execute("INSERT INTO account_rotation (pool, last_index, last_account, updated_at) VALUES (?, ?, ?, ?)", (self._pool, index, account, now))
+        else:
+            cursor = txn.execute("UPDATE account_rotation SET last_index=?, last_account=?, updated_at=? WHERE pool=?", (index, account, now, self._pool))
+            if cursor.rowcount != 1:
+                raise GatewayError("rotation row disappeared", code=ErrorCode.INTERNAL)
+        return account
 
     # -- routing -------------------------------------------------------
 
@@ -290,17 +404,16 @@ class AccountRouter:
                     # Another principal's session: do not leak that it exists.
                     raise SessionNotFound(f"conversation {conversation_id} not found")
                 account = owner["account"]
+                self._assert_active(account, txn)
                 if requested not in (AUTO, account):
                     raise SessionConflict(
                         f"conversation {conversation_id} belongs to account "
                         f"{account!r}, not {requested!r}"
                     )
-                if self._is_cooling(account, txn):
+                remaining = self._cooldown_remaining_seconds(account, txn)
+                if remaining > 0:
                     # No failover: the ownership row is immutable.
-                    raise ResourceExhausted(
-                        f"account {account!r} is rate limited; the conversation "
-                        "cannot move to another account"
-                    )
+                    raise AccountCoolingDown(account, remaining)
                 self._store.assign_account(job_id, account, txn=txn)
                 return Reservation(
                     account=account,
@@ -342,6 +455,7 @@ class AccountRouter:
 
         account = self._validate_requested(account)
         with self._store.transaction() as txn:
+            self._assert_active(account, txn)
             existing = self._store.get_session_owner(conversation_id, txn=txn)
             if existing is not None:
                 if (
@@ -380,6 +494,7 @@ class AccountRouter:
 
         account = self._validate_requested(account)
         with self._store.transaction() as txn:
+            self._assert_active(account, txn)
             self._store.bind_session_owner(
                 conversation_id=conversation_id,
                 tenant_id=tenant_id,
@@ -436,6 +551,8 @@ class AccountRouter:
                 f"conversation {conversation_id} belongs to account "
                 f"{account!r}, not {requested_account!r}"
             )
+        with self._store.transaction() as txn:
+            self._assert_active(account, txn)
         return account
 
     def list_owners(self, *, tenant_id: str, principal_id: str) -> list[dict]:
