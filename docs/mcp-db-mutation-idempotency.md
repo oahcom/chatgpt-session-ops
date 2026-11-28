@@ -1,18 +1,19 @@
 # MCP database mutation idempotency
 
-All database mutation tools accept an `idempotency_key` (UUIDv4). New clients
-should generate it before the operation and reuse the exact value across
-retries, new JSON-RPC request IDs, and new MCP sessions. It is scoped by the
-authenticated tenant/principal and tool name. The receipt stores a digest of
-canonical business arguments and the original result. Reusing the key with
-changed arguments returns `CONFLICT`.
+The MCP tool schemas require an `idempotency_key` (UUIDv4) for every
+database mutation. New clients must generate it before the operation and reuse
+the exact value across retries, new JSON-RPC request IDs, and new MCP sessions.
+It is scoped by authenticated tenant/principal and tool name. The receipt
+stores a digest of canonical business arguments and the original result.
+Reusing the key with changed arguments returns `CONFLICT`.
 
-For legacy clients that omit the field, the server derives a fallback from the
-authenticated principal, tool, MCP session ID, and JSON-RPC request ID. That
-fallback is intentionally session-scoped. If no MCP session ID exists, the
-server uses a per-call random key rather than risking collisions between
-unrelated stateless clients. Legacy stateless calls do not get retry
-deduplication; callers requiring it must send an explicit key.
+For legacy clients that omit the field, the server normalizes a fallback from
+the authenticated principal, tool, MCP session ID, and JSON-RPC request ID
+before argument validation. That fallback is intentionally session-scoped.
+If no MCP session ID exists, the server uses a per-call random key rather than
+risking collisions between unrelated stateless clients. Legacy stateless
+calls do not get retry deduplication; callers requiring it must send an
+explicit key.
 
 The receipt reservation, domain mutation, and terminal result commit in the
 same SQLite `BEGIN IMMEDIATE` transaction. If the process exits before commit,

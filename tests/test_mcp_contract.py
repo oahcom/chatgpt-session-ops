@@ -1062,7 +1062,7 @@ class MCPContractTests(unittest.TestCase):
 
     def test_oversized_response_becomes_resource_exhausted(self):
         class OversizedStore(FakeStore):
-            def create_work_item(self, principal, request_id=None):
+            def create_work_item(self, principal, request_id=None, idempotency_key=None):
                 return {"content": "x" * MAX_STRUCTURED_CONTENT_BYTES}
 
         service = MCPToolService(OversizedStore())
