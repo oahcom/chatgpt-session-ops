@@ -27,7 +27,9 @@ class ChatGPTDirectClientAccountPreflightTests(unittest.TestCase):
         for account in ("acct1", "acct5"):
             folder = self.accounts / account
             folder.mkdir()
-            (folder / "cookies.json").write_text("{}")
+            (folder / "cookies.json").write_text(
+                '[{"name":"session","value":"test-cookie","domain":".chatgpt.com"}]'
+            )
             (folder / "access_token.txt").write_text("token")
 
         self.db = root / "state.sqlite3"
@@ -54,10 +56,14 @@ class ChatGPTDirectClientAccountPreflightTests(unittest.TestCase):
         self.client = ChatGPTDirectClient.__new__(ChatGPTDirectClient)
         self.client.database_path = self.db
         self.client.accounts_dir = self.accounts
+        self.client.runtime_dir = self.runtime
+        self.client.repository_root = Path(__file__).resolve().parents[1]
         self.client.prompt_dir = self.prompts
         self.client._db_lock = threading.RLock()
         self.client._executor = _Executor()
         self.client.max_queue_size = 1
+        self.client._cli = self.client._load_cli()
+        self.client._sync_runtime_accounts()
 
     def tearDown(self):
         self.tmp.cleanup()

@@ -330,15 +330,11 @@ class CredentialIdentityGuardTests(unittest.TestCase):
             f.write("token\n")
         return base
 
-    def test_unknown_account_rejected(self):
-        """4314: account must be a configured identity, not a path fragment."""
+    def test_malformed_account_identity_rejected(self):
+        """账户身份接受 acctN 格式，但拒绝路径片段和零编号。"""
         with self.assertRaises(ValueError) as ctx:
-            sender.ChatGPTAPI(base_dir=self.root, account="acct7")
-        self.assertEqual(
-            str(ctx.exception),
-            "account must be one of acct1, acct2, acct3, acct4, acct5, "
-            "acct6, default, nologin",
-        )
+            sender.ChatGPTAPI(base_dir=self.root, account="acct0")
+        self.assertEqual(str(ctx.exception), "account must be default, nologin, or acctN")
 
     def test_accepts_configured_account(self):
         """Acceptance pair for 4314 and 4333: a known identity with an array

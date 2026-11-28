@@ -30,6 +30,8 @@ def load_module():
 
 m = load_module()
 
+LEGACY_ROTATION_PRIMARY = ("acct1", "acct2", "acct3", "acct4", "acct5", "acct6")
+
 
 def initial_rotation_state():
     return {
@@ -96,6 +98,11 @@ class AID2026011Tests(unittest.TestCase):
         )
 
         self.write_rotation(initial_rotation_state())
+        self._discovery = mock.patch.object(
+            m, "_rotation_primary", return_value=list(LEGACY_ROTATION_PRIMARY)
+        )
+        self._discovery.start()
+        self.addCleanup(self._discovery.stop)
 
     def tearDown(self):
         m.BASE = self._base
@@ -436,7 +443,7 @@ class AID2026011Tests(unittest.TestCase):
         def fake_attempt(st, name, prompt_file, attempts, thinking=None):
             calls.append(name)
 
-            if name in m.ROTATION_PRIMARY:
+            if name in LEGACY_ROTATION_PRIMARY:
                 attempts.append({
                     "account": name,
                     "status": 429,
@@ -459,9 +466,9 @@ class AID2026011Tests(unittest.TestCase):
 
         self.assertEqual(result, 0)
 
-        self.assertEqual(len(calls), len(m.ROTATION_PRIMARY) + 1)
-        self.assertEqual(set(calls[:len(m.ROTATION_PRIMARY)]), set(m.ROTATION_PRIMARY))
-        self.assertEqual(calls[len(m.ROTATION_PRIMARY)], "nologin")
+        self.assertEqual(len(calls), len(LEGACY_ROTATION_PRIMARY) + 1)
+        self.assertEqual(set(calls[:len(LEGACY_ROTATION_PRIMARY)]), set(LEGACY_ROTATION_PRIMARY))
+        self.assertEqual(calls[len(LEGACY_ROTATION_PRIMARY)], "nologin")
 
     def test_200_without_conv_id_stops_rotation(self):
         """Assert a 200 without identity does not cause another account attempt."""

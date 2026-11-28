@@ -198,6 +198,15 @@ The application tree is immutable at runtime. The service unit sets:
 - `CHATGPT_SESSION_OPS_ACCOUNTS_DIR=/var/lib/chatgpt-session-ops/accounts` for the credential vault. Credentials remain in the existing account directories and are not copied into the application tree.
 - `CHATGPT_SESSION_OPS_RUNTIME_DIR=/var/lib/so-mcp/chatgpt-session-ops` for mutable CLI state, prompt files, logs, and per-account runtime state.
 
+At startup and before each account preflight, `ChatGPTDirectClient` discovers
+all valid `acctN` directories in the vault (natural numeric order) and mirrors
+new account credentials into the runtime tree. Credential files begin as
+symlinks to the read-only vault; atomic cookie warm-up replaces only the
+runtime symlink with a writable runtime overlay, never the vault file. If an
+operator replaces vault credentials after a runtime overlay exists, remove that
+account's runtime overlay files before restarting so the new vault credentials
+are mirrored.
+
 The service runs as `User=ubuntu`, `Group=chatgpt-sender`. Keep the existing
 credential vault owned by `chatgpt-sender:chatgpt-sender` with directories
 mode `0750` and credential files mode `0660`; the service needs read/traverse

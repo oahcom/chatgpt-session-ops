@@ -45,6 +45,10 @@ def load_module():
 
 m = load_module()
 
+# Historical fixture for regression cases; production account pools are discovered dynamically.
+LEGACY_ROTATION_PRIMARY = ("acct1", "acct2", "acct3", "acct4", "acct5", "acct6")
+LEGACY_ROTATION_ORDER = LEGACY_ROTATION_PRIMARY + ("nologin",)
+
 # `_replace_with_bounded_retry` 的退避预算是 0.05+0.10+0.20+0.40+0.80+1.00 = 2.55s：
 # Windows 上 AV/索引器短暂持有目标文件时，一次**合法**的 replace 重试就能吃掉整个
 # 预算，CI 负载高时更久。所以锁路径的墙钟断言只做 10s「死锁/挂死保护」：真正等满
@@ -794,11 +798,17 @@ class TestStateFiles(TmpBase):
 
 # ---------------------------------------------------------------- 轮转
 class TestRotation(TmpBase):
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(m, "_rotation_primary", return_value=list(LEGACY_ROTATION_PRIMARY))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_normalize_fills_all_identities(self):
         st = m._normalize_rotation({"cursor": 99})
-        self.assertEqual(set(st["order"]), set(m.ROTATION_ORDER))
-        self.assertLess(st["cursor"], len(m.ROTATION_PRIMARY))
-        for a in m.ROTATION_ORDER:
+        self.assertEqual(set(st["order"]), set(LEGACY_ROTATION_ORDER))
+        self.assertLess(st["cursor"], len(LEGACY_ROTATION_PRIMARY))
+        for a in LEGACY_ROTATION_ORDER:
             self.assertIn(a, st["created"])
             self.assertIn(a, st["failures"])
 
@@ -843,7 +853,7 @@ class TestRotation(TmpBase):
         m.mark_unavailable(st, "acct1", "HTTP 401")
         plan = m.rotation_plan(st)
         self.assertEqual(plan[-1], "acct1")
-        self.assertEqual(len(plan), len(m.ROTATION_PRIMARY))
+        self.assertEqual(len(plan), len(LEGACY_ROTATION_PRIMARY))
 
     # ---- F-34：状态文件形状/类型畸形 → 确定性结局 ----
     def test_normalize_converges_polluted_shapes(self):
@@ -854,9 +864,9 @@ class TestRotation(TmpBase):
             with self.subTest(blob=blob):
                 st = m._normalize_rotation(blob)
                 self.assertIsInstance(st["cursor"], int)
-                self.assertLess(st["cursor"], len(m.ROTATION_PRIMARY))
-                self.assertEqual(set(st["order"]), set(m.ROTATION_ORDER))
-                for a in m.ROTATION_ORDER:
+                self.assertLess(st["cursor"], len(LEGACY_ROTATION_PRIMARY))
+                self.assertEqual(set(st["order"]), set(LEGACY_ROTATION_ORDER))
+                for a in LEGACY_ROTATION_ORDER:
                     self.assertIsInstance(st["created"][a], int)
                     self.assertIsInstance(st["failures"][a], int)
                 self.assertIsInstance(st["unavailable"], dict)
@@ -868,7 +878,7 @@ class TestRotation(TmpBase):
         self.assertEqual(m._normalize_rotation({"cursor": 3.5})["cursor"], 0)
         self.assertEqual(m._normalize_rotation({"cursor": "3.5"})["cursor"], 0)
         self.assertEqual(m._normalize_rotation({"cursor": "7"})["cursor"],
-                         7 % len(m.ROTATION_PRIMARY), "纯数字串是合法整数，要保住计数")
+                         7 % len(LEGACY_ROTATION_PRIMARY), "纯数字串是合法整数，要保住计数")
 
     def test_rotation_helpers_total_on_polluted_unavailable(self):
         for blob in ({"unavailable": "x"}, {"unavailable": {"acct1": "str"}},
@@ -878,7 +888,7 @@ class TestRotation(TmpBase):
                 self.assertFalse(m.is_unavailable(st, "acct1"))
                 self.assertIn(m.purge_expired(st), (True, False))
                 m.mark_unavailable(st, "acct1", "r")
-                self.assertEqual(len(m.rotation_plan(st)), len(m.ROTATION_PRIMARY))
+                self.assertEqual(len(m.rotation_plan(st)), len(LEGACY_ROTATION_PRIMARY))
                 reason = m.anon_fallback_block_reason(st, {"acct1": 429, "acct2": 429})
                 self.assertTrue(reason is None or isinstance(reason, str),
                                 "结局必须是 None（放行）或人话，不得抛异常")
@@ -916,11 +926,11 @@ class TestRotation(TmpBase):
             m.create_chat_rotating, sys.argv = real_rot, real_argv
         return rc, hit["rotate"], buf.getvalue()
 
-    def test_explicit_account_429_escalates_to_rotation(self):
-        """显式指定 acct1 却 429：必须换账号（换不动则匿名），不能原地失败。"""
+    def test_explicit_account_429_keeps_strict_pin(self):
+        """显式指定 acct1 遇到 429：记录冷却并失败，不得切换身份。"""
         rc, rotated, out = self._run_new("acct1", 429)
-        self.assertTrue(rotated, "429 未进入轮转兜底：用户裁定要求换账号/走匿名\n%s" % out)
-        self.assertEqual(rc, 0)
+        self.assertFalse(rotated, "显式账户不得触发轮转/匿名兜底\n%s" % out)
+        self.assertEqual(rc, 1)
         # 该账号要被记进冷却，否则轮转计划会先把它自己再试一遍
         st = m.load_rotation()
         self.assertIn("acct1", st["unavailable"])
@@ -1092,7 +1102,7 @@ class TestRotation(TmpBase):
 
         self.assertEqual(
             calls,
-            list(m.ROTATION_PRIMARY),
+            list(LEGACY_ROTATION_PRIMARY),
             "全部登录态必须各尝试一次",
         )
 
@@ -1110,7 +1120,7 @@ class TestRotation(TmpBase):
 
         st = m.load_rotation()
 
-        for account in m.ROTATION_PRIMARY:
+        for account in LEGACY_ROTATION_PRIMARY:
             with self.subTest(account=account):
                 self.assertIn(account, st["unavailable"])
                 self.assertIn(
@@ -5473,103 +5483,117 @@ class TestRegistryAuditAndReconcileAudit(TmpBase):
 
 
 class TestAccountExpansionAcct6(unittest.TestCase):
-    """DECISION-147：acct6 进轮转，但身份白名单仍是显式枚举（不做目录扫描）。"""
+    """历史 acct6 顺序回归；线上轮转池现在由凭证目录动态发现。"""
+
+    def setUp(self):
+        patcher = mock.patch.object(m, "_rotation_primary", return_value=list(LEGACY_ROTATION_PRIMARY))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_acct6_in_rotation_constants(self):
-        self.assertIn("acct6", m.ROTATION_ORDER)
-        self.assertIn("acct6", m.ROTATION_PRIMARY)
+        self.assertIn("acct6", LEGACY_ROTATION_ORDER)
+        self.assertIn("acct6", LEGACY_ROTATION_PRIMARY)
         # nologin 仍只能是兜底，不能进 PRIMARY
-        self.assertNotIn("nologin", m.ROTATION_PRIMARY)
+        self.assertNotIn("nologin", LEGACY_ROTATION_PRIMARY)
         self.assertLess(
-            m.ROTATION_ORDER.index("acct6"),
-            m.ROTATION_ORDER.index("nologin"),
+            LEGACY_ROTATION_ORDER.index("acct6"),
+            LEGACY_ROTATION_ORDER.index("nologin"),
         )
 
     def test_acct6_is_a_valid_identity(self):
-        self.assertIn("acct6", m._VALID_ACCOUNT_IDENTITIES)
+        self.assertTrue(m._is_account_identity("acct6"))
         self.assertEqual(m.normalize_account_identity("acct6"), "acct6")
 
-    def test_unknown_identity_still_rejected(self):
-        """扩表不等于放开：磁盘上放个 acct9 目录也不该被接受。"""
-        for bad in ("acct7", "acct9", "../etc", "acct6/../acct1", ""):
-            with self.assertRaises((ValueError, Exception)):
+    def test_dynamic_account_identity_is_valid_but_paths_are_rejected(self):
+        """身份格式允许任意正整数 acctN；路径片段仍必须拒绝。"""
+        self.assertEqual(m.normalize_account_identity("acct7"), "acct7")
+        self.assertEqual(m.normalize_account_identity("acct109"), "acct109")
+        for bad in ("acct0", "acct09", "../etc", "acct6/../acct1", ""):
+            with self.assertRaises(ValueError):
                 m.normalize_account_identity(bad)
 
     def test_acct6_rotation_participates_and_shares_cursor(self):
         """cursor 推进必须覆盖 acct6，而不是在 4 个老账号里打转。"""
         seen = []
-        for start in range(len(m.ROTATION_PRIMARY)):
+        for start in range(len(LEGACY_ROTATION_PRIMARY)):
             st = m._normalize_rotation({"cursor": start})
-            plan = [m.ROTATION_PRIMARY[(st["cursor"] + i) % len(m.ROTATION_PRIMARY)]
-                    for i in range(len(m.ROTATION_PRIMARY))]
+            plan = [LEGACY_ROTATION_PRIMARY[(st["cursor"] + i) % len(LEGACY_ROTATION_PRIMARY)]
+                    for i in range(len(LEGACY_ROTATION_PRIMARY))]
             seen.extend(plan)
         self.assertIn("acct6", seen)
         self.assertEqual(
             len([a for a in seen if a == "acct6"]),
-            len(m.ROTATION_PRIMARY),
+            len(LEGACY_ROTATION_PRIMARY),
             "每个 cursor 起点下 acct6 都应恰好出现一次",
         )
 
     def test_acct6_failure_state_is_isolated(self):
         """acct6 的失败计数不得污染其他账号。"""
         st = m._normalize_rotation({})
-        for name in m.ROTATION_PRIMARY:
+        for name in LEGACY_ROTATION_PRIMARY:
             self.assertIn(name, st["failures"])
             self.assertIn(name, st["created"])
 
 
 class TestAccountRecoveryAcct5(unittest.TestCase):
-    """DECISION-154：acct5 凭据被新登录覆盖后重新验证通过，恢复为第六身份。
+    """历史 acct5 顺序回归；线上轮转池现在由凭证目录动态发现。
 
     源文件名与内容不符（`acct6-export (1).json` 里其实是 acct5），
     因此身份判定必须以凭据内容（sub/email）为准，不得按文件名。
     """
 
+    def setUp(self):
+        patcher = mock.patch.object(m, "_rotation_primary", return_value=list(LEGACY_ROTATION_PRIMARY))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_acct5_in_rotation_constants(self):
-        self.assertIn("acct5", m.ROTATION_ORDER)
-        self.assertIn("acct5", m.ROTATION_PRIMARY)
-        self.assertNotIn("nologin", m.ROTATION_PRIMARY)
+        self.assertIn("acct5", LEGACY_ROTATION_ORDER)
+        self.assertIn("acct5", LEGACY_ROTATION_PRIMARY)
+        self.assertNotIn("nologin", LEGACY_ROTATION_PRIMARY)
         self.assertLess(
-            m.ROTATION_ORDER.index("acct5"),
-            m.ROTATION_ORDER.index("nologin"),
+            LEGACY_ROTATION_ORDER.index("acct5"),
+            LEGACY_ROTATION_ORDER.index("nologin"),
         )
 
     def test_acct5_keeps_natural_number_order(self):
         """DECISION-154 Q2=A：按编号自然序，acct5 夹在 acct4 与 acct6 之间。"""
-        self.assertLess(m.ROTATION_ORDER.index("acct4"), m.ROTATION_ORDER.index("acct5"))
-        self.assertLess(m.ROTATION_ORDER.index("acct5"), m.ROTATION_ORDER.index("acct6"))
+        self.assertLess(LEGACY_ROTATION_ORDER.index("acct4"), LEGACY_ROTATION_ORDER.index("acct5"))
+        self.assertLess(LEGACY_ROTATION_ORDER.index("acct5"), LEGACY_ROTATION_ORDER.index("acct6"))
         self.assertEqual(
-            list(m.ROTATION_PRIMARY),
-            sorted(m.ROTATION_PRIMARY),
+            list(LEGACY_ROTATION_PRIMARY),
+            sorted(LEGACY_ROTATION_PRIMARY),
             "PRIMARY 必须是编号升序",
         )
 
     def test_acct5_is_a_valid_identity(self):
-        self.assertIn("acct5", m._VALID_ACCOUNT_IDENTITIES)
+        self.assertTrue(m._is_account_identity("acct5"))
         self.assertEqual(m.normalize_account_identity("acct5"), "acct5")
 
-    def test_recovery_does_not_open_the_whitelist(self):
-        """恢复一个身份不等于放开枚举：相邻编号仍须被拒。"""
-        for bad in ("acct7", "acct0", "acct55", "acct5/../acct1", "ACCT5"):
-            with self.assertRaises((ValueError, Exception)):
+    def test_dynamic_identity_format_accepts_positive_account_numbers(self):
+        """账户身份采用 acctN 格式；正整数编号开放，路径片段仍拒绝。"""
+        for bad in ("acct0", "acct05", "acct5/../acct1", "ACCT5"):
+            with self.assertRaises(ValueError):
                 m.normalize_account_identity(bad)
+        self.assertEqual(m.normalize_account_identity("acct7"), "acct7")
+        self.assertEqual(m.normalize_account_identity("acct55"), "acct55")
 
     def test_acct5_rotation_participates_and_shares_cursor(self):
         seen = []
-        for start in range(len(m.ROTATION_PRIMARY)):
+        for start in range(len(LEGACY_ROTATION_PRIMARY)):
             st = m._normalize_rotation({"cursor": start})
-            plan = [m.ROTATION_PRIMARY[(st["cursor"] + i) % len(m.ROTATION_PRIMARY)]
-                    for i in range(len(m.ROTATION_PRIMARY))]
+            plan = [LEGACY_ROTATION_PRIMARY[(st["cursor"] + i) % len(LEGACY_ROTATION_PRIMARY)]
+                    for i in range(len(LEGACY_ROTATION_PRIMARY))]
             seen.extend(plan)
         self.assertEqual(
             len([a for a in seen if a == "acct5"]),
-            len(m.ROTATION_PRIMARY),
+            len(LEGACY_ROTATION_PRIMARY),
             "每个 cursor 起点下 acct5 都应恰好出现一次",
         )
 
     def test_acct5_failure_state_is_isolated(self):
         st = m._normalize_rotation({})
-        for name in m.ROTATION_PRIMARY:
+        for name in LEGACY_ROTATION_PRIMARY:
             self.assertIn(name, st["failures"])
             self.assertIn(name, st["created"])
 
@@ -7808,6 +7832,65 @@ class ThinkingModelPreferenceTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         self.m.ChatGPTAPI.resolve_thinking_model(api, cache={})
                 self.assertEqual(api.calls, 0, "非法配置必须在请求清单之前失败")
+
+
+class TestDynamicAccountRoutingEvidence(unittest.TestCase):
+    def _write_account(self, root, account, *, token="token", cookies=None):
+        directory = root if account == "acct1" else os.path.join(root, "accounts", account)
+        os.makedirs(directory, exist_ok=True)
+        if cookies is None:
+            cookies = [{
+                "name": "__Secure-next-auth.session-token",
+                "value": "session",
+                "domain": ".chatgpt.com",
+            }]
+        with open(os.path.join(directory, "cookies.json"), "w", encoding="utf-8") as fh:
+            json.dump(cookies, fh)
+        with open(os.path.join(directory, "access_token.txt"), "w", encoding="utf-8") as fh:
+            fh.write(token)
+        return directory
+
+    def test_discovers_dynamic_accounts_in_natural_order_and_skips_invalid(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._write_account(root, "acct1")
+            self._write_account(root, "acct2")
+            self._write_account(root, "acct10")
+            self._write_account(root, "acct3", cookies={"not": "an array"})
+            self._write_account(root, "acct4", token="")
+            self._write_account(root, "acct0")
+            self._write_account(root, "acct02")
+            self.assertEqual(
+                m.discover_configured_accounts(root),
+                ["acct1", "acct2", "acct10"],
+            )
+
+    def test_operator_disabled_is_persistent_and_migrates_legacy_marker(self):
+        with mock.patch.object(m, "_rotation_primary", return_value=["acct1", "acct10"]):
+            state = m._normalize_rotation({"operator_disabled": ["acct10"]})
+            self.assertNotIn("acct10", m.rotation_plan(state))
+            legacy = m._normalize_rotation({
+                "unavailable": {
+                    "acct10": {
+                        "reason": "manually disabled",
+                        "epoch": 1,
+                        "ttl": 1,
+                        "at": "old",
+                    }
+                }
+            })
+            self.assertIn("acct10", legacy["operator_disabled"])
+            self.assertNotIn("acct10", legacy["unavailable"])
+            self.assertNotIn("acct10", m.rotation_plan(legacy))
+
+    def test_cursor_and_summary_support_more_than_six_accounts(self):
+        accounts = ["acct1", "acct2", "acct3", "acct4", "acct5", "acct6", "acct7", "acct10"]
+        with mock.patch.object(m, "_rotation_primary", return_value=accounts):
+            state = m._normalize_rotation({"cursor": 7})
+            self.assertEqual(state["cursor"], 7)
+            self.assertEqual(m.rotation_plan(state)[0], "acct10")
+            with mock.patch.object(m, "load_rotation", return_value=state):
+                summary = m.rotation_summary()
+            self.assertEqual(summary["next"], "acct10")
 
 
 if __name__ == "__main__":
