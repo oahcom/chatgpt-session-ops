@@ -466,7 +466,7 @@ class MCPEventsStore:
         webhook_id = "msg_verification_" + uuid.uuid4().hex
         headers = _signed_headers(subscription_id, secret, webhook_id, body)
         try:
-            status, response_body = self.post_json(callback_url, body, headers)
+            status, response_body = self._post_with_metrics(callback_url, body, headers)
         except (TimeoutError, OSError) as exc:
             raise CallbackEndpointError("timeout" if isinstance(exc, TimeoutError) else "unreachable") from exc
         except Exception as exc:
@@ -969,7 +969,7 @@ class MCPEventsStore:
                         self._increment_metric("secret_decryption_failures")
                         raise
                     headers = _signed_headers(row["subscription_id"], secret, row["event_id"], body, previous_secret=previous)
-                    status, _ = self.post_json(row["callback_url"], body, headers)
+                    status, _ = self._post_with_metrics(row["callback_url"], body, headers)
                 except PermissionError:
                     status = 403
                 except Exception:
