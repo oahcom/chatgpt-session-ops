@@ -9093,7 +9093,11 @@ def _main_impl():
         apply_changes = "--apply" in supplied_flags
         include_nologin = "--include-nologin" in supplied_flags
 
-        configured_accounts = list(ROTATION_PRIMARY)
+        rotation_state = load_rotation()
+        configured_accounts = [
+            name for name in ROTATION_PRIMARY
+            if not is_unavailable(rotation_state, name)
+        ]
         if include_nologin:
             configured_accounts.append("nologin")
 
