@@ -14,6 +14,7 @@ import json
 import os
 import secrets
 import sqlite3
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -127,6 +128,20 @@ class MCPEventsStore:
         self.database = database
         self.post_json = post_json or _post_public_https
         self.clock = clock
+        self._metrics_lock = threading.Lock()
+        self._process_metrics = {
+            "callback_count": 0,
+            "callback_latency_ms_total": 0,
+            "callback_latency_ms_max": 0,
+            "callback_status_2xx": 0,
+            "callback_status_3xx": 0,
+            "callback_status_4xx": 0,
+            "callback_status_5xx": 0,
+            "callback_status_410": 0,
+            "callback_status_413": 0,
+            "secret_decryption_failures": 0,
+            "sqlite_busy_errors": 0,
+        }
         if encryption_key is None or not isinstance(encryption_key, bytes) or len(encryption_key) != 32:
             raise ValueError("a 32-byte encryption_key is required for subscription secret storage")
         self._cipher = AESGCM(encryption_key)
@@ -267,11 +282,124 @@ class MCPEventsStore:
         try:
             yield db
             db.commit()
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc, sqlite3.OperationalError) and (
+                "locked" in str(exc).lower() or "busy" in str(exc).lower()
+            ):
+                self._increment_metric("sqlite_busy_errors")
             db.rollback()
             raise
         finally:
             db.close()
+
+    def _increment_metric(self, name: str, amount: int = 1) -> None:
+        with self._metrics_lock:
+            self._process_metrics[name] = self._process_metrics.get(name, 0) + amount
+
+    def _post_with_metrics(
+        self, url: str, body: bytes, headers: Mapping[str, str]
+    ) -> tuple[int, bytes]:
+        started = time.monotonic()
+        status = 599
+        try:
+            status, response = self.post_json(url, body, headers)
+            return status, response
+        finally:
+            elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
+            with self._metrics_lock:
+                self._process_metrics["callback_count"] += 1
+                self._process_metrics["callback_latency_ms_total"] += elapsed_ms
+                self._process_metrics["callback_latency_ms_max"] = max(
+                    self._process_metrics["callback_latency_ms_max"], elapsed_ms
+                )
+                status_code = status if isinstance(status, int) and not isinstance(status, bool) else 599
+                status_class = status_code // 100
+                metric = "callback_status_%dxx" % status_class
+                if metric in self._process_metrics:
+                    self._process_metrics[metric] += 1
+                if status_code == 410:
+                    self._process_metrics["callback_status_410"] += 1
+                elif status_code == 413:
+                    self._process_metrics["callback_status_413"] += 1
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """Return bounded aggregate health data; never expose IDs, URLs, or payloads."""
+        now = float(self.clock())
+        with self._db() as db:
+            delivery_rows = db.execute(
+                "SELECT status, count(*) AS count FROM event_deliveries GROUP BY status"
+            ).fetchall()
+            delivery_counts = {row["status"]: int(row["count"]) for row in delivery_rows}
+            subscription_row = db.execute(
+                """SELECT
+                     SUM(CASE WHEN active=1 AND (expires_at IS NULL OR expires_at>?) THEN 1 ELSE 0 END) AS active,
+                     SUM(CASE WHEN active=1 AND expires_at IS NOT NULL AND expires_at<=? THEN 1 ELSE 0 END) AS expired,
+                     SUM(CASE WHEN active=0 THEN 1 ELSE 0 END) AS inactive
+                   FROM event_subscriptions""",
+                (int(now), int(now)),
+            ).fetchone()
+            oldest_row = db.execute(
+                """SELECT MIN(e.created_at) AS oldest
+                   FROM event_deliveries d JOIN event_outbox e ON e.event_id=d.event_id
+                   WHERE d.status IN ('pending','sending')"""
+            ).fetchone()
+            attempts = db.execute(
+                "SELECT COALESCE(SUM(attempts), 0) FROM event_deliveries"
+            ).fetchone()[0]
+            exhausted = db.execute(
+                "SELECT count(*) FROM event_deliveries WHERE status='failed' AND attempts>=?",
+                (MAX_DELIVERY_ATTEMPTS,),
+            ).fetchone()[0]
+            last_status_rows = db.execute(
+                """SELECT CASE
+                     WHEN last_status BETWEEN 200 AND 299 THEN '2xx'
+                     WHEN last_status BETWEEN 300 AND 399 THEN '3xx'
+                     WHEN last_status BETWEEN 400 AND 499 THEN '4xx'
+                     WHEN last_status BETWEEN 500 AND 599 THEN '5xx'
+                     ELSE 'other' END AS status_class, count(*) AS count
+                   FROM event_deliveries WHERE last_status IS NOT NULL
+                   GROUP BY status_class"""
+            ).fetchall()
+            outbox_count = int(db.execute("SELECT count(*) FROM event_outbox").fetchone()[0])
+        database_path = Path(self.database)
+        try:
+            database_bytes = database_path.stat().st_size
+        except OSError:
+            database_bytes = 0
+        try:
+            wal_bytes = Path(str(database_path) + "-wal").stat().st_size
+        except OSError:
+            wal_bytes = 0
+        with self._metrics_lock:
+            process_metrics = dict(self._process_metrics)
+        oldest = oldest_row["oldest"]
+        return {
+            "outbox": {
+                "events": outbox_count,
+                "pending": delivery_counts.get("pending", 0),
+                "sending": delivery_counts.get("sending", 0),
+                "delivered": delivery_counts.get("delivered", 0),
+                "failed": delivery_counts.get("failed", 0),
+                "retry_exhausted": int(exhausted),
+                "attempts": int(attempts),
+                "oldest_pending_age_seconds": (
+                    max(0, int(now - float(oldest))) if oldest is not None else 0
+                ),
+                "last_status_class": {
+                    row["status_class"]: int(row["count"]) for row in last_status_rows
+                },
+            },
+            "subscriptions": {
+                "active": int(subscription_row["active"] or 0),
+                "expired": int(subscription_row["expired"] or 0),
+                "inactive": int(subscription_row["inactive"] or 0),
+            },
+            "callbacks": process_metrics,
+            "storage": {
+                "database_bytes": database_bytes,
+                "wal_bytes": wal_bytes,
+            },
+        }
 
     def _encrypt_secret(self, subscription_id: str, secret: str) -> bytes:
         nonce = secrets.token_bytes(12)
@@ -832,10 +960,14 @@ class MCPEventsStore:
                                  row["lease_token"], row["subscription_id"], row["generation"], current_time),
                             )
                         continue
-                    secret = self._decrypt_secret(row["subscription_id"], row["secret_enc"])
-                    previous = None
-                    if row["secret_prev_enc"] is not None and row["secret_prev_until"] is not None and row["secret_prev_until"] > current_time:
-                        previous = self._decrypt_secret(row["subscription_id"], row["secret_prev_enc"])
+                    try:
+                        secret = self._decrypt_secret(row["subscription_id"], row["secret_enc"])
+                        previous = None
+                        if row["secret_prev_enc"] is not None and row["secret_prev_until"] is not None and row["secret_prev_until"] > current_time:
+                            previous = self._decrypt_secret(row["subscription_id"], row["secret_prev_enc"])
+                    except (InvalidTag, ValueError, UnicodeDecodeError):
+                        self._increment_metric("secret_decryption_failures")
+                        raise
                     headers = _signed_headers(row["subscription_id"], secret, row["event_id"], body, previous_secret=previous)
                     status, _ = self.post_json(row["callback_url"], body, headers)
                 except PermissionError:
