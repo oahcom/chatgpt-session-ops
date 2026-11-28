@@ -136,6 +136,25 @@ class ChatGPTWorkItemExecutionTests(unittest.TestCase):
         attempt.assert_called_once()
         mark_success.assert_not_called()
 
+    def test_new_chat_post_transport_failure_is_outcome_unknown_without_rotation(self):
+        context = {
+            "store": object(),
+            "principal": object(),
+            "work_item_id": "wi_00000000-0000-4000-8000-000000000001",
+            "attempt_id": "att_00000000-0000-4000-8000-000000000001",
+        }
+        api = SimpleNamespace(account="acct2", last_send_started=True)
+        with (
+            mock.patch.object(runtime, "ChatGPTAPI", return_value=api),
+            mock.patch.object(runtime, "send_prompt_for_work_item", return_value=((0, None, None), None, None)),
+        ):
+            status, conv = runtime._attempt_create({}, "acct2", "/tmp/prompt", [], work_item_context=context)
+        self.assertEqual(status, "OUTCOME_UNKNOWN")
+        self.assertIsNone(conv)
+        self.assertTrue(context["outcome_unknown"])
+        self.assertEqual(context["status"], 0)
+        self.assertIn("POST attempt", context["link_error"])
+
     def test_work_item_send_rejects_anonymous_api_before_any_send(self):
         store = SecureWorkItemStore.__new__(SecureWorkItemStore)
         principal = Principal("tenant-a", "principal-a")

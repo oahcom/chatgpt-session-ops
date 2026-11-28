@@ -7017,6 +7017,9 @@ def _send_prompt_impl(
     """
     if conv_id:
         conv_id = safe_id(conv_id, "conv_id")
+    # Distinguish failures before POST (safe to rotate) from ambiguous
+    # transport failures after a POST may have reached ChatGPT.
+    api.last_send_started = False
     if text is None:
         text = load_prompt_text(prompt_file)
     # ponytail: 只做空正文判定，不再删行。旧版 `[l for l in ... if not
@@ -7100,6 +7103,7 @@ def _send_prompt_impl(
             send_timeout = override
             print("timeout: %ss (source=%s)"
                   % (send_timeout, SEND_TIMEOUT_SOURCE or "env"), flush=True)
+        api.last_send_started = True
         st, resp = api.send(conv_id, text, tail, req_token, proof, model=model,
                             timeout=send_timeout)
         # 截断/超时被 _partial_result 折成 200 交回既有解析链路（不丢字节），但
@@ -7581,6 +7585,25 @@ def _attempt_create(
                 attempt_id=work_item_context["attempt_id"],
             )
             status, _path, conv = (tuple(result) + (None, None, None))[:3]
+            ambiguous_transport = (
+                status in (408, 425)
+                or (isinstance(status, int) and status >= 500)
+                or (status == 0 and bool(getattr(api, "last_send_started", False)))
+            )
+            if ambiguous_transport:
+                detail = "send outcome unknown after POST attempt (status=%s)" % status
+                if work_item_context is not None:
+                    work_item_context.update({
+                        "status": status,
+                        "api": api,
+                        "link": None,
+                        "link_error": detail,
+                        "conversation_id": None,
+                        "account": name,
+                        "outcome_unknown": True,
+                    })
+                attempts.append({"account": name, "status": "OUTCOME_UNKNOWN", "reason": detail})
+                return "OUTCOME_UNKNOWN", None
             if isinstance(conv, ConvRef) and conv.mismatch:
                 # HTTP 200 was accepted but the returned conversation identity
                 # is not trustworthy. Never rotate and resend this prompt.
@@ -7665,6 +7688,20 @@ def _attempt_create(
 
     except Exception as e:
         status, conv = 0, None
+        if bool(getattr(api, "last_send_started", False)):
+            detail = "send outcome unknown after POST exception: %s: %s" % (type(e).__name__, e)
+            if work_item_context is not None:
+                work_item_context.update({
+                    "status": 0,
+                    "api": api,
+                    "link": None,
+                    "link_error": detail,
+                    "conversation_id": None,
+                    "account": name,
+                    "outcome_unknown": True,
+                })
+            attempts.append({"account": name, "status": "OUTCOME_UNKNOWN", "reason": detail})
+            return "OUTCOME_UNKNOWN", None
 
         print(
             "rotate: %s 通道异常（%s）" % (name, e),

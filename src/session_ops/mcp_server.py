@@ -759,6 +759,7 @@ class MCPToolService:
         api = None
         resolved_account = None
         outcome_unknown = False
+        attempt_error = None
         try:
             # All local authorization and account checks happen before the
             # remote side effect. A failed preflight consumes this attempt ID
@@ -821,9 +822,13 @@ class MCPToolService:
                     actual = getattr(conv_ref, "actual_conv_id", "") or "unknown"
                     reason = getattr(conv_ref, "reason", "") or "conversation identity mismatch"
                     link_error = "conversation outcome unknown: %s; actual=%s" % (reason, actual)
+                    attempt_error = "conversation_identity_mismatch actual=%s" % actual
                     # ConvRef mismatch is produced only after the remote POST
                     # returned HTTP 200; identity uncertainty is not a safe retry.
                     http_status = 200
+                elif http_status == 0 and bool(getattr(api, "last_send_started", False)):
+                    outcome_unknown = True
+                    link_error = "send outcome unknown after POST transport failure"
             else:
                 context = {
                     "store": self.store,
@@ -842,6 +847,17 @@ class MCPToolService:
                 resolved_conversation_id = context.get("conversation_id")
                 resolved_account = context.get("account")
                 outcome_unknown = bool(context.get("outcome_unknown"))
+                if outcome_unknown:
+                    actual = context.get("actual_conv_id")
+                    attempt_error = (
+                        "conversation_identity_mismatch actual=%s" % actual
+                        if actual else
+                        "outcome_unknown_http_%s" % http_status
+                        if http_status is not None else
+                        "outcome_unknown_no_response"
+                    )
+                elif link_error:
+                    attempt_error = "session_link_failed"
 
             if outcome_unknown:
                 status = "outcome_unknown"
@@ -861,6 +877,25 @@ class MCPToolService:
             else:
                 status = "failed"
 
+            if isinstance(link_error, str) and link_error:
+                attempt_error = link_error[:1000]
+            elif status == "sent_unlinked":
+                attempt_error = "session_link_not_confirmed"
+            elif status == "outcome_unknown":
+                attempt_error = "remote_send_outcome_unknown (status=%s)" % http_status
+            elif status == "failed":
+                attempt_error = "send_failed (status=%s)" % http_status
+            else:
+                attempt_error = None
+            if status == "outcome_unknown" and attempt_error is None:
+                attempt_error = (
+                    "outcome_unknown_http_%s" % http_status
+                    if http_status is not None else
+                    "outcome_unknown_no_response"
+                )
+            elif status == "sent_unlinked" and attempt_error is None:
+                attempt_error = "session_link_failed"
+
             record = self._run_db(
                 lambda: self.store.complete_send_attempt(
                     principal,
@@ -870,7 +905,7 @@ class MCPToolService:
                     conversation_id=resolved_conversation_id,
                     account=resolved_account,
                     http_status=http_status,
-                    error="session_link_failed" if link_error else None,
+                    error=attempt_error,
                 )
             )
             return {
