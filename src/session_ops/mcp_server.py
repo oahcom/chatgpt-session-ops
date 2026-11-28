@@ -254,6 +254,13 @@ TOOL_SCHEMAS = {
         },
         ("work_item_id", "status"),
     ),
+    "work_item.finish": _object_schema(
+        {
+            "work_item_id": _WORK_ITEM_ID,
+            "status": {"type": "string", "enum": ["completed", "cancelled"]},
+        },
+        ("work_item_id", "status"),
+    ),
     "work_item.grant": _object_schema(
         {
             "work_item_id": _WORK_ITEM_ID,
@@ -352,6 +359,7 @@ TOOL_DESCRIPTIONS = {
     "work_item.get": "Get a WorkItem visible to the authenticated principal.",
     "work_item.list": "List visible WorkItems using keyset pagination.",
     "work_item.update": "Update a WorkItem status with optional optimistic concurrency.",
+    "work_item.finish": "Complete or cancel a WorkItem as its immutable owner; terminal state, session unlink, and completion event are atomic.",
     "work_item.grant": "Grant a same-tenant principal read or write access.",
     "work_item.revoke": "Revoke a same-tenant principal read or write access.",
     "session.link": "Link a confirmed session to a visible WorkItem.",
@@ -1315,6 +1323,17 @@ class MCPToolService:
                 )
                 data = _record_dict(result)
 
+            elif name == "work_item.finish":
+                result = self._run_db(
+                    lambda: self.store.finish_work_item(
+                        principal,
+                        args["work_item_id"],
+                        args["status"],
+                        request_id=request_id,
+                    )
+                )
+                data = _record_dict(result)
+
             elif name == "work_item.grant":
                 self._run_db(
                     lambda: self.store.grant(
@@ -1572,6 +1591,8 @@ class MCPToolService:
 def build_mcp_server(
     service: MCPToolService,
     token_provider: JWTVerifier,
+    *,
+    events_store: Any = None,
 ) -> Any:
     """Build and return the authenticated Streamable HTTP ASGI application."""
     if not isinstance(service, MCPToolService):
@@ -1701,6 +1722,90 @@ def build_mcp_server(
         on_list_tools=on_list_tools,
         on_call_tool=on_call_tool,
     )
+
+    if events_store is not None:
+        from src.session_ops.mcp_events import CallbackEndpointError, build_event_request_models
+
+        EventsListParams, EventsSubscribeParams, EventsUnsubscribeParams = build_event_request_models()
+
+        def _event_auth(ctx: Any) -> Any:
+            request = getattr(ctx, "request", None)
+            if request is None:
+                return None
+            state = request.scope.get("state", {})
+            return state.get("session_ops_auth") if isinstance(state, dict) else None
+
+        async def on_events_list(ctx: Any, params: Any) -> Any:
+            auth = _event_auth(ctx)
+            if not isinstance(auth, AuthContext):
+                raise AuthenticationError("verified authentication context required")
+            auth.require("session_ops.chatgpt.session.read")
+            events_store._identity(auth)
+            return {"events": events_store.event_catalog()}
+
+        async def on_events_subscribe(ctx: Any, params: Any) -> Any:
+            auth = _event_auth(ctx)
+            if not isinstance(auth, AuthContext):
+                raise AuthenticationError("verified authentication context required")
+            auth.require("session_ops.chatgpt.session.write")
+
+            def create_subscription() -> Any:
+                payload = params.model_dump(by_alias=True, exclude_unset=True)
+                arguments = payload.get("arguments") or {}
+                job_id = arguments.get("job_id")
+                if job_id is not None:
+                    service.store.require_owner(auth.principal, job_id)
+                return events_store.subscribe(auth, payload)
+
+            try:
+                return await asyncio.to_thread(create_subscription)
+            except CallbackEndpointError as exc:
+                from mcp.shared.exceptions import MCPError
+                raise MCPError(
+                    code=-32015,
+                    message="Callback endpoint verification failed",
+                    data={"reason": exc.reason},
+                ) from exc
+            except (NotAuthorized, InvalidIdentifier) as exc:
+                from mcp.shared.exceptions import MCPError
+                raise MCPError(
+                    code=-32602,
+                    message="Invalid event subscription",
+                    data={"reason": "job_not_owned"},
+                ) from exc
+            except ValueError as exc:
+                from mcp.shared.exceptions import MCPError
+                raise MCPError(
+                    code=-32602,
+                    message="Invalid event subscription",
+                    data={"reason": "invalid_subscription"},
+                ) from exc
+
+        async def on_events_unsubscribe(ctx: Any, params: Any) -> Any:
+            auth = _event_auth(ctx)
+            if not isinstance(auth, AuthContext):
+                raise AuthenticationError("verified authentication context required")
+            auth.require("session_ops.chatgpt.session.write")
+            return await asyncio.to_thread(
+                events_store.unsubscribe,
+                auth,
+                params.model_dump(by_alias=True, exclude_unset=True),
+            )
+
+        server.add_request_handler("events/list", EventsListParams, on_events_list)
+        server.add_request_handler("events/subscribe", EventsSubscribeParams, on_events_subscribe)
+        server.add_request_handler("events/unsubscribe", EventsUnsubscribeParams, on_events_unsubscribe)
+
+        async def advertise_events_capability(ctx: Any, call_next: Any) -> Any:
+            result = await call_next(ctx)
+            if ctx.method in ("initialize", "server/discover") and isinstance(result, dict):
+                capabilities = result.get("capabilities")
+                if isinstance(capabilities, dict):
+                    result["capabilities"] = {**capabilities, "events": {}}
+            return result
+
+        server.middleware.append(advertise_events_capability)
+
 
     allowed_hosts = [
         resource.netloc,
