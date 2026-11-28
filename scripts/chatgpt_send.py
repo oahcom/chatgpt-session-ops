@@ -4409,6 +4409,7 @@ class ChatGPTAPI:
     def __init__(self, base_dir=None, account="default"):
         # CHATGPT_AUTH_DIR selects credential/cache root; account data stays isolated.
         root = base_dir or os.environ.get("CHATGPT_AUTH_DIR") or BASE
+        configured_accounts_root = os.environ.get("SO_SENDER_ACCOUNTS_DIR", "").strip()
         if account not in _VALID_ACCOUNT_IDENTITIES:
             raise ValueError(
                 "account must be one of %s"
@@ -4418,7 +4419,11 @@ class ChatGPTAPI:
             normalized = "acct1" if account == "default" else account
             if normalized not in _effective_rotation_primary():
                 raise ValueError("account is not active for routing")
-        b = root if account in ("default", "acct1") else os.path.join(root, "accounts", account)
+        if base_dir is None and configured_accounts_root:
+            account_name = "acct1" if account in ("default", "acct1") else account
+            b = os.path.join(configured_accounts_root, account_name)
+        else:
+            b = root if account in ("default", "acct1") else os.path.join(root, "accounts", account)
         self.account = account
         self.base_dir = b
         self.is_anon = account == "nologin"  # 匿名态：走 /backend-anon/，POST 需浏览器过 Turnstile
