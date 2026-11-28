@@ -7750,6 +7750,57 @@ class ThinkingModelPreferenceTests(unittest.TestCase):
         self.assertEqual(third, "gpt-5-6-t-mini")
         self.assertEqual(api.calls, 1, "显式指定不请求模型清单")
 
+    def test_preferred_thinking_env_override_wins(self):
+        """CHATGPT_PREFERRED_THINKING 覆盖默认 gpt-6-t-mini。"""
+        api = self._ModelsAPI(self._models())
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CHATGPT_MODEL", None)
+            os.environ["CHATGPT_PREFERRED_THINKING"] = "gpt-5-6-t-mini"
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                chosen = self.m.ChatGPTAPI.resolve_thinking_model(api, cache={})
+        self.assertEqual(chosen, "gpt-5-6-t-mini")
+        self.assertIn("优先命中 gpt-5-6-t-mini（source=env）", out.getvalue())
+
+    def test_preferred_thinking_default_when_env_unset(self):
+        """变量不存在时行为明确：默认 gpt-6-t-mini，日志标 source=default。"""
+        api = self._ModelsAPI(self._models())
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CHATGPT_MODEL", None)
+            os.environ.pop("CHATGPT_PREFERRED_THINKING", None)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                chosen = self.m.ChatGPTAPI.resolve_thinking_model(api, cache={})
+        self.assertEqual(chosen, "gpt-6-t-mini")
+        self.assertIn("优先命中 gpt-6-t-mini（source=default）", out.getvalue())
+
+    def test_preferred_thinking_absent_from_list_prints_diagnostic(self):
+        """优先候选不在清单里：必须留可 grep 的诊断，不得静默当成已选中。"""
+        api = self._ModelsAPI(self._models())
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CHATGPT_MODEL", None)
+            os.environ["CHATGPT_PREFERRED_THINKING"] = "gpt-7-t-mini"
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                chosen = self.m.ChatGPTAPI.resolve_thinking_model(api, cache={})
+        self.assertEqual(chosen, "gpt-5-6-t-mini", "缺失时按后备顺序解析")
+        self.assertIn(
+            "优先候选 gpt-7-t-mini 不在清单里（source=env），按后备顺序解析",
+            out.getvalue(),
+        )
+
+    def test_preferred_thinking_invalid_value_raises_before_request(self):
+        """非法配置（无 -t- / 空白 / 带空格）直接抛 ValueError，且不发请求。"""
+        for bad in ("gpt-4o", "", "   ", "gpt 6 t mini"):
+            with self.subTest(value=bad):
+                api = self._ModelsAPI(self._models())
+                with mock.patch.dict(os.environ):
+                    os.environ.pop("CHATGPT_MODEL", None)
+                    os.environ["CHATGPT_PREFERRED_THINKING"] = bad
+                    with self.assertRaises(ValueError):
+                        self.m.ChatGPTAPI.resolve_thinking_model(api, cache={})
+                self.assertEqual(api.calls, 0, "非法配置必须在请求清单之前失败")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

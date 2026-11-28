@@ -201,17 +201,19 @@ class TestCliSurface(unittest.TestCase):
         import subprocess
         proc = subprocess.run(
             [sys.executable, os.path.join(SCRIPTS, "extract_auth.py"), "--help"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-        self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
-        self.assertIn("usage:", proc.stdout.decode("utf-8", "replace"))
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+            encoding="utf-8", errors="replace")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("usage:", proc.stdout)
 
     def test_continue_full_usage_guard_still_returns_2(self):
         import subprocess
         proc = subprocess.run(
             [sys.executable, os.path.join(SCRIPTS, "continue_full.py")],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+            encoding="utf-8", errors="replace")
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("usage:", proc.stdout.decode("utf-8", "replace"))
+        self.assertIn("usage:", proc.stdout)
 
     def test_extract_auth_bad_port_still_returns_2(self):
         """退出码契约：用法/参数错误仍是 2，不得被归入「缺依赖」的 3。"""
@@ -219,9 +221,10 @@ class TestCliSurface(unittest.TestCase):
         proc = subprocess.run(
             [sys.executable, os.path.join(SCRIPTS, "extract_auth.py"),
              "--port", "abc"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+            encoding="utf-8", errors="replace")
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("--port", proc.stdout.decode("utf-8", "replace"))
+        self.assertIn("--port", proc.stdout)
 
     def test_continue_full_missing_prompt_returns_2(self):
         import subprocess
@@ -229,18 +232,39 @@ class TestCliSurface(unittest.TestCase):
             [sys.executable, os.path.join(SCRIPTS, "continue_full.py"),
              "9f8e7d6c-1111-4222-8333-444455556666",
              os.path.join(SCRIPTS, "no-such-prompt-file.txt")],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+            encoding="utf-8", errors="replace")
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("读不到提示词文件", proc.stdout.decode("utf-8", "replace"))
+        self.assertIn("读不到提示词文件", proc.stdout)
 
     def test_continue_full_invalid_conv_id_returns_2(self):
         import subprocess
         proc = subprocess.run(
             [sys.executable, os.path.join(SCRIPTS, "continue_full.py"),
              "../../etc/passwd", os.path.join(SCRIPTS, "SKILL.md")],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+            encoding="utf-8", errors="replace")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("非法", proc.stdout)
+
+    def test_cli_piped_stdout_is_utf8_not_local_codepage(self):
+        """管道 stdout 必须是 UTF-8 字节。
+
+        事故：中文 Windows 的 stdout 默认 cp936，父进程按 UTF-8 解码就得到
+        乱码——断言「读不到提示词文件」永远不成立。这里用**严格** UTF-8 解码
+        （不传 errors）钉住契约：子进程一旦回退到代码页，这条用例直接抛
+        UnicodeDecodeError。
+        """
+        import subprocess
+        proc = subprocess.run(
+            [sys.executable, os.path.join(SCRIPTS, "continue_full.py"),
+             "9f8e7d6c-1111-4222-8333-444455556666",
+             os.path.join(SCRIPTS, "no-such-prompt-file.txt")],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
         self.assertEqual(proc.returncode, 2)
-        self.assertIn("非法", proc.stdout.decode("utf-8", "replace"))
+        text = proc.stdout.decode("utf-8")  # 严格解码：非 UTF-8 即失败
+        self.assertIn("读不到提示词文件", text)
+        self.assertNotIn("\ufffd", text, "输出里出现替换字符说明编码没对齐")
 
 
 if __name__ == "__main__":

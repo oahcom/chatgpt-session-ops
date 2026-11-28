@@ -335,7 +335,23 @@ def conv_id_from_url(url):
     return m.group(1) if m else None
 
 
+def _utf8_stdio():
+    """管道输出统一成 UTF-8。
+
+    Windows 下 stdout 默认是本地代码页（中文环境 cp936），父进程按 UTF-8 解码
+    就得到乱码——测试与 CI 都是管道调用，这条通道必须与仓库的 UTF-8 约定一致。
+    TTY 不动：控制台按代码页显示才对，强行改成 UTF-8 只会让终端变乱码。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None and not stream.isatty():
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def main():
+    _utf8_stdio()
     if len(sys.argv) < 3:
         print("usage: python continue_full.py <old_conv_id> <prompt_file>", flush=True)
         return 2

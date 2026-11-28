@@ -30,11 +30,11 @@ ChatGPT 会话操控与生命周期管理。把"手和眼"（I/O、投递、收�
 |---|---|
 | **CB-A1** | **默认不开 `--thinking`**：同输出量 411.5s vs 209s（约 2×），方差约 10 倍，13% 的 thinking 投递在服务端 1700s 断流墙上白跑 |
 | **CB-A2** | **新任务一律 `--new`**：`--new` 只省一次 tail GET（1–2s），但 413 全部发生在续接（13/13 vs 0），且被截断会话会毒化（后续 413 率 21.4% vs 1.9%，11×） |
-| **CB-A3** | **`--timeout` 默认 600s**（命令行 > `CHATGPT_SEND_TIMEOUT` > 600）；超时产出 `TIMEOUT_PARTIAL` 并落盘 `<auth>/timeouts/`；长等待显式 `--timeout 1800` |
+| **CB-A3** | **发送预算按运行时 tier**：`--timeout` > `CHATGPT_SEND_TIMEOUT` > tier（**非思考 420s / 思考 1800s**）；超时产出 `TIMEOUT_PARTIAL` 并落盘 `<auth>/timeouts/`；`DEFAULT_SEND_TIMEOUT=600` 只是保留常量，**不是有效默认预算**；长等待显式 `--timeout 1800` |
 | **CB-A4** | **不拆长提示词**：耗时跟回复长度走（r=0.690），不跟提示词长度走（r=0.197）；每多一轮白付 40–105s |
 | **CB-A5** | **同账号可并行 2–3 路 POST**（`SLOT_CAP` 未启用、POST 不持锁），**必须逐条送达验证**；GET 仍单进程 |
-| **CB-B6/B8** | **`SEND <prompt> -> 200` 是唯一送达凭证**；`NOT_SENT` 三条件合取（无 `SEND` + <200 字节 + mtime>5 分钟），**在飞不判死** |
-| **CB-B9** | 投递必须在**同一个未结束回合**内前台等完（长 timeout）；**0 字节日志＝进程被掐**，不是"没写日志" |
+| **CB-B6/B8** | **只有匹配 `SEND_OK_RE`（`^SEND .+ -> 200\\b`）的 `SEND ... -> 200` 才是送达凭证；非 200 SEND 行不满足该条件。** `judge_send_log()` 优先判定匹配的成功 SEND 为 `SENT`，其次判定 `SEND_TRUNCATED` 为 `TRUNCATED`（两者共存时 `SENT` 优先）；否则默认 `IN_FLIGHT`。只有 `size < 200`、`age > 300s`、进程检查结果为空且 `window_open` 为假才输出 `NOT_SENT`；`window_open` 必须同时满足 `age <= 3600s` 和首个非空日志行以 `timeout:` 开头。无 pfile 时进程检查被跳过，不等于确认无存活进程；枚举能力完全不可用时 fail-closed，但逐条跳过异常所得的不完整枚举列表不受该保护。进程枚举返回不完整列表时目标进程是否实际存活、未提供 pfile 时是否存在同一逻辑发送任务、未覆盖的枚举异常/平台差异/竞态下能否安全断定 `NOT_SENT`，以及未覆盖边界格能否由六个标准格通过证明整体正确，均为 `UNVERIFIED`。**实现判定为 NOT_SENT**是当前代码的输出，不等于**可以安全重发**的事实证明。 |
+| **CB-B9** | 投递必须在**同一个未结束回合**内前台等完（长 timeout）；默认路径 POST 前 **0 字节日志是正常状态**，不能单独判 `NOT_SENT`／进程被掐 |
 | **CB-C12** | **一轮一条指令，一次给全**；不发"若 A 则 B"条件指令（条件会在错误时点被满足并执行） |
 | **CB-D14/E16** | 编号按**账号固定号段**（禁抢 `max+1`）；合并走**原子窗口**（刷新 → 16 项全绿 → 立刻合并，中间不插任何 API 调用） |
 
@@ -383,7 +383,8 @@ s.pop("last", None)
 | L1 读路径 | `--account <acct> --list` | token 被服务端接受，会话列表可拉 | 401 → 认证失效；403/429 → 风控；超时 → 网络 |
 | L2 写路径 | `--account <acct> --new <probe.txt>` | **完整链路可用**：PoW、发送、流式响应、落盘 | 才叫「不可用」 |
 
-L2 的探针文件内容写成 `Reply with exactly: PROBE_OK`，回复正文（`replies/reply-*.md` 去掉首行注释）应恰好是 `PROBE_OK`——**收到非空且符合预期的正文**才算通过，`status:200` 本身不算。单账号 L2 约 5–8 秒，六账号串行约 45 秒；L1 单账号 30–45 秒，六账号约 90 秒。**探针要设足前台 timeout 一次跑完（契约 CB-B9）**：不要短超时后台发射再结束回合——回合结束会把后台进程掐死，日志 0 字节即"从未投递"。
+
+L2 的探针文件内容写成 `Reply with exactly: PROBE_OK`，回复正文（`replies/reply-*.md` 去掉首行注释）应恰好是 `PROBE_OK`——**收到非空且符合预期的正文**才算通过，`status:200` 本身不算。单账号 L2 约 5–8 秒，六账号串行约 45 秒；L1 单账号 30–45 秒，六账号约 90 秒。**探针要设足前台 timeout 一次跑完（契约 CB-B9）**：不要短超时后台发射再结束回合。日志 0 字节本身不能证明 POST 未发生、后台进程已终止或投递失败；不得仅凭 0 字节判定未投递。
 
 故意不带 conversation_id。用于：各工作会话自产"Owner 裁决提示词"（自包含：背景、精确基线、待裁决项、可选裁决、记录格式）→ **原样**收集（回复中最长代码块，一字不改）→ 投递给全新 ChatGPT 会话扮演 Owner → 收割裁决记录（ACCEPT / ACCEPT WITH AMENDMENTS / NEEDS REVISION / REJECT + 理由 + 执行边界）→ 原文引用回灌工作会话。
 
@@ -455,7 +456,7 @@ python scripts/chatgpt_send.py --tail <conv_id>
 python -m unittest tests.test_hardening -v
 ```
 
-`tests/test_hardening.py` 485 条，覆盖 id 校验与路径穿越、状态文件损坏隔离（语法坏与顶层类型坏同罪）与字段形状收敛（`_as_int` 等五件套，畸形字段一律「没有这个值」不抛异常）、原子写（tmp 名唯一，防同进程多线程互踩）与并发 80 次不丢更新、锁重入/stale 回收/持有者身份、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性、设备身份留存与多设备回退（含凭据剔除、429 停手、归属自愈），以及用离线桩跑通的投递主流程（含 413、空提示词、非法 id、发送异常时的孤儿会话登记）；出口代理（优先级、fail-closed、http/socks 真分流、死节点探测、出口判定、目标站探活、WebRTC 泄漏分类；坏端口＝配置非法在入口拒，探活对垃圾端口一律 False）；B8 六进程并发抢槽（抢不到锁即 QUEUED、半截槽位不回收）、B15 租约心跳与超时两档；交付正文托管（`--extract` 字节级、CRLF 不改、标记不唯一退 2、`--verify-copy` 单字节差异即拒）；调度口径（`--check-name` 12 条命名契约、`--check-schedule` 1 小时维度、`--check-oneshot` 一次性窗口）；证据矩阵自校验（条款与证据一一对应，引用不存在的用例即红）。**改锁、改落盘、改 id、改设备身份、改代理、改基线条款前先跑一遍。**
+`tests/test_hardening.py` 489 条，覆盖 id 校验与路径穿越、状态文件损坏隔离（语法坏与顶层类型坏同罪）与字段形状收敛（`_as_int` 等五件套，畸形字段一律「没有这个值」不抛异常）、原子写（tmp 名唯一，防同进程多线程互踩）与并发 80 次不丢更新、锁重入/stale 回收/持有者身份、轮转兜底判定矩阵、SSE/正则解析、PoW 稳定性、设备身份留存与多设备回退（含凭据剔除、429 停手、归属自愈），以及用离线桩跑通的投递主流程（含 413、空提示词、非法 id、发送异常时的孤儿会话登记）；出口代理（优先级、fail-closed、http/socks 真分流、死节点探测、出口判定、目标站探活、WebRTC 泄漏分类；坏端口＝配置非法在入口拒，探活对垃圾端口一律 False）；B8 六进程并发抢槽（抢不到锁即 QUEUED、半截槽位不回收）、B15 租约心跳与超时两档；交付正文托管（`--extract` 字节级、CRLF 不改、标记不唯一退 2、`--verify-copy` 单字节差异即拒）；调度口径（`--check-name` 12 条命名契约、`--check-schedule` 1 小时维度、`--check-oneshot` 一次性窗口）；证据矩阵自校验（条款与证据一一对应，引用不存在的用例即红）。**改锁、改落盘、改 id、改设备身份、改代理、改基线条款前先跑一遍。**
 
 ### 交付正文与排程口径的机器闸口（v1.8）
 
@@ -615,8 +616,8 @@ python scripts/chatgpt_send.py --work-item wi_<uuid> \
 | 上下文压缩/续接后发现仓库出现自己没写的提交 | **上下文压缩不杀后台进程**：丢失段启动的协调驱动仍存活，与新代理并行写同一 repo | 恢复后**先盘点**（`git log`、文件 mtime）再动手；发现并行写者改为协作（审其产物、补缺口），不重做不回滚 |
 | 构建脚本 git HEAD 报旧 SHA / 产物指向旧树 | 同工作区有双 repo：`workspace/repo`（可能滞留旧头）vs `workspace/state/repo`（真头） | 构建/取证脚本显式指对 repo 路径；每次开工先 `git log -1` 确认头与预期一致 |
 | 413 conversation_too_large | 会话满员 | 新任务按契约 CB-A2 直接 `--new`，不要在满员会话硬发重试；确需续接的链走 `continue_full.py` 摘要续接 |
-| `TIMEOUT_PARTIAL after Ns, M bytes buffered, saved to <path>` | 投递超过 `--timeout` 预算（默认 600s），已收内容落到 `<auth>/timeouts/` | 按契约 CB-A3：该轮正文按不完整处理，用 A12 raw mapping 补采；确需长等待时显式 `--timeout 1800`，不要改默认值 |
-| 投递日志 0 字节，或只有一行 `timeout: 600s (source=default)` | 0 字节＝进程被掐（回合结束时后台进程被终止）；只有首行＝还在飞 | 0 字节：同一未结束回合内重投；只有首行且 mtime<5 分钟：等 `SEND` 行，**不得判 `NOT_SENT`**（契约 CB-B7/B8/B9） |
+| `TIMEOUT_PARTIAL after Ns, M bytes buffered, saved to <path>` | 投递超过本次发送预算（tier：非思考 420s / 思考 1800s；显式 `--timeout` / `CHATGPT_SEND_TIMEOUT` 覆盖，`600` 只是保留常量），已收内容落到 `<auth>/timeouts/` | 按契约 CB-A3：该轮正文按不完整处理，用 A12 raw mapping 补采；确需长等待时显式 `--timeout 1800` |
+| 投递日志 0 字节，或只有一行 `timeout: <N>s (source=cli\|env)` | 0 字节是默认 `--new` 路径 POST **之前**的正常状态（该路径不打印 `timeout:` 行）；`timeout:` 行只在显式配置 timeout 时打印，`source` 只会是 `cli`/`env`，**没有 `source=default` 这种发送日志** | 0 字节本身不能证明 POST 未发生、进程已终止或投递失败。`judge_send_log()` 的 `NOT_SENT` 必须同时满足：日志大小 `< 200` 字节、日志年龄 `> 300` 秒、未检测到存活发送进程、`window_open` 为假，且日志中没有 `SEND` 或 `SEND_TRUNCATED` 行。`window_open` 仅在日志年龄 `<= 3600` 秒 **且** 首行以 `timeout:` 开头时为真。没有 prompt file 时，`live_senders(None)` 返回空列表并跳过进程检查；这不等于确认没有存活进程。只有进程枚举能力完全不可用、返回 `None` 时才触发 fail-closed；逐进程异常被跳过后得到的不完整列表不受该保护。不得仅凭 0 字节或 `mtime<5 分钟` 判定 `NOT_SENT`；最终判定必须依据 `judge_send_log()` 的实际结果（契约 CB-B7/B8/B9）。 |
 | **投递的代码正文里 `#[derive]` / `#[test]` / `#[cfg]` / markdown 标题全部消失** | 投递器把 `#` 开头行当注释删（旧版 `[l for l in text.splitlines() if not l.strip().startswith("#")]`）；Rust 属性行恰好全部以 `#` 开头 | 该行已改为只做空正文判定、不删任何行（2026-11-21）。**症状识别**：会话反馈"正文里没有属性行"时先查投递器，别怀疑会话。回归自检：投递前后 `text.count("#[derive")` 必须相等 |
 | 流读取为空 | `with` 提前关连接 | 读到 EOF（chatgpt_send.py 已正确处理） |
 | 输入框填入失败 | 用了 innerHTML 或裸赋值 | 文本域用原生 setter + InputEvent，或 CDP `Input.insertText` |
@@ -646,7 +647,7 @@ python scripts/chatgpt_send.py --work-item wi_<uuid> \
 
 ### references/
 
-- `CONTRACT-BASELINE.md` — **投递与编排契约基线（v1.0，2026-11-26 实测，数字来自当日实测、复测后需更新）**：17 条规则，覆盖投递参数（thinking 默认关、一律 `--new`、`--timeout` 600/优先级/`TIMEOUT_PARTIAL`、不拆提示词、并行 2–3 路）、送达验证（`SEND … -> 200` 唯一凭证、在飞时序、`NOT_SENT` 三条件合取、0 字节＝进程被掐、日志 BOM 编码）、提示词纪律（数字取当期实测、一轮一条、否定句加"停下来指出"）、编号（账号固定号段、合并后不改号）、合并（原子窗口 1–2 分钟、不关 strict）。**§0 是机读 JSON 索引；§6 是它取代的旧建议清单；本契约优先于 `SKILL.md` 与 `baselines.md` 中的冲突建议。** 发布状态：B 侧权威；列入 `docs/RELEASE-AUTHORITY.md` §2 白名单需单独审查（未列入前 A 侧不会随发布更新）。
+- `CONTRACT-BASELINE.md` — **投递与编排契约基线（v1.0，2026-11-26 实测，数字来自当日实测、复测后需更新）**：17 条规则，覆盖投递参数（thinking 默认关、一律 `--new`、发送预算 tier 非思考 420s/思考 1800s 与优先级、`TIMEOUT_PARTIAL`、不拆提示词、并行 2–3 路）、送达验证（`SEND … -> 200` 唯一凭证、`timeout:` 行只在显式配置时出现、`NOT_SENT` 由 `judge_send_log()` 判定、0 字节是默认路径正常态、日志 BOM 编码）、提示词纪律（数字取当期实测、一轮一条、否定句加"停下来指出"）、编号（账号固定号段、合并后不改号）、合并（原子窗口 1–2 分钟、不关 strict）。**§0 是机读 JSON 索引；§6 是它取代的旧建议清单；本契约优先于 `SKILL.md` 与 `baselines.md` 中的冲突建议。** 发布状态：B 侧权威；列入 `docs/RELEASE-AUTHORITY.md` §2 白名单需单独审查（未列入前 A 侧不会随发布更新）。
 - `baselines.md` — **基线条款（全部唯一条款，含 A/B/C/E 类，共 51 条）**：每条带判定口径与违例后果，附 C 类现成配方（每小时巡检、落盘看门狗、到期处置、配额哨兵）、D 类事故→条款映射、E 类变更纪律、G 类证据矩阵说明。**开工前扫 A0/B0 清单，排程前读 B1–B15，改代码前读对应条款。投递/编排细节与 `CONTRACT-BASELINE.md` 冲突时以契约为准（A16 已加取代注记）。**
 - `evidence-matrix.md` — **逐条对账「这条基线由什么证明」**：`test:` 用例名 / `code:` 符号 / `live:` 实测日期 / `human:` 人判理由，四类分开标注；34 条有离线用例、3 条只有代码、14 条纯人判，缺口按危害排序列在文末。改基线必须同步这张表——`TestEvidenceMatrix` 会校验引用是否真实存在。
 - `security-acceptance-matrix.md` — **安全验收矩阵（SO MCP 面，仅存在于仓库、不随发布拷贝到 A）**：逐场景写「攻击者/误操作会得到什么、实际发生什么」，是负面测试台账而非功能清单。行数以表格本身为准（本文不复述，复述必漂移），每行带 `test:`/`code:` 证据与状态（`PROVEN`、`PROVEN mutation-checked`、`partial` 等）；**`PROVEN` 不等于 `mutation-checked`**，只有带 `mutation-checked` 标记的行真的做过「删掉实现看它变红」。改这张表必须同步——`TestSecurityMatrix` 会校验引用与状态列。**A 侧没有本文件，也没有它引用的 `test_mcp_*` 用例**：这张表的每一行都以「哪个用例证明了它」为证，脱离那些用例就只剩结论没有依据，所以它留在 B，不跟着 `SKILL.md` 发布出去。
@@ -667,7 +668,7 @@ python scripts/chatgpt_send.py --work-item wi_<uuid> \
 
 ### tests/
 
-- `test_hardening.py` — 离线回归（485 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW、设备身份留存与多设备回退、出口代理（含本地假 http/socks 代理真分流）。
+- `test_hardening.py` — 离线回归（489 条）：id 校验/路径穿越、状态文件损坏隔离、原子写、锁重入与 stale、并发不丢更新、轮转兜底判定、SSE 解析、PoW、设备身份留存与多设备回退、出口代理（含本地假 http/socks 代理真分流）。
 
 ## 协议细节
 

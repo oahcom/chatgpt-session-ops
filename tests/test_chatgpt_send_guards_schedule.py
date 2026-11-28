@@ -299,7 +299,10 @@ class ThinkingModelUnavailableGuardTests(unittest.TestCase):
                 _InvalidThinkingResolverAPI("auto"), cache=cache
             )
         self.assertEqual(slug, "gpt-6-t-mini")
-        self.assertEqual(cache[("acct1", "gpt-6-t-mini")], "gpt-6-t-mini")
+        # 缓存键含优先 slug：改 CHATGPT_PREFERRED_THINKING 后不得复用旧结果。
+        self.assertEqual(
+            cache[("acct1", "gpt-6-t-mini", "gpt-6-t-mini")], "gpt-6-t-mini"
+        )
 
 
 class CredentialIdentityGuardTests(unittest.TestCase):

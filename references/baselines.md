@@ -2,7 +2,7 @@
 
 本文件把 `chatgpt-session-ops` 跑过的真实事故与 WorkBuddy automation 的真实运行日志，收敛成**带编号、带判定口径、带违例后果**的基线。SKILL.md 讲「怎么做」，本文件讲「什么算做对、什么算做错」。
 
-**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**四十二轮对外对抗审查**逐条改写（第三十三～四十二轮为收敛后终检自检，其余为对外会话裁定；每轮裁定见 §F；**第二十五轮 `PASS`——锁子系统全文最终确认·收敛**，第二十二轮 `PASS`（F-10 残留定向复审），**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至二十三轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08）、锁元数据写入失败进临界区（F-09）、损坏启动时间误判 pid_reused（F-10）、归档覆盖（F-11）、超长 pid 串 int() 异常逃逸（F-07 残留）、**收割/对账解析器畸形 JSON 崩溃（F-12，41 处）**、**落点不一致只 WARN 导致会话身份与回复归属分裂（F-13）**、**RRULE 校验语义 ≠ 下发语义（F-14）**、**解析边界与证据保全缺口（F-15～F-19）**、**落点正则绕过与回复完整性 fail-open（F-13/F-16 残留 + F-23～F-25）**、**浮点精度与首尾换行边界（F-12c/F-22 残留 + N-01/N-02）**、**对账器跨角色畸形漏检（D-01）**——前 11 组已在第二十五轮核销，**F-12～F-25 + D-01 全部核销，三十二轮对抗审查收敛**），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**`tests/test_hardening.py` 当前 485 条回归。
+**版本**：v1.8（2026-11-19）。v1.0 起经 ChatGPT 思考模式**四十二轮对外对抗审查**逐条改写（第三十三～四十二轮为收敛后终检自检，其余为对外会话裁定；每轮裁定见 §F；**第二十五轮 `PASS`——锁子系统全文最终确认·收敛**，第二十二轮 `PASS`（F-10 残留定向复审），**第十九轮 `PASS`**（锁/进程身份子系统），第十四轮 `PASS`（B15-R 全文），第八轮亦 `PASS`，其余均为 `NEEDS-REVISION` 后返修；第九轮把「可判定」本身当成攻击面；第十五至二十三轮分别抓出 stale 锁回收 TOCTOU（F-02）、进程存活二态误判（F-03）、假值 pid 绕过（F-04/05）、ctypes 句柄截断（F-06）、int() 折叠与损坏内容借老格式逃生（F-07/08）、锁元数据写入失败进临界区（F-09）、损坏启动时间误判 pid_reused（F-10）、归档覆盖（F-11）、超长 pid 串 int() 异常逃逸（F-07 残留）、**收割/对账解析器畸形 JSON 崩溃（F-12，41 处）**、**落点不一致只 WARN 导致会话身份与回复归属分裂（F-13）**、**RRULE 校验语义 ≠ 下发语义（F-14）**、**解析边界与证据保全缺口（F-15～F-19）**、**落点正则绕过与回复完整性 fail-open（F-13/F-16 残留 + F-23～F-25）**、**浮点精度与首尾换行边界（F-12c/F-22 残留 + N-01/N-02）**、**对账器跨角色畸形漏检（D-01）**——前 11 组已在第二十五轮核销，**F-12～F-25 + D-01 全部核销，三十二轮对抗审查收敛**），**未采纳项与理由见 §F**，不静默丢弃。**每条判定口径的证据载体（用例名/符号/实测日期/人判理由）见 `references/evidence-matrix.md`，该矩阵由回归校验，引用不存在的用例会直接红。**`tests/test_hardening.py` 当前 489 条回归。
 
 **用法**：动手前扫 A0/B0；出问题时按编号回查；改脚本前先读对应条款的判定口径——它是回归测试的依据。
 
@@ -34,7 +34,7 @@
 | 2 | 这个会话归谁 | `--owner <conv_id>` | 输出唯一账号 |
 | 3 | 配额有没有冷却 | `--rotation` | `unavailable` 为空或目标账号不在其中 |
 | 4 | 匿名要用先看设备 | `--anon-devices` | 目标设备 `jar=true` |
-| 5 | 改代码了吗 | `python -m unittest tests.test_hardening` | 全绿（当前 485 条） |
+| 5 | 改代码了吗 | `python -m unittest tests.test_hardening` | 全绿（当前 489 条） |
 
 ### A1–A4 内容主权（不可协商）
 
@@ -80,7 +80,7 @@
 | **A17** | `Retry-After` 是**下限**，不是上限 | 秒数 → 等待 ≥ 该值；HTTP 日期 → 等到该时刻；缺失/不可解析 → ≥90s；本地最小 5s；**禁止把服务端要求向下截到 180s**；等待期内禁止对同账号主动探测（只读本地缓存）；冷却截止时间必须持久化 | 早于服务端允许时间恢复 → 持续 429 |
 | **A18** | 失败分级，别一锅端 | 401→封 6h；403→补 cookie + 重跑 PoW **重试 1 次**→仍败冷却 15min；429→按 A17；匿名浏览器不可用→30min；401/403 **不触发匿名兜底** | 把 403 当永久封禁白停身份；把 401 当瞬时错反复撞墙 |
 
-> **已被取代（2026-11-26，见 `references/CONTRACT-BASELINE.md`）**：A16 的「会话间 ≥60s」固定间距 → **CB-A5**（同账号可并行 2–3 路 POST，但必须逐条送达验证）；「超时上限 非思考 7 分钟 / 思考 30 分钟、超时标 `TIMEOUT`」→ **CB-A3**（`--timeout` 默认 600s，优先级 命令行 > `CHATGPT_SEND_TIMEOUT` > 600，超时产 `TIMEOUT_PARTIAL` 并落盘 `<auth>/timeouts/`）。A16 的「同会话串行」与「超时禁止自动重复 POST」两条**继续有效**。
+> **已被取代（2026-11-26，见 `references/CONTRACT-BASELINE.md`）**：A16 的「会话间 ≥60s」固定间距 → **CB-A5**（同账号可并行 2–3 路 POST，但必须逐条送达验证）；「超时上限 非思考 7 分钟 / 思考 30 分钟、超时标 `TIMEOUT`」→ **CB-A3**（优先级：CLI 显式 `--timeout` > `CHATGPT_SEND_TIMEOUT` > 运行时 tier（非思考 420s / 思考 1800s）；`DEFAULT_SEND_TIMEOUT=600` 是**保留的兼容常量**，不是有效运行时默认值；超时产 `TIMEOUT_PARTIAL` 并落盘 `<auth>/timeouts/`）。A16 的「同会话串行」与「超时禁止自动重复 POST」两条**继续有效**。
 
 **A18 配套**：403 先数 cookie——只有 `session-token + oai-did`（2 条）时 GET 全 200 但 POST 恒 403，缺 `__cf_bm/_cfuvid/__cflb`，`warm_cookies()` 访问首页补回可自愈，不必重新登录。
 
@@ -159,9 +159,11 @@
 
 | 编号 | 基线 | 判定口径 | 违例后果 |
 |---|---|---|---|
-| **A27** | **新建会话必须开思考模式**（评审/裁决/审查类硬要求，用户明示 2026-11-19） | API：输出必须出现 `thinking model: *-t-*`；浏览器：`思考` 按钮 `aria-pressed="true"` | 回复更浅、更「防御性」，评审流于表态、抓不到真缺陷 |
+| **A27** | **显式开启 thinking 的路径必须真的落到思考模型**（评审/裁决/审查类硬要求，用户明示 2026-11-19）。**「新建会话必须开思考模式」是旧结论，默认值已由 `references/CONTRACT-BASELINE.md` CB-A1 取代：默认不开**；本条的判定口径只适用于显式 `--thinking` / `CHATGPT_THINKING=1` 的路径（适用范围注记见下方） | API：输出必须出现 `thinking model: *-t-*`；**优先 slug：清单里存在 `gpt-6-t-mini` 时优先选它（默认），可用 `CHATGPT_PREFERRED_THINKING` 覆盖；该 slug 不在清单、或配置非法时，必须留下可 grep 的诊断并按后备顺序解析，不得静默选中后备模型后当成「优先模型命中」**；浏览器：`思考` 按钮 `aria-pressed="true"` | 回复更浅、更「防御性」，评审流于表态、抓不到真缺陷 |
 | **A28** | **流被截断 ≠ 发送失败** | 收到 `IncompleteRead` 时保留 `e.partial` 字节并返回 200 语义（`last_truncated=True`），从中解析 `conversation_id`；随后 **GET 补全文**，不得据此换身份重投 | 同一 prompt 建出多个会话 + 白烧一轮配额 |
 | **A29** | **Cookie 落盘只允许 OpenAI 自有域** | `cookies.json` 里每条 cookie 的 `domain` 必须等于 `chatgpt.com`/`openai.com` 或其子域（**精确域名或后缀匹配，禁止字符串包含**）；`warm_cookies()` 回写前对内存与磁盘同步过滤；`extract_auth.py` 导入时同语义过滤 | 请求头过滤只管「发不发得出去」，管不住「存不存得下来」——实测 acct1 的 `cookies.json` 混进 50 条 Google 会话，每次补 CF cookie 都整包回写磁盘，等于把全站登录态反复备份 |
+
+> **适用范围与取代关系（2026-11-27，见 `references/CONTRACT-BASELINE.md`）**：A27 原口径「新建会话必须开思考模式」是**旧结论**——默认行为由 **CB-A1** 决定：**默认不开 `--thinking`**，只有用户显式要求深度推理、且已接受约 2 倍时间预算时才开，开则同时给足 `--timeout 1800`（CB-A3：非思考 tier 420s / 思考 tier 1800s）。A27 其余内容**继续有效，但只对显式开启 thinking 的路径生效**：`thinking model:` 行必须命中 `-t-`、优先 slug `gpt-6-t-mini`（可被 `CHATGPT_PREFERRED_THINKING` 覆盖）、三种原因码可区分、浏览器 `思考` 按钮 `aria-pressed="true"`。默认路径**没有** `source=default` 这类发送/超时日志分支——`source=default` 只出现在 `thinking model: …（source=default）` 的优先 slug 诊断行里。
 
 **A27 实现口径（实测）**：`GET /backend-api/models` 里同一标题有**两个 slug**，带 `-t-` 的 `max_tokens=262144`、不带的是 `34834` —— `-t-` 即 thinking 变体；默认会话发 `"model": "auto"`（不思考）。脚本 `--thinking`（或 `CHATGPT_THINKING=1`）把 body 的 `model` 换成解析出的 `-t-` slug。解析不出时抛 `ThinkingModelUnavailable`（**不再提供 `CHATGPT_ALLOW_NON_THINKING` 降级口子**，见下），由调用方按作用域处置：默认轮转视为**该身份不可用**并换下一个，四个登录态全不可用才 `exit 1`；显式 `--account` 则直接失败、不换号。三种原因码必须可区分——`AUTH_INVALID`（models 端点 401）、`MODEL_ENDPOINT_UNAVAILABLE`（非 200/网络异常/畸形 JSON）、`THINKING_MODEL_UNAVAILABLE`（清单正常但无 `-t-` 变体）。失败结果**不写入** `_THINKING_MODEL_CACHE`，只有成功解析才缓存（旧实现把失败缓存成 `"auto"`，同进程内后续重试再也拿不到真值）。浏览器侧按钮靠 `innerText === "思考"`（英文 UI `Thinking`）命中，未开时 `aria-pressed="false"`，点一次变 `true` 且 class 增加 `accentSubtle-*`；`enable_thinking()` 幂等返回 `ALREADY / ENABLED / NO_TOGGLE / FAILED_TO_TOGGLE`。**顺序：先开思考再填词**——切换模型可能重置输入框。关闭：`CHATGPT_NO_THINKING=1`。代价：单条 5–19 分钟，`_idle` 预算要放宽（A16）。
 
@@ -352,7 +354,7 @@ prompt：读 --rotation 冷却表 + watchdog.log 近 24h 的 429 记录；
 | automation 名称 / 排程 | 同上 + `--check-name`、`--check-schedule`、`--check-oneshot` | B1/B4/B5/B10/B11 |
 | 排程口径 | `automation_update list` 全量盘点 | B1–B5 |
 
-**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix`（`tests/test_hardening.py`）校验，新增条款不补证据会直接红。当前 485 条。
+**写测试的硬要求**：任何「已修 bug」都要有能复现旧行为的用例，注释写明事故场景。**改了哪条基线，就要同步 `references/evidence-matrix.md` 的证据行**——矩阵由 `TestEvidenceMatrix`（`tests/test_hardening.py`）校验，新增条款不补证据会直接红。当前 489 条。
 
 ### E1 历史记录完整性原则（DECISION-158 正式入库）
 
