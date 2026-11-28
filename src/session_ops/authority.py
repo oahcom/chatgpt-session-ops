@@ -24,7 +24,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Protocol, Tuple, Union
 
 from src.session_ops.work_items import (
     ALLOWED_TRANSITIONS,
@@ -428,10 +428,12 @@ class SecureWorkItemStore:
         database_path: Path,
         store: Optional[WorkItemStore] = None,
         principal_directory: Optional[PrincipalDirectory] = None,
+        completion_event_publisher: Optional[Callable[..., Any]] = None,
     ) -> None:
         self.database_path = Path(database_path)
         self._store = store or WorkItemStore(self.database_path)
         self._principal_directory = principal_directory or DenyAllPrincipalDirectory()
+        self._completion_event_publisher = completion_event_publisher
 
     def initialize(self) -> None:
         self._store.initialize()
@@ -915,6 +917,15 @@ class SecureWorkItemStore:
         ):
             raise NotAuthorized()
 
+    def require_owner(self, principal: Principal, work_item_id: str) -> None:
+        """Fail unless principal is the immutable owner of this WorkItem."""
+        validate_work_item_id(work_item_id)
+        conn = self._connect()
+        try:
+            self._require_owner(conn, principal, work_item_id)
+        finally:
+            conn.close()
+
     def _resolve_grant_target(self, principal: Principal, target: str) -> PrincipalRecord:
         _validate_principal_id(target, "target_principal_id")
         try:
@@ -1122,6 +1133,116 @@ class SecureWorkItemStore:
             self._operation_complete(
                 conn, principal, "work_item.update", request_id, result
             )
+            conn.execute("COMMIT")
+            return _row_to_work_item(stored)
+        except BaseException:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def finish_work_item(
+        self,
+        principal: Principal,
+        work_item_id: str,
+        status: str,
+        request_id: Optional[str] = None,
+    ) -> WorkItem:
+        """Complete or cancel a WorkItem as its immutable owner.
+
+        Terminal state, audit, session auto-unlinks, and the optional Events
+        outbox row commit in one SQLite transaction. Delegated write grants
+        never authorize terminal transitions.
+        """
+        validate_work_item_id(work_item_id)
+        if status not in TERMINAL_STATUSES:
+            raise InvalidTransition("terminal status must be completed or cancelled")
+        tool_name = "work_item.finish"
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._require_owner(conn, principal, work_item_id)
+            replay = self._operation_begin(
+                conn, principal, tool_name, request_id,
+                {"work_item_id": work_item_id, "status": status},
+            )
+            if replay is not _NO_OPERATION_RECEIPT:
+                conn.execute("COMMIT")
+                return WorkItem(**replay)
+            row = conn.execute(
+                "SELECT status FROM work_items WHERE work_item_id = ?",
+                (work_item_id,),
+            ).fetchone()
+            if row is None:
+                raise NotAuthorized()
+            current = row["status"]
+            if current in TERMINAL_STATUSES or status not in ALLOWED_TRANSITIONS[current]:
+                raise InvalidTransition("work item cannot transition from %s to %s" % (current, status))
+            changed_at = _utc_now()
+            conn.execute(
+                "UPDATE work_items SET status = ?, updated_at = ? WHERE work_item_id = ?",
+                (status, changed_at, work_item_id),
+            )
+            active_links = conn.execute(
+                "SELECT link_id, session_id FROM session_links "
+                "WHERE work_item_id = ? AND unlinked_at IS NULL "
+                "ORDER BY linked_at, link_id",
+                (work_item_id,),
+            ).fetchall()
+            if self._completion_event_publisher is not None:
+                owner = conn.execute(
+                    "SELECT tenant_id, owner_principal_id FROM work_item_owners WHERE work_item_id = ?",
+                    (work_item_id,),
+                ).fetchone()
+                if owner is None:
+                    raise AuthorityError("WorkItem owner is missing")
+                event_id = "evt_" + uuid.uuid5(
+                    uuid.NAMESPACE_URL, "chatgpt-session-ops:%s" % work_item_id
+                ).hex
+                source_conversations = [link["session_id"] for link in active_links]
+                event_conversation = (
+                    {"conversation_id": source_conversations[0]}
+                    if len(source_conversations) == 1
+                    else {"conversation_ids": source_conversations}
+                    if source_conversations else {}
+                )
+                self._completion_event_publisher(
+                    conn,
+                    tenant_id=owner["tenant_id"],
+                    principal_id=owner["owner_principal_id"],
+                    job_id=work_item_id,
+                    summary="Work item completed" if status == "completed" else "Work item cancelled",
+                    event_id=event_id,
+                    completed_at=changed_at,
+                    status="succeeded" if status == "completed" else "failed",
+                    **event_conversation,
+                )
+            for link in active_links:
+                changed = conn.execute(
+                    "UPDATE session_links SET unlinked_at = ? WHERE link_id = ? AND unlinked_at IS NULL",
+                    (changed_at, link["link_id"]),
+                ).rowcount
+                if changed != 1:
+                    raise AuthorityError("active link changed during terminal transition")
+                self._audit(
+                    conn, principal, "session.auto_unlink_terminal",
+                    work_item_id=work_item_id, session_id=link["session_id"],
+                    link_id=link["link_id"], request_id=request_id,
+                )
+            self._audit(
+                conn, principal, "work_item.complete" if status == "completed" else "work_item.cancel",
+                work_item_id=work_item_id, request_id=request_id,
+            )
+            stored = conn.execute(
+                "SELECT work_item_id, status, created_at, updated_at FROM work_items WHERE work_item_id = ?",
+                (work_item_id,),
+            ).fetchone()
+            result = {
+                "work_item_id": stored["work_item_id"], "status": stored["status"],
+                "created_at": stored["created_at"], "updated_at": stored["updated_at"],
+            }
+            self._operation_complete(conn, principal, tool_name, request_id, result)
             conn.execute("COMMIT")
             return _row_to_work_item(stored)
         except BaseException:
