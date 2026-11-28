@@ -363,6 +363,7 @@ class MCPChatGPTToolTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["data"]["text"], "assistant: done")
         self.assertEqual(result["data"]["status"], "ok")
+        api.live_tail.assert_called_once_with(SESSION_ID, tries=1)
         self.assertEqual(store.access_checks[0][2], "read")
 
     def test_explicit_account_conflict_rejects_send_before_remote_call(self):

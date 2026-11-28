@@ -72,6 +72,17 @@ ADAPTER_DEADLINE_SECONDS = 8.0
 REQUEST_DEADLINE_SECONDS = 10.0
 AUTH_VERIFY_DEADLINE_SECONDS = 3.5
 
+# Remote ChatGPT reads may outlive the MCP caller deadline. Keep them out of
+# asyncio's shared executor and retain admission until the real thread exits.
+_READ_WORKERS = 2
+_READ_EXECUTOR = ThreadPoolExecutor(
+    max_workers=_READ_WORKERS,
+    thread_name_prefix="session-ops-read",
+)
+_READ_SLOTS = threading.BoundedSemaphore(_READ_WORKERS)
+_READ_INFLIGHT_LOCK = threading.Lock()
+_READ_INFLIGHT_KEYS: set[tuple[str, str]] = set()
+
 MCP_SERVER_NAME = "chatgpt-session-ops"
 MCP_SERVER_VERSION = "0.1.0"
 
@@ -979,7 +990,9 @@ class MCPToolService:
         if resolved.get("account") is None:
             raise InvalidIdentifier("conversation account is unknown; specify account")
         api = runtime.ChatGPTAPI(account=resolved["account"])
-        tail, _body = api.live_tail(conversation_id, tries=2)
+        # A caller timeout cannot stop an already-running synchronous HTTP read.
+        # Never retry inside this operation: retries can overlap abandoned GETs.
+        tail, _body = api.live_tail(conversation_id, tries=1)
         if tail is None:
             return {
                 "work_item_id": work_item_id,
@@ -1160,22 +1173,72 @@ def build_mcp_server(
         else:
             arguments = params.arguments if params.arguments is not None else {}
             loop = asyncio.get_running_loop()
-            future = loop.run_in_executor(
-                None,
-                lambda: service.dispatch(
-                    params.name,
-                    arguments,
-                    auth,
-                    request_id=request_id,
-                ),
-            )
-            try:
-                envelope = await asyncio.wait_for(
-                    future,
-                    timeout=REQUEST_DEADLINE_SECONDS,
+            if params.name == "chatgpt.session.read":
+                conversation_id = str(arguments.get("conversation_id", ""))
+                read_key = (
+                    "%s|%s|%s" % (auth.issuer, auth.realm_namespace, auth.subject),
+                    conversation_id,
                 )
-            except asyncio.TimeoutError:
-                envelope = _error("TIMEOUT", request_id)
+                with _READ_INFLIGHT_LOCK:
+                    admitted = (
+                        read_key not in _READ_INFLIGHT_KEYS
+                        and _READ_SLOTS.acquire(blocking=False)
+                    )
+                    if admitted:
+                        _READ_INFLIGHT_KEYS.add(read_key)
+                if not admitted:
+                    envelope = _error("DEPENDENCY_UNAVAILABLE", request_id)
+                else:
+                    try:
+                        job = _READ_EXECUTOR.submit(
+                            service.dispatch,
+                            params.name,
+                            arguments,
+                            auth,
+                            request_id=request_id,
+                        )
+                    except BaseException:
+                        with _READ_INFLIGHT_LOCK:
+                            _READ_INFLIGHT_KEYS.discard(read_key)
+                        _READ_SLOTS.release()
+                        raise
+
+                    def release_read(_job: Any) -> None:
+                        with _READ_INFLIGHT_LOCK:
+                            _READ_INFLIGHT_KEYS.discard(read_key)
+                        _READ_SLOTS.release()
+
+                    # Register outside the lock: add_done_callback may execute
+                    # synchronously when the job already completed.
+                    job.add_done_callback(release_read)
+                    future = asyncio.wrap_future(job, loop=loop)
+                    try:
+                        # Shield prevents wait_for from cancelling the
+                        # wrapper; the underlying job remains tracked until
+                        # its completion callback releases admission.
+                        envelope = await asyncio.wait_for(
+                            asyncio.shield(future),
+                            timeout=REQUEST_DEADLINE_SECONDS,
+                        )
+                    except asyncio.TimeoutError:
+                        envelope = _error("TIMEOUT", request_id)
+            else:
+                future = loop.run_in_executor(
+                    None,
+                    lambda: service.dispatch(
+                        params.name,
+                        arguments,
+                        auth,
+                        request_id=request_id,
+                    ),
+                )
+                try:
+                    envelope = await asyncio.wait_for(
+                        future,
+                        timeout=REQUEST_DEADLINE_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    envelope = _error("TIMEOUT", request_id)
 
         # Keep the text fallback small; the complete contract envelope is in
         # structured_content and is size-checked by MCPToolService.
