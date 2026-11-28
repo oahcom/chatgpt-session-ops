@@ -32,7 +32,7 @@ The event store key is separate from the database file. `SO_MCP_EVENTS_DB`, if c
 
 ## Verification
 
-Latest full repository test run: **1322 passed, 13 skipped, 1575 subtests passed**.
+Latest canonical CI test command (`python -m unittest discover -s tests -v`): **1334 tests passed, 13 skipped**. Supplemental full pytest run: **1322 passed, 13 skipped, 1575 subtests passed**.
 
 Focused integration tests cover the full local path: authenticated WorkItem -> terminal transition -> same-transaction outbox insert -> webhook delivery. They also verify one event is fanned out once when a WorkItem has multiple linked sessions, delegated completion is routed to the owner, and an outbox insertion failure rolls back the terminal transition and session unlink. Additional regression tests cover bounded DNS resolution, dispatcher shutdown failure without duplicate stop waits, send-attempt idempotency, and ambiguous remote-send outcomes without account rotation/retry.
 
