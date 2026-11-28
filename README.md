@@ -283,7 +283,7 @@ CHATGPT_STATE_DIR=/var/lib/chatgpt-session-ops \\
 python -m scripts.run_mcp_server
 ```
 
-完整服务配置、权限和状态迁移步骤见 [直接集成部署说明](docs/CHATGPT-MCP.md)；工具参数与 OAuth scope 见 [MCP 工具契约](references/mcp-tools.md)。
+完整服务配置、权限和状态迁移步骤见 [部署说明](docs/DEPLOY-so-mcp.md) §2c；工具参数与 OAuth scope 见 [MCP 工具契约](references/mcp-tools.md)。
 
 ---
 
