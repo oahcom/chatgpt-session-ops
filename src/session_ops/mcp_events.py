@@ -611,28 +611,26 @@ class MCPEventsStore:
                         raise PermissionError("event resource is no longer accessible")
                     current_time = int(self.clock())
                     with self._db() as db:
-                        lease = db.execute(
-                            """SELECT s.active, s.expires_at, s.generation, d.generation AS delivery_generation,
-                                      d.lease_until, d.lease_token
-                               FROM event_subscriptions s JOIN event_deliveries d ON d.subscription_id=s.id
-                               WHERE s.id=? AND d.event_id=?""",
-                            (row["subscription_id"], row["event_id"]),
-                        ).fetchone()
-                        valid = (
-                            lease is not None and lease["active"] == 1
-                            and lease["generation"] == row["generation"]
-                            and lease["delivery_generation"] == row["generation"]
-                            and lease["lease_token"] == row["lease_token"]
-                            and lease["lease_until"] is not None and lease["lease_until"] > current_time
-                            and (lease["expires_at"] is None or lease["expires_at"] > current_time)
+                        # Validate and renew in one conditional write. A
+                        # SELECT followed by UPDATE leaves a race where a
+                        # second worker can reclaim the expired lease between
+                        # those statements while this worker still proceeds
+                        # to external callback I/O using its stale snapshot.
+                        renewed = db.execute(
+                            """UPDATE event_deliveries SET lease_until=?
+                               WHERE event_id=? AND subscription_id=? AND generation=?
+                                 AND status='sending' AND lease_token=? AND lease_until>?
+                                 AND EXISTS (
+                                     SELECT 1 FROM event_subscriptions s
+                                      WHERE s.id=event_deliveries.subscription_id
+                                        AND s.active=1 AND s.generation=event_deliveries.generation
+                                        AND (s.expires_at IS NULL OR s.expires_at>?)
+                                 )""",
+                            (current_time + DELIVERY_LEASE_SECONDS, row["event_id"],
+                             row["subscription_id"], row["generation"], row["lease_token"],
+                             current_time, current_time),
                         )
-                        if valid:
-                            db.execute(
-                                """UPDATE event_deliveries SET lease_until=?
-                                   WHERE event_id=? AND subscription_id=? AND generation=?
-                                     AND status='sending' AND lease_token=?""",
-                                (current_time + DELIVERY_LEASE_SECONDS, row["event_id"], row["subscription_id"], row["generation"], row["lease_token"]),
-                            )
+                        valid = renewed.rowcount == 1
                     if not valid:
                         # If this exact lease is still ours but the subscription
                         # expired during authorization, terminalize it. A lease

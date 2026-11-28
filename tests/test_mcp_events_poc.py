@@ -4,6 +4,7 @@ import json
 import tempfile
 import threading
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -399,6 +400,44 @@ class MCPEventsStoreTests(unittest.TestCase):
         self.assertFalse(first.is_alive())
         self.assertEqual(first_result, [1])
         self.assertEqual(len(calls), 1)
+
+    def test_lease_reclaim_between_validation_and_renewal_prevents_callback(self):
+        with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
+            self.subscribe(job_id="job-lease-race")
+        self.store.publish_job_completed("tenant-a", "issuer:user-a", "job-lease-race", "Finished")
+        self.callback.requests.clear()
+        original_db = self.store._db
+
+        class InterleavingConnection:
+            def __init__(self, connection):
+                self.connection = connection
+
+            def execute(self, sql, params=()):
+                if sql.lstrip().startswith("UPDATE event_deliveries SET lease_until=?"):
+                    # Simulate another worker reclaiming the lease after this
+                    # worker's old SELECT snapshot but before its renewal.
+                    with original_db() as competing:
+                        competing.execute(
+                            "UPDATE event_deliveries SET lease_token='reclaimed' WHERE event_id=?",
+                            (params[1],),
+                        )
+                return self.connection.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+        @contextmanager
+        def interleaving_db():
+            with original_db() as connection:
+                yield InterleavingConnection(connection)
+
+        self.store._db = interleaving_db
+        self.assertEqual(self.store.deliver_pending(limit=1), 0)
+        self.assertEqual(self.callback.requests, [])
+        with original_db() as db:
+            row = db.execute("SELECT status, lease_token FROM event_deliveries").fetchone()
+        self.assertEqual(row["status"], "sending")
+        self.assertEqual(row["lease_token"], "reclaimed")
 
     def test_null_ttl_means_no_expiration(self):
         with patch("src.session_ops.mcp_events._resolve_validated_address", return_value="93.184.216.34"):
