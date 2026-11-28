@@ -1,0 +1,10 @@
+--- a/so-sender/sender_gateway/sender_adapter.py
++++ b/so-sender/sender_gateway/sender_adapter.py
+@@ -121,3 +121,7 @@
+     "LANG",
+     "LC_ALL",
++    # Explicit non-secret roots must be shared with the CLI child so its
++    # identity discovery and credential loading use the Gateway's configured roots.
++    "SO_SENDER_ACCOUNTS_DIR",
++    "CHATGPT_AUTH_DIR",
+ )
