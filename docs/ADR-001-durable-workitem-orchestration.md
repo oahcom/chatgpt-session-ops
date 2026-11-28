@@ -25,11 +25,23 @@ The following boundaries are normative:
 5. **Owner/Coordinator co-location is intentional.** One stable Orchestrator Session may hold Owner and Coordinator assignments across many WorkItems. Worker and Reviewer remain separate execution contexts.
 6. **No second workflow service is introduced in v1.** Durable SO state plus Sender Job receipts and GitHub references must be sufficient to reconstruct progress after restart.
 
+### Engineering Knowledge and proactive goal discovery
+
+The Orchestrator continuously maintains a versioned, reviewable Engineering Knowledge artifact in the SO orchestration repository; v1 does not add a separate Knowledge service or mutable Knowledge database. The artifact contains:
+
+- verified architecture map, cross-repository boundaries, invariants and explicit non-goals;
+- claims tagged `verified`, `inferred`, or `unknown`, each with source references (repository commit + path/line, Issue/PR/CI, or dated production observation), last-verified time and evidence digest;
+- decisions/ADRs with rationale and supersession links;
+- unresolved questions, missing evidence, risk register and candidate architecture goals;
+- current repository/branch/PR/CI state and dependency relationships.
+
+The artifact is a derived, versioned knowledge index, not a replacement for source code, GitHub or production as the factual authority. The Orchestrator revalidates stale claims before dispatch and never upgrades a Worker assertion to `verified` without independent evidence. No separate Goal entity is introduced in v1: a validated candidate goal becomes a canonical GitHub Issue; multiple bounded WorkItems may implement that Issue. Unvalidated candidates remain in the artifact. After an Acceptance, the Orchestrator updates the artifact in a new commit; the next WorkItemSpec records the exact knowledge revision and source evidence used.
+
 ## 2. WorkItem identity and specification
 
 A WorkItem is one bounded execution slice, not a mirror of a GitHub Issue.
 
-- New WorkItems declare `kind=development` or `kind=operational`.
+- New WorkItems declare `workflow_version=1` and `kind=development` or `kind=operational`.
 - A development WorkItem has exactly one immutable primary Issue reference: canonical `repository_full_name + issue_number`; the URL is derived. V1 allows the three canonical repositories: `oahcom/chatgpt-session-ops`, `oahcom/ai-memory-adapter`, and `oahcom/AiMemoryBrainArchitecture`.
 - An operational WorkItem may omit a primary Issue. One Issue may own many bounded WorkItems. PRs, commits, CI runs, reviews, and decisions are typed evidence, not additional primary Issues.
 - The primary Issue binding is immutable after the first Assignment or Attempt. Before activation it may be amended by an authorized Owner with an audit event; after activation, create a replacement WorkItem and preserve history.
@@ -50,12 +62,12 @@ Roles are `owner`, `coordinator`, `worker`, and `reviewer`. A role label is not 
 ### Role matrix and reuse
 
 - **Owner/Coordinator:** one stable Orchestrator Session may hold Owner and/or Coordinator assignments across many WorkItems. These assignments do not create SessionLinks. Authority comes from the authenticated SO principal and explicit WorkItem-scoped capabilities. Coordinator has no implicit Owner privilege.
-- **Worker:** a separate execution Session is bound to one WorkItem for its lifetime. It may continue across successive repair Attempts after Reviewer rejection, preserving repair context. It must never be rebound to another WorkItem. Once accepted/cancelled and unlinked, it is retired from execution use.
+- **Worker:** a separate execution Session is bound to one WorkItem for its lifetime and is never rebound to another WorkItem. After Reviewer rejection, supersede the prior immutable Worker Assignment and create the next monotonic Assignment generation; the same Worker Session may continue within that WorkItem only if its SessionLink remains active and the full transcript/context digest is pinned, or a new Worker Session may be provisioned. Never create concurrent active Worker Assignments. Once accepted/cancelled and unlinked, the Session is retired from execution use.
 - **Reviewer:** a fresh Session is used for exactly one review decision tuple: `(WorkItem, Worker Assignment ID/generation, Spec version, head SHA)`. It is never reused for another WorkItem, head, or later review. Its only allowed pre-review transcript is the verified bootstrap exchange from its own provisioning Attempt; unrelated history disqualifies it.
 
 No Session may hold Owner/Coordinator and Worker/Reviewer roles for the same WorkItem. Worker cannot review its own Assignment; Reviewer cannot accept; Owner cannot be the Worker or Reviewer for the same slice. Different ChatGPT accounts are not required; Session and prompt/context separation is required. Session separation establishes agent-context independence, not independent human assurance.
 
-A WorkItem has at most one current Worker Assignment generation and at most one active Reviewer Assignment for a given Worker Assignment/head. Worker base SHA and Reviewer target head SHA are immutable. New commits are appended as Evidence; they do not mutate an Assignment's head. A changed head or Spec requires a fresh Reviewer Session and decision.
+A WorkItem has at most one current Worker Assignment generation and at most one active Reviewer Assignment for a given Worker Assignment/head. Worker base SHA and Reviewer target head SHA are immutable. A changed head or Spec creates a new Worker revision Assignment when implementation continues and always requires a fresh Reviewer Session/Assignment for the new exact head. New commits are appended as Evidence; they do not mutate an Assignment's head. A changed head or Spec requires a fresh Reviewer Session and decision.
 
 ### Authorization is separate from role
 
@@ -146,7 +158,7 @@ All mutating SO operations require durable receipts keyed by tenant, authenticat
 
 ## 8. Compatibility and migration
 
-- Existing WorkItems with no verified type/Issue become migration-only `legacy_unclassified`; do not relabel them all as operational. Preserve status, owner, grants, timestamps, SessionLinks, and landing history. Do not synthesize Assignments, Attempts, Evidence, or Acceptance.
+- Existing WorkItems with no verified type/Issue become migration-only `workflow_version=0 / legacy_unclassified`; do not relabel them all as operational. Preserve status, owner, grants, timestamps, SessionLinks, and landing history. Do not synthesize Assignments, Attempts, Evidence, or Acceptance.
 - New WorkItems must be development or operational. `legacy_unclassified` cannot be newly created.
 - Historical v0 rows already marked completed remain historical projections; migration does not fabricate Acceptance and those rows cannot authorize GitHub closure.
 - V0.1 tools may retain non-terminal operational behavior only for workflow-version 0 rows. They reject v2 WorkItems/Attempts/Assignments. V0.1 link/unlink/context cannot mutate or access v2 lifecycle.
