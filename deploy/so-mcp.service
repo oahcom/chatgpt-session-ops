@@ -8,9 +8,8 @@ After=network-online.target
 [Service]
 Type=simple
 
-User=chatgpt-sender
-Group=chatgpt-sender
-SupplementaryGroups=chatgpt-sender
+User=ubuntu
+Group=ubuntu
 
 WorkingDirectory=/opt/so-mcp
 
@@ -39,7 +38,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 
-ReadWritePaths=/var/lib/so-mcp /var/lib/chatgpt-session-ops
+ReadWritePaths=/var/lib/so-mcp /var/lib/chatgpt-session-ops/accounts
 
 [Install]
 WantedBy=multi-user.target
