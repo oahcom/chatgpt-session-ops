@@ -13,8 +13,8 @@ Rules enforced here (report section 2.6, section 1.2):
   remote outcome becomes ``failed / OUTCOME_UNKNOWN`` -- never a resend;
 * any unexpected exception out of the injected callable means "the remote may
   have received it", which is also ``OUTCOME_UNKNOWN``;
-* a declared ``GatewayError`` (429, dependency down, ...) fails the job with
-  that code and is never retried automatically.
+* a definitive upstream 429 or account cooldown is deferred until the
+  persisted Retry-After expires; uncertain mutating outcomes are never retried.
 
 Run sample::
 
@@ -29,7 +29,7 @@ from __future__ import annotations
 import uuid
 from typing import Any, Callable, Iterable, Mapping
 
-from .account_router import AccountRouter, Reservation
+from .account_router import AccountCoolingDown, AccountRouter, Reservation
 from .job_store import JobStore
 from .models import (
     AccountBusy,
@@ -161,11 +161,13 @@ class Worker:
                 conversation_id=job["conversation_id"],
             )
         except AccountBusy:
-            # Another job is already sending on the chosen account.  Nothing
+            # Another job is already sending on the chosen account. Nothing
             # has been sent: requeue and yield the pass.
-            self._store.release(
-                job_id, delay_seconds=ACCOUNT_BUSY_BACKOFF_SECONDS
-            )
+            self._store.release(job_id, delay_seconds=ACCOUNT_BUSY_BACKOFF_SECONDS)
+            return False
+        except AccountCoolingDown as exc:
+            # 429 cooldown is a known pre-send condition: defer, don't fail.
+            self._store.release(job_id, delay_seconds=exc.retry_after_seconds)
             return False
         except GatewayError as exc:
             self._settle(job_id, "fail", exc.code)
@@ -177,6 +179,11 @@ class Worker:
             else:
                 result = self._send_prompt(job, reservation)
         except GatewayError as exc:
+            if exc.upstream_status == 429 and exc.retry_after_seconds is not None:
+                # The upstream definitively rejected this request with 429.
+                # Persisted account cooldown + next_eligible_at prevent a hot loop.
+                self._store.release(job_id, delay_seconds=exc.retry_after_seconds)
+                return False
             # A mutating CLI operation may have reached the remote before its
             # local process timed out. Missing/malformed receipt is also unknown.
             mutating = job["operation"] in (
