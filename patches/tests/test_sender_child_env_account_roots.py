@@ -11,6 +11,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 TEMP_ROOT = Path.home() / ".worktrees"
+
+
+def _purge_sender_gateway_modules():
+    for module_name in tuple(sys.modules):
+        if module_name == "sender_gateway" or module_name.startswith("sender_gateway."):
+            sys.modules.pop(module_name, None)
+
 SNAPSHOT = ROOT / "deploy/source-snapshot/2026-11-28/so-sender"
 PATCH = ROOT / "patches/sender-child-env-account-roots.patch"
 
@@ -59,14 +66,10 @@ class SenderChildAccountRootsTests(unittest.TestCase):
         self.auth_root = self.root / "auth-root"
         self.accounts_root = self.auth_root / "accounts"
         self.auth_root.mkdir(parents=True, exist_ok=True)
-        # acct1/default credentials live directly in CHATGPT_AUTH_DIR.
-        (self.auth_root / "cookies.json").write_text("[]")
-        (self.auth_root / "access_token.txt").write_text("fixture-acct1-token-not-a-secret")
-        # acct1 is a real, empty legacy marker directory under the Gateway
-        # accounts root. Its credentials remain independently rooted at
-        # CHATGPT_AUTH_DIR; Gateway and CLI must agree on that mapping.
+        # This child-env contract test is intentionally acct10-only. acct1's
+        # legacy auth-root mapping is covered separately; no acct1 symlink or
+        # marker is introduced into this dynamic acctN closure fixture.
         self.accounts_root.mkdir(parents=True, exist_ok=True)
-        (self.accounts_root / "acct1").mkdir()
         auth_account = self.accounts_root / "acct10"
         auth_account.mkdir(parents=True)
         (auth_account / "cookies.json").write_text("[]")
@@ -87,11 +90,13 @@ class SenderChildAccountRootsTests(unittest.TestCase):
 
         sys.path.insert(0, str(self.root / "so-sender"))
         try:
+            _purge_sender_gateway_modules()
             from sender_gateway.account_router import discover_accounts
             from sender_gateway.sender_adapter import ChatGPTSenderAdapter, _discover_logged_in_accounts
             gateway_accounts = discover_accounts(self.accounts_root, auth_root=self.auth_root)
-            self.assertEqual(gateway_accounts, ("acct1", "acct10"))
-            self.assertIn("acct1", _discover_logged_in_accounts())
+            self.assertEqual(gateway_accounts, ("acct10",))
+            # The legacy Adapter discovery set includes built-in acct1-acct6;
+            # assert the dynamic acct10 identity is added, not that defaults vanish.
             self.assertIn("acct10", _discover_logged_in_accounts())
 
             adapter = ChatGPTSenderAdapter(
@@ -104,8 +109,7 @@ class SenderChildAccountRootsTests(unittest.TestCase):
             finally:
                 adapter.close()
         finally:
-            sys.modules.pop("sender_gateway.sender_adapter", None)
-            sys.modules.pop("sender_gateway", None)
+            _purge_sender_gateway_modules()
             sys.path.remove(str(self.root / "so-sender"))
 
         self.assertEqual(child_env["SO_SENDER_ACCOUNTS_DIR"], str(self.accounts_root))
@@ -123,13 +127,10 @@ spec.loader.exec_module(cli)
 cli.resolve_proxy_info = lambda: {"source": "isolated-test"}
 cli.require_proxy = lambda: "http://127.0.0.1:8080"
 cli.build_opener_for = lambda *args, **kwargs: object()
-acct1 = cli.ChatGPTAPI(account="acct1")
 acct10 = cli.ChatGPTAPI(account="acct10")
 print(json.dumps({
     "acct1_identity_discovered": "acct1" in cli._VALID_ACCOUNT_IDENTITIES,
     "acct10_identity_discovered": "acct10" in cli._VALID_ACCOUNT_IDENTITIES,
-    "acct1_auth_root_used": acct1.base_dir,
-    "acct1_token_loaded": acct1.token == "fixture-acct1-token-not-a-secret",
     "acct10_auth_root_used": acct10.base_dir,
     "acct10_token_loaded": acct10.token == "fixture-acct10-token-not-a-secret",
 }))
@@ -145,10 +146,8 @@ print(json.dumps({
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         result = json.loads(completed.stdout.strip().splitlines()[-1])
-        self.assertTrue(result["acct1_identity_discovered"])
+        self.assertFalse(result["acct1_identity_discovered"])
         self.assertTrue(result["acct10_identity_discovered"])
-        self.assertEqual(result["acct1_auth_root_used"], str(self.auth_root))
-        self.assertTrue(result["acct1_token_loaded"])
         self.assertEqual(
             result["acct10_auth_root_used"],
             str(self.auth_root / "accounts/acct10"),
@@ -158,11 +157,10 @@ print(json.dumps({
     def test_gateway_discovery_rejects_symlink_account_dirs_and_credential_files(self):
         sys.path.insert(0, str(self.root / "so-sender"))
         try:
+            _purge_sender_gateway_modules()
             from sender_gateway.account_directory import discover_accounts
         finally:
-            sys.modules.pop("sender_gateway.account_router", None)
-            sys.modules.pop("sender_gateway.account_directory", None)
-            sys.modules.pop("sender_gateway", None)
+            _purge_sender_gateway_modules()
             sys.path.remove(str(self.root / "so-sender"))
 
         symlink_dir = self.accounts_root / "acct11"
@@ -178,7 +176,7 @@ print(json.dumps({
         )
 
         found = discover_accounts(self.accounts_root, auth_root=self.auth_root)
-        self.assertEqual(found, ("acct1", "acct10"))
+        self.assertEqual(found, ("acct10",))
 
     def test_unset_roots_are_not_added_to_child_environment(self):
         os.environ.pop("SO_SENDER_ACCOUNTS_DIR", None)
@@ -195,8 +193,7 @@ print(json.dumps({
             finally:
                 adapter.close()
         finally:
-            sys.modules.pop("sender_gateway.sender_adapter", None)
-            sys.modules.pop("sender_gateway", None)
+            _purge_sender_gateway_modules()
             sys.path.remove(str(self.root / "so-sender"))
         self.assertNotIn("SO_SENDER_ACCOUNTS_DIR", child_env)
         self.assertNotIn("CHATGPT_AUTH_DIR", child_env)

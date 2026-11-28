@@ -16,6 +16,13 @@ from unittest.mock import Mock
 
 ROOT = Path(__file__).resolve().parents[2]
 TEMP_ROOT = Path.home() / ".worktrees"
+
+
+def _purge_sender_gateway_modules():
+    for module_name in tuple(sys.modules):
+        if module_name == "sender_gateway" or module_name.startswith("sender_gateway."):
+            sys.modules.pop(module_name, None)
+
 SNAPSHOT = ROOT / "deploy/source-snapshot/2026-11-28/so-sender"
 PATCH = ROOT / "patches/sender-account-identity-pin.patch"
 
@@ -95,6 +102,7 @@ class SenderAccountIdentityPinTests(unittest.TestCase):
         sys.modules[spec.name] = cls.cli
         spec.loader.exec_module(cls.cli)
 
+        _purge_sender_gateway_modules()
         from sender_gateway.sender_adapter import ChatGPTSenderAdapter, SenderError
         from sender_gateway.account_router import discover_accounts as gateway_discover_accounts
         cls.adapter_type = ChatGPTSenderAdapter
@@ -108,9 +116,7 @@ class SenderAccountIdentityPinTests(unittest.TestCase):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
-        sys.modules.pop("sender_gateway.sender_adapter", None)
-        sys.modules.pop("sender_gateway.account_router", None)
-        sys.modules.pop("sender_gateway", None)
+        _purge_sender_gateway_modules()
         sys.path.remove(str(cls.cli_dir.parent))
         cls.temp.cleanup()
 

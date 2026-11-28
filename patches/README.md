@@ -37,6 +37,16 @@ The deployed-runtime and Sender Gateway tests are preserved under `patches/tests
   deduplicated; a new request id is a new intent. Test with
   `PYTHONPATH=/opt/so-mcp pytest patches/tests/test_mcp_request_id_idempotency.py`.
 
+## Sender snapshot patch registry (isolated tests; not deployment authorization)
+
+| Artifact | Target / purpose | Base and validation |
+|---|---|---|
+| `sender-account-identity-pin.patch` | Snapshot-only explicit-account identity preflight and explicit 429 no-cross-account behavior in `so-sender/cli/chatgpt_send.py`. | Snapshot SHA256 `de20a07cfe7667efc4ee79fe3231e6753a1dd09fa4cdbd55279fbcf239dcb3bd`; covered by `patches/tests/test_sender_account_identity_pin.py`. |
+| `sender-child-env-account-roots.patch` | Pass `SO_SENDER_ACCOUNTS_DIR` and `CHATGPT_AUTH_DIR` through the Adapter child environment allowlist. | Same 2026-11-28 Sender snapshot; covered by `patches/tests/test_sender_child_env_account_roots.py` together with the account-directory resolver patch. |
+| `sender-account-directory-contract.patch` | Shared Gateway/CLI account directory resolution, including dynamic acctN credential loading. | Same isolated Sender snapshot; tested with synthetic paths and credentials. |
+
+CI runs both Sender patch test modules together in the unit job. They are snapshot-fixture tests only and do not authorize applying any patch to production.
+
 ## Sender account-directory contract (isolated source patch)
 
 `sender-account-directory-contract.patch` applies from a clean `so-sender` source root. It adds `sender_gateway/account_directory.py` and makes Gateway discovery, CLI identity discovery, and `ChatGPTAPI` use the same resolver. The deployed runtime must include this new module alongside `sender_gateway/account_router.py`, `sender_gateway/app.py`, and `cli/chatgpt_send.py`; omitting it makes the CLI import fail.
@@ -48,7 +58,7 @@ Contract:
 - Symlink account directories and symlink credential marker files are rejected, preserving Gateway's no-symlink discovery boundary.
 - `acct2+` always resolve to `SO_SENDER_ACCOUNTS_DIR/acctN` (defaulting to `<auth-root>/accounts/acctN`). If `CHATGPT_AUTH_DIR` is absent, a configured accounts path named `accounts` implies its parent as auth root; another configured path is itself the auth root; with neither configured, CLI `BASE/accounts` is used.
 
-**Release gate:** production env values, effective service-user path access, and acct1 real-directory marker/legacy credential targets were not verified because production env and process-environment reads are permission-blocked. The isolated cross-layer fixture uses `SO_SENDER_ACCOUNTS_DIR = CHATGPT_AUTH_DIR/accounts`, a real empty `accounts/acct1` marker, independent synthetic acct1 credentials at `CHATGPT_AUTH_DIR`, and real `accounts/acct10` credentials; this proves the tested legacy dual-path mapping and acct10 path closure, but does **not** establish that the production directory layout matches it. Before release, an authorized deployment operator must confirm the effective `SO_SENDER_ACCOUNTS_DIR` and `CHATGPT_AUTH_DIR`, inspect only path metadata and confirm no symlink account directories or credential marker files are relied upon (not credential contents), explicitly confirm the real `accounts/acct1` marker/legacy credential layout without introducing symlink exceptions, confirm that Gateway discovery and CLI credential loading resolve the same physical directories for acct1 and at least one acct2+, and include the new `account_directory.py` module in the deployed runtime. Do not create or change production symlinks/layout based on this fixture. Isolated tests do not satisfy this production gate.
+**Release gate:** production env values, effective service-user path access, and acct1 real-directory marker/legacy credential targets were not verified because production env and process-environment reads are permission-blocked. The isolated child-env fixture uses `SO_SENDER_ACCOUNTS_DIR = CHATGPT_AUTH_DIR/accounts` with a real `accounts/acct10` directory and synthetic credentials; a separate account-directory test covers acct1's legacy auth-root mapping. These fixtures prove the tested resolver behavior, but do **not** establish that the production directory layout matches it. Before release, an authorized deployment operator must confirm the effective `SO_SENDER_ACCOUNTS_DIR` and `CHATGPT_AUTH_DIR`, inspect only path metadata and confirm no symlink account directories or credential marker files are relied upon (not credential contents), explicitly confirm the real `accounts/acct1` marker/legacy credential layout without introducing symlink exceptions, confirm that Gateway discovery and CLI credential loading resolve the same physical directories for acct1 and at least one acct2+, and include the new `account_directory.py` module in the deployed runtime. Do not create or change production symlinks/layout based on this fixture. Isolated tests do not satisfy this production gate.
 
 ## Sender explicit-account identity pin (snapshot-only patch)
 
