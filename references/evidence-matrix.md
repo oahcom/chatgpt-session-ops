@@ -13,7 +13,7 @@
 
 **矩阵自身受回归保护**：`tests/test_hardening.py::TestEvidenceMatrix` 会校验「条款集合 = 矩阵行集合」「每个 `test:`/`code:` 引用都能解析」「每条至少一种证据」。也就是说，新增条款而不补证据行、或引用了不存在的用例，测试会直接红。
 
-> 最后更新：2026-11-24（v1.9）。当前回归 485 条（`tests/test_hardening.py`），全绿（1 条 POSIX-only skip）。
+> 最后更新：2026-11-27（v1.9）。当前回归 489 条（`tests/test_hardening.py`），全绿（1 条 POSIX-only skip）。
 
 ---
 
@@ -48,7 +48,7 @@
 | A24 | **FULL** | 测试+代码 | `test:test_fail_closed_when_nothing_configured` `test:test_allow_direct_is_explicit_only` `test:test_normalize_proxy_rejects_illegal_port` `test:test_tcp_alive_never_raises_on_junk_port` `test:test_autodetect_ports_pollution_never_escapes` `code:require_proxy` `code:normalize_proxy` `code:_tcp_alive` | 解析不到出口就 SystemExit(3)，直连需显式放行。F-35：代理端口字段收敛——坏端口＝配置非法（与坏 scheme 同待遇 ValueError，不得潜到 `u.port` 才炸）；`_tcp_alive` 对任何不可信端口返回 False（int() 的 TypeError/OverflowError 不得穿出）；`autodetect_ports` 畸形项跳过不崩 |
 | A25 | **FULL** | 测试+代码 | `test:test_dead_proxy_detected_even_if_port_accepts` `test:test_socks5_handshake_reaches_target` `test:test_socks5_open_junk_port_raises_oserror_not_typeerror` `code:_proxy_alive` `code:_socks5_open` | 端口在听 ≠ 能用；要过 TLS 握手 |
 | A26 | **FULL** | 测试+代码 | `test:test_probe_site_ok` `test:test_probe_site_blocked_by_vpn` `test:test_probe_site_challenge_is_usable` `test:test_probe_site_other_status_not_ok` `test:test_proxy_check_requires_site_ok` `code:probe_site` | 目标站 verdict 五分类，只有 ok/challenge 算通 |
-| A27 | **FULL** | 测试+代码+实测 | `test:test_thinking_uses_thinking_slug` `test:test_default_keeps_auto_model` `code:resolve_thinking_model` `code:enable_thinking` `live:2026-11-19` | `-t-` 变体解析不出就退 1；浏览器侧幂等开按钮 |
+| A27 | **FULL** | 测试+代码+实测 | `test:test_thinking_uses_thinking_slug` `test:test_default_keeps_auto_model` `test:test_preferred_thinking_env_override_wins` `test:test_preferred_thinking_default_when_env_unset` `test:test_preferred_thinking_absent_from_list_prints_diagnostic` `test:test_preferred_thinking_invalid_value_raises_before_request` `code:resolve_thinking_model` `code:_preferred_thinking_slug` `code:enable_thinking` `live:2026-11-19` | `-t-` 变体解析不出就退 1；浏览器侧幂等开按钮；优先 slug 由 `CHATGPT_PREFERRED_THINKING` 覆盖（未设置时默认 `gpt-6-t-mini`），命中 / 缺失 / 非法配置各有断言，缺失必留可 grep 诊断 |
 | A28 | **FULL** | 测试+代码 | `test:test_truncated_stream_completed_by_get` `test:test_truncated_send_prints_no_send_line_and_exits_3` `code:send` | `IncompleteRead.partial` 按 200 处理 + GET 补全文；但**截断不冒充送达凭证**——无 `SEND ... -> 200`、打 `SEND_TRUNCATED`、exit 3 |
 | A29 | **FULL** | 测试+代码+实测 | `test:test_chatgpt_domain_allowed` `test:test_openai_domain_allowed` `test:test_lookalike_domains_rejected` `test:test_empty_and_malformed_domain_rejected` `test:test_filter_keeps_only_openai` `test:test_filter_preserves_all_fields` `test:test_filter_handles_non_list_and_non_dict` `test:test_extract_auth_shares_the_same_domain_semantics` `test:test_cookie_header_built_at_init_excludes_foreign_domains` `test:test_warm_cookies_drops_foreign_cookies_on_writeback` `code:_cookie_domain_allowed` `code:_filter_openai_cookies` `code:warm_cookies` `live:2026-11-21` | 持久化边界与请求头过滤是**两道独立的关**：前者管「哪些有资格被保存」。精确域名/后缀匹配——`notchatgpt.com`、`evil-openai.com`、`chatgpt.com.evil.io` 全部拒绝（字符串包含会误收）；`warm_cookies()` 回写前同步收敛内存与磁盘，避免两者不一致；回归用 50 条 Google + 3 条 OpenAI 走真实回写路径，且已做变异验证（回滚过滤后断言 `54 != 4` 直接失败，证明这条用例不是空跑）。**三处同类绕过全部堵上**：`__init__` 拼 Cookie 头、`warm_cookies()` 回写、`extract_auth.py` 导入——任一漏掉都等于边界失效，变异验证显示回滚 `__init__` 后 `evil=x; evil2=y` 会被真的发出去 |
 
