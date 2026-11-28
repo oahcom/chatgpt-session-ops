@@ -144,10 +144,10 @@ def test_stop_cancels_waiting_futures_and_restart_recovers_durable_queue(tmp_pat
     else:
         raise AssertionError("closed executor accepted a new ChatGPT job")
 
-    def recovered_run(_client, _row):
+    def recovered_run(_row):
         return {"conversation_id": "recovered", "account": "acct1", "receipt_durable": True}
 
-    with patch.object(ChatGPTDirectClient, "_run_operation", recovered_run):
+    with patch.object(ChatGPTDirectClient, "_run_operation", staticmethod(recovered_run)):
         restarted = ChatGPTDirectClient(
             client.database_path,
             repository_root=client.repository_root,

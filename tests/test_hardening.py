@@ -812,11 +812,19 @@ class TestRotation(TmpBase):
 
     def test_fallback_requires_all_login_429(self):
         st = m._normalize_rotation({})
-        self.assertIsNone(m.anon_fallback_block_reason(st, {"acct1": 429, "acct2": 429}))
-        for outcomes in ({"acct1": 429, "acct2": 401}, {"acct1": 403, "acct2": 403},
-                         {"acct1": 429, "acct2": "SKIP:cooldown"}, {}):
-            with self.subTest(outcomes=outcomes):
-                self.assertIsNotNone(m.anon_fallback_block_reason(st, outcomes))
+        old = os.environ.get("CHATGPT_ANON_FALLBACK")
+        os.environ["CHATGPT_ANON_FALLBACK"] = "1"
+        try:
+            self.assertIsNone(m.anon_fallback_block_reason(st, {"acct1": 429, "acct2": 429}))
+            for outcomes in ({"acct1": 429, "acct2": 401}, {"acct1": 403, "acct2": 403},
+                             {"acct1": 429, "acct2": "SKIP:cooldown"}, {}):
+                with self.subTest(outcomes=outcomes):
+                    self.assertIsNotNone(m.anon_fallback_block_reason(st, outcomes))
+        finally:
+            if old is None:
+                os.environ.pop("CHATGPT_ANON_FALLBACK", None)
+            else:
+                os.environ["CHATGPT_ANON_FALLBACK"] = old
 
     def test_fallback_blocked_when_disabled_by_env(self):
         st = m._normalize_rotation({})

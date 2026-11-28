@@ -295,7 +295,7 @@ TOOL_SCHEMAS = {
             "attempt_id": _ATTEMPT_ID,
             "idempotency_key": _IDEMPOTENCY_KEY,
         },
-        ("session_id", "work_item_id"),
+        ("session_id", "work_item_id", "attempt_id"),
     ),
     "session.unlink": _object_schema(
         {
