@@ -137,7 +137,7 @@ class MCPChatGPTToolTests(unittest.TestCase):
                 make_auth("session_ops.session.write", "session_ops.work_item.write"),
             )
         self.assertTrue(result["ok"])
-        self.assertEqual(result["data"]["status"], "failed")
+        self.assertEqual(result["data"]["status"], "outcome_unknown")
         self.assertEqual(result["data"]["http_status"], 503)
 
     def test_reusing_attempt_id_with_different_prompt_is_rejected(self):

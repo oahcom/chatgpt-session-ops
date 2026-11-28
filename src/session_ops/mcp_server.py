@@ -834,7 +834,7 @@ class MCPToolService:
                 resolved_conversation_id = context.get("conversation_id")
                 resolved_account = context.get("account")
 
-            if link is not None:
+            if http_status == 200 and link is not None:
                 status = "sent"
             elif http_status == 200 and resolved_conversation_id:
                 status = "sent_unlinked"
