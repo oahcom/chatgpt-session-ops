@@ -85,34 +85,58 @@ _TAIL_RE = re.compile(r"^tail: ?(.*)$")
 
 # scripts/chatgpt_send.py:3291-3300：CLI 认得的身份集合。
 def _discover_logged_in_accounts():
-    """Discover account identities from the configured credential directory."""
+    """Discover current credential-backed identities on every validation."""
     from pathlib import Path
+
+    roots = []
     configured_root = os.environ.get("SO_SENDER_ACCOUNTS_DIR")
-    if not configured_root:
-        return frozenset()
-    root = Path(configured_root)
+    if configured_root:
+        roots.append(Path(configured_root))
+    else:
+        roots.append(Path.cwd() / "scripts" / "accounts")
+
     names = set()
-    try:
-        entries = tuple(root.iterdir()) if root.is_dir() else ()
-    except OSError:
-        entries = ()
-    for entry in entries:
+    auth_root = Path(os.environ.get("CHATGPT_AUTH_DIR") or (Path.cwd() / "scripts"))
+    if _credential_pair_exists(auth_root):
+        names.add("acct1")
+
+    for root in roots:
         try:
-            if (entry.is_symlink() or not entry.is_dir()
-                    or not re.fullmatch(r"acct[1-9][0-9]*", entry.name)):
-                continue
-            cookies, token = entry / "cookies.json", entry / "access_token.txt"
-            if (cookies.is_symlink() or token.is_symlink()
-                    or not cookies.is_file() or not token.is_file()):
-                continue
-            names.add(entry.name)
+            entries = tuple(root.iterdir()) if root.is_dir() else ()
         except OSError:
             continue
+        for entry in entries:
+            try:
+                if (
+                    entry.is_symlink() or not entry.is_dir()
+                    or not re.fullmatch(r"acct[1-9][0-9]*", entry.name)
+                    or not _credential_pair_exists(entry)
+                ):
+                    continue
+                if entry.name != "acct1" or "acct1" in names:
+                    names.add(entry.name)
+            except OSError:
+                continue
     return frozenset(names)
 
 
-_LOGGED_IN_ACCOUNTS = _discover_logged_in_accounts()
-_VALID_IDENTITIES = frozenset({"default", "nologin", *_LOGGED_IN_ACCOUNTS})
+def _credential_pair_exists(root):
+    from pathlib import Path
+    root = Path(root)
+    cookies, token = root / "cookies.json", root / "access_token.txt"
+    try:
+        return (
+            not cookies.is_symlink() and not token.is_symlink()
+            and cookies.is_file() and token.is_file()
+            and os.access(str(cookies), os.R_OK)
+            and os.access(str(token), os.R_OK)
+        )
+    except OSError:
+        return False
+
+
+_VALID_IDENTITIES = frozenset({"default", "nologin"})
+
 
 _OPERATIONS = frozenset(("create", "send", "read", "list"))
 
@@ -630,9 +654,9 @@ class ChatGPTCLIAdapter:
             )
         # scripts/chatgpt_send.py:3310-3314：default 与 acct1 共用同一凭据根。
         normalized = "acct1" if account == "default" else account
-        if normalized not in _LOGGED_IN_ACCOUNTS:
+        if normalized not in _discover_logged_in_accounts():
             raise SenderError(
-                CODE_INVALID_ARGUMENT,
+                CODE_DEPENDENCY_UNAVAILABLE,
                 "account credentials are not available",
             )
         if self._allowed_accounts is not None:
